@@ -146,16 +146,38 @@ class BeastModeBot:
                 asyncio.create_task(self._run_performance_evaluation(db_manager))
             ]
             
-            # Setup shutdown handler
-            def signal_handler():
-                self.logger.info("🛑 Shutdown signal received")
+            # Setup shutdown handler. Log which signal arrived so unexpected
+            # shutdowns (issue #37) can be diagnosed. SIGINT = Ctrl-C from the
+            # user. SIGTERM is almost always external: parent shell closing,
+            # systemd / launchd / cloud platform stopping the process, an
+            # OOM-killer first warning, or `kill <pid>` from another shell.
+            # SIGHUP fires when the controlling terminal disappears (closed
+            # SSH session without nohup/tmux/screen).
+            def signal_handler(signum: int):
+                try:
+                    sig_name = signal.Signals(signum).name
+                except ValueError:
+                    sig_name = str(signum)
+                self.logger.info(f"🛑 Shutdown signal received: {sig_name} ({signum})")
+                if sig_name == "SIGTERM":
+                    self.logger.info(
+                        "    SIGTERM came from outside the bot — common sources: "
+                        "parent shell closing, systemd/launchd timeout, cloud "
+                        "platform auto-stop, or `kill <pid>` from another shell. "
+                        "If this is unexpected, run inside tmux/screen or with nohup."
+                    )
                 self.shutdown_event.set()
                 for task in tasks:
                     task.cancel()
-            
-            # Handle Ctrl+C gracefully
-            for sig in [signal.SIGINT, signal.SIGTERM]:
-                signal.signal(sig, lambda s, f: signal_handler())
+
+            # Handle Ctrl+C and external termination gracefully.
+            # SIGHUP is POSIX-only — skip on Windows where it doesn't exist.
+            sig_names = ["SIGINT", "SIGTERM", "SIGHUP"]
+            for name in sig_names:
+                sig = getattr(signal, name, None)
+                if sig is None:
+                    continue
+                signal.signal(sig, lambda s, f, _sig=sig: signal_handler(_sig))
             
             # Wait for shutdown or completion
             await asyncio.gather(*tasks, return_exceptions=True)

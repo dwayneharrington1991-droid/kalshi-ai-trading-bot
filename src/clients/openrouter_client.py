@@ -31,6 +31,10 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "input_per_1k": 0.003,
         "output_per_1k": 0.015,
     },
+    "anthropic/claude-sonnet-4.5": {
+        "input_per_1k": 0.003,
+        "output_per_1k": 0.015,
+    },
     "openai/o3": {
         "input_per_1k": 0.002,
         "output_per_1k": 0.008,
@@ -50,6 +54,14 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "deepseek/deepseek-r1": {
         "input_per_1k": 0.0008,
         "output_per_1k": 0.002,
+    },
+    "google/gemini-3-pro-preview": {
+        "input_per_1k": 0.002,
+        "output_per_1k": 0.012,
+    },
+    "deepseek/deepseek-v3.2": {
+        "input_per_1k": 0.00014,
+        "output_per_1k": 0.00028,
     },
 }
 

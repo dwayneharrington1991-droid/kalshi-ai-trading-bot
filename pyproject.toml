@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "kalshi-ai-trading-bot"
@@ -78,9 +78,9 @@ dashboard = [
 kalshi-bot = "cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/kalshi-ai-trading-bot"
-Repository = "https://github.com/yourusername/kalshi-ai-trading-bot"
-Issues = "https://github.com/yourusername/kalshi-ai-trading-bot/issues"
+Homepage = "https://github.com/ryanfrigo/kalshi-ai-trading-bot"
+Repository = "https://github.com/ryanfrigo/kalshi-ai-trading-bot"
+Issues = "https://github.com/ryanfrigo/kalshi-ai-trading-bot/issues"
 
 [tool.setuptools]
 py-modules = ["cli", "beast_mode_bot", "beast_mode_dashboard"]
@@ -105,3 +105,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: hits the real Kalshi API and may place REAL orders / spend LLM credits; skipped unless RUN_LIVE_TESTS=1 (see tests/conftest.py)",
+]

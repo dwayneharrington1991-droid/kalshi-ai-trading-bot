@@ -11,8 +11,8 @@ from src.config.settings import settings
 from tests.test_database import load_and_prepare_markets, TEST_DB, FIXTURE_PATH
 from tests.test_helpers import find_suitable_test_market
 
-# Mark all tests in this file as async
-pytestmark = pytest.mark.asyncio
+# live: uses the real Kalshi API and real LLM credits (see tests/conftest.py)
+pytestmark = [pytest.mark.asyncio, pytest.mark.live]
 
 async def test_make_decision_for_market_creates_position():
     """

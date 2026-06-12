@@ -105,17 +105,18 @@ pre-commit install
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run the safe suite (default — no credentials needed, never touches the live API)
 pytest
 
 # Run specific test file
-pytest tests/test_decide.py
+pytest tests/test_execute.py
 
 # Run with coverage
 pytest --cov=src --cov-report=html
 
-# Run integration tests
-pytest tests/integration/
+# Live tests (marked `live`) hit the real Kalshi API and may PLACE REAL ORDERS.
+# They are skipped unless you explicitly opt in:
+RUN_LIVE_TESTS=1 pytest -m live
 ```
 
 ### Writing Tests

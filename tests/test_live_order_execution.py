@@ -13,11 +13,16 @@ from datetime import datetime
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.utils.database import DatabaseManager, Market
 from src.utils.logging_setup import setup_logging
 from src.strategies.portfolio_optimization import create_market_opportunities_from_markets
+
+# live: PLACES REAL ORDERS on Kalshi (see tests/conftest.py)
+pytestmark = pytest.mark.live
 
 async def test_immediate_trading_fix():
     """Test if immediate trading fix actually places real orders."""

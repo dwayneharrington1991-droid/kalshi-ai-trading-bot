@@ -28,7 +28,7 @@ Signed Kalshi API client, market-data ingestion, position tracking, SQLite telem
 # 1. Clone and set up
 git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
-python setup.py        # creates .venv, installs deps
+python setup_env.py    # creates .venv, installs deps
 
 # 2. Add your API keys
 cp env.template .env
@@ -146,7 +146,7 @@ python cli.py status
 ```bash
 git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
-python setup.py
+python setup_env.py
 ```
 
 Creates a virtual env, installs dependencies, and prints next steps.
@@ -225,7 +225,7 @@ kalshi-ai-trading-bot/
 ├── beast_mode_bot.py          # Example AI directional bot — main loop orchestration
 ├── cli.py                     # Unified CLI: run, dashboard, status, health, close-all, scores, history
 ├── paper_trader.py            # Paper-trading signal logger + static dashboard
-├── setup.py                   # Bootstrap script
+├── setup_env.py               # Bootstrap script (interactive env setup — not a setuptools file)
 ├── env.template               # Environment variable template
 │
 ├── src/
@@ -298,9 +298,16 @@ python cli.py status                 # Live balance + open positions from Kalshi
 ### Running Tests
 
 ```bash
-pytest tests/          # full suite
-pytest tests/ -v       # verbose
+pytest                 # safe suite (no credentials needed; never touches the live API)
+pytest -v              # verbose
 pytest --cov=src       # with coverage
+```
+
+Tests marked `live` hit the real Kalshi API — some **place real orders** — and
+are skipped by default. To run them (against an account whose losses you accept):
+
+```bash
+RUN_LIVE_TESTS=1 pytest -m live
 ```
 
 ### Code Quality

@@ -12,8 +12,8 @@ from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
 from tests.test_helpers import find_suitable_test_market
 
-# Mark all tests in this file as async
-pytestmark = pytest.mark.asyncio
+# live: uses the real Kalshi API and real LLM credits (see tests/conftest.py)
+pytestmark = [pytest.mark.asyncio, pytest.mark.live]
 
 E2E_TEST_DB = "e2e_test_trading_system.db"
 

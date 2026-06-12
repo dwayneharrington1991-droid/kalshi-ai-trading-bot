@@ -14,8 +14,13 @@ import os
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+
 from src.clients.kalshi_client import KalshiClient
 from src.utils.logging_setup import setup_logging
+
+# live: PLACES AND CANCELS REAL ORDERS on Kalshi (see tests/conftest.py)
+pytestmark = pytest.mark.live
 
 async def test_order_placement_flow():
     """Test the complete order placement and cancellation flow."""

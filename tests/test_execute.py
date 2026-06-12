@@ -41,6 +41,15 @@ async def test_execute_position_places_live_order():
     mock_kalshi_client = Mock()
     mock_kalshi_client.place_order = AsyncMock(return_value={"order": {"order_id": "test-order-123"}})
     mock_kalshi_client.close = AsyncMock()
+    # execute_position fetches live prices before ordering (issue #42 sanity guards)
+    mock_kalshi_client.get_market = AsyncMock(return_value={
+        "market": {
+            "yes_bid_dollars": 0.58,
+            "yes_ask_dollars": 0.60,
+            "no_bid_dollars": 0.40,
+            "no_ask_dollars": 0.42,
+        }
+    })
 
     try:
         # Act: Execute the position directly
@@ -74,6 +83,7 @@ async def test_execute_position_places_live_order():
             os.remove(db_path) 
 
 
+@pytest.mark.live  # PLACES REAL ORDERS on Kalshi (see tests/conftest.py)
 async def test_sell_limit_order_functionality():
     """
     Test the sell limit order functionality with real Kalshi API.
@@ -138,6 +148,7 @@ async def test_sell_limit_order_functionality():
             os.remove(test_db)
 
 
+@pytest.mark.live  # PLACES REAL ORDERS on Kalshi (see tests/conftest.py)
 async def test_profit_taking_orders():
     """
     Test profit-taking sell limit orders with real positions.

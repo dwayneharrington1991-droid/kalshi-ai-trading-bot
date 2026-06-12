@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Split the 1,300-line `portfolio_optimization.py` into the
+  `src/strategies/portfolio/` package (`models`, `optimizer`, `immediate`,
+  `runner`). `portfolio_optimization.py` remains as a compatibility shim, so
+  all existing imports — including in forks — keep working unchanged.
 - Consolidated the Kelly criterion kernel into `src/utils/position_sizing.py`.
   It was previously implemented three times (twice in
   `portfolio_optimization`, once in `safe_compounder`) with subtle

@@ -291,7 +291,13 @@ class AdvancedMarketMaker:
         confidence: float
     ) -> Tuple[int, int]:
         """
-        Calculate optimal position sizes using Kelly Criterion principles.
+        Calculate position sizes from quoting edge.
+
+        NOTE: despite the comments below, this is NOT the Kelly criterion —
+        it is a linear edge scaler (win_prob - 0.5) / 0.5 capped at 25%.
+        The canonical Kelly kernel lives in src/utils/position_sizing.py;
+        if this sizing is ever revisited, use that instead of "fixing" the
+        formula here in place.
         """
         try:
             # Available capital for market making

@@ -37,6 +37,7 @@ from src.clients.xai_client import XAIClient
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
 from src.utils.market_prices import get_market_prices
+from src.utils.position_sizing import binary_market_payout_odds, kelly_fraction
 
 
 @dataclass
@@ -272,17 +273,16 @@ class AdvancedPortfolioOptimizer:
                 # Where p = win probability, q = lose probability, b = odds
                 
                 win_prob = opp.predicted_probability
-                lose_prob = 1 - win_prob
-                
-                # Calculate odds from market price
+
+                # Calculate odds from market price (even odds for degenerate prices)
                 if opp.market_probability > 0 and opp.market_probability < 1:
-                    odds = (1 - opp.market_probability) / opp.market_probability
+                    odds = binary_market_payout_odds(opp.market_probability, bet_yes=True)
                 else:
                     odds = 1.0
-                
-                # Standard Kelly calculation
+
+                # Standard Kelly calculation (shared kernel; see src/utils/position_sizing.py)
                 if opp.edge > 0 and win_prob > 0.5:
-                    kelly_standard = (odds * win_prob - lose_prob) / odds
+                    kelly_standard = kelly_fraction(win_prob, odds)
                 else:
                     kelly_standard = 0.0
                 
@@ -1184,24 +1184,27 @@ async def _evaluate_immediate_trade(
         logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
 
 def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
-    """Calculate simple Kelly fraction for immediate trading."""
+    """Calculate simple Kelly fraction for immediate trading.
+
+    Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
+    the side selection (YES on positive edge, NO otherwise), the 20% cap, and
+    the legacy 5% fallback for degenerate market prices.
+    """
     try:
-        # Simple Kelly: (bp - q) / b
-        # where b = odds, p = win probability, q = lose probability
         if opportunity.edge > 0:  # Betting YES
             p = opportunity.predicted_probability
-            q = 1 - p
-            b = (1 - opportunity.market_probability) / opportunity.market_probability
+            b = binary_market_payout_odds(opportunity.market_probability, bet_yes=True)
         else:  # Betting NO
-            p = 1 - opportunity.predicted_probability  
-            q = opportunity.predicted_probability
-            b = opportunity.market_probability / (1 - opportunity.market_probability)
-        
-        kelly = (b * p - q) / b
-        return max(0, min(kelly, 0.2))  # Cap at 20%
+            p = 1 - opportunity.predicted_probability
+            b = binary_market_payout_odds(opportunity.market_probability, bet_yes=False)
+
+        if b <= 0:
+            return 0.05  # degenerate price (e.g. NO at P=0): keep legacy fallback
+
+        return min(kelly_fraction(p, b), 0.2)  # Cap at 20%
 
     except Exception:
-        return 0.05  # Default 5% allocation
+        return 0.05  # Default 5% allocation (includes division by zero on P=0/P=1)
 
 
 async def _get_fast_ai_prediction(

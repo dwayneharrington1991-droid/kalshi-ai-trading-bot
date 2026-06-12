@@ -31,6 +31,8 @@ from typing import Dict, List, Optional, Tuple
 
 import aiosqlite
 
+from src.utils.position_sizing import kelly_fraction
+
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------
@@ -112,15 +114,6 @@ def estimate_true_no_prob(yes_last: float, hours_to_expiry: float) -> float:
         if yes_last <= 0.03:
             return min(0.97, base_prob + 0.01)
         return base_prob
-
-
-def kelly_fraction(prob_win: float, payout_ratio: float) -> float:
-    """Kelly fraction for a binary bet."""
-    if payout_ratio <= 0 or prob_win <= 0:
-        return 0.0
-    prob_lose = 1.0 - prob_win
-    f = (prob_win * payout_ratio - prob_lose) / payout_ratio
-    return max(0.0, f)
 
 
 def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple[float, str]:

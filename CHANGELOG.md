@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Consolidated the Kelly criterion kernel into `src/utils/position_sizing.py`.
+  It was previously implemented three times (twice in
+  `portfolio_optimization`, once in `safe_compounder`) with subtle
+  differences. Strategy-level policy (fractional multipliers, regime/time
+  adjustments, caps) is unchanged; behavior is pinned by 28 characterization
+  tests in `tests/test_position_sizing.py`.
+- `market_making._calculate_optimal_sizes` docstring now states that its
+  formula is a linear edge scaler, not Kelly (the math itself is untouched).
+
 ### Added
 - Initial public release of Kalshi AI Trading Bot
 - Multi-agent AI decision engine with Forecaster, Critic, and Trader agents

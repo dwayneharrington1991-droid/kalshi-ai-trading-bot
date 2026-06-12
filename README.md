@@ -2,6 +2,7 @@
 
 <div align="center">
 
+[![CI](https://github.com/ryanfrigo/kalshi-ai-trading-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/ryanfrigo/kalshi-ai-trading-bot?style=flat&color=yellow)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/stargazers)
@@ -161,7 +162,7 @@ python -m venv .venv
 source .venv/bin/activate        # macOS / Linux
 # .venv\Scripts\activate          # Windows
 
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ### Configuration
@@ -418,7 +419,7 @@ The Kalshi `/markets` endpoint returns parlay tickers; real markets live under t
 
 ```bash
 export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
-pip install -r requirements.txt
+pip install -e .
 ```
 
 Or use Python 3.13:
@@ -426,7 +427,7 @@ Or use Python 3.13:
 ```bash
 pyenv install 3.13.1 && pyenv local 3.13.1
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 </details>

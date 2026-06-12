@@ -36,7 +36,7 @@ def main():
     print(f"✅ Python version: {sys.version.split()[0]}")
     
     # Install requirements
-    if not run_command("pip install -r requirements.txt", "Installing dependencies"):
+    if not run_command("pip install -e .", "Installing dependencies"):
         print("❌ Failed to install dependencies. Try manually: pip install scipy pandas numpy")
         return False
     

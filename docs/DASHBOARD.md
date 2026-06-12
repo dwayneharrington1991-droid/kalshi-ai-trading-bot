@@ -46,7 +46,7 @@ A comprehensive Streamlit-based dashboard for monitoring and analyzing all aspec
 ### Prerequisites
 ```bash
 # Install dashboard requirements
-pip install -r dashboard_requirements.txt
+pip install -e ".[dashboard]"
 
 # Or install individually
 pip install streamlit pandas plotly
@@ -213,7 +213,7 @@ The dashboard is responsive and works on:
 ### Common Issues
 1. **"No data available"**: System needs to run and collect data first
 2. **"LLM queries empty"**: Update XAI client instantiation with db_manager
-3. **"Dashboard won't start"**: Install requirements with `pip install -r dashboard_requirements.txt`
+3. **"Dashboard won't start"**: Install requirements with `pip install -e ".[dashboard]"`
 4. **"Charts not loading"**: Refresh browser or check console for errors
 
 ### Getting Help
@@ -226,7 +226,7 @@ The dashboard is responsive and works on:
 
 ## 🎯 Quick Start Summary
 
-1. **Install**: `pip install -r dashboard_requirements.txt`
+1. **Install**: `pip install -e ".[dashboard]"`
 2. **Launch**: `python launch_dashboard.py`
 3. **Browse**: Navigate to different sections via sidebar
 4. **Analyze**: Review strategy performance and LLM usage

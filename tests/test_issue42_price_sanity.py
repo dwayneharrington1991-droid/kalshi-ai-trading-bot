@@ -124,6 +124,8 @@ def _mock_clients(market_prices: dict):
     kalshi_mock = Mock()
     kalshi_mock.get_market = AsyncMock(return_value={"market": market_prices})
     kalshi_mock.place_order = AsyncMock(return_value={"order": {"order_id": "ord-test-42"}})
+    # Ample balance so the pre-order balance guard passes by default.
+    kalshi_mock.get_balance = AsyncMock(return_value={"balance": 1_000_000})
     return db_mock, kalshi_mock
 
 

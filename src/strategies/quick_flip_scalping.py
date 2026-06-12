@@ -264,13 +264,13 @@ REASON: [brief explanation]
                 if 'TARGET_PRICE:' in line:
                     try:
                         target_price = float(line.split(':')[1].strip())
-                    except:
-                        pass
+                    except (ValueError, IndexError):
+                        pass  # keep default; LLM output was malformed
                 elif 'CONFIDENCE:' in line:
                     try:
                         confidence = float(line.split(':')[1].strip())
-                    except:
-                        pass
+                    except (ValueError, IndexError):
+                        pass  # keep default; LLM output was malformed
                 elif 'REASON:' in line:
                     reason = line.split(':', 1)[1].strip()
             

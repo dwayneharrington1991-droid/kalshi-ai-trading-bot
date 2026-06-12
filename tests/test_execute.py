@@ -50,6 +50,8 @@ async def test_execute_position_places_live_order():
             "no_ask_dollars": 0.42,
         }
     })
+    # execute_position verifies balance before ordering (fail-closed guard)
+    mock_kalshi_client.get_balance = AsyncMock(return_value={"balance": 100_000})  # $1,000 in cents
 
     try:
         # Act: Execute the position directly
@@ -80,7 +82,57 @@ async def test_execute_position_places_live_order():
     finally:
         # Teardown
         if os.path.exists(db_path):
-            os.remove(db_path) 
+            os.remove(db_path)
+
+
+async def test_execute_position_skips_order_when_balance_insufficient():
+    """Balance guard: a live order costing more than the available balance must not be placed."""
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="LIVE-TEST-2",
+        side="YES",
+        entry_price=0.60,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Test rationale",
+        confidence=0.80,
+        live=False
+    )
+    test_position.id = await db_manager.add_position(test_position)
+
+    from unittest.mock import Mock
+    mock_kalshi_client = Mock()
+    mock_kalshi_client.place_order = AsyncMock()
+    mock_kalshi_client.close = AsyncMock()
+    mock_kalshi_client.get_market = AsyncMock(return_value={
+        "market": {
+            "yes_bid_dollars": 0.58,
+            "yes_ask_dollars": 0.60,
+            "no_bid_dollars": 0.40,
+            "no_ask_dollars": 0.42,
+        }
+    })
+    # Order needs 10 contracts @ 60¢ = 600¢; only 500¢ available.
+    mock_kalshi_client.get_balance = AsyncMock(return_value={"balance": 500})
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=True,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client
+        )
+        assert result == False, "Execution should be refused when balance is insufficient"
+        mock_kalshi_client.place_order.assert_not_called()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
 
 
 @pytest.mark.live  # PLACES REAL ORDERS on Kalshi (see tests/conftest.py)

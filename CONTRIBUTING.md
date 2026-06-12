@@ -45,10 +45,9 @@ We welcome various types of contributions:
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
-3. **Install dependencies**
+3. **Install dependencies** (runtime + dev tools, single source of truth: `pyproject.toml`)
    ```bash
-   pip install -r requirements.txt
-   pip install -r requirements-dev.txt
+   pip install -e ".[dev]"
    ```
 
 4. **Configure environment**

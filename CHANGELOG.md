@@ -5,6 +5,40 @@ All notable changes to the Kalshi AI Trading Bot project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-06-12
+
+### Fixed
+- **`pytest` is now safe to run by default.** Tests that hit the real Kalshi
+  API — several of which place real orders — are marked `live` and skipped
+  unless `RUN_LIVE_TESTS=1` is set. Previously, running the test suite with a
+  configured `.env` could place real-money orders.
+- **`pip install -e .` works again.** The declared build backend
+  (`setuptools.backends._legacy:_Backend`) does not exist, and `setup.py` was
+  an interactive wizard that setuptools executed (and hung on) during every
+  install. The backend is now `setuptools.build_meta` and the wizard lives at
+  `setup_env.py`.
+- Balance guard in order execution: live orders are skipped (fail-closed) if
+  the account balance cannot be verified or is insufficient for the order.
+- `MODEL_PRICING` was missing entries for `anthropic/claude-sonnet-4.5` (the
+  default model), `google/gemini-3-pro-preview`, and `deepseek/deepseek-v3.2`,
+  so the daily AI cost limit was not tracking their spend.
+- Replaced 6 bare `except:` clauses (which also swallow
+  `asyncio.CancelledError` and can block shutdown) with narrow handlers.
+- Fixed placeholder `yourusername` URLs in `pyproject.toml` and the broken
+  mocked execution test.
+
+### Added
+- GitHub Actions CI: test suite (no secrets required) + gitleaks secret scan.
+- `SECURITY.md` with vulnerability reporting and credential-handling guidance.
+- Regression test: orders exceeding the available balance are refused.
+
+### Removed
+- `requirements.txt` (and stale `requirements-dev.txt` /
+  `dashboard_requirements.txt` references) — `pyproject.toml` is the single
+  source of truth: `pip install -e ".[dev]"` / `".[dashboard]"`.
+- One-off debug scripts `verify_fix.py` and `test_live_mode.py` from the
+  repo root.
+
 ## [Unreleased]
 
 ### Added

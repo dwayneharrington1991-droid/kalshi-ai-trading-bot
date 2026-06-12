@@ -783,7 +783,7 @@ class AdvancedPortfolioOptimizer:
             eigenvals, eigenvecs = np.linalg.eigh(matrix)
             eigenvals = np.maximum(eigenvals, 0.001)  # Ensure positive
             return eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
-        except:
+        except Exception:
             return np.eye(matrix.shape[0])
     
     def _estimate_portfolio_max_drawdown(self, weights: np.ndarray, opportunities: List[MarketOpportunity]) -> float:
@@ -1199,8 +1199,8 @@ def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
         
         kelly = (b * p - q) / b
         return max(0, min(kelly, 0.2))  # Cap at 20%
-        
-    except:
+
+    except Exception:
         return 0.05  # Default 5% allocation
 
 

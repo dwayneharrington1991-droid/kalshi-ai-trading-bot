@@ -506,8 +506,8 @@ class UnifiedAdvancedTradingSystem:
                         market_obj = next((m for m in opportunities if m.market_id == market_id), None)
                         if market_obj:
                             time_to_expiry_days = getattr(market_obj, 'time_to_expiry', 30)
-                    except:
-                        pass
+                    except Exception:
+                        pass  # keep 30-day default
                     
                     exit_levels = StopLossCalculator.calculate_stop_loss_levels(
                         entry_price=price,

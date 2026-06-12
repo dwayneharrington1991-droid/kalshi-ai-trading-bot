@@ -108,7 +108,29 @@ async def execute_position(
                     )
                     return False
                 order_params["no_price"] = no_ask_cents
-            
+
+            # --- Balance guard: never place an order we cannot afford ---
+            # Fail closed: if the balance check itself errors, skip the order
+            # rather than risk placing it against a stale bankroll figure.
+            order_cost_cents = ask_cents * position.quantity
+            try:
+                balance_response = await kalshi_client.get_balance()
+                available_cents = int(balance_response.get("balance", 0) or 0)
+            except Exception as e:
+                logger.error(
+                    f"❌ Could not verify balance before order for {position.market_id} "
+                    f"({e}); skipping order (fail-closed)."
+                )
+                return False
+            if order_cost_cents > available_cents:
+                logger.warning(
+                    f"⚠️  Insufficient balance for {position.market_id}: order needs "
+                    f"~{order_cost_cents}¢ ({position.quantity} @ {ask_cents}¢) but only "
+                    f"{available_cents}¢ available. Skipping order."
+                )
+                return False
+            # --- End balance guard ---
+
             logger.info(f"Placing order with params: {order_params}")
             order_response = await kalshi_client.place_order(**order_params)
             

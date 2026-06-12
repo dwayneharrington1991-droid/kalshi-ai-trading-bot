@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kalshi-ai-trading-bot"
-version = "2.0.0"
+version = "2.0.1"
 description = "Multi-model AI trading bot for Kalshi prediction markets"
 readme = "README.md"
 license = {text = "MIT"}

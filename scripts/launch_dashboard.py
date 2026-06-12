@@ -35,7 +35,7 @@ def check_requirements():
         print(f"   pip install {' '.join(missing_packages)}")
         print()
         print("Or install all dashboard requirements:")
-        print("   pip install -r dashboard_requirements.txt")
+        print('   pip install -e ".[dashboard]"')
         return False
     
     return True

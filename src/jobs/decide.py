@@ -439,8 +439,10 @@ async def make_decision_for_market(
             await db_manager.record_market_analysis(
                 market.market_id, "ERROR", 0.0, 0.01, "error"
             )
-        except:
-            pass  # Don't fail on logging failure
+        except Exception:
+            # Don't fail on logging failure. Must not be a bare except:
+            # that would swallow asyncio.CancelledError and block shutdown.
+            pass
         return None
 
 

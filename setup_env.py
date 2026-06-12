@@ -100,17 +100,17 @@ def run_command(cmd, capture_output=True):
 
 
 def install_dependencies():
-    """Install dependencies from requirements.txt."""
+    """Install the project (and its dependencies) from pyproject.toml."""
     print("Installing dependencies...")
-    
+
     # For Python 3.14, set the compatibility flag
     env = os.environ.copy()
     if sys.version_info.minor == 14:
         env['PYO3_USE_ABI3_FORWARD_COMPATIBILITY'] = '1'
         print("🔧 Setting PyO3 compatibility flag for Python 3.14")
-    
+
     success, stdout, stderr = run_command(
-        f"{sys.executable} -m pip install -r requirements.txt",
+        f"{sys.executable} -m pip install -e .",
         capture_output=True
     )
     
@@ -207,7 +207,7 @@ def main():
     if not test_dashboard():
         print("\n💡 Try these solutions:")
         print("   1. Make sure you activated your virtual environment")
-        print("   2. Run: pip install -r requirements.txt")
+        print("   2. Run: pip install -e .")
         print("   3. Check that you're in the project root directory")
         return False
     

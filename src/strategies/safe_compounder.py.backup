@@ -671,8 +671,8 @@ class SafeCompounder:
                 continue
 
             try:
-                # Convert dollar price to cents for API call
-                price_cents = int(price * 100)
+                # Convert dollar price to cents for API callnano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.py
+nano src/strategies/safe_compounder.pynano src/strategies/safe_compounder.py                price_cents = int(price * 100)
                 client_order_id = str(uuid.uuid4())
                 r = await self.client.place_order(
                     ticker=ticker,

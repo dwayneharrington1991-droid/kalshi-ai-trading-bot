@@ -818,4 +818,3 @@ class SafeCompounder:
                 print(f"  {created} | {side} x{count} @ {price_display} | {ticker}", flush=True)
         except Exception:
             pass
-

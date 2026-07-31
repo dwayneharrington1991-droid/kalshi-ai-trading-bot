@@ -117,7 +117,7 @@ async def process_and_queue_markets(
             )
             and m.category not in settings.trading.excluded_categories
         ]
-
+        eligible_markets = sorted(eligible_markets, key=lambda m: m.volume, reverse=True)[:20]
         logger.info(
             f"Found {len(eligible_markets)} eligible markets to process in this batch."
         )

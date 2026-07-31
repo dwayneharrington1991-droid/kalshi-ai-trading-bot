@@ -36,7 +36,7 @@ class EdgeFilter:
     
     # LOOSENED: Allow more trading opportunities (approved 2026-03-29)
     MIN_EDGE_REQUIREMENT = 0.04        # LOOSENED: 4% minimum edge (was 8%)
-    HIGH_CONFIDENCE_EDGE = 0.03        # LOOSENED: 3% edge for high confidence (was 6%)  
+    HIGH_CONFIDENCE_EDGE = 0.02        # LOOSENED: 3% edge for high confidence (was 6%)  
     MEDIUM_CONFIDENCE_EDGE = 0.05      # LOOSENED: 5% edge for medium confidence (was 8%)
     LOW_CONFIDENCE_EDGE = 0.08         # LOOSENED: 8% edge for low confidence (was 12%)
     

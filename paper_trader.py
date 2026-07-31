@@ -80,11 +80,12 @@ async def scan_and_log():
     # 2. Run decision on each market
     for market in markets:
         try:
-            market_id = market.get("ticker") or market.get("market_id", "")
-            title = market.get("title", market_id)
+            market_id = market.market_id
+            title = market.title
+            
 
             decision = await make_decision_for_market(
-                market_data=market,
+                market=market,
                 kalshi_client=kalshi,
                 xai_client=xai,
                 db_manager=db,
@@ -99,7 +100,7 @@ async def scan_and_log():
 
             side = decision.get("side", "NO")
             confidence = decision.get("confidence", 0)
-            limit_price = decision.get("limit_price", market.get("no_ask", 0))
+            limit_price = decision.get("limit_price", market.no_price)
             reasoning = decision.get("reasoning", "")
 
             # Only log signals with meaningful confidence edge

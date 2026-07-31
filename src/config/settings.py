@@ -77,7 +77,7 @@ class TradingConfig:
     
     # Market filtering criteria — DISCIPLINED
     min_volume: float = 500.0           # SANE: Higher volume requirement (was 200 beast mode)
-    max_time_to_expiry_days: int = 14   # SANE: Shorter timeframes (was 30)
+    max_time_to_expiry_days: int = 90   # SANE: Shorter timeframes (was 30)
     
     # AI decision making — DATA-DRIVEN THRESHOLDS  
     min_confidence_to_trade: float = 0.45   # LOOSENED: 45% confidence minimum (was 60%, approved 2026-03-29)
@@ -135,24 +135,23 @@ class TradingConfig:
     min_confidence_threshold: float = 0.45  # DECREASED: Lower confidence threshold (was 0.55, now 0.45)
 
     # Cost control and market analysis frequency - MORE PERMISSIVE
-    daily_ai_budget: float = 10.0  # INCREASED: Higher daily budget (was 5.0, now 10.0)
-    max_ai_cost_per_decision: float = 0.08  # INCREASED: Higher per-decision cost (was 0.05, now 0.08)
-    analysis_cooldown_hours: int = 3  # DECREASED: Shorter cooldown (was 6, now 3)
-    max_analyses_per_market_per_day: int = 4  # INCREASED: More analyses per day (was 2, now 4)
-    
+    daily_ai_budget: float = 15.0
+    max_ai_cost_per_decision: float = 0.08
+    analysis_cooldown_hours: int = 3
+    max_analyses_per_market_per_day: int = 4
+    skip_news_for_low_volume: bool = True
+    news_search_volume_threshold: float = 1000.0
+
     # Daily AI spending limits - SAFETY CONTROLS
-    # Default is $10/day — conservative limit to prevent runaway API spend.
-    # Raise via DAILY_AI_COST_LIMIT env var or by editing this value directly.
-    # e.g. export DAILY_AI_COST_LIMIT=25  (for more aggressive scanning)
-    daily_ai_cost_limit: float = field(default_factory=lambda: float(os.getenv("DAILY_AI_COST_LIMIT", "10.0")))
-    enable_daily_cost_limiting: bool = True  # Enable daily cost limits
-    sleep_when_limit_reached: bool = True  # Sleep until next day when limit reached
+    daily_ai_cost_limit: float = field(
+        default_factory=lambda: float(os.getenv("DAILY_AI_COST_LIMIT", "10.0"))
+    )
+    enable_daily_cost_limiting: bool = True
+    sleep_when_limit_reached: bool = True
 
     # Enhanced market filtering to reduce analyses - MORE PERMISSIVE
-    min_volume_for_ai_analysis: float = 200.0  # DECREASED: Much lower threshold (was 500, now 200)
-    exclude_low_liquidity_categories: List[str] = field(default_factory=lambda: [
-        # REMOVED weather and entertainment - trade all categories
-    ])
+    min_volume_for_ai_analysis: float = 200.0
+    exclude_low_liquidity_categories: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -163,7 +162,7 @@ class LoggingConfig:
     log_file: str = "logs/trading_system.log"
     enable_file_logging: bool = True
     enable_console_logging: bool = True
-    max_log_file_size: int = 10 * 1024 * 1024  # 10MB
+    max_log_file_size: int = 10 * 1024 * 1024
     backup_count: int = 5
 
 
@@ -176,7 +175,7 @@ market_making_allocation: float = 0.40  # 40% for market making (spread profits)
 directional_allocation: float = 0.50    # 50% for directional trading (AI predictions) 
 arbitrage_allocation: float = 0.10      # 10% for arbitrage opportunities
 
-  # === PORTFOLIO OPTIMIZATION SETTINGS ===
+# === PORTFOLIO OPTIMIZATION SETTINGS ===
 # Kelly Criterion is now the PRIMARY position sizing method (moved to TradingConfig)
 # total_capital: DYNAMICALLY FETCHED from Kalshi balance - never hardcoded!
 use_risk_parity: bool = True            # Equal risk allocation vs equal capital

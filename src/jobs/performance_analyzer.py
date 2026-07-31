@@ -140,9 +140,9 @@ class TradingPerformanceAnalyzer:
                      FROM positions 
                      WHERE status = 'open'
                  """)
-                 open_position_stats = await cursor.fetchone()
+                open_position_stats = await cursor.fetchone()
                  
-                 data['performance'] = {
+                data['performance'] = {
                      'overall_stats': {
                          'total_trades': trade_stats[0] if trade_stats else 0,
                          'winning_trades': trade_stats[1] if trade_stats else 0,

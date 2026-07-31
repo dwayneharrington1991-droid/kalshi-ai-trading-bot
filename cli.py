@@ -9,7 +9,7 @@ Provides a single entry point for all bot operations:
     python cli.py backtest     Run backtests (placeholder)
     python cli.py health       Verify API connections, database, and configuration
 """
-
+#
 import argparse
 import asyncio
 import os
@@ -352,13 +352,24 @@ def cmd_history(args: argparse.Namespace) -> None:
                         f"{t['quantity']:>4} ${t['pnl']:>7.2f}  {cat}"
                     )
 
-            # Blocked trades summary
-            cursor2 = await db.execute("""
-                SELECT COUNT(*) FROM blocked_trades
-            """)
-            r2 = await cursor2.fetchone()
-            if r2 and r2[0]:
-                print(f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
+            # Blocked trades summary — only query it if the optional table exists
+            cursor2 = await db.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='blocked_trades'"
+            )
+            blocked_table_exists = await cursor2.fetchone()
+
+            if blocked_table_exists:
+                cursor2 = await db.execute(
+                    "SELECT COUNT(*) FROM blocked_trades"
+                )
+                r2 = await cursor2.fetchone()
+
+                if r2 and r2[0]:
+                    print(
+                        f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer "
+                        "(use 'python cli.py health' for details)"
+                    )
 
             print("=" * 70)
 

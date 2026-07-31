@@ -1,0 +1,65 @@
+2026-07-30 05:04:26,577 - trading_system.logging - INFO - [2m2026-07-30 05:04:26[0m [[32m[1minfo     [0m] [1mLogging system initialized    [0m [[0m[1m[34mtrading_system.logging[0m][0m [36mconsole_enabled[0m=[35mTrue[0m [36mfile_enabled[0m=[35mTrue[0m [36mlatest_log[0m=[35mlogs/latest.log[0m [36mlog_file[0m=[35mlogs/trading_system_20260730_050426.log[0m [36mlog_level[0m=[35mINFO[0m
+⚠️  WARNING: LIVE TRADING MODE ENABLED
+   This will use real money and place actual trades.
+🔒 SAFE COMPOUNDER MODE
+   NO-side only | Edge-based | Near-certain outcomes
+2026-07-30 05:04:26,738 - trading_system.kalshiclient - INFO - [2m2026-07-30 05:04:26[0m [[32m[1minfo     [0m] [1mPrivate key loaded successfully[0m [[0m[1m[34mtrading_system.kalshiclient[0m][0m
+2026-07-30 05:04:26,820 - trading_system.kalshiclient - INFO - [2m2026-07-30 05:04:26[0m [[32m[1minfo     [0m] [1mKalshi client initialized     [0m [[0m[1m[34mtrading_system.kalshiclient[0m][0m [36mapi_key_length[0m=[35m36[0m
+2026-07-30 05:04:26,820 - src.strategies.safe_compounder - INFO - ======================================================================
+2026-07-30 05:04:26,821 - src.strategies.safe_compounder - INFO - SAFE COMPOUNDER v5 — EDGE-BASED NO-SIDE
+2026-07-30 05:04:26,821 - src.strategies.safe_compounder - INFO - 2026-07-30 05:04:26
+2026-07-30 05:04:26,821 - src.strategies.safe_compounder - INFO - Rules: NO only | ask > $0.80 | edge > $0.03 | max 10%/position | maker orders
+2026-07-30 05:04:26,821 - src.strategies.safe_compounder - INFO - ======================================================================
+
+💰 Cash: $25.00 | Portfolio: $0.00 | Total: $25.00
+
+🧹 Step 0: Cancel legacy YES orders...
+  No legacy YES orders.
+
+📡 Step 1: Fetching all active markets...
+2026-07-30 05:05:09,921 - src.strategies.safe_compounder - INFO - Fetched 73136 unique markets (73136 from events)
+  Fetched 73136 markets
+
+🔍 Step 2: Finding NO-side candidates (YES ≤ $0.20)...
+2026-07-30 05:05:10,786 - src.strategies.safe_compounder - INFO - Found 15496 NO-side candidates (YES last <= $0.20)
+2026-07-30 05:05:10,806 - src.strategies.safe_compounder - INFO - Capping to top 200 candidates (from 15496) for orderbook checks
+
+📊 Step 3: Checking orderbooks for edge ≥ $0.03...
+2026-07-30 05:05:24,784 - src.strategies.safe_compounder - INFO - Orderbook progress: 50/200 checked
+2026-07-30 05:05:38,698 - src.strategies.safe_compounder - INFO - Orderbook progress: 100/200 checked
+2026-07-30 05:05:52,626 - src.strategies.safe_compounder - INFO - Orderbook progress: 150/200 checked
+2026-07-30 05:06:06,564 - src.strategies.safe_compounder - INFO - Orderbook progress: 200/200 checked
+2026-07-30 05:06:06,564 - src.strategies.safe_compounder - INFO - 1 opportunities with edge > $0.03
+
+📋 Top Opportunities:
+  NO ask:$0.96 → our:$0.95 | EV:$0.99 edge:$0.03 | YES@$0.05 | 5.3% (6404%ann) | 0.3d | vol:74028 | KXPCECORE-26JUN-T0.2
+    Will the rate of core PCE inflation be above 0.2% in June 2026?
+
+🚀 Step 4: Placing maker orders (ask - $0.01)...
+
+======================================================================
+PLACING MAKER ORDERS — Portfolio: $0.00 | Cash: $25.00 | LIVE
+Max per position: $0.00 (10%)
+======================================================================
+
+  ✅ NO x1 @ $0.95 | ? | edge:$0.03 5.3% | KXPCECORE-26JUN-T0.2
+
+======================================================================
+📊 SAFE COMPOUNDER REPORT
+======================================================================
+  Markets scanned:      73136
+  NO candidates:        200
+  With edge > $0.03:      1
+  Orders placed:        1
+  Instantly filled:     0
+  Skipped (existing):   0
+  Errors:               0
+  Capital deployed:     $0.95
+  Potential profit:     $0.05
+  YES orders cancelled: 0
+  Cash:                 $25.00
+  Portfolio:            $0.00
+  Elapsed:              101s
+======================================================================
+
+2026-07-30 05:06:08,034 - trading_system.kalshiclient - INFO - [2m2026-07-30 05:06:08[0m [[32m[1minfo     [0m] [1mKalshi client closed          [0m [[0m[1m[34mtrading_system.kalshiclient[0m][0m

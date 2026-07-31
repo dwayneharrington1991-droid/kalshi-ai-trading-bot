@@ -684,7 +684,10 @@ class SafeCompounder:
                 )
                 order = r.get("order", {})
                 status = order.get("status", "?")
-                filled = order.get("fill_count", 0)
+                try:
+                    filled = int(float(order.get("fill_count", 0) or 0))
+                except (TypeError, ValueError):
+                    filled = 0
 
                 if filled > 0:
                     stats["filled"] += filled
@@ -716,10 +719,16 @@ class SafeCompounder:
     def _calculate_position_size(self, opp: Dict, portfolio: int, cash: int) -> int:
         """Size each position using Kelly or fixed fraction."""
         max_position_value = int(portfolio * self.max_position_pct)
-        price = opp["our_price"]  # Already in dollar format
+        try:
+            price = float(opp["our_price"])
+            true_prob = float(opp["true_no_prob"])
+        except (TypeError, ValueError, KeyError):
+            return 0
+
+        if price <= 0 or price >= 1:
+            return 0
 
         if self.use_kelly:
-            true_prob = opp["true_no_prob"]  # Already in 0-1 format
             odds = (1.0 - price) / price  # Dollar format
             kf = kelly_fraction(true_prob, odds)
             half_kelly_f = kf * 0.5
@@ -809,3 +818,4 @@ class SafeCompounder:
                 print(f"  {created} | {side} x{count} @ {price_display} | {ticker}", flush=True)
         except Exception:
             pass
+

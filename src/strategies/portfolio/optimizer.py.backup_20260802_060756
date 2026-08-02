@@ -586,11 +586,6 @@ class AdvancedPortfolioOptimizer:
                 
                 # Apply minimum position size
                 dollar_allocation = fraction * self.total_capital
-                self.logger.warning(
-                    f"ALLOCATION DEBUG: market={market_id}, fraction={fraction:.6f}, "
-                    f"capital=${self.total_capital:.2f}, dollars=${dollar_allocation:.2f}, "
-                    f"minimum=${self.min_position_size:.2f}, opportunity={opp is not None}"
-                )
                 if dollar_allocation < self.min_position_size:
                     continue
                 

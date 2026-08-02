@@ -544,7 +544,7 @@ async def run_quick_flip_strategy(
         
         # Get available markets
         markets = await db_manager.get_eligible_markets(
-            volume_min=0,  # Lower liquidity requirement for small positions
+            volume_min=100,  # Lower liquidity requirement for small positions
             max_days_to_expiry=3  # Accept any timeline for quick flips
         )
         

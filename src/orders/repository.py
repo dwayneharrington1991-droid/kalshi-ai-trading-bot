@@ -2,12 +2,16 @@
 
 from datetime import datetime, timezone
 from math import isfinite
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import aiosqlite
 
 from src.orders.models import Order, OrderFill
 from src.orders.state_machine import OrderState, OrderStateMachine
+
+
+class ReconciliationRunInProgress(RuntimeError):
+    """Raised when another non-stale reconciliation run owns the database."""
 
 
 def _utcnow() -> str:
@@ -256,3 +260,142 @@ class OrderRepository:
             cursor = await db.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def get_all_orders(self) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM orders ORDER BY created_at")
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def mark_verified(
+        self, order_id: int, exchange_status: str, raw_order_response: Optional[str] = None
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            cursor = await db.execute("""
+                UPDATE orders SET exchange_status = ?, last_verified_at = ?,
+                    verification_error = NULL,
+                    raw_order_response = COALESCE(?, raw_order_response)
+                WHERE id = ?
+            """, (exchange_status, _utcnow(), raw_order_response, order_id))
+            if cursor.rowcount != 1:
+                await db.rollback()
+                raise KeyError(f"Order {order_id} does not exist")
+            await db.commit()
+
+    async def start_reconciliation_run(self, trigger: str, stale_after_seconds: int = 300) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                cursor = await db.execute("""
+                    SELECT id, started_at FROM reconciliation_runs
+                    WHERE status = 'running' ORDER BY started_at DESC LIMIT 1
+                """)
+                running = await cursor.fetchone()
+                if running:
+                    started = datetime.fromisoformat(str(running[1]).replace("Z", "+00:00"))
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    age = (datetime.now(timezone.utc) - started).total_seconds()
+                    if age <= stale_after_seconds:
+                        raise ReconciliationRunInProgress(
+                            f"Reconciliation run {running[0]} is still active"
+                        )
+                    await db.execute("""
+                        UPDATE reconciliation_runs
+                        SET status = 'failed', completed_at = ?, error_count = error_count + 1,
+                            summary = 'abandoned stale reconciliation run'
+                        WHERE id = ?
+                    """, (_utcnow(), running[0]))
+                inserted = await db.execute("""
+                    INSERT INTO reconciliation_runs (trigger, status, started_at)
+                    VALUES (?, 'running', ?)
+                """, (trigger, _utcnow()))
+                await db.commit()
+                return inserted.lastrowid
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def finish_reconciliation_run(self, run_id: int, status: str, **counts: Any) -> None:
+        allowed = {
+            "local_orders_checked", "remote_orders_seen", "fills_seen", "positions_checked",
+            "mismatch_count", "error_count", "checkpoint", "summary",
+        }
+        unknown = set(counts) - allowed
+        if unknown:
+            raise ValueError(f"Unknown reconciliation fields: {sorted(unknown)}")
+        assignments = ["status = ?", "completed_at = ?"]
+        values: List[Any] = [status, _utcnow()]
+        for key, value in counts.items():
+            assignments.append(f"{key} = ?")
+            values.append(value)
+        values.append(run_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            cursor = await db.execute(
+                f"UPDATE reconciliation_runs SET {', '.join(assignments)} WHERE id = ?", values
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                raise KeyError(f"Reconciliation run {run_id} does not exist")
+            await db.commit()
+
+    async def record_alert(
+        self, severity: str, kind: str, *, order_id: Optional[int] = None,
+        position_id: Optional[int] = None, market_id: Optional[str] = None,
+        expected_value: Optional[str] = None, observed_value: Optional[str] = None,
+        details: Optional[str] = None,
+    ) -> int:
+        now = _utcnow()
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                cursor = await db.execute("""
+                    SELECT id FROM reconciliation_alerts
+                    WHERE resolved_at IS NULL AND kind = ?
+                      AND COALESCE(order_id, -1) = COALESCE(?, -1)
+                      AND COALESCE(position_id, -1) = COALESCE(?, -1)
+                      AND COALESCE(market_id, '') = COALESCE(?, '')
+                    LIMIT 1
+                """, (kind, order_id, position_id, market_id))
+                row = await cursor.fetchone()
+                if row:
+                    alert_id = row[0]
+                    await db.execute("""
+                        UPDATE reconciliation_alerts SET severity = ?, expected_value = ?,
+                            observed_value = ?, details = ?, last_seen_at = ?,
+                            occurrence_count = occurrence_count + 1 WHERE id = ?
+                    """, (
+                        severity, expected_value, observed_value, details, now, alert_id,
+                    ))
+                else:
+                    inserted = await db.execute("""
+                        INSERT INTO reconciliation_alerts (
+                            severity, kind, order_id, position_id, market_id,
+                            expected_value, observed_value, details, first_seen_at, last_seen_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        severity, kind, order_id, position_id, market_id,
+                        expected_value, observed_value, details, now, now,
+                    ))
+                    alert_id = inserted.lastrowid
+                await db.commit()
+                return alert_id
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def get_live_position_snapshot(self) -> List[dict]:
+        """Read-only position data used solely for mismatch detection."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT id, market_id, side, quantity, status, live
+                FROM positions WHERE live = 1 AND status IN ('open', 'pending')
+            """)
+            return [dict(row) for row in await cursor.fetchall()]

@@ -17,6 +17,9 @@ class APIConfig:
     """API configuration settings."""
     kalshi_api_key: str = field(default_factory=lambda: os.getenv("KALSHI_API_KEY", ""))
     kalshi_base_url: str = "https://external-api.kalshi.com"  # Updated to new API endpoint
+    kalshi_environment: str = field(
+        default_factory=lambda: os.getenv("KALSHI_ENVIRONMENT", "production").lower()
+    )
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     openai_base_url: str = "https://api.openai.com/v1"
@@ -113,6 +116,30 @@ class TradingConfig:
     # Live trading mode control
     live_trading_enabled: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true")
     paper_trading_mode: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() != "true")
+
+    # Exchange reconciliation is disabled and shadow-only by default. Phase 2
+    # never routes order submission or position mutation through this system.
+    order_reconciliation_enabled: bool = field(
+        default_factory=lambda: os.getenv("ORDER_RECONCILIATION_ENABLED", "false").lower() == "true"
+    )
+    reconciliation_shadow_mode: bool = field(
+        default_factory=lambda: os.getenv("RECONCILIATION_SHADOW_MODE", "true").lower() == "true"
+    )
+    reconciliation_startup_required: bool = field(
+        default_factory=lambda: os.getenv("RECONCILIATION_STARTUP_REQUIRED", "true").lower() == "true"
+    )
+    reconciliation_interval_seconds: int = field(
+        default_factory=lambda: int(os.getenv("RECONCILIATION_INTERVAL_SECONDS", "10"))
+    )
+    full_reconciliation_interval_seconds: int = field(
+        default_factory=lambda: int(os.getenv("FULL_RECONCILIATION_INTERVAL_SECONDS", "60"))
+    )
+    order_verification_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("ORDER_VERIFICATION_TIMEOUT_SECONDS", "30"))
+    )
+    reconciliation_max_staleness_seconds: int = field(
+        default_factory=lambda: int(os.getenv("RECONCILIATION_MAX_STALENESS_SECONDS", "30"))
+    )
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)

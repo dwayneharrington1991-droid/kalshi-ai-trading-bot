@@ -26,6 +26,8 @@ from src.clients.xai_client import XAIClient
 from src.utils.database import DatabaseManager, Market
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
+from src.orders.readiness import ReadinessContext, SubmissionReadinessEvaluator
+from src.orders.repository import OrderRepository
 
 
 @dataclass
@@ -341,6 +343,8 @@ class AdvancedMarketMaker:
         """
         results = {
             'orders_placed': 0,
+            'orders_blocked': 0,
+            'refusal_reasons': [],
             'total_exposure': 0.0,
             'expected_profit': 0.0,
             'markets_count': 0
@@ -352,20 +356,35 @@ class AdvancedMarketMaker:
         
         for opportunity in top_opportunities:
             try:
-                await self._place_market_making_orders(opportunity)
+                order_results = await self._place_market_making_orders(opportunity)
+                placed = sum(1 for success, _ in order_results if success)
+                reasons = [reason for success, reason in order_results if not success]
+                results['orders_placed'] += placed
+                results['orders_blocked'] += len(reasons)
+                results['refusal_reasons'].extend(reasons)
+                if placed:
+                    results['total_exposure'] += opportunity.optimal_yes_size + opportunity.optimal_no_size
+                    results['expected_profit'] += opportunity.total_expected_profit
+                    results['markets_count'] += 1
+                    self.logger.info(
+                        f"Market making orders placed for {opportunity.market_title}: "
+                        f"Expected profit: ${opportunity.total_expected_profit:.2f}"
+                    )
+                elif reasons:
+                    self.logger.warning(
+                        "Market making submission blocked",
+                        market_id=opportunity.market_id,
+                        reason=reasons[0],
+                    )
                 
-                results['orders_placed'] += 2  # YES and NO orders
-                results['total_exposure'] += opportunity.optimal_yes_size + opportunity.optimal_no_size
-                results['expected_profit'] += opportunity.total_expected_profit
-                results['markets_count'] += 1
-                
-                self.logger.info(
-                    f"Market making orders placed for {opportunity.market_title}: "
-                    f"Expected profit: ${opportunity.total_expected_profit:.2f}"
+            except Exception:
+                reason = "market-making readiness could not be verified"
+                results['orders_blocked'] += 2
+                results['refusal_reasons'].extend([reason, reason])
+                self.logger.error(
+                    "Market-making opportunity failed closed",
+                    market_id=opportunity.market_id,
                 )
-                
-            except Exception as e:
-                self.logger.error(f"Error executing market making for {opportunity.market_id}: {e}")
                 continue
         
         return results
@@ -397,77 +416,83 @@ class AdvancedMarketMaker:
         orders.extend([yes_bid_order, no_bid_order])
         
         # Place orders with Kalshi (simulated for now)
+        outcomes = []
         for order in orders:
-            await self._place_limit_order(order)
+            outcomes.append(await self._place_limit_order(order))
         
         # Track active orders
-        if opportunity.market_id not in self.active_orders:
-            self.active_orders[opportunity.market_id] = []
-        self.active_orders[opportunity.market_id].extend(orders)
+        placed_orders = [order for order, (success, _) in zip(orders, outcomes) if success]
+        if placed_orders:
+            if opportunity.market_id not in self.active_orders:
+                self.active_orders[opportunity.market_id] = []
+            self.active_orders[opportunity.market_id].extend(placed_orders)
+        return outcomes
 
     async def _place_limit_order(self, order: LimitOrder):
         """
-        Place a limit order with the exchange.
+        Simulate in paper mode and fail closed in live mode.
+
+        Market-making does not yet have the position-ledger identity required by
+        VerifiedExecutionService. Direct exchange submission is forbidden until
+        that projection model exists.
         """
         try:
-            # Check if we're in live mode
             live_mode = getattr(settings.trading, 'live_trading_enabled', False)
-            
+
             if live_mode:
-                # Place actual limit order with Kalshi
-                import uuid
-                client_order_id = str(uuid.uuid4())
-                
-                # Convert side to match Kalshi API
-                side = order.side.lower()  # "YES" -> "yes", "NO" -> "no"
-                
-                # Set price parameters based on side
-                order_params = {
-                    "ticker": order.market_id,
-                    "client_order_id": client_order_id,
-                    "side": side,
-                    "action": "buy",  # Market making involves buying at our bid prices
-                    "count": order.quantity,
-                    "type_": "limit"
-                }
-                
-                # Add the appropriate price parameter
-                if side == "yes":
-                    order_params["yes_price"] = int(order.price)  # Price in cents
-                else:
-                    order_params["no_price"] = int(order.price)
-                
-                # Place the order
-                response = await self.kalshi_client.place_order(**order_params)
-                
-                if response and 'order' in response:
-                    order.status = "placed"
-                    order.placed_at = datetime.now()
-                    order.order_id = response['order'].get('order_id', client_order_id)
-                    
-                    # Convert cents back to dollars for display
-                    display_price = order.price / 100 if order.price > 1.0 else order.price
-                    self.logger.info(
-                        f"✅ LIVE limit order placed: {order.side} {order.quantity} at ${display_price:.2f} "
-                        f"for market {order.market_id} (Order ID: {order.order_id})"
-                    )
-                else:
-                    self.logger.error(f"Failed to place live order: {response}")
-                    order.status = "failed"
+                evaluator = SubmissionReadinessEvaluator(
+                    OrderRepository(self.db_manager.db_path)
+                )
+                report = await evaluator.evaluate(ReadinessContext(
+                    live_mode=True,
+                    authoritative_execution_enabled=(
+                        settings.trading.authoritative_live_execution_enabled
+                    ),
+                    reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+                    reconciliation_shadow_mode=settings.trading.reconciliation_shadow_mode,
+                    kill_switch=settings.trading.live_order_submission_kill_switch,
+                    configured_environment=settings.api.kalshi_environment,
+                    client_environment=getattr(self.kalshi_client, "environment", None),
+                    production_acknowledgement=(
+                        settings.trading.production_execution_acknowledgement
+                    ),
+                    reconciliation_max_age_seconds=(
+                        settings.trading.reconciliation_health_max_age_seconds
+                    ),
+                    action="buy",
+                    market_id=order.market_id,
+                    side=order.side,
+                    quantity=order.quantity,
+                    valid_quote=0.01 <= (order.price / 100) <= 0.99,
+                    price=order.price / 100,
+                ), scope="pre_submission")
+                reason = (
+                    report.blocking_checks[0].reason if report.blocking_checks
+                    else "market-making verified execution integration is unavailable"
+                )
+                order.status = "blocked"
+                self.logger.warning(
+                    "Live market-making order refused",
+                    market_id=order.market_id,
+                    side=order.side,
+                    reason=reason,
+                )
+                return False, reason
             else:
-                # Simulate order placement for paper trading
                 order.status = "placed"
                 order.placed_at = datetime.now()
                 order.order_id = f"sim_{order.market_id}_{order.side}_{int(datetime.now().timestamp())}"
-                
+
                 self.logger.info(
                     f"📝 SIMULATED limit order placed: {order.side} {order.quantity} at {order.price:.1f}¢ "
                     f"for market {order.market_id}"
                 )
-            
-        except Exception as e:
-            self.logger.error(f"Error placing limit order: {e}")
-            order.status = "failed"
+                return True, "paper simulation"
+
+        except Exception:
+            self.logger.error("Market-making readiness evaluation failed closed")
+            order.status = "blocked"
+            return False, "market-making readiness could not be verified"
 
     async def _get_ai_analysis(self, market: Market) -> Optional[Dict]:
         """
@@ -673,4 +698,4 @@ async def run_market_making_strategy(
         
     except Exception as e:
         logger.error(f"Error in market making strategy: {e}")
-        return {'error': str(e)} 
+        return {'error': str(e)}

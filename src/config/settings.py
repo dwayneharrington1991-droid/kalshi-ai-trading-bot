@@ -140,6 +140,24 @@ class TradingConfig:
     reconciliation_max_staleness_seconds: int = field(
         default_factory=lambda: int(os.getenv("RECONCILIATION_MAX_STALENESS_SECONDS", "30"))
     )
+    authoritative_live_execution_enabled: bool = field(
+        default_factory=lambda: os.getenv("AUTHORITATIVE_LIVE_EXECUTION_ENABLED", "false").lower() == "true"
+    )
+    live_order_submission_kill_switch: bool = field(
+        default_factory=lambda: os.getenv("LIVE_ORDER_SUBMISSION_KILL_SWITCH", "true").lower() == "true"
+    )
+    production_execution_acknowledgement: str = field(
+        default_factory=lambda: os.getenv("PRODUCTION_EXECUTION_ACKNOWLEDGEMENT", "")
+    )
+    reconciliation_health_max_age_seconds: int = field(
+        default_factory=lambda: int(os.getenv("RECONCILIATION_HEALTH_MAX_AGE_SECONDS", "30"))
+    )
+    allow_risk_reducing_live_exits: bool = field(
+        default_factory=lambda: os.getenv("ALLOW_RISK_REDUCING_LIVE_EXITS", "false").lower() == "true"
+    )
+    allow_live_order_cancellations: bool = field(
+        default_factory=lambda: os.getenv("ALLOW_LIVE_ORDER_CANCELLATIONS", "false").lower() == "true"
+    )
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)

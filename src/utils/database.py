@@ -126,6 +126,7 @@ class DatabaseManager(TradingLoggerMixin):
         migrations = (
             (1, "legacy_schema_compatibility", self._migration_001_legacy_schema),
             (2, "order_reconciliation_foundation", self._migration_002_order_reconciliation),
+            (3, "authoritative_position_projection", self._migration_003_position_projection),
         )
         for version, name, migration in migrations:
             if version in applied:
@@ -276,6 +277,33 @@ class DatabaseManager(TradingLoggerMixin):
         """
         # sqlite3 ``executescript`` commits implicitly, so execute each DDL
         # statement separately inside initialize()'s migration transaction.
+        for statement in statements.split(";"):
+            if statement.strip():
+                await db.execute(statement)
+
+    async def _migration_003_position_projection(self, db: aiosqlite.Connection) -> None:
+        statements = """
+            CREATE TABLE position_projection_baselines (
+                position_id INTEGER PRIMARY KEY REFERENCES positions(id) ON DELETE RESTRICT,
+                base_quantity REAL NOT NULL CHECK (base_quantity >= 0),
+                base_entry_price REAL CHECK (base_entry_price >= 0 AND base_entry_price <= 1),
+                captured_at TEXT NOT NULL,
+                legacy_unreconciled BOOLEAN NOT NULL DEFAULT 0
+            );
+            CREATE TABLE position_fill_projections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER NOT NULL REFERENCES positions(id) ON DELETE RESTRICT,
+                order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+                exchange_fill_id TEXT NOT NULL UNIQUE REFERENCES order_fills(exchange_fill_id),
+                action TEXT NOT NULL CHECK (action IN ('buy', 'sell')),
+                quantity REAL NOT NULL CHECK (quantity > 0),
+                price REAL NOT NULL CHECK (price >= 0 AND price <= 1),
+                fee REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),
+                applied_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_position_fill_projections_position
+                ON position_fill_projections(position_id, applied_at);
+        """
         for statement in statements.split(";"):
             if statement.strip():
                 await db.execute(statement)

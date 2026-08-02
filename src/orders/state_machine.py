@@ -77,3 +77,11 @@ class OrderStateMachine:
             raise InvalidOrderTransition(
                 f"Invalid order transition: {current_state.value} -> {target_state.value}"
             )
+
+    @classmethod
+    def can_transition(
+        cls, current: Union[OrderState, str], target: Union[OrderState, str]
+    ) -> bool:
+        current_state = cls.normalize(current)
+        target_state = cls.normalize(target)
+        return target_state in cls._TRANSITIONS.get(current_state, set())

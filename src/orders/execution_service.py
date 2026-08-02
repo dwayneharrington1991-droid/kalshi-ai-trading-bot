@@ -9,12 +9,13 @@ from typing import Any, Optional
 
 from src.orders.models import Order
 from src.orders.reconciler import OrderReconciler
+from src.orders.readiness import (
+    PRODUCTION_ACKNOWLEDGEMENT, ReadinessContext, SubmissionReadinessEvaluator,
+    sufficient_order_balance, valid_order_price,
+)
 from src.orders.repository import OrderRepository
 from src.orders.state_machine import OrderState, OrderStateMachine
 from src.utils.logging_setup import get_trading_logger
-
-PRODUCTION_ACKNOWLEDGEMENT = "I_ACKNOWLEDGE_PRODUCTION_ORDER_RISK"
-
 
 class ExecutionSafetyError(RuntimeError):
     """Raised when an execution safety gate fails."""
@@ -75,7 +76,11 @@ class VerifiedExecutionService:
         self.logger = get_trading_logger("verified_execution")
 
     async def execute(self, intent: OrderIntent) -> ExecutionResult:
-        self._validate_intent(intent)
+        try:
+            self._validate_intent(intent)
+        except (TypeError, ValueError):
+            await self._log_refusal(intent, valid_quote=valid_order_price(intent.price))
+            raise
         fingerprint = intent.fingerprint()
         existing = await self.repository.get_order_by_fingerprint(fingerprint)
         requires_submission = existing is None or existing["state"] == "locally_created"
@@ -180,31 +185,31 @@ class VerifiedExecutionService:
         )
 
     async def _preflight_gateway(self, intent: OrderIntent, *, require_health: bool) -> None:
-        if not self.safety.live_mode:
-            raise ExecutionSafetyError("live mode is not enabled")
-        if not self.safety.authoritative_execution_enabled:
-            raise ExecutionSafetyError("authoritative execution is disabled")
-        if not self.safety.reconciliation_enabled:
-            raise ExecutionSafetyError("reconciliation is disabled")
-        if self.safety.kill_switch:
-            raise ExecutionSafetyError("live order submission kill switch is enabled")
-        if intent.action.lower() == "sell" and not self.safety.allow_risk_reducing_exits:
-            raise ExecutionSafetyError("risk-reducing live exits are not enabled")
-        if str(getattr(self.client, "environment", "")).lower() != intent.environment.lower():
-            raise ExecutionSafetyError("Kalshi client environment does not match order intent")
-        if intent.environment.lower() == "production" and (
-            self.safety.production_acknowledgement != PRODUCTION_ACKNOWLEDGEMENT
-        ):
-            raise ExecutionSafetyError("production execution acknowledgement is missing")
         try:
-            await self.repository.assert_position_intent(
-                intent.position_id, intent.market_id, intent.side,
-                intent.action, intent.quantity,
+            context = ReadinessContext(
+                live_mode=self.safety.live_mode,
+                authoritative_execution_enabled=self.safety.authoritative_execution_enabled,
+                reconciliation_enabled=self.safety.reconciliation_enabled,
+                reconciliation_shadow_mode=True,
+                kill_switch=self.safety.kill_switch,
+                configured_environment=intent.environment,
+                client_environment=str(getattr(self.client, "environment", "")),
+                production_acknowledgement=self.safety.production_acknowledgement,
+                reconciliation_max_age_seconds=self.safety.reconciliation_max_age_seconds,
+                allow_risk_reducing_exits=self.safety.allow_risk_reducing_exits,
+                action=intent.action,
+                position_id=intent.position_id,
+                market_id=intent.market_id,
+                side=intent.side,
+                quantity=intent.quantity,
             )
-            if require_health:
-                await self.repository.assert_reconciliation_healthy(
-                    self.safety.reconciliation_max_age_seconds
-                )
+            evaluator = SubmissionReadinessEvaluator(self.repository)
+            report = await evaluator.evaluate(
+                context, scope="pre_submission", require_health=require_health
+            )
+            if report.blocking_checks:
+                evaluator.log(report, self.logger)
+                raise RuntimeError(report.blocking_checks[0].reason)
         except RuntimeError as exc:
             raise ExecutionSafetyError(str(exc)) from exc
 
@@ -212,16 +217,49 @@ class VerifiedExecutionService:
         try:
             balance = await self.client.get_balance()
         except Exception as exc:
+            await self._log_refusal(intent, sufficient_balance=False)
             raise ExecutionSafetyError("balance could not be verified") from exc
         if not isinstance(balance, dict) or isinstance(balance.get("balance"), bool):
+            await self._log_refusal(intent, sufficient_balance=False)
             raise ExecutionSafetyError("balance response is malformed")
         try:
             available = Decimal(str(balance["balance"]))
         except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+            await self._log_refusal(intent, sufficient_balance=False)
             raise ExecutionSafetyError("balance response is malformed") from exc
         required = Decimal(str(intent.price)) * 100 * Decimal(str(intent.quantity))
-        if intent.action.lower() == "buy" and available < required:
+        if not sufficient_order_balance(available, intent.price, intent.quantity, intent.action):
+            await self._log_refusal(
+                intent, sufficient_balance=False, available_balance=float(available),
+                required_balance=float(required),
+            )
             raise ExecutionSafetyError("insufficient verified balance")
+
+    async def _log_refusal(self, intent: OrderIntent, **observations: Any) -> None:
+        try:
+            evaluator = SubmissionReadinessEvaluator(self.repository)
+            report = await evaluator.evaluate(ReadinessContext(
+                live_mode=self.safety.live_mode,
+                authoritative_execution_enabled=self.safety.authoritative_execution_enabled,
+                reconciliation_enabled=self.safety.reconciliation_enabled,
+                reconciliation_shadow_mode=True,
+                kill_switch=self.safety.kill_switch,
+                configured_environment=intent.environment,
+                client_environment=str(getattr(self.client, "environment", "")),
+                production_acknowledgement=self.safety.production_acknowledgement,
+                reconciliation_max_age_seconds=self.safety.reconciliation_max_age_seconds,
+                allow_risk_reducing_exits=self.safety.allow_risk_reducing_exits,
+                action=intent.action,
+                market_id=intent.market_id,
+                position_id=intent.position_id,
+                side=intent.side,
+                quantity=intent.quantity,
+                price=intent.price,
+                **observations,
+            ), scope="pre_submission")
+            evaluator.log(report, self.logger)
+        except Exception as exc:
+            self.logger.error("Submission readiness diagnostic failed")
 
     @staticmethod
     def _validate_intent(intent: OrderIntent) -> None:
@@ -236,7 +274,7 @@ class VerifiedExecutionService:
         quantity, price = Decimal(str(intent.quantity)), Decimal(str(intent.price))
         if not quantity.is_finite() or quantity <= 0:
             raise ValueError("quantity must be positive and finite")
-        if not price.is_finite() or not Decimal("0.01") <= price <= Decimal("0.99"):
+        if not valid_order_price(price):
             raise ValueError("price must be between 0.01 and 0.99")
         if intent.environment.lower() not in {"demo", "production"}:
             raise ValueError("environment must be demo or production")

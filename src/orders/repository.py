@@ -377,6 +377,16 @@ class OrderRepository:
             return dict(row) if row else None
 
     async def assert_reconciliation_healthy(self, max_age_seconds: int) -> None:
+        health = await self.get_reconciliation_health(max_age_seconds)
+        if not health["healthy_status"]:
+            raise RuntimeError(health["health_reason"])
+        if not health["fresh"]:
+            raise RuntimeError(health["freshness_reason"])
+        if health["critical_alert_count"]:
+            raise RuntimeError("unresolved critical reconciliation alert")
+
+    async def get_reconciliation_health(self, max_age_seconds: int) -> dict:
+        """Return the detailed checkpoint state used by execution and diagnostics."""
         async with aiosqlite.connect(self.db_path) as db:
             await self._configure(db)
             cursor = await db.execute("""
@@ -384,19 +394,34 @@ class OrderRepository:
                 WHERE completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1
             """)
             row = await cursor.fetchone()
-            if row is None or row[0] not in {"completed", "completed_with_mismatches"}:
-                raise RuntimeError("reconciliation has no completed health checkpoint")
-            completed = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
-            if completed.tzinfo is None:
-                completed = completed.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - completed).total_seconds() > max_age_seconds:
-                raise RuntimeError("reconciliation health checkpoint is stale")
+            healthy_status = row is not None and row[0] in {"completed", "completed_with_mismatches"}
+            age_seconds = None
+            fresh = False
+            if row is not None:
+                try:
+                    completed = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+                    if completed.tzinfo is None:
+                        completed = completed.replace(tzinfo=timezone.utc)
+                    age_seconds = max(0.0, (datetime.now(timezone.utc) - completed).total_seconds())
+                    fresh = age_seconds <= max_age_seconds
+                except (TypeError, ValueError):
+                    pass
             critical = await db.execute("""
-                SELECT 1 FROM reconciliation_alerts
-                WHERE resolved_at IS NULL AND severity = 'critical' LIMIT 1
+                SELECT COUNT(*) FROM reconciliation_alerts
+                WHERE resolved_at IS NULL AND severity = 'critical'
             """)
-            if await critical.fetchone():
-                raise RuntimeError("unresolved critical reconciliation alert")
+            critical_count = int((await critical.fetchone())[0])
+            return {
+                "status": row[0] if row else None,
+                "healthy_status": healthy_status,
+                "health_reason": ("latest checkpoint completed" if healthy_status
+                                  else "reconciliation has no completed health checkpoint"),
+                "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+                "fresh": fresh,
+                "freshness_reason": ("checkpoint is fresh" if fresh
+                                     else "reconciliation health checkpoint is stale"),
+                "critical_alert_count": critical_count,
+            }
 
     async def assert_position_intent(
         self, position_id: int, market_id: str, side: str,

@@ -562,6 +562,12 @@ class DatabaseManager(TradingLoggerMixin):
                 markets.append(Market(**market_dict))
             return markets
 
+    async def get_market_count(self) -> int:
+        """Return the total number of locally ingested markets."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM markets")
+            return int((await cursor.fetchone())[0])
+
     async def get_markets_with_positions(self) -> set[str]:
         """
         Returns a set of market IDs that have associated open positions.

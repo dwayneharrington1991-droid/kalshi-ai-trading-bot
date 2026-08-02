@@ -40,6 +40,7 @@ from src.clients.xai_client import XAIClient
 from src.config.settings import settings
 from src.orders.reconciler import OrderReconciler
 from src.orders.repository import OrderRepository
+from src.orders.readiness import ReadinessContext, SubmissionReadinessEvaluator
 
 # Import Beast Mode components
 from src.strategies.unified_trading_system import run_unified_trading_system, TradingSystemConfig
@@ -148,6 +149,20 @@ class BeastModeBot:
                         )
                 else:
                     self.logger.info("Order reconciliation remains separate from paper mode")
+
+            startup_readiness = SubmissionReadinessEvaluator(OrderRepository(db_manager.db_path))
+            startup_report = await startup_readiness.evaluate(ReadinessContext(
+                live_mode=self.live_mode,
+                authoritative_execution_enabled=settings.trading.authoritative_live_execution_enabled,
+                reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+                reconciliation_shadow_mode=settings.trading.reconciliation_shadow_mode,
+                kill_switch=settings.trading.live_order_submission_kill_switch,
+                configured_environment=settings.api.kalshi_environment,
+                client_environment=kalshi_client.environment,
+                production_acknowledgement=settings.trading.production_execution_acknowledgement,
+                reconciliation_max_age_seconds=settings.trading.reconciliation_health_max_age_seconds,
+            ), scope="startup")
+            startup_readiness.log(startup_report, self.logger)
 
             # Small delay to ensure everything is ready
             await asyncio.sleep(1)

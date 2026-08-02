@@ -32,6 +32,7 @@ class OrderReconciler:
         self, repository: OrderRepository, kalshi_client: Any, *,
         shadow_mode: bool = True, paper_mode: bool = False,
         max_staleness_seconds: int = 30, verification_timeout_seconds: int = 30,
+        project_positions: bool = False,
     ):
         if not shadow_mode:
             raise ValueError("Phase 2 reconciliation is shadow-mode only")
@@ -41,6 +42,7 @@ class OrderReconciler:
         self.paper_mode = paper_mode
         self.max_staleness_seconds = max_staleness_seconds
         self.verification_timeout_seconds = verification_timeout_seconds
+        self.project_positions = project_positions
         self.logger = get_trading_logger("order_reconciler")
 
     async def reconcile(self, trigger: str = "periodic", full: bool = True) -> ReconciliationResult:
@@ -190,6 +192,7 @@ class OrderReconciler:
                     filled_at=fill.filled_at,
                     raw_response=json.dumps(fill.raw, default=str),
                 ),
+                project_position=self.project_positions,
             )
             if inserted:
                 self.logger.info(

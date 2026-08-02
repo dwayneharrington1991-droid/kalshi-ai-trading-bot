@@ -8,6 +8,7 @@ pytestmark = pytest.mark.asyncio
 EXPECTED_TABLES = {
     "schema_migrations", "orders", "order_fills", "order_state_events",
     "reconciliation_runs", "reconciliation_alerts",
+    "position_projection_baselines", "position_fill_projections",
 }
 
 
@@ -28,7 +29,7 @@ async def test_fresh_database_applies_versioned_migrations(tmp_path):
         versions = await (await db.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         )).fetchall()
-    assert versions == [(1,), (2,)]
+    assert versions == [(1,), (2,), (3,)]
 
 
 async def test_migrations_are_idempotent(tmp_path):
@@ -38,7 +39,7 @@ async def test_migrations_are_idempotent(tmp_path):
     await manager.initialize()
     async with aiosqlite.connect(db_path) as db:
         count = (await (await db.execute("SELECT COUNT(*) FROM schema_migrations")).fetchone())[0]
-    assert count == 2
+    assert count == 3
 
 
 async def test_legacy_data_is_preserved(tmp_path):

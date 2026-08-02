@@ -13,6 +13,53 @@ from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
 from src.clients.kalshi_client import KalshiClient, KalshiAPIError
 from src.utils.market_prices import get_market_prices, is_tradeable_market
+from src.orders.execution_service import (
+    ExecutionSafetyConfig, ExecutionSafetyError, OrderIntent, VerifiedExecutionService,
+)
+from src.orders.reconciler import OrderReconciler
+from src.orders.repository import OrderRepository
+
+
+def _verified_service(db_manager, kalshi_client, live_mode=True):
+    repository = OrderRepository(db_manager.db_path)
+    safety = ExecutionSafetyConfig(
+        live_mode=live_mode,
+        authoritative_execution_enabled=settings.trading.authoritative_live_execution_enabled,
+        reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+        kill_switch=settings.trading.live_order_submission_kill_switch,
+        production_acknowledgement=settings.trading.production_execution_acknowledgement,
+        reconciliation_max_age_seconds=settings.trading.reconciliation_health_max_age_seconds,
+        allow_risk_reducing_exits=settings.trading.allow_risk_reducing_live_exits,
+    )
+    reconciler = OrderReconciler(
+        repository, kalshi_client, shadow_mode=True, paper_mode=False,
+        max_staleness_seconds=settings.trading.reconciliation_max_staleness_seconds,
+        verification_timeout_seconds=settings.trading.order_verification_timeout_seconds,
+    )
+    return VerifiedExecutionService(repository, kalshi_client, reconciler, safety)
+
+
+async def _execute_verified_buy(position, db_manager, kalshi_client):
+    logger = get_trading_logger("trade_execution")
+    if not settings.trading.authoritative_live_execution_enabled:
+        logger.error("Legacy live buy path is disabled; authoritative execution is not enabled")
+        return False
+    try:
+        market = (await kalshi_client.get_market(position.market_id)).get("market", {})
+        if not is_tradeable_market(market):
+            return False
+        _, yes_ask, _, no_ask = get_market_prices(market)
+        price = yes_ask if position.side.upper() == "YES" else no_ask
+        result = await _verified_service(db_manager, kalshi_client).execute(OrderIntent(
+            market_id=position.market_id, side=position.side, action="buy",
+            quantity=position.quantity, price=price, order_type="market",
+            position_id=position.id, environment=kalshi_client.environment,
+            strategy=position.strategy,
+        ))
+        return result.state in {"resting", "partially_filled", "fully_filled", "canceled"}
+    except Exception as exc:
+        logger.error("Verified live buy refused", error=str(exc), market_id=position.market_id)
+        return False
 
 async def execute_position(
     position: Position, 
@@ -37,6 +84,8 @@ async def execute_position(
     logger.info(f"🎛️ Live mode: {live_mode}")
     
     if live_mode:
+        return await _execute_verified_buy(position, db_manager, kalshi_client)
+        # Disabled legacy acceptance-as-fill path retained for compatibility.
         logger.warning(f"💰 PLACING LIVE ORDER - Real money will be used for {position.market_id}")
         try:
             # Get current market prices to determine the appropriate price field
@@ -175,6 +224,22 @@ async def place_sell_limit_order(
         True if order placed successfully, False otherwise
     """
     logger = get_trading_logger("sell_limit_order")
+    if not settings.trading.authoritative_live_execution_enabled:
+        logger.error("Legacy live sell path is disabled; authoritative execution is not enabled")
+        return False
+    try:
+        result = await _verified_service(db_manager, kalshi_client).execute(OrderIntent(
+            market_id=position.market_id, side=position.side, action="sell",
+            quantity=position.quantity, price=limit_price, order_type="limit",
+            position_id=position.id, environment=kalshi_client.environment,
+            strategy=position.strategy,
+        ))
+        return result.state in {"resting", "partially_filled", "fully_filled", "canceled"}
+    except Exception as exc:
+        logger.error("Verified live sell refused", error=str(exc), market_id=position.market_id)
+        return False
+
+    # Disabled legacy sell path retained temporarily for source compatibility.
     
     try:
         import uuid

@@ -59,8 +59,15 @@ class OrderRepository:
         remaining = order.requested_quantity if order.remaining_quantity is None else order.remaining_quantity
         async with aiosqlite.connect(self.db_path) as db:
             await self._configure(db)
+            db.row_factory = aiosqlite.Row
             try:
                 await db.execute("BEGIN IMMEDIATE")
+                duplicate = await db.execute(
+                    "SELECT id FROM orders WHERE submission_fingerprint = ? LIMIT 1",
+                    (order.submission_fingerprint,),
+                )
+                if await duplicate.fetchone():
+                    raise ValueError("submission_fingerprint already exists")
                 cursor = await db.execute("""
                     INSERT INTO orders (
                         position_id, parent_order_id, client_order_id, exchange_order_id,
@@ -160,7 +167,9 @@ class OrderRepository:
                 await db.rollback()
                 raise
 
-    async def insert_fill(self, order_id: int, fill: OrderFill) -> bool:
+    async def insert_fill(
+        self, order_id: int, fill: OrderFill, *, project_position: bool = False,
+    ) -> bool:
         if not fill.exchange_fill_id.strip():
             raise ValueError("exchange_fill_id is required")
         if not fill.exchange_order_id.strip():
@@ -173,28 +182,43 @@ class OrderRepository:
             raise ValueError("fill fee must be finite and non-negative")
         async with aiosqlite.connect(self.db_path) as db:
             await self._configure(db)
+            db.row_factory = aiosqlite.Row
             try:
                 await db.execute("BEGIN IMMEDIATE")
                 order_cursor = await db.execute(
-                    "SELECT exchange_order_id, requested_quantity FROM orders WHERE id = ?",
+                    "SELECT exchange_order_id, requested_quantity, position_id FROM orders WHERE id = ?",
                     (order_id,),
                 )
                 order_row = await order_cursor.fetchone()
                 if order_row is None:
                     raise KeyError(f"Order {order_id} does not exist")
-                stored_exchange_id, requested_quantity = order_row
+                stored_exchange_id, requested_quantity, position_id = order_row
                 if stored_exchange_id is None:
                     raise ValueError("order must have an exchange_order_id before storing fills")
                 if stored_exchange_id != fill.exchange_order_id:
                     raise ValueError("fill exchange_order_id does not match its order")
                 duplicate = await db.execute(
-                    "SELECT order_id FROM order_fills WHERE exchange_fill_id = ?",
+                    """SELECT order_id, exchange_trade_id, exchange_order_id,
+                              quantity, price, fee, is_taker, filled_at
+                       FROM order_fills WHERE exchange_fill_id = ?""",
                     (fill.exchange_fill_id,),
                 )
                 duplicate_row = await duplicate.fetchone()
                 if duplicate_row is not None:
                     if duplicate_row[0] != order_id:
                         raise ValueError("exchange_fill_id is already attached to another order")
+                    expected = (
+                        fill.exchange_trade_id, fill.exchange_order_id, float(fill.quantity),
+                        float(fill.price), float(fill.fee), fill.is_taker,
+                        fill.filled_at.isoformat(),
+                    )
+                    observed = (
+                        duplicate_row[1], duplicate_row[2], float(duplicate_row[3]),
+                        float(duplicate_row[4]), float(duplicate_row[5]), duplicate_row[6],
+                        duplicate_row[7],
+                    )
+                    if observed != expected:
+                        raise ValueError("conflicting payload for existing exchange_fill_id")
                     await db.rollback()
                     return False
                 existing = await db.execute(
@@ -224,11 +248,91 @@ class OrderRepository:
                     UPDATE orders SET filled_quantity = ?, remaining_quantity = ?,
                         vwap_fill_price = ?, fees = ? WHERE id = ?
                 """, (quantity, remaining, notional / quantity, fees or 0.0, order_id))
+                if project_position and position_id is not None:
+                    await self._project_authoritative_fills_in_transaction(db, position_id)
                 await db.commit()
                 return True
             except Exception:
                 await db.rollback()
                 raise
+
+    async def _project_authoritative_fills_in_transaction(
+        self, db: aiosqlite.Connection, position_id: int,
+    ) -> int:
+        position = await (await db.execute(
+            "SELECT * FROM positions WHERE id = ?", (position_id,)
+        )).fetchone()
+        if position is None:
+            raise KeyError(f"Position {position_id} does not exist")
+        baseline = await (await db.execute(
+            "SELECT * FROM position_projection_baselines WHERE position_id = ?",
+            (position_id,),
+        )).fetchone()
+        if baseline is None:
+            base_quantity = float(
+                (position["open_quantity"] if position["open_quantity"] is not None
+                 else position["quantity"]) if position["live"] else 0
+            )
+            base_price = float(position["entry_price"]) if base_quantity else None
+            await db.execute("""
+                INSERT INTO position_projection_baselines
+                    (position_id, base_quantity, base_entry_price, captured_at,
+                     legacy_unreconciled)
+                VALUES (?, ?, ?, ?, ?)
+            """, (position_id, base_quantity, base_price, _utcnow(), bool(base_quantity)))
+        pending = await db.execute("""
+            SELECT f.exchange_fill_id, f.quantity, f.price, f.fee,
+                   o.id AS order_id, o.action, o.side
+            FROM order_fills f JOIN orders o ON o.id = f.order_id
+            LEFT JOIN position_fill_projections p ON p.exchange_fill_id = f.exchange_fill_id
+            WHERE o.position_id = ? AND p.id IS NULL
+            ORDER BY f.filled_at, f.exchange_fill_id
+        """, (position_id,))
+        inserted = 0
+        for fill in await pending.fetchall():
+            if fill["side"] != str(position["side"]).upper():
+                raise ValueError("fill side is inconsistent with position")
+            await db.execute("""
+                INSERT INTO position_fill_projections
+                    (position_id, order_id, exchange_fill_id, action,
+                     quantity, price, fee, applied_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (position_id, fill["order_id"], fill["exchange_fill_id"],
+                  fill["action"], fill["quantity"], fill["price"], fill["fee"], _utcnow()))
+            inserted += 1
+        baseline = await (await db.execute(
+            "SELECT base_quantity, base_entry_price FROM position_projection_baselines WHERE position_id = ?",
+            (position_id,),
+        )).fetchone()
+        totals = await (await db.execute("""
+            SELECT
+              COALESCE(SUM(CASE WHEN action='buy' THEN quantity ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN action='buy' THEN quantity * price ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN action='sell' THEN quantity ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN action='sell' THEN quantity * price ELSE 0 END), 0)
+            FROM position_fill_projections WHERE position_id = ?
+        """, (position_id,))).fetchone()
+        bought, buy_notional, sold, sell_notional = map(float, totals)
+        if not bought and not sold:
+            return inserted
+        base_quantity, base_price = float(baseline[0]), baseline[1]
+        open_quantity = base_quantity + bought - sold
+        if open_quantity < -1e-9:
+            raise ValueError("authoritative sell fills over-close position")
+        entry_quantity = base_quantity + bought
+        entry_notional = base_quantity * float(base_price or 0) + buy_notional
+        average_entry = entry_notional / entry_quantity if entry_quantity else None
+        average_exit = sell_notional / sold if sold else None
+        open_quantity = max(open_quantity, 0.0)
+        await db.execute("""
+            UPDATE positions SET quantity = ?, open_quantity = ?, filled_quantity = ?,
+                entry_price = COALESCE(?, entry_price), average_entry_price = ?,
+                average_exit_price = ?, live = ?, status = ?, last_reconciled_at = ?,
+                reconciliation_status = 'verified' WHERE id = ?
+        """, (open_quantity, open_quantity, entry_quantity, average_entry,
+              average_entry, average_exit, open_quantity > 0,
+              "open" if open_quantity > 0 else "closed", _utcnow(), position_id))
+        return inserted
 
     async def _get_orders_by_states(self, states: tuple[OrderState, ...]) -> List[dict]:
         values = tuple(state.value for state in states)
@@ -260,6 +364,155 @@ class OrderRepository:
             cursor = await db.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def get_order_by_fingerprint(self, fingerprint: str) -> Optional[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT * FROM orders WHERE submission_fingerprint = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (fingerprint,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def assert_reconciliation_healthy(self, max_age_seconds: int) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            cursor = await db.execute("""
+                SELECT status, completed_at FROM reconciliation_runs
+                WHERE completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1
+            """)
+            row = await cursor.fetchone()
+            if row is None or row[0] not in {"completed", "completed_with_mismatches"}:
+                raise RuntimeError("reconciliation has no completed health checkpoint")
+            completed = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+            if completed.tzinfo is None:
+                completed = completed.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - completed).total_seconds() > max_age_seconds:
+                raise RuntimeError("reconciliation health checkpoint is stale")
+            critical = await db.execute("""
+                SELECT 1 FROM reconciliation_alerts
+                WHERE resolved_at IS NULL AND severity = 'critical' LIMIT 1
+            """)
+            if await critical.fetchone():
+                raise RuntimeError("unresolved critical reconciliation alert")
+
+    async def assert_position_intent(
+        self, position_id: int, market_id: str, side: str,
+        action: str, quantity: float,
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT * FROM positions WHERE id = ?", (position_id,)
+            )).fetchone()
+            if row is None:
+                raise RuntimeError("position does not exist")
+            if row["market_id"] != market_id or str(row["side"]).upper() != side.upper():
+                raise RuntimeError("order intent does not match its position")
+            if action.lower() == "sell":
+                available = row["open_quantity"] if row["open_quantity"] is not None else row["quantity"]
+                if not row["live"] or float(quantity) > float(available) + 1e-9:
+                    raise RuntimeError("sell intent exceeds verified open position quantity")
+
+    async def project_authoritative_fills(self, position_id: int) -> int:
+        """Apply unprojected fills and derive a position atomically."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            db.row_factory = aiosqlite.Row
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                position_cursor = await db.execute(
+                    "SELECT * FROM positions WHERE id = ?", (position_id,)
+                )
+                position = await position_cursor.fetchone()
+                if position is None:
+                    raise KeyError(f"Position {position_id} does not exist")
+                baseline_cursor = await db.execute(
+                    "SELECT * FROM position_projection_baselines WHERE position_id = ?",
+                    (position_id,),
+                )
+                baseline = await baseline_cursor.fetchone()
+                if baseline is None:
+                    base_quantity = float(
+                        (position["open_quantity"] if position["open_quantity"] is not None
+                         else position["quantity"])
+                        if position["live"] else 0
+                    )
+                    base_price = float(position["entry_price"]) if base_quantity else None
+                    await db.execute("""
+                        INSERT INTO position_projection_baselines
+                            (position_id, base_quantity, base_entry_price, captured_at,
+                             legacy_unreconciled)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (position_id, base_quantity, base_price, _utcnow(), bool(base_quantity)))
+                pending = await db.execute("""
+                    SELECT f.exchange_fill_id, f.quantity, f.price, f.fee,
+                           o.id AS order_id, o.action, o.side
+                    FROM order_fills f JOIN orders o ON o.id = f.order_id
+                    LEFT JOIN position_fill_projections p
+                      ON p.exchange_fill_id = f.exchange_fill_id
+                    WHERE o.position_id = ? AND p.id IS NULL
+                    ORDER BY f.filled_at, f.exchange_fill_id
+                """, (position_id,))
+                inserted = 0
+                for fill in await pending.fetchall():
+                    if fill["side"] != str(position["side"]).upper():
+                        raise ValueError("fill side is inconsistent with position")
+                    await db.execute("""
+                        INSERT INTO position_fill_projections
+                            (position_id, order_id, exchange_fill_id, action,
+                             quantity, price, fee, applied_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        position_id, fill["order_id"], fill["exchange_fill_id"],
+                        fill["action"], fill["quantity"], fill["price"], fill["fee"],
+                        _utcnow(),
+                    ))
+                    inserted += 1
+                baseline = await (await db.execute(
+                    "SELECT base_quantity, base_entry_price FROM position_projection_baselines WHERE position_id = ?",
+                    (position_id,),
+                )).fetchone()
+                totals = await (await db.execute("""
+                    SELECT
+                      COALESCE(SUM(CASE WHEN action='buy' THEN quantity ELSE 0 END), 0),
+                      COALESCE(SUM(CASE WHEN action='buy' THEN quantity * price ELSE 0 END), 0),
+                      COALESCE(SUM(CASE WHEN action='sell' THEN quantity ELSE 0 END), 0),
+                      COALESCE(SUM(CASE WHEN action='sell' THEN quantity * price ELSE 0 END), 0)
+                    FROM position_fill_projections WHERE position_id = ?
+                """, (position_id,))).fetchone()
+                bought, buy_notional, sold, sell_notional = map(float, totals)
+                if not bought and not sold:
+                    await db.commit()
+                    return 0
+                base_quantity, base_price = float(baseline[0]), baseline[1]
+                open_quantity = base_quantity + bought - sold
+                if open_quantity < -1e-9:
+                    raise ValueError("authoritative sell fills over-close position")
+                entry_quantity = base_quantity + bought
+                entry_notional = base_quantity * float(base_price or 0) + buy_notional
+                average_entry = entry_notional / entry_quantity if entry_quantity else None
+                average_exit = sell_notional / sold if sold else None
+                open_quantity = max(open_quantity, 0.0)
+                await db.execute("""
+                    UPDATE positions SET quantity = ?, open_quantity = ?, filled_quantity = ?,
+                        entry_price = COALESCE(?, entry_price), average_entry_price = ?,
+                        average_exit_price = ?, live = ?, status = ?,
+                        last_reconciled_at = ?, reconciliation_status = 'verified'
+                    WHERE id = ?
+                """, (
+                    open_quantity, open_quantity, entry_quantity, average_entry,
+                    average_entry, average_exit, open_quantity > 0,
+                    "open" if open_quantity > 0 else "closed", _utcnow(), position_id,
+                ))
+                await db.commit()
+                return inserted
+            except Exception:
+                await db.rollback()
+                raise
 
     async def get_all_orders(self) -> List[dict]:
         async with aiosqlite.connect(self.db_path) as db:
@@ -388,6 +641,21 @@ class OrderRepository:
             except Exception:
                 await db.rollback()
                 raise
+
+    async def resolve_order_alerts(self, order_id: int, *, kinds: tuple[str, ...]) -> int:
+        if not kinds:
+            return 0
+        placeholders = ",".join("?" for _ in kinds)
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            cursor = await db.execute(
+                f"""UPDATE reconciliation_alerts SET resolved_at = ?
+                    WHERE order_id = ? AND resolved_at IS NULL
+                      AND kind IN ({placeholders})""",
+                (_utcnow(), order_id, *kinds),
+            )
+            await db.commit()
+            return cursor.rowcount
 
     async def get_live_position_snapshot(self) -> List[dict]:
         """Read-only position data used solely for mismatch detection."""

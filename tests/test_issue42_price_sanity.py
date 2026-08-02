@@ -227,8 +227,8 @@ async def test_execute_skips_100_cent_price():
     kalshi_mock.place_order.assert_not_called()
 
 
-async def test_execute_allows_normal_market():
-    """execute_position proceeds normally for a healthy 50/50 market."""
+async def test_normal_market_still_requires_authoritative_execution_gate():
+    """A valid quote alone must not bypass the disabled live-execution gate."""
     from src.jobs.execute import execute_position
 
     normal_market = {
@@ -247,5 +247,5 @@ async def test_execute_allows_normal_market():
         kalshi_client=kalshi_mock,
     )
 
-    assert result is True, "Should succeed for a normal tradeable market"
-    kalshi_mock.place_order.assert_called_once()
+    assert result is False
+    kalshi_mock.place_order.assert_not_called()

@@ -32,6 +32,11 @@ from src.clients.xai_client import XAIClient
 from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
+from src.orders.readiness import (
+    CheckStatus, ReadinessCheck, ReadinessContext, ReadinessReport,
+    SubmissionReadinessEvaluator,
+)
+from src.orders.repository import OrderRepository
 
 from src.strategies.market_making import (
     AdvancedMarketMaker, 
@@ -210,6 +215,7 @@ class UnifiedAdvancedTradingSystem:
         6. Monitor and rebalance as needed
         """
         self.logger.info("🚀 Executing Unified Advanced Trading Strategy")
+        self._readiness_logged = False
         
         try:
             # Step 0: Check and enforce position limits AND cash reserves
@@ -221,10 +227,12 @@ class UnifiedAdvancedTradingSystem:
             
             # Check position limits
             limits_status = await limits_manager.get_position_limits_status()
+            self._readiness_limits_status = limits_status
             self.logger.info(f"📊 POSITION LIMITS STATUS: {limits_status['status']} ({limits_status['position_utilization']})")
             
             # Check cash reserves
             cash_status = await cash_manager.get_cash_status()
+            self._readiness_cash_status = cash_status
             self.logger.info(f"💰 CASH RESERVES STATUS: {cash_status['status']} ({cash_status['reserve_percentage']:.1f}%)")
             
             # Handle cash emergency first (higher priority)
@@ -233,6 +241,7 @@ class UnifiedAdvancedTradingSystem:
                 emergency_action = await cash_manager.handle_cash_emergency()
                 if emergency_action.action_type == 'halt_trading':
                     self.logger.critical(f"🛑 TRADING HALTED DUE TO CASH EMERGENCY: {emergency_action.reason}")
+                    await self._log_cycle_readiness(None, None, None)
                     return TradingSystemResults()  # Return empty results
                 elif emergency_action.action_type == 'close_positions':
                     self.logger.warning(f"⚠️ Need to close {emergency_action.positions_to_close} positions for cash reserves")
@@ -251,7 +260,9 @@ class UnifiedAdvancedTradingSystem:
         )
             if not markets:
                 self.logger.warning("No markets available for trading")
+                await self._log_cycle_readiness([], None, None)
                 return TradingSystemResults()
+            self._readiness_market_count = len(markets)
             
             self.logger.info(f"Analyzing {len(markets)} markets across all strategies")
             
@@ -288,6 +299,7 @@ class UnifiedAdvancedTradingSystem:
             
         except Exception as e:
             self.logger.error(f"Error in unified trading strategy: {e}")
+            await self._log_cycle_readiness(None, None, None)
             return TradingSystemResults()
 
     async def _execute_market_making_strategy(self, markets: List[Market]) -> Dict:
@@ -337,6 +349,7 @@ class UnifiedAdvancedTradingSystem:
             
             if not opportunities:
                 self.logger.warning("No directional trading opportunities found")
+                await self._log_cycle_readiness(markets, [], self.portfolio_optimizer._empty_allocation())
                 return self.portfolio_optimizer._empty_allocation()
             
             # Filter opportunities based on available capital
@@ -352,6 +365,7 @@ class UnifiedAdvancedTradingSystem:
             
             # DEBUG: Log allocation details before execution attempt
             self.logger.info(f"Portfolio allocation result: {len(allocation.allocations) if allocation else 0} allocations, ${allocation.total_capital_used if allocation else 0:.0f} capital used")
+            await self._log_cycle_readiness(markets, opportunities, allocation)
             
             # Actually execute the trades from the allocation
             if allocation and allocation.allocations:
@@ -371,7 +385,70 @@ class UnifiedAdvancedTradingSystem:
             
         except Exception as e:
             self.logger.error(f"Error in directional trading strategy: {e}")
+            await self._log_cycle_readiness(markets, None, None)
             return self.portfolio_optimizer._empty_allocation()
+
+    async def _log_cycle_readiness(self, markets, opportunities, allocation) -> None:
+        """Emit one human and one structured readiness summary for this cycle."""
+        if getattr(self, "_readiness_logged", False):
+            return
+        self._readiness_logged = True
+        try:
+            await self._evaluate_and_log_cycle_readiness(markets, opportunities, allocation)
+        except Exception:
+            live = settings.trading.live_trading_enabled
+            fallback = ReadinessReport(
+                mode="LIVE" if live else "PAPER",
+                overall="BLOCKED" if live else "PAPER",
+                scope="cycle",
+                checks=[ReadinessCheck(
+                    "Diagnostic snapshot", CheckStatus.BLOCKED,
+                    "cycle readiness data unavailable", required=live,
+                )],
+            )
+            SubmissionReadinessEvaluator.log(fallback, self.logger)
+
+    async def _evaluate_and_log_cycle_readiness(self, markets, opportunities, allocation) -> None:
+        """Build the cycle snapshot; caller prevents diagnostic failures escaping."""
+        limits = getattr(self, "_readiness_limits_status", {})
+        cash = getattr(self, "_readiness_cash_status", {})
+        allocations = allocation.allocations if allocation is not None else None
+        duplicate_count = None
+        if allocations is not None:
+            open_position_keys = {
+                (position.market_id, str(position.side).upper())
+                for position in await self.db_manager.get_open_positions()
+            }
+            intended_keys = set()
+            for market_id in allocations:
+                opportunity = next((item for item in (opportunities or [])
+                                    if item.market_id == market_id), None)
+                intended_keys.add((market_id, "YES" if opportunity and opportunity.edge > 0 else "NO"))
+            duplicate_count = len(open_position_keys & intended_keys)
+        evaluator = SubmissionReadinessEvaluator(OrderRepository(self.db_manager.db_path))
+        report = await evaluator.evaluate(ReadinessContext(
+            live_mode=settings.trading.live_trading_enabled,
+            authoritative_execution_enabled=settings.trading.authoritative_live_execution_enabled,
+            reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+            reconciliation_shadow_mode=settings.trading.reconciliation_shadow_mode,
+            kill_switch=settings.trading.live_order_submission_kill_switch,
+            configured_environment=settings.api.kalshi_environment,
+            client_environment=getattr(self.kalshi_client, "environment", None),
+            production_acknowledgement=settings.trading.production_execution_acknowledgement,
+            reconciliation_max_age_seconds=settings.trading.reconciliation_health_max_age_seconds,
+            total_markets=await self.db_manager.get_market_count(),
+            eligible_markets=len(markets) if markets is not None else 0,
+            opportunity_count=len(opportunities) if opportunities is not None else None,
+            allocation_count=len(allocations) if allocations is not None else None,
+            allocated_dollars=(allocation.total_capital_used if allocation is not None else None),
+            cash_reserve_ok=(None if not cash else cash.get("trading_permitted", False)),
+            cash_reserve_pct=cash.get("reserve_percentage"),
+            position_limit_ok=(None if not limits else limits.get("status") == "HEALTHY"),
+            current_positions=limits.get("current_positions"),
+            max_positions=limits.get("max_positions"),
+            existing_position_blocked=(None if duplicate_count is None else duplicate_count > 0),
+        ), scope="cycle")
+        evaluator.log(report, self.logger)
 
     # Quick flip strategy REMOVED — 0% win rate, -$208 across 12 trades.
     # All capital now routed to AI ensemble directional trading.

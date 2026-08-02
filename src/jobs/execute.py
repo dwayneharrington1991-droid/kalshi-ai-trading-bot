@@ -18,6 +18,7 @@ from src.orders.execution_service import (
 )
 from src.orders.reconciler import OrderReconciler
 from src.orders.repository import OrderRepository
+from src.orders.readiness import ReadinessContext, SubmissionReadinessEvaluator
 
 
 def _verified_service(db_manager, kalshi_client, live_mode=True):
@@ -42,6 +43,23 @@ def _verified_service(db_manager, kalshi_client, live_mode=True):
 async def _execute_verified_buy(position, db_manager, kalshi_client):
     logger = get_trading_logger("trade_execution")
     if not settings.trading.authoritative_live_execution_enabled:
+        try:
+            evaluator = SubmissionReadinessEvaluator(OrderRepository(db_manager.db_path))
+            report = await evaluator.evaluate(ReadinessContext(
+                live_mode=True,
+                authoritative_execution_enabled=settings.trading.authoritative_live_execution_enabled,
+                reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+                reconciliation_shadow_mode=settings.trading.reconciliation_shadow_mode,
+                kill_switch=settings.trading.live_order_submission_kill_switch,
+                configured_environment=settings.api.kalshi_environment,
+                client_environment=getattr(kalshi_client, "environment", None),
+                production_acknowledgement=settings.trading.production_execution_acknowledgement,
+                reconciliation_max_age_seconds=settings.trading.reconciliation_health_max_age_seconds,
+                market_id=position.market_id,
+            ), scope="pre_submission")
+            evaluator.log(report, logger)
+        except Exception:
+            logger.error("Submission readiness diagnostic unavailable")
         logger.error("Legacy live buy path is disabled; authoritative execution is not enabled")
         return False
     try:

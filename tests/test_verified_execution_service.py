@@ -115,6 +115,19 @@ async def test_acceptance_without_fills_does_not_open_position(setup, status):
     assert await position_row(repository, position_id) == before
 
 
+async def test_matching_active_order_blocks_changed_price_resubmission(setup):
+    _, repository, position_id = setup
+    client = FakeClient(status="resting")
+    executor = service(repository, client)
+    await executor.execute(intent(position_id))
+    changed = OrderIntent(
+        "MKT", "YES", "buy", 10, .41, "limit", position_id, "demo"
+    )
+    with pytest.raises(ExecutionSafetyError, match="matching active"):
+        await executor.execute(changed)
+    assert client.place_calls == 1
+
+
 @pytest.mark.parametrize("status,filled,fills,expected_state", [
     ("executed", 10, [(10, .43)], "fully_filled"),
     ("resting", 4, [(4, .42)], "partially_filled"),
@@ -272,7 +285,9 @@ async def test_paper_execution_uses_existing_simulation_without_exchange_calls(s
             raise AssertionError(f"paper mode accessed exchange method {name}")
 
     assert await execute_position(position, False, manager, NoNetworkClient()) is True
-    assert (await position_row(repository, position_id))["live"] == 1
+    row = await position_row(repository, position_id)
+    assert row["live"] == 0
+    assert row["status"] == "open"
 
 
 async def test_authoritative_missing_order_after_acceptance_is_quarantined(setup):

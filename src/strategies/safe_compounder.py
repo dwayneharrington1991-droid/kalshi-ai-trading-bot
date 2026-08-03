@@ -597,6 +597,11 @@ class SafeCompounder:
     async def _place_resting_orders(
         self, opportunities: List[Dict], portfolio: int, cash: int
     ) -> Dict:
+        if not self.dry_run:
+            raise RuntimeError(
+                "Safe Compounder live submission is disabled because this legacy strategy "
+                "is not connected to the verified execution gateway"
+            )
         """Place NO-side resting orders at lowest_ask - 1¢."""
         # Get existing positions and orders
         try:

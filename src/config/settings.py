@@ -189,6 +189,27 @@ class TradingConfig:
     allow_live_order_cancellations: bool = field(
         default_factory=lambda: os.getenv("ALLOW_LIVE_ORDER_CANCELLATIONS", "false").lower() == "true"
     )
+    overnight_canary_enabled: bool = field(
+        default_factory=lambda: os.getenv("OVERNIGHT_CANARY_ENABLED", "false").lower() == "true"
+    )
+    overnight_canary_max_total_risk: float = field(
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_TOTAL_RISK", "5"))
+    )
+    overnight_canary_max_market_risk: float = field(
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_MARKET_RISK", "1"))
+    )
+    overnight_canary_max_positions: int = field(
+        default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MAX_POSITIONS", "5"))
+    )
+    overnight_canary_max_rejections: int = field(
+        default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MAX_REJECTIONS", "3"))
+    )
+    overnight_canary_max_daily_loss: float = field(
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_DAILY_LOSS", "2"))
+    )
+    overnight_canary_market_data_max_age_seconds: int = field(
+        default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MARKET_DATA_MAX_AGE_SECONDS", "120"))
+    )
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)
@@ -339,7 +360,7 @@ class Settings:
 
     def validate(self) -> bool:
         """Validate configuration settings."""
-        if not self.api.kalshi_api_key:
+        if self.trading.live_trading_enabled and not self.api.kalshi_api_key:
             raise ValueError("KALSHI_API_KEY environment variable is required")
 
         if self.trading.max_position_size_pct <= 0 or self.trading.max_position_size_pct > 100:

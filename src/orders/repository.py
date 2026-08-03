@@ -1,6 +1,6 @@
 """Transactional SQLite repository for orders, fills, and state history."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from math import isfinite
 from typing import Any, List, Optional
 
@@ -376,6 +376,20 @@ class OrderRepository:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def get_active_orders_for_position(self, position_id: int) -> List[dict]:
+        states = tuple(
+            state.value for state in (OrderStateMachine.ACTIVE | OrderStateMachine.UNCERTAIN)
+        )
+        placeholders = ",".join("?" for _ in states)
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                f"SELECT * FROM orders WHERE position_id = ? AND state IN ({placeholders}) ORDER BY id",
+                (position_id, *states),
+            )).fetchall()
+            return [dict(row) for row in rows]
+
     async def assert_reconciliation_healthy(self, max_age_seconds: int) -> None:
         health = await self.get_reconciliation_health(max_age_seconds)
         if not health["healthy_status"]:
@@ -545,6 +559,101 @@ class OrderRepository:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM orders ORDER BY created_at")
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_matching_active_order(
+        self, market_id: str, side: str, action: str
+    ) -> Optional[dict]:
+        states = sorted(
+            OrderStateMachine.ACTIVE | {OrderState.VERIFICATION_FAILED},
+            key=lambda state: state.value,
+        )
+        placeholders = ",".join("?" for _ in states)
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""SELECT * FROM orders
+                    WHERE market_id = ? AND side = ? AND action = ?
+                      AND state IN ({placeholders})
+                    ORDER BY id DESC LIMIT 1""",
+                (market_id, side.upper(), action.lower(), *(state.value for state in states)),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_canary_risk_snapshot(
+        self, market_id: str, market_data_max_age_seconds: int
+    ) -> dict:
+        """Return conservative local risk facts used immediately before canary submission."""
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=max(0, market_data_max_age_seconds)
+        )
+        today = datetime.now(timezone.utc).date().isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await self._configure(db)
+            db.row_factory = aiosqlite.Row
+            risk_cursor = await db.execute("""
+                SELECT COUNT(*) AS open_positions,
+                       COALESCE(SUM(entry_price * quantity), 0) AS total_risk
+                FROM positions
+                WHERE live = 1 AND status IN ('open', 'pending')
+            """)
+            risk = dict(await risk_cursor.fetchone())
+            pnl_cursor = await db.execute("""
+                SELECT COALESCE(SUM(pnl), 0) AS daily_pnl
+                FROM trade_logs WHERE substr(exit_timestamp, 1, 10) = ?
+            """, (today,))
+            daily_pnl = float((await pnl_cursor.fetchone())["daily_pnl"])
+            marks_cursor = await db.execute("""
+                SELECT p.side, p.entry_price, p.quantity, m.yes_price, m.no_price,
+                       m.last_updated
+                FROM positions p LEFT JOIN markets m ON m.market_id = p.market_id
+                WHERE p.live = 1 AND p.status IN ('open', 'pending')
+            """)
+            unrealized_pnl = 0.0
+            any_open_market_stale = False
+            for row in await marks_cursor.fetchall():
+                mark = row["yes_price"] if str(row["side"]).upper() == "YES" else row["no_price"]
+                try:
+                    unrealized_pnl += (float(mark) - float(row["entry_price"])) * int(row["quantity"])
+                    updated = datetime.fromisoformat(str(row["last_updated"]).replace("Z", "+00:00"))
+                    if updated.tzinfo is None:
+                        updated = updated.replace(tzinfo=timezone.utc)
+                    any_open_market_stale |= updated.astimezone(timezone.utc) < cutoff
+                except (TypeError, ValueError):
+                    any_open_market_stale = True
+            rejection_cursor = await db.execute("""
+                SELECT state FROM orders ORDER BY id DESC LIMIT ?
+            """, (max(1, self._safe_limit(100)),))
+            consecutive_rejections = 0
+            for row in await rejection_cursor.fetchall():
+                if row["state"] != OrderState.REJECTED.value:
+                    break
+                consecutive_rejections += 1
+            market_cursor = await db.execute(
+                "SELECT last_updated FROM markets WHERE market_id = ?", (market_id,)
+            )
+            market = await market_cursor.fetchone()
+            market_data_stale = True
+            if market is not None and market["last_updated"]:
+                try:
+                    updated = datetime.fromisoformat(str(market["last_updated"]).replace("Z", "+00:00"))
+                    if updated.tzinfo is None:
+                        updated = updated.replace(tzinfo=timezone.utc)
+                    market_data_stale = updated.astimezone(timezone.utc) < cutoff
+                except (TypeError, ValueError):
+                    market_data_stale = True
+            return {
+                "open_positions": int(risk["open_positions"]),
+                "total_risk": float(risk["total_risk"]),
+                "daily_pnl": daily_pnl + unrealized_pnl,
+                "consecutive_rejections": consecutive_rejections,
+                "market_data_stale": market_data_stale or any_open_market_stale,
+            }
+
+    @staticmethod
+    def _safe_limit(value: int) -> int:
+        return max(1, min(int(value), 1000))
 
     async def mark_verified(
         self, order_id: int, exchange_status: str, raw_order_response: Optional[str] = None

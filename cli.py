@@ -107,6 +107,12 @@ def _run_safe_compounder(
     from src.clients.kalshi_client import KalshiClient
     from src.strategies.safe_compounder import SafeCompounder
 
+    if live_mode:
+        raise RuntimeError(
+            "Safe Compounder live submission is disabled because this legacy command "
+            "is not connected to the verified execution gateway."
+        )
+
     print("🔒 SAFE COMPOUNDER MODE")
     print("   NO-side only | Edge-based | Near-certain outcomes")
     if not live_mode:
@@ -392,6 +398,12 @@ def cmd_close_all(args: argparse.Namespace) -> None:
 
     auto_yes = getattr(args, "yes", False)
     live_mode = getattr(args, "live", False)
+
+    if live_mode:
+        raise RuntimeError(
+            "Direct close-all submission is disabled. Live exits must use the verified "
+            "execution gateway and authoritative fill reconciliation."
+        )
 
     print("=" * 56)
     print("  CLOSE ALL POSITIONS")

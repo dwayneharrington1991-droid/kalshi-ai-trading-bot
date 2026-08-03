@@ -160,7 +160,12 @@ async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
                 
                 if position:
                     # Execute position
-                    success = await execute_position(position, kalshi_client, db_manager)
+                    success = await execute_position(
+                        position=position,
+                        live_mode=settings.trading.live_trading_enabled,
+                        db_manager=db_manager,
+                        kalshi_client=kalshi_client,
+                    )
                     if success:
                         positions_created += 1
                         total_exposure += position.entry_price * position.quantity
@@ -189,4 +194,4 @@ async def run_legacy_trading():
     """Legacy entry point - redirects to enhanced system."""
     logger = get_trading_logger("legacy_redirect")
     logger.info("🔄 Legacy trading call redirected to enhanced system")
-    return await run_trading_job() 
+    return await run_trading_job()

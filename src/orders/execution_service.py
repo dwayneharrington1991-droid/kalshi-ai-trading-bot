@@ -15,6 +15,7 @@ from src.orders.readiness import (
 )
 from src.orders.repository import OrderRepository
 from src.orders.state_machine import OrderState, OrderStateMachine
+from src.orders.decision_log import log_order_decision
 from src.utils.logging_setup import get_trading_logger
 
 class ExecutionSafetyError(RuntimeError):
@@ -52,6 +53,13 @@ class ExecutionSafetyConfig:
     production_acknowledgement: str = ""
     reconciliation_max_age_seconds: int = 30
     allow_risk_reducing_exits: bool = False
+    overnight_canary_enabled: bool = False
+    canary_max_total_risk: float = 5.0
+    canary_max_market_risk: float = 1.0
+    canary_max_positions: int = 5
+    canary_max_rejections: int = 3
+    canary_max_daily_loss: float = 2.0
+    canary_market_data_max_age_seconds: int = 120
 
 
 @dataclass(frozen=True)
@@ -83,8 +91,19 @@ class VerifiedExecutionService:
             raise
         fingerprint = intent.fingerprint()
         existing = await self.repository.get_order_by_fingerprint(fingerprint)
+        matching_active = await self.repository.get_matching_active_order(
+            intent.market_id, intent.side, intent.action
+        )
+        if matching_active is not None and (
+            existing is None or matching_active["id"] != existing["id"]
+        ):
+            raise ExecutionSafetyError(
+                "matching active or verification-failed order already exists"
+            )
         requires_submission = existing is None or existing["state"] == "locally_created"
         await self._preflight_gateway(intent, require_health=requires_submission)
+        if requires_submission:
+            await self._canary_gateway(intent)
         if existing is not None:
             return await self._recover(existing, intent)
         client_order_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"kalshi-order:{fingerprint}"))
@@ -118,8 +137,25 @@ class VerifiedExecutionService:
                 order_id, OrderState.ACCEPTED, "verified_execution",
                 reason="exchange order identity received",
             )
+            log_order_decision(
+                self.logger, market_id=intent.market_id, strategy=intent.strategy,
+                side=intent.side, action=intent.action, price=intent.price,
+                quantity=intent.quantity, outcome="PENDING",
+                reason="exchange identity accepted; authoritative fill pending",
+                api_attempted=True, order_id=exchange_order_id,
+            )
         except Exception as exc:
-            await self._quarantine(order_id, f"submission outcome unverifiable: {exc}")
+            await self._quarantine(
+                order_id,
+                f"submission outcome unverifiable ({type(exc).__name__})",
+            )
+            log_order_decision(
+                self.logger, market_id=intent.market_id, strategy=intent.strategy,
+                side=intent.side, action=intent.action, price=intent.price,
+                quantity=intent.quantity, outcome="BLOCKED",
+                reason="submission outcome unverifiable", api_attempted=True,
+                api_error_category=type(exc).__name__,
+            )
             return ExecutionResult(order_id, client_order_id, "verification_failed", submitted=True)
         return await self._verify_and_project(order_id, client_order_id, submitted=True)
 
@@ -234,6 +270,29 @@ class VerifiedExecutionService:
                 required_balance=float(required),
             )
             raise ExecutionSafetyError("insufficient verified balance")
+
+    async def _canary_gateway(self, intent: OrderIntent) -> None:
+        if not self.safety.overnight_canary_enabled:
+            return
+        snapshot = await self.repository.get_canary_risk_snapshot(
+            intent.market_id, self.safety.canary_market_data_max_age_seconds
+        )
+        order_risk = float(Decimal(str(intent.price)) * Decimal(str(intent.quantity)))
+        opening = intent.action.lower() == "buy"
+        if opening and order_risk > self.safety.canary_max_market_risk:
+            raise ExecutionSafetyError("overnight canary per-market capital limit exceeded")
+        if opening and (
+            snapshot["total_risk"] + order_risk > self.safety.canary_max_total_risk
+        ):
+            raise ExecutionSafetyError("overnight canary total capital-at-risk limit exceeded")
+        if opening and snapshot["open_positions"] >= self.safety.canary_max_positions:
+            raise ExecutionSafetyError("overnight canary open-position limit reached")
+        if opening and snapshot["consecutive_rejections"] >= self.safety.canary_max_rejections:
+            raise ExecutionSafetyError("overnight canary stopped after consecutive rejected orders")
+        if opening and snapshot["daily_pnl"] <= -abs(self.safety.canary_max_daily_loss):
+            raise ExecutionSafetyError("overnight canary daily loss limit reached")
+        if snapshot["market_data_stale"]:
+            raise ExecutionSafetyError("overnight canary market data is stale or unavailable")
 
     async def _log_refusal(self, intent: OrderIntent, **observations: Any) -> None:
         try:

@@ -16,6 +16,8 @@ from src.utils.database import DatabaseManager, Position, TradeLog
 from src.config.settings import settings
 from src.utils.logging_setup import setup_logging, get_trading_logger
 from src.clients.kalshi_client import KalshiClient
+from src.utils.market_prices import get_market_prices
+from src.orders.decision_log import log_order_decision
 
 async def should_exit_position(
     position: Position, 
@@ -38,8 +40,9 @@ async def should_exit_position(
         if market_result:
             exit_price = 1.0 if market_result == position.side else 0.0
         else:
-            # Fallback to current price if no result available
-            exit_price = current_price
+            # A closed market without an authoritative YES/NO result is not
+            # safe to settle locally. It may be voided or still finalizing.
+            return False, "resolution_unverified", current_price
         return True, "market_resolution", exit_price
     
     # 2. ENHANCED Stop-loss exit using proper logic for YES/NO positions
@@ -124,7 +127,11 @@ async def calculate_dynamic_exit_levels(position: Position) -> dict:
     
     return exit_levels
 
-async def run_tracking(db_manager: Optional[DatabaseManager] = None):
+async def run_tracking(
+    db_manager: Optional[DatabaseManager] = None,
+    kalshi_client: Optional[KalshiClient] = None,
+    live_mode: Optional[bool] = None,
+):
     """
     Enhanced position tracking with smart exit strategies and sell limit orders.
     
@@ -138,7 +145,16 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         db_manager = DatabaseManager()
         await db_manager.initialize()
 
-    kalshi_client = KalshiClient()
+    resolved_live_mode = (
+        settings.trading.live_trading_enabled if live_mode is None else live_mode
+    )
+    if not resolved_live_mode:
+        logger.info("Position tracking skipped: resolved mode is PAPER; live account reads disabled")
+        return
+
+    owns_client = kalshi_client is None
+    if kalshi_client is None:
+        kalshi_client = KalshiClient()
 
     try:
         # Step 1: Place sell limit orders for profit-taking and stop-loss
@@ -184,11 +200,20 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
 
                 if not market_data:
                     logger.warning(f"Could not retrieve market data for {position.market_id}. Skipping.")
+                    log_order_decision(
+                        logger, market_id=position.market_id, strategy=position.strategy,
+                        side=position.side, action="sell", price=None,
+                        quantity=position.quantity, outcome="BLOCKED",
+                        reason="market data unavailable", risk_limit="MARKET_DATA",
+                        api_attempted=False,
+                    )
                     continue
 
-                # Get current prices
-                current_yes_price = market_data.get('yes_price', 0) / 100  # Convert cents to dollars
-                current_no_price = market_data.get('no_price', 0) / 100
+                # A sell executes against the bid. Normalize both current and
+                # legacy Kalshi price fields instead of silently defaulting to zero.
+                yes_bid, _, no_bid, _ = get_market_prices(market_data)
+                current_yes_price = yes_bid
+                current_no_price = no_bid
                 market_status = market_data.get('status', 'unknown')
                 market_result = market_data.get('result')  # Market resolution result
                 
@@ -231,6 +256,14 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                                 f"will retry next cycle."
                             )
                             exit_sell_failures += 1
+                            log_order_decision(
+                                logger, market_id=position.market_id,
+                                strategy=position.strategy, side=position.side,
+                                action="sell", price=exit_price,
+                                quantity=position.quantity, outcome="BLOCKED",
+                                reason="valid executable bid unavailable",
+                                risk_limit="MARKET_DATA", api_attempted=False,
+                            )
                             continue
 
                         from src.jobs.execute import place_sell_limit_order
@@ -246,8 +279,31 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                                 f"position remains open. Will retry next cycle."
                             )
                             exit_sell_failures += 1
+                            log_order_decision(
+                                logger, market_id=position.market_id,
+                                strategy=position.strategy, side=position.side,
+                                action="sell", price=exit_price,
+                                quantity=position.quantity, outcome="BLOCKED",
+                                reason="verified sell refused or unverifiable",
+                                api_attempted=False,
+                            )
                             continue
                         exit_sell_orders_placed += 1
+
+                        # Acceptance/resting is not a fill. Re-read the position,
+                        # which the verified service projects only from exchange fills.
+                        projected = await db_manager.get_position_by_id(position.id)
+                        if projected is None or projected.status != "closed":
+                            log_order_decision(
+                                logger, market_id=position.market_id,
+                                strategy=position.strategy, side=position.side,
+                                action="sell", price=exit_price,
+                                quantity=position.quantity, outcome="PENDING",
+                                reason="sell accepted but authoritative closing fill not complete",
+                                api_attempted=True,
+                            )
+                            continue
+                        exit_price = projected.average_exit_price or exit_price
 
                     # Calculate PnL
                     pnl = (exit_price - position.entry_price) * position.quantity
@@ -278,7 +334,23 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         f"Position for market {position.market_id} closed via {exit_reason}. "
                         f"PnL: ${pnl:.2f}"
                     )
+                    log_order_decision(
+                        logger, market_id=position.market_id,
+                        strategy=position.strategy, side=position.side,
+                        action="sell", price=exit_price,
+                        quantity=position.quantity, outcome="FILLED",
+                        reason=exit_reason, api_attempted=not is_resolution,
+                    )
                 else:
+                    if exit_reason == "resolution_unverified":
+                        log_order_decision(
+                            logger, market_id=position.market_id,
+                            strategy=position.strategy, side=position.side,
+                            action="sell", price=current_yes_price if position.side == "YES" else current_no_price,
+                            quantity=position.quantity, outcome="BLOCKED",
+                            reason="closed market has no authoritative YES/NO result",
+                            risk_limit="SETTLEMENT_VERIFICATION", api_attempted=False,
+                        )
                     # Log current position status for monitoring
                     current_price = current_yes_price if position.side == "YES" else current_no_price
                     unrealized_pnl = (current_price - position.entry_price) * position.quantity
@@ -292,6 +364,13 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
 
             except Exception as e:
                 logger.error(f"Failed to process position for market {position.market_id}.", error=str(e))
+                log_order_decision(
+                    logger, market_id=position.market_id, strategy=position.strategy,
+                    side=position.side, action="sell", price=None,
+                    quantity=position.quantity, outcome="BLOCKED",
+                    reason="position tracking error", api_attempted=False,
+                    api_error_category=type(e).__name__,
+                )
 
         logger.info(
             f"Position tracking completed. "
@@ -304,7 +383,8 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
     except Exception as e:
         logger.error("Error in position tracking job.", error=str(e), exc_info=True)
     finally:
-        await kalshi_client.close()
+        if owns_client:
+            await kalshi_client.close()
 
 if __name__ == "__main__":
     setup_logging()

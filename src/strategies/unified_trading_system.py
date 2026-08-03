@@ -37,6 +37,8 @@ from src.orders.readiness import (
     SubmissionReadinessEvaluator,
 )
 from src.orders.repository import OrderRepository
+from src.orders.decision_log import log_order_decision
+from src.utils.market_prices import get_market_prices
 
 from src.strategies.market_making import (
     AdvancedMarketMaker, 
@@ -401,14 +403,28 @@ class UnifiedAdvancedTradingSystem:
             if allocation and allocation.allocations:
                 self.logger.info(f"Attempting to execute {len(allocation.allocations)} allocations: {list(allocation.allocations.keys())}")
                 execution_results = await self._execute_portfolio_allocations(allocation, opportunities)
-                self.logger.info(f"Executed {execution_results['positions_created']} positions from portfolio allocation")
+                self._last_directional_execution_results = execution_results
+                self.logger.info(
+                    "Directional execution summary",
+                    authoritative_positions_created=execution_results['positions_created'],
+                    orders_pending=execution_results['orders_pending'],
+                    failed_executions=execution_results['failed_executions'],
+                )
             else:
+                self._last_directional_execution_results = {
+                    'positions_created': 0, 'orders_pending': 0,
+                    'failed_executions': 0, 'total_capital_used': 0.0,
+                }
                 self.logger.warning(f"No allocations to execute. Allocation exists: {allocation is not None}, Has allocations: {bool(allocation and allocation.allocations)}")
             
+            execution = self._last_directional_execution_results
             self.logger.info(
-                f"✅ Directional Trading: {len(allocation.allocations)} positions, "
-                f"${allocation.total_capital_used:.0f} allocated, "
-                f"Sharpe: {allocation.portfolio_sharpe:.2f}"
+                "Directional trading complete",
+                proposed_allocations=len(allocation.allocations),
+                authoritative_positions_created=execution['positions_created'],
+                orders_pending=execution['orders_pending'],
+                capital_actually_used=execution['total_capital_used'],
+                sharpe=allocation.portfolio_sharpe,
             )
             
             return allocation
@@ -549,6 +565,7 @@ class UnifiedAdvancedTradingSystem:
         """
         results = {
             'positions_created': 0,
+            'orders_pending': 0,
             'total_capital_used': 0.0,
             'successful_executions': 0,
             'failed_executions': 0
@@ -558,11 +575,20 @@ class UnifiedAdvancedTradingSystem:
             from src.jobs.execute import execute_position
             
             for market_id, allocation_fraction in allocation.allocations.items():
+                intended_side = "UNKNOWN"
+                price = None
+                quantity = None
                 try:
                     # Find the corresponding opportunity first to determine intended side
                     opportunity = next((opp for opp in opportunities if opp.market_id == market_id), None)
                     if not opportunity:
                         self.logger.warning(f"Could not find opportunity for {market_id}")
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side="UNKNOWN", action="buy", price=None, quantity=None,
+                            outcome="BLOCKED", reason="allocation has no matching opportunity",
+                            risk_limit="SIGNAL_INTEGRITY", api_attempted=False,
+                        )
                         continue
                     
                     # Determine the intended side based on edge direction
@@ -573,8 +599,13 @@ class UnifiedAdvancedTradingSystem:
                     
                     if existing_position:
                         self.logger.info(f"⏭️ SKIPPING {market_id} {intended_side} - exact position already exists (likely from immediate trade)")
-                        results['positions_created'] += 1  # Count as created since it exists
-                        results['total_capital_used'] += allocation_fraction * self.directional_capital
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=opportunity.market_probability,
+                            quantity=None, outcome="BLOCKED",
+                            reason="existing local position or pending intent",
+                            risk_limit="DUPLICATE_POSITION", api_attempted=False,
+                        )
                         continue
                     else:
                         # Check if we have the opposite side (just for logging)
@@ -619,10 +650,23 @@ class UnifiedAdvancedTradingSystem:
                             if current_positions >= limits_manager.max_positions:
                                 self.logger.info(f"❌ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
                                 results['failed_executions'] += 1
+                                log_order_decision(
+                                    self.logger, market_id=market_id, strategy="portfolio_optimization",
+                                    side=intended_side, action="buy", price=opportunity.market_probability,
+                                    quantity=None, outcome="BLOCKED", reason=limit_reason,
+                                    risk_limit=f"MAX_POSITIONS={limits_manager.max_positions}",
+                                    api_attempted=False,
+                                )
                                 continue
                             else:
                                 self.logger.info(f"❌ POSITION SIZE LIMIT: Even minimum size ${initial_position_value * 0.1:.2f} exceeds limits")
                                 results['failed_executions'] += 1
+                                log_order_decision(
+                                    self.logger, market_id=market_id, strategy="portfolio_optimization",
+                                    side=intended_side, action="buy", price=opportunity.market_probability,
+                                    quantity=None, outcome="BLOCKED", reason=limit_reason,
+                                    risk_limit="POSITION_EXPOSURE", api_attempted=False,
+                                )
                                 continue
                     
                     position_value = initial_position_value
@@ -638,6 +682,12 @@ class UnifiedAdvancedTradingSystem:
                     if not can_trade_reserves:
                         self.logger.info(f"❌ CASH RESERVES BLOCK ALLOCATION: {market_id} - {reserves_reason}")
                         results['failed_executions'] += 1
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=opportunity.market_probability,
+                            quantity=None, outcome="BLOCKED", reason=reserves_reason,
+                            risk_limit="CASH_RESERVE", api_attempted=False,
+                        )
                         continue
                     
                     self.logger.info(f"✅ CASH RESERVES OK FOR ALLOCATION: {market_id}")
@@ -646,16 +696,30 @@ class UnifiedAdvancedTradingSystem:
                     market_data = await self.kalshi_client.get_market(market_id)
                     if not market_data:
                         self.logger.warning(f"Could not get market data for {market_id}")
+                        results['failed_executions'] += 1
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=None, quantity=None,
+                            outcome="BLOCKED", reason="market data unavailable",
+                            risk_limit="MARKET_DATA", api_attempted=False,
+                        )
                         continue
                     
                     # FIXED: Extract from nested 'market' object
                     market_info = market_data.get('market', {})
                     
                     # Get price for the intended side (already determined above)
-                    if intended_side == "YES":
-                        price = market_info.get('yes_price', 50) / 100
-                    else:
-                        price = market_info.get('no_price', 50) / 100
+                    _, yes_ask, _, no_ask = get_market_prices(market_info)
+                    price = yes_ask if intended_side == "YES" else no_ask
+                    if not 0.01 <= price <= 0.99:
+                        results['failed_executions'] += 1
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=price, quantity=None,
+                            outcome="BLOCKED", reason="valid executable ask unavailable",
+                            risk_limit="VALID_QUOTE", api_attempted=False,
+                        )
+                        continue
                     
                     # Calculate quantity
                     quantity = max(1, int(position_value / price))
@@ -690,6 +754,7 @@ class UnifiedAdvancedTradingSystem:
                         rationale=f"Portfolio optimization allocation: {allocation_fraction:.1%} of capital. Edge: {opportunity.edge:.3f}, Confidence: {opportunity.confidence:.3f}, Stop: {exit_levels['stop_loss_pct']}%",
                         confidence=opportunity.confidence,
                         live=False,  # Will be set to True after execution
+                        status="pending",
                         strategy="portfolio_optimization",
                         
                         # Enhanced exit strategy using Grok4 recommendations
@@ -725,11 +790,33 @@ class UnifiedAdvancedTradingSystem:
                         results['total_capital_used'] += position_value
                         self.logger.info(f"✅ Executed position: {market_id} {intended_side} {quantity} at {price:.3f}")
                     else:
-                        results['failed_executions'] += 1
-                        self.logger.error(f"❌ Failed to execute position for {market_id}")
+                        active_orders = await OrderRepository(
+                            self.db_manager.db_path
+                        ).get_active_orders_for_position(position.id)
+                        if active_orders:
+                            results['orders_pending'] += 1
+                            self.logger.info(
+                                "Order accepted or unresolved; position not counted until authoritative fill",
+                                market_id=market_id, position_id=position.id,
+                            )
+                        else:
+                            results['failed_executions'] += 1
+                            await self.db_manager.quarantine_position(
+                                position.id, "entry execution refused before authoritative fill"
+                            )
+                            self.logger.error(
+                                "Failed to execute position", market_id=market_id,
+                                position_id=position.id,
+                            )
                 
                 except Exception as e:
                     self.logger.error(f"Error executing allocation for {market_id}: {e}")
+                    log_order_decision(
+                        self.logger, market_id=market_id, strategy="portfolio_optimization",
+                        side=intended_side, action="buy", price=price, quantity=quantity,
+                        outcome="BLOCKED", reason="allocation execution error",
+                        api_attempted=False, api_error_category=type(e).__name__,
+                    )
                     results['failed_executions'] += 1
                     continue
             
@@ -773,15 +860,18 @@ class UnifiedAdvancedTradingSystem:
         """
         try:
             # Calculate total metrics
+            directional_execution = getattr(self, "_last_directional_execution_results", {})
+            directional_capital_used = float(directional_execution.get('total_capital_used', 0.0))
+            directional_positions_created = int(directional_execution.get('positions_created', 0))
             total_capital_used = (
                 market_making_results.get('total_exposure', 0) +
-                portfolio_allocation.total_capital_used +
+                directional_capital_used +
                 arbitrage_results.get('arbitrage_exposure', 0)
             )
             
             # Weight expected returns by capital allocation
             mm_weight = market_making_results.get('total_exposure', 0) / (total_capital_used + 1e-8)
-            dir_weight = portfolio_allocation.total_capital_used / (total_capital_used + 1e-8)
+            dir_weight = directional_capital_used / (total_capital_used + 1e-8)
             arb_weight = arbitrage_results.get('arbitrage_exposure', 0) / (total_capital_used + 1e-8)
             
             # Portfolio expected return (weighted average)
@@ -800,7 +890,7 @@ class UnifiedAdvancedTradingSystem:
             # Total positions
             total_positions = (
                 market_making_results.get('orders_placed', 0) // 2 +  # 2 orders per position
-                len(portfolio_allocation.allocations) +
+                directional_positions_created +
                 arbitrage_results.get('arbitrage_trades', 0)
             )
             
@@ -811,8 +901,8 @@ class UnifiedAdvancedTradingSystem:
                 market_making_expected_profit=market_making_results.get('expected_profit', 0),
                 
                 # Directional trading
-                directional_positions=len(portfolio_allocation.allocations),
-                directional_exposure=portfolio_allocation.total_capital_used,
+                directional_positions=directional_positions_created,
+                directional_exposure=directional_capital_used,
                 directional_expected_return=portfolio_allocation.expected_portfolio_return,
                 
                 # Portfolio metrics

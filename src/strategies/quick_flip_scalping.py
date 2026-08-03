@@ -483,33 +483,20 @@ REASON: [brief explanation]
     async def _cut_losses_market_order(self, position: Position) -> bool:
         """Place market order to immediately exit a position."""
         try:
-            # Place market sell order to cut losses
-            import uuid
-            client_order_id = str(uuid.uuid4())
-            
-            order_params = {
-                "ticker": position.market_id,
-                "client_order_id": client_order_id,
-                "side": position.side.lower(),
-                "action": "sell",
-                "count": position.quantity,
-                "type_": "market"
-            }
-            
             live_mode = getattr(settings.trading, 'live_trading_enabled', False)
             
             if live_mode:
-                response = await self.kalshi_client.place_order(**order_params)
-                
-                if response and 'order' in response:
-                    self.logger.info(
-                        f"🛑 Loss cut order placed: {position.side} {position.quantity} "
-                        f"MARKET SELL for {position.market_id}"
-                    )
-                    return True
-                else:
-                    self.logger.error(f"Failed to place loss cut order: {response}")
+                from src.utils.market_prices import get_market_prices
+                market = (await self.kalshi_client.get_market(position.market_id)).get("market", {})
+                yes_bid, _, no_bid, _ = get_market_prices(market)
+                price = yes_bid if position.side.upper() == "YES" else no_bid
+                if not 0.01 <= price <= 0.99:
+                    self.logger.error("Loss cut blocked: valid executable bid unavailable")
                     return False
+                return await place_sell_limit_order(
+                    position=position, limit_price=price,
+                    db_manager=self.db_manager, kalshi_client=self.kalshi_client,
+                )
             else:
                 self.logger.info(
                     f"📝 SIMULATED loss cut: {position.side} {position.quantity} "
@@ -586,4 +573,4 @@ async def run_quick_flip_strategy(
         
     except Exception as e:
         logger.error(f"Error in quick flip strategy: {e}")
-        return {'error': str(e)} 
+        return {'error': str(e)}

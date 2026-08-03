@@ -817,7 +817,9 @@ class DatabaseManager(TradingLoggerMixin):
                 return Position(**position_dict)
             return None
 
-    async def get_position_by_market_and_side(self, market_id: str, side: str) -> Optional[Position]:
+    async def get_position_by_market_and_side(
+        self, market_id: str, side: str, live: Optional[bool] = None,
+    ) -> Optional[Position]:
         """
         Get a position by market ID and side.
         
@@ -830,10 +832,13 @@ class DatabaseManager(TradingLoggerMixin):
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM positions WHERE market_id = ? AND side = ? AND status = 'open'", 
-                (market_id, side)
-            )
+            query = "SELECT * FROM positions WHERE market_id = ? AND side = ? AND status IN ('open', 'pending')"
+            params = [market_id, side]
+            if live is not None:
+                query += " AND live = ?"
+                params.append(int(live))
+            query += " ORDER BY id DESC LIMIT 1"
+            cursor = await db.execute(query, params)
             row = await cursor.fetchone()
             if row:
                 position_dict = dict(row)
@@ -1239,11 +1244,62 @@ class DatabaseManager(TradingLoggerMixin):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 UPDATE positions 
-                SET live = 1, entry_price = ?
+                SET live = 1, entry_price = ?, status = 'open'
                 WHERE id = ?
             """, (entry_price, position_id))
             await db.commit()
         self.logger.info(f"Updated position {position_id} to live.")
+
+    async def mark_position_paper(self, position_id: int, entry_price: float) -> None:
+        """Open a simulated position without labeling it exchange-live."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE positions SET live = 0, entry_price = ?, status = 'open' WHERE id = ?",
+                (entry_price, position_id),
+            )
+            await db.commit()
+
+    async def quarantine_position(self, position_id: int, reason: str) -> None:
+        """Prevent a refused/unverified local intent from blocking future entries."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA busy_timeout = 5000")
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                row = await (await db.execute(
+                    "SELECT market_id FROM positions WHERE id = ?", (position_id,)
+                )).fetchone()
+                if row is None:
+                    await db.rollback()
+                    return
+                market_id = row[0]
+                await db.execute(
+                    "UPDATE positions SET status = 'rejected', reconciliation_status = ? WHERE id = ? AND live = 0",
+                    (reason[:200], position_id),
+                )
+                active = await (await db.execute(
+                    "SELECT COUNT(*) FROM positions WHERE market_id = ? AND status IN ('open', 'pending')",
+                    (market_id,),
+                )).fetchone()
+                if int(active[0]) == 0:
+                    await db.execute(
+                        "UPDATE markets SET has_position = 0 WHERE market_id = ?", (market_id,)
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def get_position_by_id(self, position_id: int) -> Optional[Position]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT * FROM positions WHERE id = ?", (position_id,)
+            )).fetchone()
+            if row is None:
+                return None
+            values = dict(row)
+            values["timestamp"] = datetime.fromisoformat(values["timestamp"])
+            return Position(**values)
 
     async def add_position(self, position: Position) -> Optional[int]:
         """
@@ -1265,18 +1321,49 @@ class DatabaseManager(TradingLoggerMixin):
             # aiosqlite does not support dataclasses with datetime objects
             position_dict['timestamp'] = position.timestamp.isoformat()
 
-            cursor = await db.execute("""
-                INSERT OR REPLACE INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change)
-                VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change)
-            """, position_dict)
+            try:
+                cursor = await db.execute("""
+                    INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change)
+                    VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change)
+                """, position_dict)
+                position_id = cursor.lastrowid
+            except aiosqlite.IntegrityError:
+                await db.rollback()
+                db.row_factory = aiosqlite.Row
+                prior = await (await db.execute(
+                    "SELECT id, status FROM positions WHERE market_id = ? AND side = ?",
+                    (position.market_id, position.side),
+                )).fetchone()
+                child_count = 0
+                if prior is not None:
+                    child_count = int((await (await db.execute(
+                        "SELECT COUNT(*) FROM orders WHERE position_id = ?", (prior["id"],)
+                    )).fetchone())[0])
+                if prior is None or prior["status"] != "rejected" or child_count:
+                    self.logger.warning(
+                        "Historical position already exists; refusing destructive replacement",
+                        market_id=position.market_id, side=position.side,
+                    )
+                    return None
+                await db.execute("""
+                    UPDATE positions SET entry_price=:entry_price, quantity=:quantity,
+                        timestamp=:timestamp, rationale=:rationale, confidence=:confidence,
+                        live=:live, status=:status, strategy=:strategy,
+                        stop_loss_price=:stop_loss_price, take_profit_price=:take_profit_price,
+                        max_hold_hours=:max_hold_hours,
+                        target_confidence_change=:target_confidence_change,
+                        reconciliation_status=NULL
+                    WHERE id=:prior_id
+                """, {**position_dict, "prior_id": prior["id"]})
+                position_id = prior["id"]
             await db.commit()
             
             # Set has_position to True for the market
             await db.execute("UPDATE markets SET has_position = 1 WHERE market_id = ?", (position.market_id,))
             await db.commit()
 
-            self.logger.info(f"Added position for market {position.market_id}", position_id=cursor.lastrowid)
-            return cursor.lastrowid
+            self.logger.info(f"Added position for market {position.market_id}", position_id=position_id)
+            return position_id
 
     async def get_open_positions(self) -> List[Position]:
         """Get all open positions."""

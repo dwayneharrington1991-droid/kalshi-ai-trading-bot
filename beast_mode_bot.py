@@ -72,6 +72,7 @@ class BeastModeBot:
         # Set live trading in settings
         settings.trading.live_trading_enabled = live_mode
         settings.trading.paper_trading_mode = not live_mode
+        settings.validate()
         
         # Add detailed logging for debugging
         self.logger.info(
@@ -363,7 +364,10 @@ class BeastModeBot:
         while not self.shutdown_event.is_set():
             try:
                 # ✅ FIXED: Pass the shared database manager
-                await run_tracking(db_manager)
+                await run_tracking(
+                    db_manager, kalshi_client=kalshi_client,
+                    live_mode=self.live_mode,
+                )
                 await asyncio.sleep(120)  # Check positions every 2 minutes (slower to reduce API load)
             except Exception as e:
                 self.logger.error(f"Error in position tracking: {e}")

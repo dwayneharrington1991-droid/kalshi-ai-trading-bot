@@ -31,6 +31,9 @@ class NewsAnalystAgent(BaseAgent):
         "3. KEY FACTORS -- List the 2-5 most important news-driven factors.\n"
         "4. IMPACT DIRECTION -- Does the news push the probability UP or DOWN "
         "relative to the current market price?\n\n"
+        "Use only the supplied context. Separate recent, stale, irrelevant, "
+        "duplicate, and unsupported items. Never claim live web access. If no "
+        "reliable context is supplied, report insufficient evidence and do not guess.\n\n"
         "Return your analysis as a JSON object (inside a ```json``` code block) "
         "with the following keys:\n"
         '  "sentiment": float (-1.0 to 1.0),\n'
@@ -50,7 +53,7 @@ class NewsAnalystAgent(BaseAgent):
             combined = f"{news}\n{extra_news}".strip()
             news_section = f"\n\n--- NEWS FEED ---\n{combined[:2000]}\n--- END NEWS ---"
         else:
-            news_section = "\n\n[No recent news available. Analyse based on general knowledge.]"
+            news_section = "\n\n[No reliable context supplied. Report insufficient evidence; do not guess.]"
 
         return (
             f"Assess the news sentiment and relevance for the following "

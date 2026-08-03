@@ -64,6 +64,37 @@ class SentimentConfig:
     relevance_threshold: float = 0.3
 
 
+@dataclass
+class MultiAgentShadowConfig:
+    """Disabled-by-default intelligence that is forbidden from affecting trades."""
+    enabled: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_SHADOW_ENABLED", "false").lower() == "true")
+    can_affect_trading: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_CAN_AFFECT_TRADING", "false").lower() == "true")
+    max_concurrency: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_MAX_CONCURRENCY", "3")))
+    timeout_seconds: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_TIMEOUT_SECONDS", "30")))
+    max_retries: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_MAX_RETRIES", "1")))
+    min_successful_agents: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_MIN_SUCCESSFUL_AGENTS", "3")))
+    require_risk_agent: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_REQUIRE_RISK_AGENT", "true").lower() == "true")
+    require_forecaster: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_REQUIRE_FORECASTER", "true").lower() == "true")
+    abstain_on_weak_evidence: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_ABSTAIN_ON_WEAK_EVIDENCE", "true").lower() == "true")
+    log_raw_responses: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_LOG_RAW_RESPONSES", "false").lower() == "true")
+    store_sanitized_responses: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_STORE_SANITIZED_RESPONSES", "true").lower() == "true")
+    max_markets_per_cycle: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_MAX_MARKETS_PER_CYCLE", "5")))
+    configuration_version: str = field(default_factory=lambda: os.getenv("MULTI_AGENT_CONFIGURATION_VERSION", "phase4-v1"))
+    weight_learning_enabled: bool = field(default_factory=lambda: os.getenv("AGENT_WEIGHT_LEARNING_ENABLED", "false").lower() == "true")
+    weight_auto_apply: bool = field(default_factory=lambda: os.getenv("AGENT_WEIGHT_AUTO_APPLY", "false").lower() == "true")
+    weight_min_samples: int = field(default_factory=lambda: int(os.getenv("AGENT_WEIGHT_MIN_SAMPLES", "100")))
+    weight_max_change: float = field(default_factory=lambda: float(os.getenv("AGENT_WEIGHT_MAX_CHANGE", "0.05")))
+    weight_min: float = field(default_factory=lambda: float(os.getenv("AGENT_WEIGHT_MIN", "0.05")))
+    weight_max: float = field(default_factory=lambda: float(os.getenv("AGENT_WEIGHT_MAX", "0.40")))
+    weight_rolling_days: int = field(default_factory=lambda: int(os.getenv("AGENT_WEIGHT_ROLLING_DAYS", "90")))
+
+    def __post_init__(self) -> None:
+        if self.can_affect_trading:
+            raise RuntimeError("MULTI_AGENT_CAN_AFFECT_TRADING=true is forbidden in shadow phase")
+        if self.max_concurrency < 1 or self.max_markets_per_cycle < 1:
+            raise ValueError("multi-agent bounds must be positive")
+
+
 # Trading strategy configuration — DISCIPLINED DEFAULTS (sane risk management)
 # Beast mode is still available via --beast flag, but NOT the default.
 # Discipline defaults based on live prediction market trading experience.
@@ -304,6 +335,7 @@ class Settings:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
     sentiment: SentimentConfig = field(default_factory=SentimentConfig)
+    multi_agent_shadow: MultiAgentShadowConfig = field(default_factory=MultiAgentShadowConfig)
 
     def validate(self) -> bool:
         """Validate configuration settings."""

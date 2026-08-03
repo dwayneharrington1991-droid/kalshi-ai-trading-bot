@@ -22,7 +22,7 @@ Key innovations:
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 import numpy as np
@@ -149,6 +149,7 @@ class UnifiedAdvancedTradingSystem:
 
         self.market_maker = None
         self.portfolio_optimizer = None
+        self.multi_agent_shadow_service = None
         
         # Capital allocation will be set by async_initialize() after getting actual balance
 
@@ -199,6 +200,31 @@ class UnifiedAdvancedTradingSystem:
         # Initialize strategy modules with actual capital
         self.market_maker = AdvancedMarketMaker(self.db_manager, self.kalshi_client, self.xai_client)
         self.portfolio_optimizer = AdvancedPortfolioOptimizer(self.db_manager, self.kalshi_client, self.xai_client)
+
+        if settings.multi_agent_shadow.enabled:
+            try:
+                from src.agents.orchestrator import MultiAgentOrchestrator
+                from src.agents.repository import AgentRepository
+                from src.agents.shadow_service import MultiAgentShadowService, build_existing_agent_executors
+
+                shadow = settings.multi_agent_shadow
+                MultiAgentOrchestrator.assert_shadow_configuration(shadow.enabled, shadow.can_affect_trading)
+                orchestrator = MultiAgentOrchestrator(
+                    build_existing_agent_executors(self.xai_client.get_completion),
+                    max_concurrency=shadow.max_concurrency,
+                    timeout_seconds=shadow.timeout_seconds,
+                    max_retries=shadow.max_retries,
+                    min_successful_agents=shadow.min_successful_agents,
+                    require_forecaster=shadow.require_forecaster,
+                    require_risk=shadow.require_risk_agent,
+                )
+                self.multi_agent_shadow_service = MultiAgentShadowService(
+                    orchestrator, AgentRepository(self.db_manager.db_path),
+                    settings.api.kalshi_environment,
+                )
+            except Exception:
+                self.multi_agent_shadow_service = None
+                self.logger.exception("Multi-agent shadow initialization failed; trading path unchanged")
 
         self.logger.info(f"🎯 CAPITAL ALLOCATION: Market Making=${self.market_making_capital:.2f}, Directional=${self.directional_capital:.2f}, Arbitrage=${self.arbitrage_capital:.2f}")
 
@@ -351,6 +377,10 @@ class UnifiedAdvancedTradingSystem:
                 self.logger.warning("No directional trading opportunities found")
                 await self._log_cycle_readiness(markets, [], self.portfolio_optimizer._empty_allocation())
                 return self.portfolio_optimizer._empty_allocation()
+
+            # Observation-only: results are persisted and logged, but never
+            # returned to or consumed by the optimizer/execution path.
+            await self._run_multi_agent_shadow(markets, opportunities)
             
             # Filter opportunities based on available capital
             # Adjust portfolio optimizer capital
@@ -387,6 +417,62 @@ class UnifiedAdvancedTradingSystem:
             self.logger.error(f"Error in directional trading strategy: {e}")
             await self._log_cycle_readiness(markets, None, None)
             return self.portfolio_optimizer._empty_allocation()
+
+    async def _run_multi_agent_shadow(self, markets, opportunities) -> None:
+        """Run a bounded shadow comparison; failures cannot escape into trading."""
+        service = self.multi_agent_shadow_service
+        if service is None:
+            return
+        analyzed = failed = 0
+        try:
+            from src.agents.models import MarketAnalysisRequest
+
+            market_by_id = {market.market_id: market for market in markets}
+            limit = settings.multi_agent_shadow.max_markets_per_cycle
+            cycle_id = datetime.now(timezone.utc).isoformat()
+            for opportunity in list(opportunities)[:limit]:
+                market = market_by_id.get(opportunity.market_id)
+                if market is None:
+                    continue
+                timestamp = datetime.now(timezone.utc).isoformat()
+                expiry = datetime.fromtimestamp(market.expiration_ts, timezone.utc)
+                request = MarketAnalysisRequest(
+                    request_id=MarketAnalysisRequest.deterministic_id(
+                        market.market_id, timestamp,
+                        settings.multi_agent_shadow.configuration_version,
+                    ),
+                    market_id=market.market_id, title=market.title, rules="",
+                    category=market.category, yes_price=float(market.yes_price),
+                    no_price=float(market.no_price), bid_ask_spread=abs(float(market.no_price) - float(market.yes_price)),
+                    volume=float(market.volume), expiration_timestamp=expiry.isoformat(),
+                    time_remaining_seconds=max(0, int((expiry - datetime.now(timezone.utc)).total_seconds())),
+                    analysis_timestamp=timestamp,
+                    configuration_version=settings.multi_agent_shadow.configuration_version,
+                    single_model_analysis={
+                        "probability_yes": opportunity.predicted_probability,
+                        "confidence": opportunity.confidence,
+                    },
+                )
+                try:
+                    await service.analyze(request, cycle_id=cycle_id)
+                    analyzed += 1
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                        raise
+                    failed += 1
+                    self.logger.error(
+                        "MULTI_AGENT_SHADOW market=%s status=FAILED trading_impact=NONE",
+                        market.market_id,
+                    )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            self.logger.error("Multi-agent shadow cycle unavailable; trading path unchanged")
+        finally:
+            self.logger.info(
+                "MULTI_AGENT_SHADOW cycle analyzed=%s failed=%s trading_impact=NONE",
+                analyzed, failed,
+            )
 
     async def _log_cycle_readiness(self, markets, opportunities, allocation) -> None:
         """Emit one human and one structured readiness summary for this cycle."""

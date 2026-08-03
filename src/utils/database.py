@@ -127,6 +127,7 @@ class DatabaseManager(TradingLoggerMixin):
             (1, "legacy_schema_compatibility", self._migration_001_legacy_schema),
             (2, "order_reconciliation_foundation", self._migration_002_order_reconciliation),
             (3, "authoritative_position_projection", self._migration_003_position_projection),
+            (4, "multi_agent_shadow_learning", self._migration_004_multi_agent_shadow),
         )
         for version, name, migration in migrations:
             if version in applied:
@@ -303,6 +304,156 @@ class DatabaseManager(TradingLoggerMixin):
             );
             CREATE INDEX idx_position_fill_projections_position
                 ON position_fill_projections(position_id, applied_at);
+        """
+        for statement in statements.split(";"):
+            if statement.strip():
+                await db.execute(statement)
+
+    async def _migration_004_multi_agent_shadow(self, db: aiosqlite.Connection) -> None:
+        """Add shadow-analysis and offline evaluation tables without touching trades."""
+        statements = """
+            CREATE TABLE agent_analysis_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                market_id TEXT NOT NULL,
+                cycle_id TEXT,
+                environment TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (mode = 'shadow'),
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT NOT NULL,
+                agent_count INTEGER NOT NULL DEFAULT 0,
+                successful_agent_count INTEGER NOT NULL DEFAULT 0,
+                failed_agent_count INTEGER NOT NULL DEFAULT 0,
+                total_latency REAL NOT NULL DEFAULT 0,
+                total_cost REAL NOT NULL DEFAULT 0,
+                configuration_version TEXT NOT NULL,
+                error_summary TEXT
+            );
+            CREATE INDEX idx_agent_runs_market_time
+                ON agent_analysis_runs(market_id, started_at);
+
+            CREATE TABLE agent_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_run_id INTEGER NOT NULL REFERENCES agent_analysis_runs(id) ON DELETE CASCADE,
+                agent_name TEXT NOT NULL,
+                agent_version TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                probability_yes REAL CHECK (probability_yes BETWEEN 0 AND 1),
+                confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+                evidence_quality REAL CHECK (evidence_quality BETWEEN 0 AND 1),
+                risk_level TEXT,
+                veto BOOLEAN NOT NULL DEFAULT 0,
+                recommendation TEXT NOT NULL,
+                success BOOLEAN NOT NULL,
+                fallback_used BOOLEAN NOT NULL DEFAULT 0,
+                latency REAL NOT NULL DEFAULT 0,
+                token_count INTEGER,
+                estimated_cost REAL,
+                sanitized_output TEXT,
+                error_category TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(analysis_run_id, agent_name)
+            );
+
+            CREATE TABLE consensus_predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_run_id INTEGER NOT NULL UNIQUE REFERENCES agent_analysis_runs(id) ON DELETE CASCADE,
+                market_id TEXT NOT NULL,
+                probability_yes REAL NOT NULL CHECK (probability_yes BETWEEN 0 AND 1),
+                probability_no REAL NOT NULL CHECK (probability_no BETWEEN 0 AND 1),
+                process_confidence REAL NOT NULL CHECK (process_confidence BETWEEN 0 AND 1),
+                disagreement_score REAL NOT NULL CHECK (disagreement_score BETWEEN 0 AND 1),
+                evidence_quality_score REAL NOT NULL CHECK (evidence_quality_score BETWEEN 0 AND 1),
+                uncertainty_score REAL NOT NULL CHECK (uncertainty_score BETWEEN 0 AND 1),
+                recommendation TEXT NOT NULL,
+                expected_edge REAL NOT NULL,
+                risk_veto BOOLEAN NOT NULL DEFAULT 0,
+                explanation TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE single_vs_multi_comparisons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_run_id INTEGER NOT NULL UNIQUE REFERENCES agent_analysis_runs(id) ON DELETE CASCADE,
+                market_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                market_price_probability REAL NOT NULL,
+                single_model_probability REAL,
+                multi_agent_probability REAL NOT NULL,
+                single_model_action TEXT,
+                multi_agent_action TEXT NOT NULL,
+                probability_difference REAL,
+                action_agreement BOOLEAN,
+                realized_outcome INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE prediction_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                analysis_run_id INTEGER NOT NULL UNIQUE REFERENCES agent_analysis_runs(id) ON DELETE CASCADE,
+                prediction_timestamp TEXT NOT NULL,
+                settlement_timestamp TEXT,
+                predicted_probability_yes REAL NOT NULL CHECK (predicted_probability_yes BETWEEN 0 AND 1),
+                market_probability_at_prediction REAL NOT NULL CHECK (market_probability_at_prediction BETWEEN 0 AND 1),
+                actual_outcome INTEGER CHECK (actual_outcome IN (0, 1)),
+                outcome_status TEXT NOT NULL DEFAULT 'unresolved',
+                eligible_at_prediction BOOLEAN NOT NULL DEFAULT 0,
+                category TEXT,
+                time_horizon_seconds INTEGER NOT NULL,
+                model_version TEXT NOT NULL,
+                settled_at TEXT
+            );
+            CREATE INDEX idx_prediction_outcomes_status ON prediction_outcomes(outcome_status, market_id);
+
+            CREATE TABLE agent_performance (
+                agent_name TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                horizon_bucket TEXT NOT NULL,
+                sample_count INTEGER NOT NULL,
+                brier_score REAL,
+                log_loss REAL,
+                calibration_error REAL,
+                accuracy REAL,
+                average_edge REAL,
+                simulated_roi REAL,
+                last_updated TEXT NOT NULL,
+                PRIMARY KEY(agent_name, model_name, category, horizon_bucket)
+            );
+
+            CREATE TABLE calibration_buckets (
+                model_or_agent TEXT NOT NULL,
+                category TEXT NOT NULL,
+                horizon_bucket TEXT NOT NULL,
+                probability_bucket TEXT NOT NULL,
+                prediction_count INTEGER NOT NULL,
+                average_predicted_probability REAL,
+                observed_yes_rate REAL,
+                calibration_gap REAL,
+                status TEXT NOT NULL,
+                last_updated TEXT NOT NULL,
+                PRIMARY KEY(model_or_agent, category, horizon_bucket, probability_bucket)
+            );
+
+            CREATE TABLE backtest_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                configuration_version TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT NOT NULL,
+                data_start TEXT,
+                data_end TEXT,
+                markets_evaluated INTEGER NOT NULL DEFAULT 0,
+                predictions_evaluated INTEGER NOT NULL DEFAULT 0,
+                fees_model TEXT NOT NULL,
+                slippage_model TEXT NOT NULL,
+                spread_model TEXT NOT NULL,
+                latency_model TEXT NOT NULL,
+                summary_json TEXT,
+                error_summary TEXT
+            );
         """
         for statement in statements.split(";"):
             if statement.strip():

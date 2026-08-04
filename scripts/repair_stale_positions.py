@@ -34,6 +34,28 @@ from src.orders.repository import OrderRepository  # noqa: E402
 from src.utils.database import DatabaseManager  # noqa: E402
 
 
+REQUIRED_REPORT_KEYS = (
+    "mode",
+    "plan_id",
+    "source_ledger_modified",
+    "simulated_or_applied_count",
+    "pre_repair_critical_alert_count",
+    "post_repair_critical_alert_count",
+    "remaining_critical_alerts",
+    "remaining_warning_alerts",
+    "post_repair_reconciliation_status",
+    "canary_ready",
+)
+
+
+def complete_report(report: dict) -> dict:
+    """Guarantee a stable successful-report schema without inventing unavailable values."""
+    completed = dict(report)
+    for key in REQUIRED_REPORT_KEYS:
+        completed.setdefault(key, None)
+    return completed
+
+
 def backup(source: Path, directory: Path) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     target = directory / f"{source.stem}.pre-local-repair-{timestamp}.db"
@@ -66,6 +88,22 @@ async def authoritative_plan(db_path: Path, read_client: ReadOnlyAccountClient):
     return build_plan(db_path, candidates, markets)
 
 
+def alert_snapshot(db_path: Path, severity: str):
+    """Return bounded, secret-free unresolved alert details or None if unavailable."""
+    try:
+        with sqlite3.connect(db_path) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""
+                SELECT id, kind, market_id, expected_value, observed_value
+                FROM reconciliation_alerts
+                WHERE resolved_at IS NULL AND severity = ?
+                ORDER BY kind, market_id, id
+            """, (severity,)).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        return None
+
+
 async def run(args, environment: dict[str, str]) -> dict:
     source = args.db.resolve(strict=True)
     saved_backup = backup(source, args.backup_dir or source.parent / "backups")
@@ -81,6 +119,7 @@ async def run(args, environment: dict[str, str]) -> dict:
             OrderRepository(str(working_db)), read_client,
             shadow_mode=True, paper_mode=False, project_positions=False,
         ).reconcile(trigger="pre_local_repair_preview", full=True)
+        pre_critical_alerts = alert_snapshot(working_db, "critical")
         plan = await authoritative_plan(working_db, read_client)
         if args.apply:
             if args.confirm != plan["plan_id"]:
@@ -99,10 +138,16 @@ async def run(args, environment: dict[str, str]) -> dict:
             shadow_mode=True, paper_mode=False, project_positions=False,
         )
         result = await reconciler.reconcile(trigger="post_local_repair_preview", full=True)
-        critical = unresolved_critical_count(verification_db)
-        return {
+        remaining_critical = alert_snapshot(verification_db, "critical")
+        remaining_warning = alert_snapshot(verification_db, "warning")
+        post_critical_count = (
+            len(remaining_critical) if remaining_critical is not None
+            else unresolved_critical_count(verification_db)
+        )
+        report = {
             "mode": mode,
             "exchange_writes": False,
+            "source_ledger_modified": bool(args.apply),
             "backup_path": str(saved_backup),
             "plan_id": plan["plan_id"],
             "repairs": plan["repairs"],
@@ -110,11 +155,23 @@ async def run(args, environment: dict[str, str]) -> dict:
             "simulated_or_applied_count": applied,
             "pre_repair_reconciliation_status": before.status,
             "pre_repair_mismatch_count": before.mismatch_count,
+            "pre_repair_critical_alert_count": (
+                len(pre_critical_alerts) if pre_critical_alerts is not None else None
+            ),
             "post_repair_reconciliation_status": result.status,
             "post_repair_mismatch_count": result.mismatch_count,
-            "post_repair_unresolved_critical_alerts": critical,
+            "post_repair_critical_alert_count": post_critical_count,
+            "post_repair_unresolved_critical_alerts": post_critical_count,
+            "remaining_critical_alerts": remaining_critical,
+            "remaining_warning_alerts": remaining_warning,
+            "canary_ready": bool(
+                post_critical_count == 0
+                and result.status in {"completed", "completed_with_mismatches"}
+                and applied == len(plan["repairs"])
+            ),
             "apply_command_requires_exact_plan_id": not args.apply,
         }
+        return complete_report(report)
     finally:
         shutil.rmtree(tempdir, ignore_errors=True)
         await _close_client(raw_client)
@@ -130,13 +187,19 @@ def main() -> int:
     if args.confirm and not args.apply:
         parser.error("--confirm is valid only with --apply")
     load_dotenv(ROOT / ".env")
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
     try:
-        report = asyncio.run(run(args, dict(os.environ)))
+        with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
+            report = complete_report(asyncio.run(run(args, dict(os.environ))))
     except Exception as exc:
         print(f"LOCAL_RECONCILIATION_REPAIR=BLOCKED ({type(exc).__name__})")
         return 2
+    for captured in (captured_stdout.getvalue(), captured_stderr.getvalue()):
+        if captured:
+            print(captured, file=sys.stderr, end="" if captured.endswith("\n") else "\n")
     print(json.dumps(report, indent=2, sort_keys=True))
-    print("LOCAL_RECONCILIATION_REPAIR=COMPLETE")
+    print("LOCAL_RECONCILIATION_REPAIR=COMPLETE", file=sys.stderr)
     return 0
 
 

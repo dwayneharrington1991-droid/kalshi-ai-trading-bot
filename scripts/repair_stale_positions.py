@@ -20,18 +20,22 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.read_only_validate import (  # noqa: E402
-    ENVIRONMENT_URLS, ReadOnlyAccountClient, ReadOnlyValidationError,
-    _close_client, validate_read_only_safety,
-)
-from src.clients.kalshi_client import KalshiClient  # noqa: E402
-from src.orders.local_position_repair import (  # noqa: E402
-    apply_plan, build_plan, local_candidates, remote_position_map,
-    unresolved_critical_count,
-)
-from src.orders.reconciler import OrderReconciler  # noqa: E402
-from src.orders.repository import OrderRepository  # noqa: E402
-from src.utils.database import DatabaseManager  # noqa: E402
+# Some application modules configure logging while they are imported. Keep
+# those diagnostics on stderr so shell redirection of stdout always captures
+# exactly one JSON document.
+with contextlib.redirect_stdout(sys.stderr):
+    from scripts.read_only_validate import (  # noqa: E402
+        ENVIRONMENT_URLS, ReadOnlyAccountClient, ReadOnlyValidationError,
+        _close_client, validate_read_only_safety,
+    )
+    from src.clients.kalshi_client import KalshiClient  # noqa: E402
+    from src.orders.local_position_repair import (  # noqa: E402
+        apply_plan, build_plan, local_candidates, remote_position_map,
+        unresolved_critical_count,
+    )
+    from src.orders.reconciler import OrderReconciler  # noqa: E402
+    from src.orders.repository import OrderRepository  # noqa: E402
+    from src.utils.database import DatabaseManager  # noqa: E402
 
 
 REQUIRED_REPORT_KEYS = (
@@ -193,13 +197,21 @@ def main() -> int:
         with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
             report = complete_report(asyncio.run(run(args, dict(os.environ))))
     except Exception as exc:
-        print(f"LOCAL_RECONCILIATION_REPAIR=BLOCKED ({type(exc).__name__})")
+        report = complete_report({
+            "mode": "BLOCKED",
+            "source_ledger_modified": False,
+            "canary_ready": False,
+            "error": type(exc).__name__,
+        })
+        for captured in (captured_stdout.getvalue(), captured_stderr.getvalue()):
+            if captured:
+                print(captured, file=sys.stderr, end="" if captured.endswith("\n") else "\n")
+        print(json.dumps(report, indent=2, sort_keys=True))
         return 2
     for captured in (captured_stdout.getvalue(), captured_stderr.getvalue()):
         if captured:
             print(captured, file=sys.stderr, end="" if captured.endswith("\n") else "\n")
     print(json.dumps(report, indent=2, sort_keys=True))
-    print("LOCAL_RECONCILIATION_REPAIR=COMPLETE", file=sys.stderr)
     return 0
 
 

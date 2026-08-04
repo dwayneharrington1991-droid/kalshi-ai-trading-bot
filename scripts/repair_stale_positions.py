@@ -32,7 +32,7 @@ with contextlib.redirect_stdout(sys.stderr):
     )
     from src.clients.kalshi_client import KalshiClient  # noqa: E402
     from src.orders.local_position_repair import (  # noqa: E402
-        apply_plan, build_plan, local_candidates, remote_position_map,
+        active_order_snapshot, apply_plan, build_plan, local_candidates, remote_position_map,
         unresolved_critical_count,
     )
     from src.orders.reconciler import OrderReconciler  # noqa: E402
@@ -101,12 +101,40 @@ async def read_only_client(environment: dict[str, str]):
 
 
 async def authoritative_plan(db_path: Path, read_client: ReadOnlyAccountClient):
-    positions = await read_client.get_positions()
-    candidates = local_candidates(db_path, remote_position_map(positions))
+    positions_response = await read_client.get_positions()
+    positions = remote_position_map(positions_response)
+    orders = active_order_snapshot(await read_client.get_all_orders(limit=1000))
+    candidates = local_candidates(db_path, positions)
     markets = {}
     for ticker in sorted({row["market_id"] for row in candidates}):
         markets[ticker] = await read_client.get_market(ticker)
-    return build_plan(db_path, candidates, markets)
+    return build_plan(
+        db_path, candidates, markets, active_orders=orders, remote_positions=positions
+    )
+
+
+def position_mismatch_count(db_path: Path) -> int:
+    with sqlite3.connect(db_path) as db:
+        return int(db.execute("""
+            SELECT COUNT(*) FROM reconciliation_alerts
+            WHERE resolved_at IS NULL AND severity = 'critical'
+              AND kind IN ('position_mismatch_yes', 'position_mismatch_no')
+        """).fetchone()[0])
+
+
+def unresolved_critical_ids(db_path: Path) -> list[int]:
+    with sqlite3.connect(db_path) as db:
+        return [int(row[0]) for row in db.execute("""
+            SELECT id FROM reconciliation_alerts
+            WHERE resolved_at IS NULL AND severity = 'critical' ORDER BY id
+        """).fetchall()]
+
+
+def assert_plan_unchanged(preview_plan: dict, current_plan: dict) -> None:
+    if current_plan["exchange_snapshot"] != preview_plan["exchange_snapshot"]:
+        raise ReadOnlyValidationError("authoritative exchange snapshot changed after preview")
+    if current_plan["plan_id"] != preview_plan["plan_id"]:
+        raise ReadOnlyValidationError("local or exchange assumptions changed after preview")
 
 
 def alert_snapshot(db_path: Path, severity: str):
@@ -148,18 +176,31 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
         ).reconcile(trigger="pre_local_repair_preview", full=True)
         pre_critical_alerts = alert_snapshot(working_db, "critical")
         progress["stage"] = "build_authoritative_plan"
-        plan = await authoritative_plan(working_db, read_client)
+        # Plan from the untouched source. Reconciliation above is diagnostic
+        # and intentionally writes only to the disposable working copy.
+        plan = await authoritative_plan(source, read_client)
         progress["plan_id"] = plan["plan_id"]
         if args.apply:
             if args.confirm != plan["plan_id"]:
                 raise ReadOnlyValidationError("confirmation must exactly match current plan_id")
+            planned_alert_ids = sorted({
+                alert_id for repair in plan["repairs"] for alert_id in repair["alert_ids"]
+            })
+            if plan["manual_review"] or unresolved_critical_ids(source) != planned_alert_ids:
+                raise ReadOnlyValidationError(
+                    "all unresolved critical alerts must be safely repairable in one plan"
+                )
+            progress["stage"] = "second_authoritative_snapshot"
+            second_plan = await authoritative_plan(source, read_client)
+            assert_plan_unchanged(plan, second_plan)
+            progress["stage"] = "apply_exact_plan"
             applied = apply_plan(source, plan)
-            verification_db = tempdir / "verification.db"
-            shutil.copy2(source, verification_db)
-            await DatabaseManager(str(verification_db)).initialize()
+            verification_db = source
             mode = "APPLIED_LOCAL_ONLY"
         else:
-            verification_db = working_db
+            verification_db = tempdir / "verification.db"
+            shutil.copy2(saved_backup, verification_db)
+            await DatabaseManager(str(verification_db)).initialize()
             progress["stage"] = "simulate_local_repair"
             applied = apply_plan(verification_db, plan)
             mode = "PREVIEW_ONLY"
@@ -168,9 +209,14 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
             shadow_mode=True, paper_mode=False, project_positions=False,
         )
         progress["stage"] = "post_repair_reconciliation"
-        result = await reconciler.reconcile(trigger="post_local_repair_preview", full=True)
+        result = await reconciler.reconcile(
+            trigger="post_local_repair_apply" if args.apply else "post_local_repair_preview",
+            full=True,
+        )
+        health = await OrderRepository(str(verification_db)).get_reconciliation_health(30)
         remaining_critical = alert_snapshot(verification_db, "critical")
         remaining_warning = alert_snapshot(verification_db, "warning")
+        remaining_position_mismatches = position_mismatch_count(verification_db)
         post_critical_count = (
             len(remaining_critical) if remaining_critical is not None
             else unresolved_critical_count(verification_db)
@@ -183,6 +229,8 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
             "plan_id": plan["plan_id"],
             "repairs": plan["repairs"],
             "repair_count": len(plan["repairs"]),
+            "manual_review": plan["manual_review"],
+            "manual_review_count": len(plan["manual_review"]),
             "simulated_or_applied_count": applied,
             "pre_repair_reconciliation_status": before.status,
             "pre_repair_mismatch_count": before.mismatch_count,
@@ -190,14 +238,18 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
                 len(pre_critical_alerts) if pre_critical_alerts is not None else None
             ),
             "post_repair_reconciliation_status": result.status,
+            "post_repair_checkpoint_fresh": health["fresh"],
             "post_repair_mismatch_count": result.mismatch_count,
             "post_repair_critical_alert_count": post_critical_count,
             "post_repair_unresolved_critical_alerts": post_critical_count,
+            "post_repair_position_mismatch_count": remaining_position_mismatches,
             "remaining_critical_alerts": remaining_critical,
             "remaining_warning_alerts": remaining_warning,
             "canary_ready": bool(
                 post_critical_count == 0
                 and result.status in {"completed", "completed_with_mismatches"}
+                and health["healthy_status"] and health["fresh"]
+                and remaining_position_mismatches == 0
                 and applied == len(plan["repairs"])
             ),
             "apply_command_requires_exact_plan_id": not args.apply,

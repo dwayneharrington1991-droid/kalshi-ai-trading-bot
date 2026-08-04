@@ -11,6 +11,8 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,13 +63,28 @@ def complete_report(report: dict) -> dict:
 
 
 def backup(source: Path, directory: Path) -> Path:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     target = directory / f"{source.stem}.pre-local-repair-{timestamp}.db"
     target.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(f"file:{source.resolve().as_posix()}?mode=ro", uri=True) as src:
-        with sqlite3.connect(target) as dst:
-            src.backup(dst)
-    return target
+    last_error = None
+    for attempt in range(3):
+        try:
+            with sqlite3.connect(
+                f"file:{source.resolve().as_posix()}?mode=ro", uri=True, timeout=30
+            ) as src:
+                src.execute("PRAGMA busy_timeout = 30000")
+                with sqlite3.connect(target, timeout=30) as dst:
+                    dst.execute("PRAGMA busy_timeout = 30000")
+                    src.backup(dst, pages=256, sleep=0.05)
+            return target
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            target.unlink(missing_ok=True)
+            if attempt < 2:
+                time.sleep(0.25 * (attempt + 1))
+    raise last_error
 
 
 async def read_only_client(environment: dict[str, str]):
@@ -108,23 +125,31 @@ def alert_snapshot(db_path: Path, severity: str):
         return None
 
 
-async def run(args, environment: dict[str, str]) -> dict:
+async def run(args, environment: dict[str, str], progress: dict | None = None) -> dict:
+    progress = progress if progress is not None else {}
+    progress["stage"] = "resolve_source_ledger"
     source = args.db.resolve(strict=True)
+    progress["stage"] = "backup_source_ledger"
     saved_backup = backup(source, args.backup_dir or source.parent / "backups")
     tempdir = Path(tempfile.mkdtemp(prefix="kalshi-local-repair-preview-"))
     working_db = tempdir / "ledger.db"
     shutil.copy2(saved_backup, working_db)
+    progress["stage"] = "construct_read_only_client"
     read_client, raw_client = await read_only_client(environment)
     try:
         # The source ledger may predate reconciliation migrations. Initialize
         # and populate alerts only on the disposable copy, never on source.
+        progress["stage"] = "initialize_disposable_ledger"
         await DatabaseManager(str(working_db)).initialize()
+        progress["stage"] = "pre_repair_reconciliation"
         before = await OrderReconciler(
             OrderRepository(str(working_db)), read_client,
             shadow_mode=True, paper_mode=False, project_positions=False,
         ).reconcile(trigger="pre_local_repair_preview", full=True)
         pre_critical_alerts = alert_snapshot(working_db, "critical")
+        progress["stage"] = "build_authoritative_plan"
         plan = await authoritative_plan(working_db, read_client)
+        progress["plan_id"] = plan["plan_id"]
         if args.apply:
             if args.confirm != plan["plan_id"]:
                 raise ReadOnlyValidationError("confirmation must exactly match current plan_id")
@@ -135,12 +160,14 @@ async def run(args, environment: dict[str, str]) -> dict:
             mode = "APPLIED_LOCAL_ONLY"
         else:
             verification_db = working_db
+            progress["stage"] = "simulate_local_repair"
             applied = apply_plan(verification_db, plan)
             mode = "PREVIEW_ONLY"
         reconciler = OrderReconciler(
             OrderRepository(str(verification_db)), read_client,
             shadow_mode=True, paper_mode=False, project_positions=False,
         )
+        progress["stage"] = "post_repair_reconciliation"
         result = await reconciler.reconcile(trigger="post_local_repair_preview", full=True)
         remaining_critical = alert_snapshot(verification_db, "critical")
         remaining_warning = alert_snapshot(verification_db, "warning")
@@ -193,19 +220,26 @@ def main() -> int:
     load_dotenv(ROOT / ".env")
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()
+    progress = {}
     try:
         with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
-            report = complete_report(asyncio.run(run(args, dict(os.environ))))
+            report = complete_report(asyncio.run(run(args, dict(os.environ), progress)))
     except Exception as exc:
+        error_traceback = traceback.format_exc()
         report = complete_report({
             "mode": "BLOCKED",
+            "plan_id": progress.get("plan_id"),
             "source_ledger_modified": False,
             "canary_ready": False,
             "error": type(exc).__name__,
+            "error_stage": progress.get("stage"),
+            "error_message": str(exc),
+            "error_traceback": error_traceback,
         })
         for captured in (captured_stdout.getvalue(), captured_stderr.getvalue()):
             if captured:
                 print(captured, file=sys.stderr, end="" if captured.endswith("\n") else "\n")
+        print(error_traceback, file=sys.stderr, end="" if error_traceback.endswith("\n") else "\n")
         print(json.dumps(report, indent=2, sort_keys=True))
         return 2
     for captured in (captured_stdout.getvalue(), captured_stderr.getvalue()):

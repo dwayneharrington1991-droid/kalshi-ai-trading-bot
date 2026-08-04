@@ -4,11 +4,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
 from scripts import repair_stale_positions
-from scripts.repair_stale_positions import REQUIRED_REPORT_KEYS, complete_report
+from scripts.repair_stale_positions import REQUIRED_REPORT_KEYS, backup, complete_report
 from src.orders.local_position_repair import apply_plan, build_plan, local_candidates
 from src.utils.database import DatabaseManager
 
@@ -118,7 +120,7 @@ def test_successful_preview_report_always_contains_required_keys():
 def test_successful_preview_stdout_is_valid_json_when_runtime_logs_exist(
     monkeypatch, capsys, tmp_path,
 ):
-    async def fake_run(args, environment):
+    async def fake_run(args, environment, progress=None):
         print("runtime log line")
         return {"mode": "PREVIEW_ONLY", "plan_id": "plan"}
 
@@ -164,3 +166,26 @@ def test_redirected_subprocess_stdout_is_exactly_one_json_object(tmp_path):
         report = json.load(source)
     assert set(REQUIRED_REPORT_KEYS).issubset(report)
     assert report["mode"] == "BLOCKED"
+    assert "Traceback (most recent call last)" in report["error_traceback"]
+
+
+def test_backup_waits_for_transient_sqlite_lock(tmp_path):
+    source = tmp_path / "locked.db"
+    with sqlite3.connect(source) as db:
+        db.execute("CREATE TABLE proof (value TEXT)")
+        db.execute("INSERT INTO proof VALUES ('preserved')")
+        db.commit()
+    locker = sqlite3.connect(source, timeout=1, check_same_thread=False)
+    locker.execute("BEGIN EXCLUSIVE")
+
+    def release():
+        time.sleep(.2)
+        locker.rollback()
+        locker.close()
+
+    thread = threading.Thread(target=release)
+    thread.start()
+    copied = backup(source, tmp_path / "backups")
+    thread.join(timeout=2)
+    with sqlite3.connect(copied) as db:
+        assert db.execute("SELECT value FROM proof").fetchone()[0] == "preserved"

@@ -1,8 +1,10 @@
 import sqlite3
+import shutil
 
 import pytest
 
 from src.orders.local_position_repair import apply_plan, build_plan, local_candidates
+from src.utils.database import DatabaseManager
 
 
 def database(path):
@@ -59,3 +61,42 @@ def test_apply_rejects_position_changed_after_preview(tmp_path):
         db.commit()
     with pytest.raises(RuntimeError, match="changed after preview"):
         apply_plan(path, plan)
+
+
+@pytest.mark.asyncio
+async def test_legacy_source_is_initialized_only_on_disposable_copy(tmp_path):
+    source = tmp_path / "legacy.db"
+    with sqlite3.connect(source) as db:
+        db.executescript("""
+            CREATE TABLE positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, market_id TEXT NOT NULL,
+                side TEXT NOT NULL, entry_price REAL NOT NULL, quantity INTEGER NOT NULL,
+                timestamp TEXT NOT NULL, rationale TEXT, confidence REAL,
+                live BOOLEAN NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open',
+                UNIQUE(market_id, side)
+            );
+            CREATE TABLE trade_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, market_id TEXT NOT NULL,
+                side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL,
+                quantity INTEGER NOT NULL, pnl REAL NOT NULL,
+                entry_timestamp TEXT NOT NULL, exit_timestamp TEXT NOT NULL, rationale TEXT
+            );
+            INSERT INTO positions
+                (market_id, side, entry_price, quantity, timestamp, live, status)
+            VALUES ('LEGACY', 'YES', .4, 2, '2026-01-01', 1, 'open');
+        """)
+        db.commit()
+    original = source.read_bytes()
+    working = tmp_path / "working.db"
+    shutil.copy2(source, working)
+    await DatabaseManager(str(working)).initialize()
+    with sqlite3.connect(working) as db:
+        db.execute("""
+            INSERT INTO reconciliation_alerts
+                (severity, kind, market_id, expected_value, observed_value,
+                 first_seen_at, last_seen_at)
+            VALUES ('critical', 'position_mismatch_yes', 'LEGACY', '2', '0', 'now', 'now')
+        """)
+        db.commit()
+    assert [row["id"] for row in local_candidates(working, {})] == [1]
+    assert source.read_bytes() == original

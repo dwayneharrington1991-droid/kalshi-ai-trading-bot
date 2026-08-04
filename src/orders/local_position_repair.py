@@ -169,10 +169,14 @@ def apply_plan(db_path: Path, plan: dict) -> int:
             if before != expected:
                 raise RuntimeError("position changed after preview; generate a new preview")
             alert_ids = [item["alert_id"] for item in repair["alert_changes"]]
+            has_alerts = db.execute("""
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'reconciliation_alerts'
+            """).fetchone() is not None
             alert_before = [dict(item) for item in db.execute(
                 f"SELECT id, resolved_at FROM reconciliation_alerts WHERE id IN ({','.join('?' for _ in alert_ids)}) ORDER BY id",
                 alert_ids,
-            ).fetchall()] if alert_ids else []
+            ).fetchall()] if alert_ids and has_alerts else []
             db.execute("""
                 UPDATE positions SET status = ?, open_quantity = ?,
                     reconciliation_status = ?, last_reconciled_at = ? WHERE id = ?
@@ -189,11 +193,12 @@ def apply_plan(db_path: Path, plan: dict) -> int:
                   json.dumps({"position": {**after, "last_reconciled_at": now},
                               "alerts": [{"id": item["alert_id"], "resolved_at": now}
                                          for item in repair["alert_changes"]]}, sort_keys=True), now))
-            db.execute("""
-                UPDATE reconciliation_alerts SET resolved_at = ?
-                WHERE resolved_at IS NULL AND severity = 'critical' AND market_id = ?
-                  AND kind = ?
-            """, (now, repair["market_id"], f"position_mismatch_{repair['side'].lower()}"))
+            if has_alerts:
+                db.execute("""
+                    UPDATE reconciliation_alerts SET resolved_at = ?
+                    WHERE resolved_at IS NULL AND severity = 'critical' AND market_id = ?
+                      AND kind = ?
+                """, (now, repair["market_id"], f"position_mismatch_{repair['side'].lower()}"))
             applied += 1
         db.commit()
     return applied
@@ -201,6 +206,11 @@ def apply_plan(db_path: Path, plan: dict) -> int:
 
 def unresolved_critical_count(db_path: Path) -> int:
     with sqlite3.connect(db_path) as db:
+        if db.execute("""
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'reconciliation_alerts'
+        """).fetchone() is None:
+            return 0
         row = db.execute("""
             SELECT COUNT(*) FROM reconciliation_alerts
             WHERE resolved_at IS NULL AND severity = 'critical'

@@ -1,5 +1,9 @@
 import sqlite3
 import shutil
+import json
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -128,7 +132,35 @@ def test_successful_preview_stdout_is_valid_json_when_runtime_logs_exist(
     )
     assert repair_stale_positions.main() == 0
     captured = capsys.readouterr()
-    report = __import__("json").loads(captured.out)
+    report = json.loads(captured.out)
     assert set(REQUIRED_REPORT_KEYS).issubset(report)
     assert "runtime log line" not in captured.out
     assert "runtime log line" in captured.err
+
+
+def test_redirected_subprocess_stdout_is_exactly_one_json_object(tmp_path):
+    database_path = tmp_path / "ledger.db"
+    with sqlite3.connect(database_path):
+        pass
+    preview_path = tmp_path / "preview.json"
+    environment = dict(os.environ)
+    for name in (
+        "KALSHI_API_KEY", "KALSHI_PRIVATE_KEY_PATH", "READ_ONLY_ACCOUNT_VALIDATION",
+        "AUTHORITATIVE_LIVE_EXECUTION_ENABLED", "LIVE_ORDER_SUBMISSION_KILL_SWITCH",
+        "RECONCILIATION_SHADOW_MODE", "LIVE_TRADING_ENABLED",
+    ):
+        environment.pop(name, None)
+    # load_dotenv() does not override this explicit fail-closed value, so the
+    # subprocess can never construct a client even if a developer has a .env.
+    environment["AUTHORITATIVE_LIVE_EXECUTION_ENABLED"] = "true"
+    with preview_path.open("w", encoding="utf-8") as output:
+        completed = subprocess.run(
+            [sys.executable, "scripts/repair_stale_positions.py", "--db", str(database_path)],
+            cwd=repair_stale_positions.ROOT, env=environment, stdout=output,
+            stderr=subprocess.PIPE, text=True, timeout=30, check=False,
+        )
+    assert completed.returncode == 2
+    with preview_path.open("r", encoding="utf-8") as source:
+        report = json.load(source)
+    assert set(REQUIRED_REPORT_KEYS).issubset(report)
+    assert report["mode"] == "BLOCKED"

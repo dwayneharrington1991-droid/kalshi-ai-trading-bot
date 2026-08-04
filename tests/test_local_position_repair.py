@@ -3,6 +3,8 @@ import shutil
 
 import pytest
 
+from scripts import repair_stale_positions
+from scripts.repair_stale_positions import REQUIRED_REPORT_KEYS, complete_report
 from src.orders.local_position_repair import apply_plan, build_plan, local_candidates
 from src.utils.database import DatabaseManager
 
@@ -100,3 +102,33 @@ async def test_legacy_source_is_initialized_only_on_disposable_copy(tmp_path):
         db.commit()
     assert [row["id"] for row in local_candidates(working, {})] == [1]
     assert source.read_bytes() == original
+
+
+def test_successful_preview_report_always_contains_required_keys():
+    report = complete_report({"mode": "PREVIEW_ONLY", "plan_id": "plan"})
+    assert set(REQUIRED_REPORT_KEYS).issubset(report)
+    assert report["remaining_critical_alerts"] is None
+    assert report["remaining_warning_alerts"] is None
+
+
+def test_successful_preview_stdout_is_valid_json_when_runtime_logs_exist(
+    monkeypatch, capsys, tmp_path,
+):
+    async def fake_run(args, environment):
+        print("runtime log line")
+        return {"mode": "PREVIEW_ONLY", "plan_id": "plan"}
+
+    database_path = tmp_path / "ledger.db"
+    database_path.touch()
+    monkeypatch.setattr(repair_stale_positions, "run", fake_run)
+    monkeypatch.setattr(
+        repair_stale_positions.sys,
+        "argv",
+        ["repair_stale_positions.py", "--db", str(database_path)],
+    )
+    assert repair_stale_positions.main() == 0
+    captured = capsys.readouterr()
+    report = __import__("json").loads(captured.out)
+    assert set(REQUIRED_REPORT_KEYS).issubset(report)
+    assert "runtime log line" not in captured.out
+    assert "runtime log line" in captured.err

@@ -31,6 +31,7 @@ from src.orders.local_position_repair import (  # noqa: E402
 )
 from src.orders.reconciler import OrderReconciler  # noqa: E402
 from src.orders.repository import OrderRepository  # noqa: E402
+from src.utils.database import DatabaseManager  # noqa: E402
 
 
 def backup(source: Path, directory: Path) -> Path:
@@ -43,7 +44,7 @@ def backup(source: Path, directory: Path) -> Path:
     return target
 
 
-async def authoritative_plan(db_path: Path, environment: dict[str, str]):
+async def read_only_client(environment: dict[str, str]):
     selected = validate_read_only_safety(environment)
     if environment.get("LIVE_TRADING_ENABLED", "").lower() != "false":
         raise ReadOnlyValidationError("LIVE_TRADING_ENABLED must be explicitly false")
@@ -53,33 +54,44 @@ async def authoritative_plan(db_path: Path, environment: dict[str, str]):
         await _close_client(client)
         raise ReadOnlyValidationError("Kalshi client host mismatch")
     read_client = ReadOnlyAccountClient(client, selected)
-    try:
-        positions = await read_client.get_positions()
-        candidates = local_candidates(db_path, remote_position_map(positions))
-        markets = {}
-        for ticker in sorted({row["market_id"] for row in candidates}):
-            markets[ticker] = await read_client.get_market(ticker)
-        return build_plan(db_path, candidates, markets), read_client, client
-    except Exception:
-        await _close_client(client)
-        raise
+    return read_client, client
+
+
+async def authoritative_plan(db_path: Path, read_client: ReadOnlyAccountClient):
+    positions = await read_client.get_positions()
+    candidates = local_candidates(db_path, remote_position_map(positions))
+    markets = {}
+    for ticker in sorted({row["market_id"] for row in candidates}):
+        markets[ticker] = await read_client.get_market(ticker)
+    return build_plan(db_path, candidates, markets)
 
 
 async def run(args, environment: dict[str, str]) -> dict:
     source = args.db.resolve(strict=True)
     saved_backup = backup(source, args.backup_dir or source.parent / "backups")
-    plan, read_client, raw_client = await authoritative_plan(source, environment)
+    tempdir = Path(tempfile.mkdtemp(prefix="kalshi-local-repair-preview-"))
+    working_db = tempdir / "ledger.db"
+    shutil.copy2(saved_backup, working_db)
+    read_client, raw_client = await read_only_client(environment)
     try:
+        # The source ledger may predate reconciliation migrations. Initialize
+        # and populate alerts only on the disposable copy, never on source.
+        await DatabaseManager(str(working_db)).initialize()
+        before = await OrderReconciler(
+            OrderRepository(str(working_db)), read_client,
+            shadow_mode=True, paper_mode=False, project_positions=False,
+        ).reconcile(trigger="pre_local_repair_preview", full=True)
+        plan = await authoritative_plan(working_db, read_client)
         if args.apply:
             if args.confirm != plan["plan_id"]:
                 raise ReadOnlyValidationError("confirmation must exactly match current plan_id")
             applied = apply_plan(source, plan)
-            verification_db = source
+            verification_db = tempdir / "verification.db"
+            shutil.copy2(source, verification_db)
+            await DatabaseManager(str(verification_db)).initialize()
             mode = "APPLIED_LOCAL_ONLY"
         else:
-            tempdir = Path(tempfile.mkdtemp(prefix="kalshi-local-repair-preview-"))
-            verification_db = tempdir / "ledger.db"
-            shutil.copy2(saved_backup, verification_db)
+            verification_db = working_db
             applied = apply_plan(verification_db, plan)
             mode = "PREVIEW_ONLY"
         reconciler = OrderReconciler(
@@ -96,14 +108,15 @@ async def run(args, environment: dict[str, str]) -> dict:
             "repairs": plan["repairs"],
             "repair_count": len(plan["repairs"]),
             "simulated_or_applied_count": applied,
+            "pre_repair_reconciliation_status": before.status,
+            "pre_repair_mismatch_count": before.mismatch_count,
             "post_repair_reconciliation_status": result.status,
             "post_repair_mismatch_count": result.mismatch_count,
             "post_repair_unresolved_critical_alerts": critical,
             "apply_command_requires_exact_plan_id": not args.apply,
         }
     finally:
-        if not args.apply and 'tempdir' in locals():
-            shutil.rmtree(tempdir, ignore_errors=True)
+        shutil.rmtree(tempdir, ignore_errors=True)
         await _close_client(raw_client)
 
 

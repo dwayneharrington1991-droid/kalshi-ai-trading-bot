@@ -193,10 +193,10 @@ class TradingConfig:
         default_factory=lambda: os.getenv("OVERNIGHT_CANARY_ENABLED", "false").lower() == "true"
     )
     overnight_canary_max_total_risk: float = field(
-        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_TOTAL_RISK", "5"))
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_TOTAL_RISK", "20"))
     )
     overnight_canary_max_market_risk: float = field(
-        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_MARKET_RISK", "1"))
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_MARKET_RISK", "2"))
     )
     overnight_canary_max_positions: int = field(
         default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MAX_POSITIONS", "5"))
@@ -205,7 +205,7 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MAX_REJECTIONS", "3"))
     )
     overnight_canary_max_daily_loss: float = field(
-        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_DAILY_LOSS", "2"))
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_DAILY_LOSS", "5"))
     )
     overnight_canary_market_data_max_age_seconds: int = field(
         default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MARKET_DATA_MAX_AGE_SECONDS", "120"))

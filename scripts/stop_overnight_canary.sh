@@ -11,7 +11,14 @@ if [[ ! "$PID" =~ ^[0-9]+$ ]]; then
   echo "BLOCKED: invalid overnight canary PID file" >&2
   exit 2
 fi
-if kill -0 "$PID" 2>/dev/null; then
+is_running() {
+  kill -0 "$PID" 2>/dev/null || return 1
+  # A terminated child can remain as a zombie until its parent reaps it.
+  # kill -0 still succeeds for zombies, but the canary is no longer executing.
+  [[ "$(awk '{print $3}' "/proc/$PID/stat" 2>/dev/null || true)" != "Z" ]]
+}
+
+if is_running; then
   COMMAND="$(tr '\0' ' ' <"/proc/$PID/cmdline" 2>/dev/null || true)"
   [[ "$COMMAND" == *"kalshi-overnight-canary"* ]] || {
     echo "BLOCKED: recorded PID is not the overnight canary" >&2
@@ -19,10 +26,10 @@ if kill -0 "$PID" 2>/dev/null; then
   }
   kill -TERM "$PID"
   for _ in {1..50}; do
-    kill -0 "$PID" 2>/dev/null || break
+    is_running || break
     sleep 0.1
   done
-  if kill -0 "$PID" 2>/dev/null; then
+  if is_running; then
     echo "BLOCKED: canary did not stop after SIGTERM" >&2
     exit 2
   fi

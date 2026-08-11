@@ -41,6 +41,19 @@ def test_preferred_probability_candidate_can_qualify():
     assert result.estimated_net_return > 0
 
 
+def test_fifty_five_percent_candidate_can_clear_probability_gate():
+    result = evaluate_directional_candidate(
+        market_id="TEST", predicted_yes_probability=.62,
+        yes_bid=.54, yes_ask=.55, no_bid=.44, no_ask=.46,
+        min_probability=.55, max_preferred_probability=.90,
+        min_edge=.05, fee_estimate=.01, slippage_estimate=.005,
+    )
+    assert result.accepted
+    assert result.side == "YES"
+    assert result.market_implied_probability == .55
+    assert result.estimated_probability == .62
+
+
 def test_high_probability_without_positive_edge_is_rejected():
     result = evaluate(.80, .82, .84, .15, .17)
     assert not result.accepted
@@ -173,7 +186,7 @@ def test_probability_band_defaults_and_canary_limits_are_preserved(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     config = TradingConfig()
-    assert (config.min_preferred_probability, config.max_preferred_probability) == (.65, .90)
+    assert (config.min_preferred_probability, config.max_preferred_probability) == (.55, .90)
     assert config.overnight_canary_max_total_risk == 20
     assert config.overnight_canary_max_market_risk == 5
     assert config.overnight_canary_max_positions == 5

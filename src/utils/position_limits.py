@@ -62,10 +62,14 @@ class PositionLimitsManager:
         self.kalshi_client = kalshi_client
         self.logger = get_trading_logger("position_limits")
         
-        # INCREASED: More aggressive limits for more opportunities
-        self.max_positions = 15  # INCREASED: Allow 15 positions (was 10)
+        # Keep cycle checks/readiness aligned with the final execution gate.
+        self.max_positions = (
+            settings.trading.overnight_canary_max_positions
+            if settings.trading.overnight_canary_enabled
+            else settings.trading.max_positions
+        )
         self.max_position_size_pct = 5.0  # INCREASED: 5% max per trade (was 3%)
-        self.warning_threshold = self.max_positions - 3  # Warning at 12 positions
+        self.warning_threshold = max(0, self.max_positions - 3)
         
         # Additional safety limits - MORE AGGRESSIVE FOR FULL PORTFOLIO USE
         self.emergency_position_limit = 20  # INCREASED: Higher emergency threshold (was 15)
@@ -423,4 +427,4 @@ async def get_max_position_size(
     """Get maximum allowed position size."""
     manager = PositionLimitsManager(db_manager, kalshi_client)
     portfolio_value = await manager._get_portfolio_value()
-    return portfolio_value * (manager.max_position_size_pct / 100) 
+    return portfolio_value * (manager.max_position_size_pct / 100)

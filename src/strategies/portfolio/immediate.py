@@ -27,6 +27,7 @@ from src.strategies.directional_policy import (
     has_current_structured_game_state,
     is_sports_market,
     log_directional_evaluation,
+    validate_directional_model_confidence,
 )
 from src.strategies.sports_markets import classify_sports_market_type, event_correlation_group
 
@@ -149,11 +150,14 @@ async def create_market_opportunities_from_markets(
                 time_to_expiry = (market.expiration_ts - time.time()) / 86400
                 time_to_expiry = max(0.1, time_to_expiry)
             
-            # Apply Grok4 edge filtering - 10% minimum edge requirement
-            from src.utils.edge_filter import EdgeFilter
-            edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
-            
-            if edge_result.passes_filter:  # Must pass 10% edge filter
+            # Confidence is evidence quality, not a second probability/edge
+            # calculation.  The centralized directional policy above already
+            # owns probability, side, edge, EV, anomaly, and liquidity gates.
+            confidence_ok, confidence_reason = validate_directional_model_confidence(
+                confidence
+            )
+
+            if confidence_ok:
                 opportunity = MarketOpportunity(
                     market_id=market.market_id,
                     market_title=market.title,
@@ -188,19 +192,26 @@ async def create_market_opportunities_from_markets(
                     proposed_quantity=evaluation.proposed_quantity,
                 )
                 
-                # Add edge filter results to opportunity
-                opportunity.edge = edge_result.edge_magnitude  # Preserve YES-relative sign
-                opportunity.edge_percentage = edge_result.edge_percentage
+                # Preserve the legacy YES-relative edge consumed by the optimizer.
+                opportunity.edge = edge
+                opportunity.edge_percentage = abs(edge)
                 opportunity.recommended_side = evaluation.side
                 
                 opportunities.append(opportunity)
-                logger.info(f"✅ EDGE APPROVED: {market.market_id} - Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), Confidence: {confidence:.1%}, Reason: {edge_result.reason}")
+                logger.info(
+                    f"✅ DIRECTIONAL EVIDENCE APPROVED: {market.market_id} - "
+                    f"Side: {evaluation.side}, Edge: {evaluation.gross_edge:.1%}, "
+                    f"Confidence: {confidence:.1%}, Reason: {confidence_reason}"
+                )
                 
                 # 🚀 IMMEDIATE TRADING: Place trade for strong opportunities
                 if db_manager:
                     await _evaluate_immediate_trade(opportunity, db_manager, kalshi_client, total_capital)
             else:
-                logger.info(f"❌ EDGE FILTERED: {market.market_id} - {edge_result.reason}")
+                logger.info(
+                    f"❌ MODEL CONFIDENCE FILTERED: {market.market_id} - "
+                    f"{confidence_reason}"
+                )
             
         except Exception as e:
             logger.error(f"Error creating opportunity from {market.market_id}: {e}")
@@ -222,26 +233,24 @@ async def _evaluate_immediate_trade(
     logger = get_trading_logger("immediate_trading")  # Move logger definition to the top
     
     try:
-        # Use enhanced edge filtering for immediate trading decisions
-        from src.utils.edge_filter import EdgeFilter
-        
-        # Check if opportunity meets immediate trading criteria using edge filter
-        should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(
-            ai_probability=opportunity.predicted_probability,
-            market_probability=opportunity.market_probability,
-            confidence=opportunity.confidence,
-            additional_filters={
-                'volume': getattr(opportunity, 'volume', 1000),
-                'min_volume': 1000,
-                'time_to_expiry_days': opportunity.time_to_expiry,
-                'max_time_to_expiry': 365
-            }
+        # Reuse the same independent evidence-quality result.  The opportunity
+        # already passed the centralized directional economic policy.
+        should_trade, trade_reason = validate_directional_model_confidence(
+            opportunity.confidence
         )
+        volume = getattr(opportunity, 'volume', 1000)
+        if should_trade and volume < 1000:
+            should_trade, trade_reason = False, f"Volume {volume} below minimum 1000"
+        if should_trade and opportunity.time_to_expiry > 365:
+            should_trade = False
+            trade_reason = (
+                f"Time to expiry {opportunity.time_to_expiry} days exceeds maximum 365"
+            )
         
         # Additional criteria for immediate execution - MORE AGGRESSIVE
         strong_opportunity = (
             should_trade and
-            edge_result.edge_percentage >= 0.10 and  # DECREASED: 10% edge for immediate execution (was 18%)
+            opportunity.edge_percentage >= 0.10 and  # Immediate-only strength threshold
             opportunity.confidence >= 0.60 and       # DECREASED: 60% confidence (was 75%)
             opportunity.expected_return >= 0.05      # DECREASED: 5% expected return (was 8%)
         )

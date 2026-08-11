@@ -1,4 +1,6 @@
 import asyncio
+import os
+import sqlite3
 from datetime import datetime, timedelta
 
 import pytest
@@ -292,6 +294,50 @@ async def test_default_temp_database_does_not_touch_normal_database(tmp_path, mo
     )
     assert normal_db.read_bytes() == original
     assert not temporary_db.exists()
+
+
+async def test_temporary_validation_uses_audited_manual_position_context(tmp_path, monkeypatch):
+    persistent = tmp_path / "persistent.db"
+    from src.utils.database import DatabaseManager
+    await DatabaseManager(str(persistent)).initialize()
+    with sqlite3.connect(persistent) as db:
+        db.execute("""
+            INSERT INTO external_account_positions
+            (market_id, side, quantity, source, exchange_order_id, exchange_fill_id,
+             first_observed_at, last_verified_at, status, metadata_json)
+            VALUES ('MANUAL', 'YES', 1.67, 'manual_exchange_activity', 'o', 'f',
+                    'now', 'now', 'active', '{}')
+        """)
+        db.commit()
+
+    class ManualClient(AccountClient):
+        async def get_positions(self):
+            self.calls["positions"] += 1
+            return {"market_positions": [{"ticker": "MANUAL", "position_fp": "1.67"}]}
+
+    temporary_db = tmp_path / "manual-validation.db"
+    def mkstemp(**kwargs):
+        descriptor = os.open(temporary_db, os.O_CREAT | os.O_RDWR)
+        return descriptor, str(temporary_db)
+    monkeypatch.setattr("scripts.read_only_validate.tempfile.mkstemp", mkstemp)
+
+    result = await run_read_only_validation(
+        environment=environment(tmp_path, "production", DB_PATH=str(persistent)),
+        client_factory=lambda environment: ManualClient("production"),
+        ingestion_runner=fake_ingestion,
+    )
+    assert result["reconciliation"].mismatch_count == 0
+    assert result["alert_count"] == 0
+    assert not temporary_db.exists()
+
+
+async def test_missing_persistent_context_fails_closed(tmp_path):
+    with pytest.raises(ReadOnlyValidationError, match="persistent reconciliation ledger"):
+        await run_read_only_validation(
+            environment=environment(tmp_path, "production", DB_PATH=str(tmp_path / "missing.db")),
+            client_factory=lambda environment: AccountClient("production"),
+            ingestion_runner=fake_ingestion,
+        )
 
 
 async def test_malformed_balance_cannot_serialize_secret(tmp_path, capsys):

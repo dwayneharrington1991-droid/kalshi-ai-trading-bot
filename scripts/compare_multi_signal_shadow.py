@@ -61,29 +61,40 @@ async def run(sample_size: int) -> int:
         multi_funnel = Counter()
         phase_counts = Counter()
         current_accepted = multi_accepted = extreme = failures = 0
+        failure_reasons = Counter()
         differences = []
         records = []
         series_cache = {}
-        evaluated = 0
+        evaluated = attempted = 0
+        deadline = time.monotonic() + 600
         for raw in universe:
-            if evaluated >= sample_size:
+            if attempted >= sample_size or time.monotonic() >= deadline:
                 break
+            attempted += 1
             market = _as_market(raw)
+            operation = "model"
             try:
-                predicted, model_confidence = await _get_fast_ai_prediction(
-                    market, model, get_market_prices(raw)[1]
+                predicted, model_confidence = await asyncio.wait_for(
+                    _get_fast_ai_prediction(market, model, get_market_prices(raw)[1]),
+                    timeout=20,
                 )
                 if predicted is None:
                     failures += 1
+                    failure_reasons["model_unavailable"] += 1
                     continue
                 quote_started = time.monotonic()
-                fresh_response, orderbook = await asyncio.gather(
-                    client.get_market(market.market_id),
-                    client.get_orderbook(market.market_id, depth=100),
+                operation = "market_orderbook"
+                fresh_response, orderbook = await asyncio.wait_for(
+                    asyncio.gather(
+                        client.get_market(market.market_id),
+                        client.get_orderbook(market.market_id, depth=100),
+                    ),
+                    timeout=15,
                 )
                 fresh = fresh_response.get("market") if isinstance(fresh_response, dict) else None
                 if not isinstance(fresh, dict):
                     failures += 1
+                    failure_reasons["malformed_market"] += 1
                     continue
                 yes_bid, yes_ask, no_bid, no_ask = get_market_prices(fresh)
                 phase = classify_market_phase(
@@ -152,7 +163,10 @@ async def run(sample_size: int) -> int:
                 series = None
                 if isinstance(series_ticker, str) and series_ticker:
                     if series_ticker not in series_cache:
-                        series_cache[series_ticker] = _series_metadata(await client.get_series(series_ticker))
+                        operation = "series_fee"
+                        series_cache[series_ticker] = _series_metadata(
+                            await asyncio.wait_for(client.get_series(series_ticker), timeout=15)
+                        )
                     series = series_cache[series_ticker]
                 fee = None
                 if series:
@@ -216,13 +230,19 @@ async def run(sample_size: int) -> int:
                 if current_final != multi_final:
                     differences.append(record)
                 evaluated += 1
+            except asyncio.TimeoutError:
+                failures += 1
+                failure_reasons[f"{operation}_timeout"] += 1
+                continue
             except Exception:
                 failures += 1
+                failure_reasons[f"{operation}_failure"] += 1
                 continue
         print("READ_ONLY_MULTI_SIGNAL_COMPARISON")
         print(f"ENVIRONMENT={environment}")
         print(f"MARKETS_DISCOVERED={discovery.stats.markets_discovered}")
         print(f"MARKETS_WITHIN_72H={discovery.stats.markets_within_72h}")
+        print(f"MARKETS_ATTEMPTED={attempted}")
         print(f"MARKETS_EVALUATED={evaluated}")
         print(f"CURRENT_ACCEPTED={current_accepted}")
         print(f"MULTI_SIGNAL_ACCEPTED={multi_accepted}")
@@ -230,6 +250,7 @@ async def run(sample_size: int) -> int:
         print(f"CURRENT_FUNNEL={dict(current_funnel)}")
         print(f"MULTI_SIGNAL_FUNNEL={dict(multi_funnel)}")
         print(f"DATA_SOURCE_FAILURES={failures}")
+        print(f"DATA_SOURCE_FAILURE_REASONS={dict(failure_reasons)}")
         print(f"SUSPICIOUS_EXTREME_DISCREPANCIES={extreme}")
         print(f"DECISIONS_CHANGED={len(differences)}")
         print(f"CURRENT_REJECTIONS={dict(current_reasons)}")

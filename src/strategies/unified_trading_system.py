@@ -812,6 +812,15 @@ class UnifiedAdvancedTradingSystem:
                         continue
                     
                     position.id = position_id
+
+                    # Transient decision context used only for immediate
+                    # fail-closed quote, phase, game-state, and order-book
+                    # revalidation. It is intentionally not fabricated during
+                    # restart recovery.
+                    position.model_probability = opportunity.predicted_probability
+                    position.model_generated_at = datetime.now(timezone.utc).timestamp()
+                    position.market_phase = opportunity.sports_phase
+                    position.market_category = opportunity.category
                     
                     # Execute the position
                     live_mode = getattr(settings.trading, 'live_trading_enabled', False)
@@ -857,13 +866,6 @@ class UnifiedAdvancedTradingSystem:
                         outcome="BLOCKED", reason="allocation execution error",
                         api_attempted=False, api_error_category=type(e).__name__,
                     )
-                    # Transient decision context used for immediate fail-closed
-                    # quote/order-book revalidation. It is intentionally not
-                    # fabricated during restart recovery.
-                    position.model_probability = opportunity.predicted_probability
-                    position.model_generated_at = datetime.now(timezone.utc).timestamp()
-                    position.market_phase = opportunity.sports_phase
-                    position.market_category = opportunity.category
                     results['failed_executions'] += 1
                     continue
             

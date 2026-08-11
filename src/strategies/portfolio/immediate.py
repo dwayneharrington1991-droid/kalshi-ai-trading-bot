@@ -7,6 +7,7 @@ former 1,300-line portfolio_optimization.py.
 
 import logging
 import numpy as np
+from dataclasses import replace
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -22,6 +23,9 @@ from src.strategies.portfolio.models import MarketOpportunity
 from src.strategies.directional_policy import (
     evaluate_directional_candidate,
     classify_market_phase,
+    executable_liquidity,
+    has_current_structured_game_state,
+    is_sports_market,
     log_directional_evaluation,
 )
 from src.strategies.sports_markets import classify_sports_market_type, event_correlation_group
@@ -89,6 +93,46 @@ async def create_market_opportunities_from_markets(
                 event_title=str(market_info.get("event_title", market_info.get("title", market.title))),
                 market_type=classify_sports_market_type(market_info),
             )
+            try:
+                orderbook = await kalshi_client.get_orderbook(market.market_id, depth=100)
+            except Exception:
+                orderbook = None
+            proposed_risk = float(
+                getattr(settings.trading, "overnight_canary_max_market_risk", 5.0)
+            )
+            proposed_quantity = (
+                max(1, int(proposed_risk / evaluation.market_implied_probability))
+                if evaluation.market_implied_probability > 0 else 0
+            )
+            liquidity = executable_liquidity(
+                orderbook, evaluation.side, evaluation.market_implied_probability
+            )
+            sports_live = (
+                is_sports_market(market_info, market.category)
+                and sports_phase in {"LIVE", "FAST_LIVE"}
+            )
+            structured_state_available = (
+                has_current_structured_game_state(market_info)
+                if sports_live else None
+            )
+            evaluation = replace(
+                evaluation, liquidity=liquidity,
+                proposed_quantity=float(proposed_quantity),
+                structured_game_state_available=structured_state_available,
+            )
+            if (
+                sports_live and not structured_state_available
+            ):
+                evaluation = replace(
+                    evaluation, accepted=False, ranking_score=float("-inf"),
+                    reason="current structured game state unavailable for live sports",
+                )
+            elif evaluation.accepted and liquidity < proposed_quantity:
+                evaluation = replace(
+                    evaluation, accepted=False, ranking_score=float("-inf"),
+                    reason=(f"insufficient executable liquidity: {liquidity:.2f} "
+                            f"contracts available for {proposed_quantity} requested"),
+                )
             log_directional_evaluation(logger, evaluation)
             if not evaluation.accepted:
                 continue
@@ -140,6 +184,8 @@ async def create_market_opportunities_from_markets(
                     market_type=classify_sports_market_type(market_info),
                     correlation_group=event_correlation_group(market_info),
                     proposed_risk=float(getattr(settings.trading, "overnight_canary_max_market_risk", 5.0)),
+                    executable_liquidity=evaluation.liquidity,
+                    proposed_quantity=evaluation.proposed_quantity,
                 )
                 
                 # Add edge filter results to opportunity

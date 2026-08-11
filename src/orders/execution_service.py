@@ -19,7 +19,8 @@ from src.orders.state_machine import OrderState, OrderStateMachine
 from src.orders.decision_log import log_order_decision
 from src.utils.logging_setup import get_trading_logger
 from src.strategies.directional_policy import (
-    evaluate_directional_candidate, executable_liquidity, log_directional_evaluation,
+    classify_market_phase, evaluate_directional_candidate, executable_liquidity,
+    has_current_structured_game_state, is_sports_market, log_directional_evaluation,
 )
 from src.utils.market_prices import get_market_prices
 from src.config.settings import settings
@@ -42,6 +43,7 @@ class OrderIntent:
     estimated_probability: Optional[float] = None
     model_generated_at: Optional[float] = None
     market_phase: str = "NOT_APPLICABLE"
+    market_category: str = ""
 
     def fingerprint(self) -> str:
         payload = "|".join((
@@ -175,12 +177,12 @@ class VerifiedExecutionService:
             return
         if intent.estimated_probability is None:
             raise ExecutionSafetyError("directional model probability is unavailable")
-        if intent.market_phase == "FAST_LIVE":
-            if intent.model_generated_at is None or (
-                time.time() - intent.model_generated_at
-                > settings.trading.fast_live_max_model_age_seconds
-            ):
-                raise ExecutionSafetyError("FAST_LIVE model probability is stale")
+        if intent.market_phase == "FAST_LIVE" and (
+            intent.model_generated_at is None or
+            time.time() - intent.model_generated_at
+            > settings.trading.fast_live_max_model_age_seconds
+        ):
+            raise ExecutionSafetyError("FAST_LIVE model probability is stale")
         try:
             market_response = await self.client.get_market(intent.market_id)
             market = market_response.get("market") if isinstance(market_response, dict) else None
@@ -189,6 +191,29 @@ class VerifiedExecutionService:
             raise ExecutionSafetyError("fresh directional quote could not be verified") from exc
         if not isinstance(market, dict):
             raise ExecutionSafetyError("fresh directional market response is malformed")
+        fresh_phase = classify_market_phase(
+            market, intent.market_category,
+            fast_live_minutes=settings.trading.fast_live_max_remaining_minutes,
+        )
+        effective_phase = (
+            "FAST_LIVE" if "FAST_LIVE" in {intent.market_phase, fresh_phase}
+            else "LIVE" if "LIVE" in {intent.market_phase, fresh_phase}
+            else fresh_phase
+        )
+        if effective_phase == "FAST_LIVE" and (
+            intent.model_generated_at is None or
+            time.time() - intent.model_generated_at
+            > settings.trading.fast_live_max_model_age_seconds
+        ):
+            raise ExecutionSafetyError("FAST_LIVE model probability is stale")
+        if (
+            is_sports_market(market, intent.market_category)
+            and effective_phase in {"LIVE", "FAST_LIVE"}
+            and not has_current_structured_game_state(market)
+        ):
+            raise ExecutionSafetyError(
+                "current structured game state unavailable for live sports"
+            )
         yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market)
         evaluation = evaluate_directional_candidate(
             market_id=intent.market_id,
@@ -199,13 +224,13 @@ class VerifiedExecutionService:
             min_edge=settings.trading.min_directional_edge,
             fee_estimate=settings.trading.directional_fee_estimate,
             slippage_estimate=settings.trading.directional_slippage_estimate,
-            sports_phase=intent.market_phase,
+            sports_phase=effective_phase,
         )
         log_directional_evaluation(self.logger, evaluation)
         fresh_price = yes_ask if intent.side.upper() == "YES" else no_ask
         if not evaluation.accepted or evaluation.side != intent.side.upper():
             raise ExecutionSafetyError(f"fresh directional edge rejected: {evaluation.reason}")
-        if intent.market_phase == "FAST_LIVE" and abs(fresh_price - intent.price) > 1e-9:
+        if effective_phase == "FAST_LIVE" and abs(fresh_price - intent.price) > 1e-9:
             raise ExecutionSafetyError("FAST_LIVE quote moved; entry decision canceled without chasing")
         available = executable_liquidity(orderbook, intent.side, intent.price)
         if available < intent.quantity:

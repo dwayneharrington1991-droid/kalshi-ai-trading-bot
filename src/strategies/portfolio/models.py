@@ -42,6 +42,8 @@ class MarketOpportunity:
     existing_correlated_exposure: float = 0.0
     correlation_reason: str = "not evaluated"
     proposed_risk: float = 5.0
+    executable_liquidity: float = 0.0
+    proposed_quantity: float = 0.0
 
 
 @dataclass

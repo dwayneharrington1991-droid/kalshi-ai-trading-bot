@@ -35,6 +35,13 @@ class MarketOpportunity:
     ranking_score: float = 0.0
     category: str = ""
     sports_phase: str = "NOT_APPLICABLE"
+    event_ticker: str = ""
+    event_title: str = ""
+    market_type: str = "OTHER"
+    correlation_group: str = ""
+    existing_correlated_exposure: float = 0.0
+    correlation_reason: str = "not evaluated"
+    proposed_risk: float = 5.0
 
 
 @dataclass

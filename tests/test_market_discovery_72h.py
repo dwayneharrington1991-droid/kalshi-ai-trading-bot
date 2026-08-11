@@ -96,6 +96,8 @@ async def test_sports_and_non_sports_are_included_from_structured_metadata():
     assert result.stats.non_sports_markets_within_72h == 2
     sports = [item for item in result.markets if item["_is_sports_market"]]
     assert all(item["_milestone_ids"] == ["game-1"] for item in sports)
+    assert all(item["_event_ticker"] == "GAME" for item in sports)
+    assert all(item["_correlation_group"] == "GAME" for item in sports)
     assert client.milestone_calls[0]["category"] == "Sports"
 
 

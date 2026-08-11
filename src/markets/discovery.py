@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from src.clients.kalshi_client import KalshiAPIError
+from src.strategies.sports_markets import classify_sports_market_type, event_correlation_group
 
 
 @dataclass(frozen=True)
@@ -194,6 +195,10 @@ class MarketDiscovery72h:
             normalized["expected_expiration_time"] = resolution.isoformat().replace("+00:00", "Z")
             normalized["_eligible_resolution_time"] = normalized["expected_expiration_time"]
             normalized["_is_sports_market"] = is_sports
+            normalized["_event_ticker"] = str(event.get("event_ticker", event.get("ticker", "")))
+            normalized["_event_title"] = str(event.get("title", normalized["_event_ticker"]))
+            normalized["_market_type"] = classify_sports_market_type(normalized) if is_sports else "OTHER"
+            normalized["_correlation_group"] = event_correlation_group(normalized)
             normalized["_milestone_ids"] = sorted({
                 item["id"] for item in linked if isinstance(item.get("id"), str)
             })

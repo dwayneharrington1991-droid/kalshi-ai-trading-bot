@@ -103,7 +103,7 @@ class AdvancedPortfolioOptimizer:
             # Sort by confidence * expected_return and take top N
             opportunities = sorted(
                 opportunities, 
-                key=lambda x: x.confidence * x.expected_return, 
+                key=lambda x: x.ranking_score,
                 reverse=True
             )[:max_opportunities]
             self.logger.info(f"Limited to top {max_opportunities} opportunities for optimization")
@@ -195,7 +195,14 @@ class AdvancedPortfolioOptimizer:
                     risk_adjusted_fraction=0.0,
                     sharpe_ratio=sharpe_ratio,
                     sortino_ratio=sortino_ratio,
-                    max_drawdown_contribution=max_dd_contribution
+                    max_drawdown_contribution=max_dd_contribution,
+                    recommended_side=opp.recommended_side,
+                    side_probability=opp.side_probability,
+                    side_market_probability=opp.side_market_probability,
+                    net_expected_return=opp.net_expected_return,
+                    ranking_score=opp.ranking_score,
+                    category=opp.category,
+                    sports_phase=opp.sports_phase,
                 )
                 
                 enhanced.append(enhanced_opp)
@@ -531,7 +538,7 @@ class AdvancedPortfolioOptimizer:
             scores = []
             for opp in opportunities:
                 # Score based on expected return, confidence, and edge
-                score = opp.expected_return * opp.confidence * max(0, abs(opp.edge))
+                score = opp.ranking_score
                 scores.append((opp.market_id, score))
             
             # Sort by score

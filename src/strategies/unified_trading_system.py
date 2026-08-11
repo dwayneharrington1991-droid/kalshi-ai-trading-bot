@@ -52,6 +52,11 @@ from src.strategies.portfolio_optimization import (
     run_portfolio_optimization,
     create_market_opportunities_from_markets
 )
+from src.strategies.directional_policy import (
+    evaluate_directional_candidate,
+    classify_sports_phase,
+    log_directional_evaluation,
+)
 @dataclass
 class TradingSystemConfig:
     """Configuration for the unified trading system."""
@@ -525,7 +530,7 @@ class UnifiedAdvancedTradingSystem:
             for market_id in allocations:
                 opportunity = next((item for item in (opportunities or [])
                                     if item.market_id == market_id), None)
-                intended_keys.add((market_id, "YES" if opportunity and opportunity.edge > 0 else "NO"))
+                intended_keys.add((market_id, opportunity.recommended_side if opportunity else "UNKNOWN"))
             duplicate_count = len(open_position_keys & intended_keys)
         evaluator = SubmissionReadinessEvaluator(OrderRepository(self.db_manager.db_path))
         report = await evaluator.evaluate(ReadinessContext(
@@ -592,7 +597,15 @@ class UnifiedAdvancedTradingSystem:
                         continue
                     
                     # Determine the intended side based on edge direction
-                    intended_side = "YES" if opportunity.edge > 0 else "NO"
+                    intended_side = opportunity.recommended_side
+                    if intended_side not in {"YES", "NO"}:
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side="UNKNOWN", action="buy", price=None, quantity=None,
+                            outcome="BLOCKED", reason="directional side was not verified",
+                            risk_limit="SIGNAL_INTEGRITY", api_attempted=False,
+                        )
+                        continue
                     
                     # 🚨 ONLY SKIP if we already have a position on the EXACT same market_id AND side
                     existing_position = await self.db_manager.get_position_by_market_and_side(market_id, intended_side)
@@ -709,7 +722,30 @@ class UnifiedAdvancedTradingSystem:
                     market_info = market_data.get('market', {})
                     
                     # Get price for the intended side (already determined above)
-                    _, yes_ask, _, no_ask = get_market_prices(market_info)
+                    yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_info)
+                    live_evaluation = evaluate_directional_candidate(
+                        market_id=market_id,
+                        predicted_yes_probability=opportunity.predicted_probability,
+                        yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask,
+                        min_probability=settings.trading.min_preferred_probability,
+                        max_preferred_probability=settings.trading.max_preferred_probability,
+                        min_edge=settings.trading.min_directional_edge,
+                        fee_estimate=settings.trading.directional_fee_estimate,
+                        slippage_estimate=settings.trading.directional_slippage_estimate,
+                        sports_phase=classify_sports_phase(market_info, opportunity.category),
+                    )
+                    log_directional_evaluation(self.logger, live_evaluation)
+                    if not live_evaluation.accepted or live_evaluation.side != intended_side:
+                        results['failed_executions'] += 1
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=None, quantity=None,
+                            outcome="BLOCKED",
+                            reason=(live_evaluation.reason if not live_evaluation.accepted
+                                    else "live quote changed the preferred directional side"),
+                            risk_limit="DIRECTIONAL_QUALITY", api_attempted=False,
+                        )
+                        continue
                     price = yes_ask if intended_side == "YES" else no_ask
                     if not 0.01 <= price <= 0.99:
                         results['failed_executions'] += 1

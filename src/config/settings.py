@@ -196,7 +196,7 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_TOTAL_RISK", "20"))
     )
     overnight_canary_max_market_risk: float = field(
-        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_MARKET_RISK", "2"))
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_MARKET_RISK", "5"))
     )
     overnight_canary_max_positions: int = field(
         default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MAX_POSITIONS", "5"))
@@ -209,6 +209,21 @@ class TradingConfig:
     )
     overnight_canary_market_data_max_age_seconds: int = field(
         default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MARKET_DATA_MAX_AGE_SECONDS", "120"))
+    )
+    min_preferred_probability: float = field(
+        default_factory=lambda: float(os.getenv("MIN_PREFERRED_PROBABILITY", "0.65"))
+    )
+    max_preferred_probability: float = field(
+        default_factory=lambda: float(os.getenv("MAX_PREFERRED_PROBABILITY", "0.90"))
+    )
+    min_directional_edge: float = field(
+        default_factory=lambda: float(os.getenv("MIN_DIRECTIONAL_EDGE", "0.05"))
+    )
+    directional_fee_estimate: float = field(
+        default_factory=lambda: float(os.getenv("DIRECTIONAL_FEE_ESTIMATE", "0.01"))
+    )
+    directional_slippage_estimate: float = field(
+        default_factory=lambda: float(os.getenv("DIRECTIONAL_SLIPPAGE_ESTIMATE", "0.005"))
     )
     
     # Trading frequency - MORE FREQUENT

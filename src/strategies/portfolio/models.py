@@ -28,6 +28,13 @@ class MarketOpportunity:
     sharpe_ratio: float
     sortino_ratio: float
     max_drawdown_contribution: float
+    recommended_side: str = "UNKNOWN"
+    side_probability: float = 0.0
+    side_market_probability: float = 0.0
+    net_expected_return: float = 0.0
+    ranking_score: float = 0.0
+    category: str = ""
+    sports_phase: str = "NOT_APPLICABLE"
 
 
 @dataclass

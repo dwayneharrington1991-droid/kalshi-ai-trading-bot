@@ -19,6 +19,11 @@ from src.utils.market_prices import get_market_prices
 from src.utils.position_sizing import binary_market_payout_odds, kelly_fraction
 
 from src.strategies.portfolio.models import MarketOpportunity
+from src.strategies.directional_policy import (
+    evaluate_directional_candidate,
+    classify_sports_phase,
+    log_directional_evaluation,
+)
 
 
 async def create_market_opportunities_from_markets(
@@ -50,7 +55,8 @@ async def create_market_opportunities_from_markets(
             
             # FIXED: Extract from nested 'market' object (same fix as immediate trading)
             market_info = market_data.get('market', {})
-            market_prob = market_info.get('yes_price', 50) / 100
+            yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_info)
+            market_prob = yes_ask
             
             # Skip markets with extreme prices (too risky for portfolio)
             if market_prob < 0.05 or market_prob > 0.95:
@@ -66,9 +72,24 @@ async def create_market_opportunities_from_markets(
                 logger.warning(f"AI analysis failed for {market.market_id}, skipping")
                 continue
             
-            # Calculate metrics
+            sports_phase = classify_sports_phase(market_info, market.category)
+            evaluation = evaluate_directional_candidate(
+                market_id=market.market_id,
+                predicted_yes_probability=predicted_prob,
+                yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask,
+                min_probability=settings.trading.min_preferred_probability,
+                max_preferred_probability=settings.trading.max_preferred_probability,
+                min_edge=settings.trading.min_directional_edge,
+                fee_estimate=settings.trading.directional_fee_estimate,
+                slippage_estimate=settings.trading.directional_slippage_estimate,
+                sports_phase=sports_phase,
+            )
+            log_directional_evaluation(logger, evaluation)
+            if not evaluation.accepted:
+                continue
+
             edge = predicted_prob - market_prob
-            expected_return = abs(edge) * confidence
+            expected_return = evaluation.estimated_net_return
             volatility = np.sqrt(market_prob * (1 - market_prob))
             max_loss = market_prob if edge > 0 else (1 - market_prob)
             
@@ -101,13 +122,20 @@ async def create_market_opportunities_from_markets(
                     risk_adjusted_fraction=0.0,
                     sharpe_ratio=0.0,
                     sortino_ratio=0.0,
-                    max_drawdown_contribution=0.0
+                    max_drawdown_contribution=0.0,
+                    recommended_side=evaluation.side,
+                    side_probability=evaluation.estimated_probability,
+                    side_market_probability=evaluation.market_implied_probability,
+                    net_expected_return=evaluation.estimated_net_return,
+                    ranking_score=evaluation.ranking_score,
+                    category=market.category,
+                    sports_phase=sports_phase,
                 )
                 
                 # Add edge filter results to opportunity
-                opportunity.edge = edge_result.edge_magnitude  # Use filtered edge
+                opportunity.edge = edge_result.edge_magnitude  # Preserve YES-relative sign
                 opportunity.edge_percentage = edge_result.edge_percentage
-                opportunity.recommended_side = edge_result.side
+                opportunity.recommended_side = evaluation.side
                 
                 opportunities.append(opportunity)
                 logger.info(f"✅ EDGE APPROVED: {market.market_id} - Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), Confidence: {confidence:.1%}, Reason: {edge_result.reason}")

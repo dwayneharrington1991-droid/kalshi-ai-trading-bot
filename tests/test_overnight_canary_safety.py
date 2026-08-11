@@ -45,7 +45,14 @@ async def setup_service(tmp_path, **overrides):
 
 @pytest.mark.asyncio
 async def test_canary_allows_order_within_all_caps(tmp_path):
-    _, service, intent = await setup_service(tmp_path)
+    _, service, intent = await setup_service(tmp_path, canary_max_market_risk=5.0)
+    await service._canary_gateway(intent)
+
+
+@pytest.mark.asyncio
+async def test_canary_market_risk_is_a_cap_not_a_required_size(tmp_path):
+    _, service, intent = await setup_service(tmp_path, canary_max_market_risk=5.0)
+    assert intent.price * intent.quantity < 5.0
     await service._canary_gateway(intent)
 
 

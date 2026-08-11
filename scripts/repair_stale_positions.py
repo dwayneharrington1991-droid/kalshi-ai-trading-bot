@@ -33,7 +33,8 @@ with contextlib.redirect_stdout(sys.stderr):
     from src.clients.kalshi_client import KalshiClient  # noqa: E402
     from src.orders.local_position_repair import (  # noqa: E402
         active_order_snapshot, apply_plan, build_plan, local_candidates, remote_position_map,
-        unresolved_critical_count,
+        unresolved_critical_count, build_account_activity_repairs,
+        apply_account_activity_repairs,
     )
     from src.orders.reconciler import OrderReconciler  # noqa: E402
     from src.orders.repository import OrderRepository  # noqa: E402
@@ -100,17 +101,46 @@ async def read_only_client(environment: dict[str, str]):
     return read_client, client
 
 
-async def authoritative_plan(db_path: Path, read_client: ReadOnlyAccountClient):
+async def authoritative_plan(
+    db_path: Path, read_client: ReadOnlyAccountClient,
+    preview_paper_simulation_alert_ids=(),
+    manual_positions=(), terminal_order_alert_ids=(),
+):
     positions_response = await read_client.get_positions()
     positions = remote_position_map(positions_response)
-    orders = active_order_snapshot(await read_client.get_all_orders(limit=1000))
+    all_orders = await read_client.get_all_orders(limit=1000)
+    all_fills = await read_client.get_all_fills(limit=1000)
+    orders = active_order_snapshot(all_orders)
     candidates = local_candidates(db_path, positions)
     markets = {}
-    for ticker in sorted({row["market_id"] for row in candidates}):
+    terminal_markets = []
+    with sqlite3.connect(db_path) as db:
+        for alert_id in terminal_order_alert_ids:
+            row = db.execute("SELECT market_id FROM reconciliation_alerts WHERE id = ?", (alert_id,)).fetchone()
+            if row and row[0]:
+                terminal_markets.append(row[0])
+    for ticker in sorted({row["market_id"] for row in candidates} | {row[0] for row in manual_positions} | set(terminal_markets)):
         markets[ticker] = await read_client.get_market(ticker)
-    return build_plan(
-        db_path, candidates, markets, active_orders=orders, remote_positions=positions
+    position_plan = build_plan(
+        db_path, candidates, markets, active_orders=orders, remote_positions=positions,
+        exchange_orders=all_orders, exchange_fills=all_fills,
+        preview_paper_simulation_alert_ids=preview_paper_simulation_alert_ids,
+        log_dir=ROOT / "logs",
     )
+    account_plan = build_account_activity_repairs(
+        db_path, positions, all_orders, all_fills, markets,
+        manual_positions=manual_positions, terminal_order_alert_ids=terminal_order_alert_ids,
+    )
+    combined = {
+        "repairs": position_plan["repairs"],
+        "account_activity_repairs": account_plan["repairs"],
+        "manual_review": position_plan["manual_review"] + account_plan["manual_review"],
+        "exchange_snapshot": position_plan["exchange_snapshot"],
+    }
+    canonical = json.dumps(combined, sort_keys=True, separators=(",", ":"))
+    import hashlib
+    combined["plan_id"] = hashlib.sha256(canonical.encode()).hexdigest()
+    return combined
 
 
 def position_mismatch_count(db_path: Path) -> int:
@@ -178,7 +208,23 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
         progress["stage"] = "build_authoritative_plan"
         # Plan from the untouched source. Reconciliation above is diagnostic
         # and intentionally writes only to the disposable working copy.
-        plan = await authoritative_plan(source, read_client)
+        preview_paper_ids = tuple(
+            getattr(args, "preview_paper_simulation_alert", ()) or ()
+        )
+        apply_paper_ids = tuple(
+            getattr(args, "allow_paper_simulation_alert", ()) or ()
+        )
+        paper_alert_ids = apply_paper_ids if args.apply else preview_paper_ids
+        manual_positions = tuple(
+            (value.rsplit(":", 1)[0], value.rsplit(":", 1)[1].upper())
+            for value in (getattr(args, "manual_exchange_position", ()) or ())
+        )
+        terminal_order_alert_ids = tuple(
+            getattr(args, "terminal_unverified_order_alert", ()) or ()
+        )
+        plan = await authoritative_plan(
+            source, read_client, paper_alert_ids, manual_positions, terminal_order_alert_ids
+        )
         progress["plan_id"] = plan["plan_id"]
         if args.apply:
             if args.confirm != plan["plan_id"]:
@@ -186,15 +232,23 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
             planned_alert_ids = sorted({
                 alert_id for repair in plan["repairs"] for alert_id in repair["alert_ids"]
             })
+            planned_alert_ids.extend(
+                repair["alert_id"] for repair in plan["account_activity_repairs"]
+            )
+            planned_alert_ids = sorted(planned_alert_ids)
             if plan["manual_review"] or unresolved_critical_ids(source) != planned_alert_ids:
                 raise ReadOnlyValidationError(
                     "all unresolved critical alerts must be safely repairable in one plan"
                 )
             progress["stage"] = "second_authoritative_snapshot"
-            second_plan = await authoritative_plan(source, read_client)
+            second_plan = await authoritative_plan(
+                source, read_client, paper_alert_ids, manual_positions, terminal_order_alert_ids
+            )
             assert_plan_unchanged(plan, second_plan)
             progress["stage"] = "apply_exact_plan"
             applied = apply_plan(source, plan)
+            account_plan = {"plan_id": plan["plan_id"], "repairs": plan["account_activity_repairs"]}
+            applied += apply_account_activity_repairs(source, account_plan)
             verification_db = source
             mode = "APPLIED_LOCAL_ONLY"
         else:
@@ -203,6 +257,8 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
             await DatabaseManager(str(verification_db)).initialize()
             progress["stage"] = "simulate_local_repair"
             applied = apply_plan(verification_db, plan)
+            account_plan = {"plan_id": plan["plan_id"], "repairs": plan["account_activity_repairs"]}
+            applied += apply_account_activity_repairs(verification_db, account_plan)
             mode = "PREVIEW_ONLY"
         reconciler = OrderReconciler(
             OrderRepository(str(verification_db)), read_client,
@@ -228,7 +284,8 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
             "backup_path": str(saved_backup),
             "plan_id": plan["plan_id"],
             "repairs": plan["repairs"],
-            "repair_count": len(plan["repairs"]),
+            "account_activity_repairs": plan["account_activity_repairs"],
+            "repair_count": len(plan["repairs"]) + len(plan["account_activity_repairs"]),
             "manual_review": plan["manual_review"],
             "manual_review_count": len(plan["manual_review"]),
             "simulated_or_applied_count": applied,
@@ -250,7 +307,7 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
                 and result.status in {"completed", "completed_with_mismatches"}
                 and health["healthy_status"] and health["fresh"]
                 and remaining_position_mismatches == 0
-                and applied == len(plan["repairs"])
+                and applied == len(plan["repairs"]) + len(plan["account_activity_repairs"])
             ),
             "apply_command_requires_exact_plan_id": not args.apply,
         }
@@ -266,9 +323,33 @@ def main() -> int:
     parser.add_argument("--backup-dir", type=Path)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirm", default="")
+    parser.add_argument(
+        "--preview-paper-simulation-alert", action="append", type=int, default=[],
+        help="preview-only exact alert ID backed by contemporaneous paper-simulation evidence",
+    )
+    parser.add_argument(
+        "--manual-exchange-position", action="append", default=[], metavar="TICKER:SIDE",
+        help="exact user-confirmed manual exchange position to acknowledge separately from bot fills",
+    )
+    parser.add_argument(
+        "--terminal-unverified-order-alert", action="append", type=int, default=[],
+        help="exact critical alert for an uncertain order on a terminal market with no exchange history",
+    )
+    parser.add_argument(
+        "--allow-paper-simulation-alert", action="append", type=int, default=[],
+        help=(
+            "apply-only exact alert ID already proven by contemporaneous "
+            "paper-simulation evidence; still requires --confirm and an "
+            "unchanged second authoritative snapshot"
+        ),
+    )
     args = parser.parse_args()
     if args.confirm and not args.apply:
         parser.error("--confirm is valid only with --apply")
+    if args.apply and args.preview_paper_simulation_alert:
+        parser.error("paper-simulation exceptions are preview-only")
+    if args.allow_paper_simulation_alert and not args.apply:
+        parser.error("--allow-paper-simulation-alert requires --apply")
     load_dotenv(ROOT / ".env")
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()

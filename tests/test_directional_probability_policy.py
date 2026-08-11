@@ -5,7 +5,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.config.settings import TradingConfig
-from src.strategies.portfolio.immediate import create_market_opportunities_from_markets
+from src.strategies.portfolio.immediate import (
+    _calculate_simple_kelly,
+    create_market_opportunities_from_markets,
+    select_directional_analysis_markets,
+)
 from src.strategies.directional_policy import (
     classify_market_phase,
     classify_sports_phase,
@@ -52,6 +56,20 @@ def test_fifty_five_percent_candidate_can_clear_probability_gate():
     assert result.side == "YES"
     assert result.market_implied_probability == .55
     assert result.estimated_probability == .62
+
+
+def test_directional_shortlist_prioritizes_cached_prices_in_existing_band():
+    """A high-volume longshot must not consume the entire bounded AI budget."""
+    now = datetime.now()
+    outside = Market("OUTSIDE", "Longshot", .03, .97, 10_000, 0, "Other", "active", now)
+    in_band = Market("IN-BAND", "Favorite", .70, .30, 100, 0, "Other", "active", now)
+
+    selected, preferred_count = select_directional_analysis_markets(
+        [outside, in_band], limit=1, min_probability=.55, max_probability=.90,
+    )
+
+    assert preferred_count == 1
+    assert [market.market_id for market in selected] == ["IN-BAND"]
 
 
 def test_high_probability_without_positive_edge_is_rejected():
@@ -175,6 +193,48 @@ async def test_candidate_propagates_fresh_executable_liquidity(monkeypatch, caps
     output = capsys.readouterr().out
     assert "liquidity=12.00 proposed_quantity=7.00" in output
     assert "structured_game_state_available=None" in output
+
+
+@pytest.mark.asyncio
+async def test_valid_no_opportunity_uses_selected_side_for_kelly_and_allocation(monkeypatch):
+    """A policy-approved NO must not be converted to a negative YES edge."""
+    async def prediction(*_args, **_kwargs):
+        return .24, .90
+
+    class Client:
+        async def get_market(self, _ticker):
+            return {"market": {
+                "yes_bid_dollars": ".28", "yes_ask_dollars": ".30",
+                "no_bid_dollars": ".68", "no_ask_dollars": ".70",
+                "close_time": "2099-01-01T00:00:00Z", "title": "Fixture",
+            }}
+
+        async def get_orderbook(self, _ticker, depth=100):
+            return {"orderbook_fp": {
+                "yes_dollars": [[".30", "100"]], "no_dollars": [[".68", "100"]],
+            }}
+
+    monkeypatch.setattr(
+        "src.strategies.portfolio.immediate._get_fast_ai_prediction", prediction
+    )
+    market = Market(
+        "TEST-NO", "Fixture", .29, .69, 1000,
+        datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp(),
+        "Crypto", "active", datetime.now(), False,
+    )
+
+    opportunities = await create_market_opportunities_from_markets(
+        [market], object(), Client()
+    )
+
+    assert len(opportunities) == 1
+    opportunity = opportunities[0]
+    assert opportunity.recommended_side == "NO"
+    assert opportunity.predicted_probability == pytest.approx(.76)
+    assert opportunity.market_probability == pytest.approx(.70)
+    assert opportunity.edge == pytest.approx(.06)
+    assert opportunity.net_expected_return > 0
+    assert _calculate_simple_kelly(opportunity) > 0
 
 
 def test_probability_band_defaults_and_canary_limits_are_preserved(monkeypatch):

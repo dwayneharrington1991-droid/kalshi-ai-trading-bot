@@ -24,6 +24,7 @@ from src.strategies.directional_policy import (
     classify_market_phase,
     log_directional_evaluation,
 )
+from src.strategies.sports_markets import classify_sports_market_type, event_correlation_group
 
 
 async def create_market_opportunities_from_markets(
@@ -85,6 +86,8 @@ async def create_market_opportunities_from_markets(
                 fee_estimate=settings.trading.directional_fee_estimate,
                 slippage_estimate=settings.trading.directional_slippage_estimate,
                 sports_phase=sports_phase,
+                event_title=str(market_info.get("event_title", market_info.get("title", market.title))),
+                market_type=classify_sports_market_type(market_info),
             )
             log_directional_evaluation(logger, evaluation)
             if not evaluation.accepted:
@@ -132,6 +135,11 @@ async def create_market_opportunities_from_markets(
                     ranking_score=evaluation.ranking_score,
                     category=market.category,
                     sports_phase=sports_phase,
+                    event_ticker=str(market_info.get("event_ticker", "")),
+                    event_title=str(market_info.get("event_title", market.title)),
+                    market_type=classify_sports_market_type(market_info),
+                    correlation_group=event_correlation_group(market_info),
+                    proposed_risk=float(getattr(settings.trading, "overnight_canary_max_market_risk", 5.0)),
                 )
                 
                 # Add edge filter results to opportunity

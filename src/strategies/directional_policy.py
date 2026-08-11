@@ -22,6 +22,10 @@ class DirectionalEvaluation:
     reason: str
     ranking_score: float
     sports_phase: str = "NOT_APPLICABLE"
+    event_title: str = ""
+    market_type: str = "OTHER"
+    liquidity: float = 0.0
+    existing_correlated_exposure: float = 0.0
 
     def safe_metadata(self) -> dict[str, Any]:
         return asdict(self)
@@ -41,6 +45,8 @@ def evaluate_directional_candidate(
     fee_estimate: float,
     slippage_estimate: float,
     sports_phase: str = "NOT_APPLICABLE",
+    event_title: str = "",
+    market_type: str = "OTHER",
 ) -> DirectionalEvaluation:
     """Choose the better side and fail closed unless it clears every quality gate."""
     values = (predicted_yes_probability, yes_bid, yes_ask, no_bid, no_ask)
@@ -81,18 +87,22 @@ def evaluate_directional_candidate(
     return DirectionalEvaluation(
         market_id, side, ask, estimated, gross_edge, spread,
         fee_estimate, slippage_estimate, net_return, preferred,
-        accepted, reason, ranking_score, sports_phase,
+        accepted, reason, ranking_score, sports_phase, event_title, market_type,
     )
 
 
 def log_directional_evaluation(logger: logging.Logger, result: DirectionalEvaluation) -> None:
     logger.info(
         "DIRECTIONAL_CANDIDATE market=%s side=%s implied=%.4f estimated=%.4f "
-        "edge=%.4f price=%.4f net_return=%.4f sports_phase=%s outcome=%s reason=%s metadata=%s",
+        "edge=%.4f price=%.4f estimated_profit=%.4f net_return=%.4f net_ev=%.4f sports_phase=%s phase=%s "
+        "event=%s market_type=%s liquidity=%.2f correlated_exposure=%.2f outcome=%s reason=%s metadata=%s",
         result.market_id, result.side, result.market_implied_probability,
         result.estimated_probability, result.gross_edge,
         result.market_implied_probability, result.estimated_net_return,
-        result.sports_phase, "ACCEPTED" if result.accepted else "REJECTED",
+        result.estimated_net_return, result.estimated_net_return, result.sports_phase,
+        result.sports_phase, result.event_title,
+        result.market_type, result.liquidity, result.existing_correlated_exposure,
+        "ACCEPTED" if result.accepted else "REJECTED",
         result.reason, result.safe_metadata(),
     )
 

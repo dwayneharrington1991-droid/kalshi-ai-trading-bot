@@ -27,6 +27,7 @@ from src.strategies.directional_policy import (
     executable_liquidity,
 )
 from src.strategies.portfolio.immediate import _get_fast_ai_prediction
+from src.strategies.sports_markets import admit_event_exposure
 from src.utils.database import Market
 from src.utils.market_prices import get_market_prices, is_tradeable_market
 
@@ -104,6 +105,8 @@ async def run(max_model_calls: int, limit: int) -> int:
                 fee_estimate=settings.trading.directional_fee_estimate,
                 slippage_estimate=settings.trading.directional_slippage_estimate,
                 sports_phase=phase,
+                event_title=str(raw.get("_event_title", market.title)),
+                market_type=str(raw.get("_market_type", "OTHER")),
             )
             requested_quantity = max(1, int(5 / result.market_implied_probability)) if result.market_implied_probability else 0
             liquidity = executable_liquidity(
@@ -113,9 +116,25 @@ async def run(max_model_calls: int, limit: int) -> int:
                 remaining_minutes = max(0.0, (market.expiration_ts - time.time()) / 60)
                 results.append((
                     result, confidence, market.title, market.category,
-                    remaining_minutes, liquidity, quote_age,
+                    remaining_minutes, liquidity, quote_age, raw,
                 ))
         results.sort(key=lambda item: item[0].ranking_score, reverse=True)
+
+        # Preview the same conservative event-level exposure cap as optimization.
+        selected = []
+        selected_exposure = {}
+        event_cap = float(getattr(settings.trading, "overnight_canary_max_market_risk", 5.0))
+        for item in results:
+            raw = item[7]
+            group = str(raw.get("_correlation_group", raw["ticker"]))
+            decision = admit_event_exposure(
+                correlation_group=group, proposed_risk=event_cap,
+                existing={}, selected=selected_exposure, max_event_risk=event_cap,
+            )
+            if not decision.accepted:
+                continue
+            selected_exposure[group] = selected_exposure.get(group, 0.0) + event_cap
+            selected.append(item + (decision.existing_exposure, decision.reason))
 
         stats = discovery.stats.as_dict()
         print("READ_ONLY_DIRECTIONAL_PREVIEW")
@@ -124,13 +143,16 @@ async def run(max_model_calls: int, limit: int) -> int:
         print(f"SPORTS_WITHIN_72H={stats['sports_markets_within_72h']}")
         print(f"MODELED_CANDIDATES={min(len(candidates), max_model_calls)}")
         print(f"QUALIFYING_CANDIDATES={len(results)}")
-        print("RANK | MARKET | CATEGORY | PHASE | MIN_LEFT | SIDE | PRICE | MODEL | EDGE | NET | LIQUIDITY | QUOTE_AGE | CONFIDENCE")
-        for rank, (result, confidence, _, category, remaining, liquidity, quote_age) in enumerate(results[:limit], 1):
+        print(f"CORRELATION_ADMITTED={len(selected)}")
+        print("RANK | EVENT | MARKET | TYPE | PHASE | MIN_LEFT | SIDE | PRICE | MODEL | EDGE | PROFIT | NET_EV | LIQUIDITY | CORRELATED_EXPOSURE | QUOTE_AGE | REASON")
+        for rank, (result, confidence, _, category, remaining, liquidity, quote_age, raw, correlated, reason) in enumerate(selected[:limit], 1):
             print(
-                f"{rank:02d} | {result.market_id} | {category} | {result.sports_phase} | "
+                f"{rank:02d} | {raw.get('_event_title', raw.get('_event_ticker', '-'))} | "
+                f"{result.market_id} | {raw.get('_market_type', 'OTHER')} | {result.sports_phase} | "
                 f"{remaining:.1f} | {result.side} | {result.market_implied_probability:.1%} | "
                 f"{result.estimated_probability:.1%} | {result.gross_edge:.1%} | "
-                f"{result.estimated_net_return:.1%} | {liquidity:.0f} | {quote_age:.2f}s | {confidence:.1%}"
+                f"{result.estimated_net_return:.1%} | {result.estimated_net_return:.1%} | "
+                f"{liquidity:.0f} | ${correlated:.2f} | {quote_age:.2f}s | {reason}"
             )
         print("EXCHANGE_WRITES=IMPOSSIBLE")
         print("LIVE_TRADING=DISABLED")
@@ -145,8 +167,8 @@ def main() -> int:
     parser.add_argument("--max-model-calls", type=int, default=60)
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
-    if not 1 <= args.max_model_calls <= 200 or not 1 <= args.limit <= 20:
-        parser.error("limits must be bounded (model calls 1-200, output 1-20)")
+    if not 1 <= args.max_model_calls <= 200 or not 1 <= args.limit <= 30:
+        parser.error("limits must be bounded (model calls 1-200, output 1-30)")
     try:
         return asyncio.run(run(args.max_model_calls, args.limit))
     except Exception:

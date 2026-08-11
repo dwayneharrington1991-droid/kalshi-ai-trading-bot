@@ -428,6 +428,80 @@ class KalshiClient(TradingLoggerMixin):
         return await self._make_authenticated_request(
             "GET", "/trade-api/v2/markets", params=params, require_auth=True
         )
+
+    async def get_events(
+        self,
+        limit: int = 200,
+        cursor: Optional[str] = None,
+        status: Optional[str] = None,
+        series_ticker: Optional[str] = None,
+        with_nested_markets: bool = True,
+        with_milestones: bool = True,
+        min_close_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of events with structured market and milestone metadata."""
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "with_nested_markets": str(with_nested_markets).lower(),
+            "with_milestones": str(with_milestones).lower(),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        if status:
+            params["status"] = status
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if min_close_ts is not None:
+            params["min_close_ts"] = int(min_close_ts)
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/events", params=params, require_auth=True
+        )
+
+    async def get_event(self, event_ticker: str, *, with_nested_markets: bool = True) -> Dict[str, Any]:
+        """Get one event and its markets without any write capability."""
+        if not event_ticker or not event_ticker.strip():
+            raise ValueError("event_ticker is required")
+        return await self._make_authenticated_request(
+            "GET",
+            f"/trade-api/v2/events/{event_ticker}",
+            params={"with_nested_markets": str(with_nested_markets).lower()},
+            require_auth=True,
+        )
+
+    async def get_milestones(
+        self,
+        limit: int = 500,
+        cursor: Optional[str] = None,
+        minimum_start_date: Optional[str] = None,
+        category: Optional[str] = None,
+        competition: Optional[str] = None,
+        type_: Optional[str] = None,
+        related_event_ticker: Optional[str] = None,
+        min_updated_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of structured milestones, including sports/game metadata."""
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        params: Dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if minimum_start_date:
+            params["minimum_start_date"] = minimum_start_date
+        if category:
+            params["category"] = category
+        if competition:
+            params["competition"] = competition
+        if type_:
+            params["type"] = type_
+        if related_event_ticker:
+            params["related_event_ticker"] = related_event_ticker
+        if min_updated_ts is not None:
+            params["min_updated_ts"] = int(min_updated_ts)
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/milestones", params=params, require_auth=True
+        )
     
     async def get_market(self, ticker: str) -> Dict[str, Any]:
         """Get specific market data."""

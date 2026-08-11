@@ -21,7 +21,7 @@ from src.utils.position_sizing import binary_market_payout_odds, kelly_fraction
 from src.strategies.portfolio.models import MarketOpportunity
 from src.strategies.directional_policy import (
     evaluate_directional_candidate,
-    classify_sports_phase,
+    classify_market_phase,
     log_directional_evaluation,
 )
 
@@ -72,7 +72,9 @@ async def create_market_opportunities_from_markets(
                 logger.warning(f"AI analysis failed for {market.market_id}, skipping")
                 continue
             
-            sports_phase = classify_sports_phase(market_info, market.category)
+            sports_phase = classify_market_phase(
+                market_info, market.category, expiration_ts=market.expiration_ts
+            )
             evaluation = evaluate_directional_candidate(
                 market_id=market.market_id,
                 predicted_yes_probability=predicted_prob,

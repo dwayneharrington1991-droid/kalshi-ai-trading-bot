@@ -54,7 +54,7 @@ from src.strategies.portfolio_optimization import (
 )
 from src.strategies.directional_policy import (
     evaluate_directional_candidate,
-    classify_sports_phase,
+    classify_market_phase,
     log_directional_evaluation,
 )
 @dataclass
@@ -732,7 +732,11 @@ class UnifiedAdvancedTradingSystem:
                         min_edge=settings.trading.min_directional_edge,
                         fee_estimate=settings.trading.directional_fee_estimate,
                         slippage_estimate=settings.trading.directional_slippage_estimate,
-                        sports_phase=classify_sports_phase(market_info, opportunity.category),
+                        sports_phase=classify_market_phase(
+                            market_info, opportunity.category,
+                            expiration_ts=(datetime.now(timezone.utc).timestamp()
+                                           + opportunity.time_to_expiry * 86400),
+                        ),
                     )
                     log_directional_evaluation(self.logger, live_evaluation)
                     if not live_evaluation.accepted or live_evaluation.side != intended_side:
@@ -853,6 +857,13 @@ class UnifiedAdvancedTradingSystem:
                         outcome="BLOCKED", reason="allocation execution error",
                         api_attempted=False, api_error_category=type(e).__name__,
                     )
+                    # Transient decision context used for immediate fail-closed
+                    # quote/order-book revalidation. It is intentionally not
+                    # fabricated during restart recovery.
+                    position.model_probability = opportunity.predicted_probability
+                    position.model_generated_at = datetime.now(timezone.utc).timestamp()
+                    position.market_phase = opportunity.sports_phase
+                    position.market_category = opportunity.category
                     results['failed_executions'] += 1
                     continue
             

@@ -225,6 +225,12 @@ class TradingConfig:
     directional_slippage_estimate: float = field(
         default_factory=lambda: float(os.getenv("DIRECTIONAL_SLIPPAGE_ESTIMATE", "0.005"))
     )
+    fast_live_max_remaining_minutes: int = field(
+        default_factory=lambda: int(os.getenv("FAST_LIVE_MAX_REMAINING_MINUTES", "60"))
+    )
+    fast_live_max_model_age_seconds: int = field(
+        default_factory=lambda: int(os.getenv("FAST_LIVE_MAX_MODEL_AGE_SECONDS", "30"))
+    )
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)

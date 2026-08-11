@@ -1,6 +1,7 @@
 """Conservative, side-aware admission policy for directional entries."""
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import logging
 from typing import Any, Optional
 
@@ -103,15 +104,64 @@ def _blocked(market_id: str, side: str, reason: str, sports_phase: str = "NOT_AP
     )
 
 
-def classify_sports_phase(market_info: dict[str, Any], category: str = "") -> str:
-    """Classify sports without requiring live data for pre-game evaluation."""
-    is_sports = category.casefold() in {"sports", "esports"} or bool(
-        market_info.get("_is_sports_market")
-    )
-    if not is_sports:
-        return "NOT_APPLICABLE"
+def classify_market_phase(
+    market_info: dict[str, Any], category: str = "", *,
+    expiration_ts: Optional[float] = None, now: Optional[datetime] = None,
+    fast_live_minutes: float = 60.0,
+) -> str:
+    """Classify every open market; short-duration markets are FAST_LIVE."""
+    now = now or datetime.now(timezone.utc)
+    if expiration_ts is None:
+        for key in ("expected_expiration_time", "expiration_time", "close_time"):
+            value = market_info.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                expiration_ts = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                break
+            except ValueError:
+                continue
+    if expiration_ts is not None:
+        remaining = expiration_ts - now.timestamp()
+        if 0 <= remaining <= fast_live_minutes * 60:
+            return "FAST_LIVE"
     live_markers = (
         market_info.get("in_play"), market_info.get("is_live"),
         str(market_info.get("game_status", "")).casefold() in {"live", "in_progress"},
     )
     return "LIVE" if any(value is True for value in live_markers) else "PRE_GAME"
+
+
+def classify_sports_phase(market_info: dict[str, Any], category: str = "") -> str:
+    """Backward-compatible sports classifier used by existing callers/tests."""
+    is_sports = category.casefold() in {"sports", "esports"} or bool(market_info.get("_is_sports_market"))
+    return classify_market_phase(market_info, category) if is_sports else "NOT_APPLICABLE"
+
+
+def executable_liquidity(orderbook_response: Any, side: str, max_price: float) -> float:
+    """Return contracts available at or better than a buy limit, failing closed."""
+    if not isinstance(orderbook_response, dict):
+        return 0.0
+    book = orderbook_response.get("orderbook_fp", orderbook_response.get("orderbook"))
+    if not isinstance(book, dict):
+        return 0.0
+    source = book.get("no_dollars" if side.upper() == "YES" else "yes_dollars")
+    if source is None:
+        source = book.get("no" if side.upper() == "YES" else "yes")
+    if not isinstance(source, list):
+        return 0.0
+    available = 0.0
+    for level in source:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            return 0.0
+        try:
+            opposing_bid, quantity = float(level[0]), float(level[1])
+        except (TypeError, ValueError):
+            return 0.0
+        if opposing_bid > 1:
+            opposing_bid /= 100
+        if quantity < 0:
+            return 0.0
+        if 1 - opposing_bid <= max_price + 1e-9:
+            available += quantity
+    return available

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,11 @@ from src.orders.repository import OrderRepository
 from src.orders.state_machine import OrderState, OrderStateMachine
 from src.orders.decision_log import log_order_decision
 from src.utils.logging_setup import get_trading_logger
+from src.strategies.directional_policy import (
+    evaluate_directional_candidate, executable_liquidity, log_directional_evaluation,
+)
+from src.utils.market_prices import get_market_prices
+from src.config.settings import settings
 
 class ExecutionSafetyError(RuntimeError):
     """Raised when an execution safety gate fails."""
@@ -33,6 +39,9 @@ class OrderIntent:
     position_id: int
     environment: str
     strategy: Optional[str] = None
+    estimated_probability: Optional[float] = None
+    model_generated_at: Optional[float] = None
+    market_phase: str = "NOT_APPLICABLE"
 
     def fingerprint(self) -> str:
         payload = "|".join((
@@ -120,6 +129,7 @@ class VerifiedExecutionService:
         self, order_id: int, client_order_id: str, intent: OrderIntent,
     ) -> ExecutionResult:
         await self._balance_gateway(intent)
+        await self._fresh_directional_gateway(intent)
         await self.repository.transition_state(
             order_id, OrderState.SUBMITTED, "verified_execution",
             reason="durably recorded before HTTP submission",
@@ -158,6 +168,48 @@ class VerifiedExecutionService:
             )
             return ExecutionResult(order_id, client_order_id, "verification_failed", submitted=True)
         return await self._verify_and_project(order_id, client_order_id, submitted=True)
+
+    async def _fresh_directional_gateway(self, intent: OrderIntent) -> None:
+        """Final GET-only no-chase check immediately before HTTP submission."""
+        if intent.strategy not in {"portfolio_optimization", "immediate_portfolio_optimization"}:
+            return
+        if intent.estimated_probability is None:
+            raise ExecutionSafetyError("directional model probability is unavailable")
+        if intent.market_phase == "FAST_LIVE":
+            if intent.model_generated_at is None or (
+                time.time() - intent.model_generated_at
+                > settings.trading.fast_live_max_model_age_seconds
+            ):
+                raise ExecutionSafetyError("FAST_LIVE model probability is stale")
+        try:
+            market_response = await self.client.get_market(intent.market_id)
+            market = market_response.get("market") if isinstance(market_response, dict) else None
+            orderbook = await self.client.get_orderbook(intent.market_id, depth=100)
+        except Exception as exc:
+            raise ExecutionSafetyError("fresh directional quote could not be verified") from exc
+        if not isinstance(market, dict):
+            raise ExecutionSafetyError("fresh directional market response is malformed")
+        yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market)
+        evaluation = evaluate_directional_candidate(
+            market_id=intent.market_id,
+            predicted_yes_probability=intent.estimated_probability,
+            yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask,
+            min_probability=settings.trading.min_preferred_probability,
+            max_preferred_probability=settings.trading.max_preferred_probability,
+            min_edge=settings.trading.min_directional_edge,
+            fee_estimate=settings.trading.directional_fee_estimate,
+            slippage_estimate=settings.trading.directional_slippage_estimate,
+            sports_phase=intent.market_phase,
+        )
+        log_directional_evaluation(self.logger, evaluation)
+        fresh_price = yes_ask if intent.side.upper() == "YES" else no_ask
+        if not evaluation.accepted or evaluation.side != intent.side.upper():
+            raise ExecutionSafetyError(f"fresh directional edge rejected: {evaluation.reason}")
+        if intent.market_phase == "FAST_LIVE" and abs(fresh_price - intent.price) > 1e-9:
+            raise ExecutionSafetyError("FAST_LIVE quote moved; entry decision canceled without chasing")
+        available = executable_liquidity(orderbook, intent.side, intent.price)
+        if available < intent.quantity:
+            raise ExecutionSafetyError("insufficient executable liquidity for requested quantity")
 
     async def _recover(self, existing: dict, intent: OrderIntent) -> ExecutionResult:
         state = OrderStateMachine.normalize(existing["state"])

@@ -26,6 +26,7 @@ NAMED_READ_METHODS = {
     "get_balance", "get_positions", "get_orders", "get_order", "get_fills",
     "get_all_orders", "get_all_fills", "get_markets", "get_market",
     "get_events", "get_event", "get_milestones",
+    "get_orderbook",
     "_make_authenticated_request",
 }
 
@@ -103,6 +104,9 @@ class ReadOnlyAccountClient:
 
     async def get_milestones(self, *args, **kwargs):
         return await self.__read("get_milestones", *args, **kwargs)
+
+    async def get_orderbook(self, *args, **kwargs):
+        return await self.__read("get_orderbook", *args, **kwargs)
 
 
 def _is_set(value: Optional[str]) -> bool:

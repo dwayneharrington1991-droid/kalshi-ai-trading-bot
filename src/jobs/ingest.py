@@ -5,15 +5,14 @@ This job fetches active markets from the Kalshi API, transforms them into a stru
 and upserts them into the database.
 """
 import asyncio
-import time
 from datetime import datetime
 from typing import Optional, List
 
 from src.clients.kalshi_client import KalshiClient
 from src.utils.database import DatabaseManager, Market
-from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
 from src.utils.market_prices import is_tradeable_market
+from src.markets.discovery import MarketDiscovery72h
 
 
 async def process_and_queue_markets(
@@ -80,7 +79,10 @@ async def process_and_queue_markets(
             volume=volume,
             expiration_ts=int(
                 datetime.fromisoformat(
-                    market_data["expiration_time"].replace("Z", "+00:00")
+                    (
+                        market_data.get("_eligible_resolution_time")
+                        or market_data["expiration_time"]
+                    ).replace("Z", "+00:00")
                 ).timestamp()
             ),
             category=market_data.get("category", "unknown"),
@@ -97,9 +99,6 @@ async def process_and_queue_markets(
         # Primary filtering criteria - MORE PERMISSIVE FOR MORE OPPORTUNITIES!
         min_volume: float = 100.0  # DECREASED: Much lower volume threshold (was 100, keeping low)
         min_volume_for_ai_analysis: float = 150.0  # DECREASED: Lower volume for AI analysis (was 200, now 150)  
-        preferred_categories: List[str] = []  # Empty = all categories allowed
-        excluded_categories: List[str] = []  # Empty = no categories excluded
-
         # Enhanced filtering for better opportunities - MORE PERMISSIVE FOR MORE TRADES
         min_price_movement: float = 0.015  # DECREASED: Even lower minimum range (was 0.02, now 1.5¢)
         max_bid_ask_spread: float = 0.20   # INCREASED: Allow even wider spreads (was 0.15, now 20¢)
@@ -109,13 +108,6 @@ async def process_and_queue_markets(
             m
             for m in markets_to_upsert
             if m.volume >= min_volume
-            # REMOVED TIME RESTRICTION - we can now trade markets with ANY deadline!
-            # Dynamic exit strategies will handle timing automatically
-            and (
-                not settings.trading.preferred_categories
-                or m.category in settings.trading.preferred_categories
-            )
-            and m.category not in settings.trading.excluded_categories
         ]
         eligible_markets = sorted(eligible_markets, key=lambda m: m.volume, reverse=True)[:20]
         logger.info(
@@ -123,9 +115,11 @@ async def process_and_queue_markets(
         )
         for market in eligible_markets:
             await queue.put(market)
+        return len(eligible_markets)
 
     else:
         logger.info("No new markets to upsert in this batch.")
+        return 0
 
 
 async def run_ingestion(
@@ -166,87 +160,18 @@ async def run_ingestion(
             else:
                 logger.warning(f"Could not find market with ticker: {market_ticker}")
         else:
-            # Primary: fetch via events API (Kalshi migrated all tickers to KXMVE*,
-            # so /markets only returns parlay tickers. Real markets live under events.)
-            logger.info("Fetching markets via events API (with nested markets).")
-            seen_tickers = set()
-            cursor = None
-            events_page = 0
-            try:
-                while True:
-                    params = {"status": "open", "limit": 100, "with_nested_markets": "true"}
-                    if cursor:
-                        params["cursor"] = cursor
-                    
-                    resp = await kalshi_client._make_authenticated_request(
-                        "GET", "/trade-api/v2/events", params=params
-                    )
-                    events = resp.get("events", [])
-                    if not events:
-                        break
-                    
-                    batch = []
-                    for event in events:
-                        for m in event.get("markets", []):
-                            ticker = m.get("ticker", "")
-                            if ticker and ticker not in seen_tickers and m.get("status") == "active":
-                                seen_tickers.add(ticker)
-                                batch.append(m)
-                    
-                    if batch:
-                        logger.info(f"Fetched {len(batch)} active markets from events page {events_page}.")
-                        await process_and_queue_markets(
-                            batch,
-                            db_manager,
-                            queue,
-                            existing_position_market_ids,
-                            logger,
-                        )
-                    
-                    cursor = resp.get("cursor")
-                    if not cursor:
-                        break
-                    events_page += 1
-                    # Cap at 20 pages (~2000 events, ~5000+ markets) to avoid
-                    # 16+ minute ingestion that blocks the trading cycle.
-                    # Most high-volume tradeable markets appear in the first pages.
-                    if events_page > 20:
-                        logger.info(f"Reached page limit (20), stopping ingestion with {len(seen_tickers)} markets.")
-                        break
-                    
-                    await asyncio.sleep(0.1)
-            except Exception as events_err:
-                logger.warning(f"Events API failed, falling back to /markets: {events_err}")
-            
-            # Fallback: also check /markets for anything missed
-            if len(seen_tickers) < 100:
-                logger.info(f"Few markets from events ({len(seen_tickers)}), also fetching /markets.")
-                cursor = None
-                while True:
-                    response = await kalshi_client.get_markets(limit=100, cursor=cursor)
-                    markets_page = response.get("markets", [])
-
-                    active_markets = [m for m in markets_page if m["status"] == "active" 
-                                     and m.get("ticker", "") not in seen_tickers]
-                    if active_markets:
-                        for m in active_markets:
-                            seen_tickers.add(m.get("ticker", ""))
-                        logger.info(
-                            f"Fetched {len(markets_page)} markets, {len(active_markets)} new active."
-                        )
-                        await process_and_queue_markets(
-                            active_markets,
-                            db_manager,
-                            queue,
-                            existing_position_market_ids,
-                            logger,
-                        )
-
-                    cursor = response.get("cursor")
-                    if not cursor:
-                        break
-            
-            logger.info(f"Total unique markets ingested: {len(seen_tickers)}")
+            discovery = await MarketDiscovery72h(kalshi_client).discover()
+            queued = await process_and_queue_markets(
+                discovery.markets,
+                db_manager,
+                queue,
+                existing_position_market_ids,
+                logger,
+            )
+            scan = discovery.stats.as_dict()
+            scan["candidates_passed_to_strategy"] = queued
+            logger.info("72-hour all-market scan complete", **scan)
+            return scan
 
     except Exception as e:
         logger.error(

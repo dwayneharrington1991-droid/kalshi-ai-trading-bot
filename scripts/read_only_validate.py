@@ -25,6 +25,7 @@ INGESTION_GET_ENDPOINTS = {"/trade-api/v2/events"}
 NAMED_READ_METHODS = {
     "get_balance", "get_positions", "get_orders", "get_order", "get_fills",
     "get_all_orders", "get_all_fills", "get_markets", "get_market",
+    "get_events", "get_event", "get_milestones",
     "_make_authenticated_request",
 }
 
@@ -93,6 +94,15 @@ class ReadOnlyAccountClient:
 
     async def get_market(self, *args, **kwargs):
         return await self.__read("get_market", *args, **kwargs)
+
+    async def get_events(self, *args, **kwargs):
+        return await self.__read("get_events", *args, **kwargs)
+
+    async def get_event(self, *args, **kwargs):
+        return await self.__read("get_event", *args, **kwargs)
+
+    async def get_milestones(self, *args, **kwargs):
+        return await self.__read("get_milestones", *args, **kwargs)
 
 
 def _is_set(value: Optional[str]) -> bool:
@@ -199,7 +209,10 @@ async def run_read_only_validation(
         remote_orders = await read_client.get_all_orders(limit=1000)
         remote_fills = await read_client.get_all_fills(limit=1000)
 
-        await ingestion_runner(manager, asyncio.Queue(), kalshi_client=read_client)
+        ingestion_result = await ingestion_runner(
+            manager, asyncio.Queue(), kalshi_client=read_client
+        )
+        scan_stats = ingestion_result if isinstance(ingestion_result, dict) else {}
         reconciler = OrderReconciler(
             repository, read_client, shadow_mode=True, paper_mode=False,
             project_positions=False,
@@ -244,6 +257,7 @@ async def run_read_only_validation(
             "fill_count": len(remote_fills),
             "market_count": total_markets,
             "eligible_market_count": eligible_markets,
+            "scan_stats": scan_stats,
             "reconciliation": reconciliation,
             "health": health,
             "alert_count": alert_count,
@@ -291,6 +305,11 @@ def main() -> int:
     print(f"FILL_COUNT={result['fill_count']}")
     print(f"MARKET_COUNT={result['market_count']}")
     print(f"ELIGIBLE_MARKET_COUNT={result['eligible_market_count']}")
+    scan_stats = result.get("scan_stats", {})
+    print(f"MARKETS_DISCOVERED={scan_stats.get('markets_discovered', 'UNAVAILABLE')}")
+    print(f"MARKETS_WITHIN_72H={scan_stats.get('markets_within_72h', 'UNAVAILABLE')}")
+    print(f"SPORTS_MARKETS_WITHIN_72H={scan_stats.get('sports_markets_within_72h', 'UNAVAILABLE')}")
+    print(f"NON_SPORTS_MARKETS_WITHIN_72H={scan_stats.get('non_sports_markets_within_72h', 'UNAVAILABLE')}")
     print(f"RECONCILIATION_STATUS={reconciliation.status}")
     print(f"RECONCILIATION_HEALTH={'HEALTHY' if health['healthy_status'] and health['fresh'] else 'UNHEALTHY'}")
     print(f"CRITICAL_ALERTS={health['critical_alert_count']}")

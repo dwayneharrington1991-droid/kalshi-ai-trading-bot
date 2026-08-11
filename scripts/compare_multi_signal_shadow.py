@@ -11,6 +11,9 @@ import sys
 import time
 import json
 import math
+import queue
+import threading
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -45,13 +48,75 @@ def _series_metadata(response):
     return value if isinstance(value, dict) else None
 
 
-async def run(sample_size: int) -> int:
+async def _prediction_with_fresh_client(
+    market, market_price: float,
+) -> tuple[Optional[float], Optional[float]]:
+    """Run one model request without sharing the comparison event loop's client."""
+    model = XAIClient()
+    try:
+        return await _get_fast_ai_prediction(market, model, market_price)
+    finally:
+        try:
+            await model.close()
+        except Exception:
+            # This is a diagnostic-only resource cleanup path. Never let it
+            # suppress the comparison report or expose provider details.
+            pass
+
+
+def _prediction_worker(
+    result_queue: queue.Queue,
+    market,
+    market_price: float,
+) -> None:
+    """Daemon worker boundary for an uncooperative model-provider call."""
+    try:
+        probability, confidence = asyncio.run(
+            _prediction_with_fresh_client(market, market_price)
+        )
+        result_queue.put(("ok", probability, confidence))
+    except BaseException:
+        # Provider exceptions can include request metadata. Report only a
+        # stable category to the parent process.
+        result_queue.put(("failure", None, None))
+
+
+async def isolated_model_prediction(
+    market,
+    market_price: float,
+    timeout_seconds: float = 20.0,
+) -> tuple[Optional[float], Optional[float], str]:
+    """Return a bounded prediction even if a provider ignores cancellation.
+
+    A daemon worker cannot hold the comparison's event loop hostage. On a
+    timeout the caller opens its provider circuit breaker, so no additional
+    model calls are started and the final report is always produced.
+    """
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+    worker = threading.Thread(
+        target=_prediction_worker,
+        args=(result_queue, market, market_price),
+        daemon=True,
+        name="multi-signal-shadow-model",
+    )
+    worker.start()
+    try:
+        state, probability, confidence = await asyncio.to_thread(
+            result_queue.get, True, timeout_seconds
+        )
+    except queue.Empty:
+        return None, None, "timeout"
+    if state != "ok":
+        return None, None, "failure"
+    return probability, confidence, "ok"
+
+
+async def run(sample_size: int, model_timeout_seconds: float = 20.0) -> int:
     environment = validate_read_only_safety(os.environ)
     if os.getenv("LIVE_TRADING_ENABLED", "").lower() != "false":
         raise RuntimeError("LIVE_TRADING_ENABLED must be explicitly false")
     raw_client = KalshiClient(environment=environment)
     client = ReadOnlyAccountClient(raw_client, environment)
-    model = XAIClient()
     try:
         discovery = await MarketDiscovery72h(client).discover()
         universe = [market for market in discovery.markets if is_tradeable_market(market)]
@@ -66,6 +131,7 @@ async def run(sample_size: int) -> int:
         records = []
         series_cache = {}
         evaluated = attempted = 0
+        model_provider_unresponsive = False
         deadline = time.monotonic() + 600
         for raw in universe:
             if attempted >= sample_size or time.monotonic() >= deadline:
@@ -74,10 +140,26 @@ async def run(sample_size: int) -> int:
             market = _as_market(raw)
             operation = "model"
             try:
-                predicted, model_confidence = await asyncio.wait_for(
-                    _get_fast_ai_prediction(market, model, get_market_prices(raw)[1]),
-                    timeout=20,
+                if model_provider_unresponsive:
+                    failures += 1
+                    failure_reasons["model_provider_circuit_open"] += 1
+                    continue
+                predicted, model_confidence, prediction_state = await isolated_model_prediction(
+                    market,
+                    get_market_prices(raw)[1],
+                    timeout_seconds=model_timeout_seconds,
                 )
+                if prediction_state == "timeout":
+                    # A timed-out daemon may still be winding down, so fail
+                    # closed and never initiate another external model call.
+                    model_provider_unresponsive = True
+                    failures += 1
+                    failure_reasons["model_timeout"] += 1
+                    continue
+                if prediction_state != "ok":
+                    failures += 1
+                    failure_reasons["model_failure"] += 1
+                    continue
                 if predicted is None:
                     failures += 1
                     failure_reasons["model_unavailable"] += 1
@@ -251,6 +333,7 @@ async def run(sample_size: int) -> int:
         print(f"MULTI_SIGNAL_FUNNEL={dict(multi_funnel)}")
         print(f"DATA_SOURCE_FAILURES={failures}")
         print(f"DATA_SOURCE_FAILURE_REASONS={dict(failure_reasons)}")
+        print(f"MODEL_PROVIDER_CIRCUIT_OPEN={model_provider_unresponsive}")
         print(f"SUSPICIOUS_EXTREME_DISCREPANCIES={extreme}")
         print(f"DECISIONS_CHANGED={len(differences)}")
         print(f"CURRENT_REJECTIONS={dict(current_reasons)}")
@@ -271,7 +354,6 @@ async def run(sample_size: int) -> int:
         print("EXCHANGE_WRITES=ZERO")
         return 0
     finally:
-        await model.close()
         await raw_client.close()
 
 

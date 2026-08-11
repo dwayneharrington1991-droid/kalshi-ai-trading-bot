@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import io
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -33,6 +34,33 @@ NAMED_READ_METHODS = {
 
 class ReadOnlyValidationError(RuntimeError):
     """Secret-safe validation or authenticated-read failure."""
+
+
+def _copy_external_position_context(source_path: str, validation_path: str) -> int:
+    """Copy only audited manual-position facts into the disposable validator DB."""
+    source = Path(source_path).resolve()
+    if not source.is_file():
+        raise ReadOnlyValidationError("persistent reconciliation ledger is unavailable")
+    try:
+        with contextlib.closing(
+            sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True)
+        ) as source_db:
+            rows = source_db.execute("""
+                SELECT market_id, side, quantity, source, exchange_order_id, exchange_fill_id,
+                       first_observed_at, last_verified_at, status, metadata_json
+                FROM external_account_positions WHERE status = 'active'
+            """).fetchall()
+        with contextlib.closing(sqlite3.connect(validation_path)) as validation_db:
+            validation_db.executemany("""
+                INSERT INTO external_account_positions
+                (market_id, side, quantity, source, exchange_order_id, exchange_fill_id,
+                 first_observed_at, last_verified_at, status, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            validation_db.commit()
+        return len(rows)
+    except sqlite3.Error:
+        raise ReadOnlyValidationError("persistent external-position context is unavailable") from None
 
 
 class ReadOnlyAccountClient:
@@ -205,6 +233,8 @@ async def run_read_only_validation(
         repository = OrderRepository(db_path)
         ingestion_runner = ingestion_runner or run_ingestion
         await manager.initialize()
+        if temporary_path and environment.get("DB_PATH"):
+            _copy_external_position_context(environment["DB_PATH"], db_path)
 
         # Explicit account snapshot. Reconciliation intentionally performs its
         # own bounded authoritative reads afterward.

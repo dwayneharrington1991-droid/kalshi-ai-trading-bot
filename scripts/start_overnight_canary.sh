@@ -43,6 +43,7 @@ export ALLOW_LIVE_ORDER_CANCELLATIONS="false"
 export LEVERAGE_ENABLED="false"
 export MARTINGALE_ENABLED="false"
 export AUTO_POSITION_SIZE_INCREASE_ENABLED="false"
+export DB_PATH="${DB_PATH:-trading_system.db}"
 
 [[ "$OVERNIGHT_CANARY_MAX_TOTAL_RISK" == "20" \
    && "$OVERNIGHT_CANARY_MAX_MARKET_RISK" == "5" \
@@ -92,8 +93,6 @@ grep -q '^CRITICAL_ALERTS=0$' "$VALIDATION_OUT" || {
   exit 2
 }
 
-DB_PATH="${DB_PATH:-trading_system.db}"
-export DB_PATH
 "$PYTHON" - <<'PY' || exit 2
 import os, sqlite3
 from datetime import datetime, timezone

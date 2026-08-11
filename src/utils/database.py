@@ -128,6 +128,7 @@ class DatabaseManager(TradingLoggerMixin):
             (2, "order_reconciliation_foundation", self._migration_002_order_reconciliation),
             (3, "authoritative_position_projection", self._migration_003_position_projection),
             (4, "multi_agent_shadow_learning", self._migration_004_multi_agent_shadow),
+            (5, "external_account_activity", self._migration_005_external_account_activity),
         )
         for version, name, migration in migrations:
             if version in applied:
@@ -453,6 +454,43 @@ class DatabaseManager(TradingLoggerMixin):
                 latency_model TEXT NOT NULL,
                 summary_json TEXT,
                 error_summary TEXT
+            );
+        """
+        for statement in statements.split(";"):
+            if statement.strip():
+                await db.execute(statement)
+
+    async def _migration_005_external_account_activity(self, db: aiosqlite.Connection) -> None:
+        """Track verified manual account activity separately from bot positions/fills."""
+        statements = """
+            CREATE TABLE external_account_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('YES', 'NO')),
+                quantity REAL NOT NULL CHECK (quantity > 0),
+                source TEXT NOT NULL CHECK (source = 'manual_exchange_activity'),
+                exchange_order_id TEXT,
+                exchange_fill_id TEXT,
+                first_observed_at TEXT NOT NULL,
+                last_verified_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('active', 'administratively_reconciled')),
+                metadata_json TEXT NOT NULL,
+                UNIQUE(market_id, side, status)
+            );
+            CREATE INDEX idx_external_account_positions_active
+                ON external_account_positions(status, market_id, side);
+            CREATE TABLE reconciliation_admin_repair_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id TEXT NOT NULL,
+                repair_type TEXT NOT NULL,
+                alert_id INTEGER NOT NULL,
+                local_record_type TEXT NOT NULL,
+                local_record_id INTEGER,
+                market_id TEXT,
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                UNIQUE(plan_id, repair_type, alert_id)
             );
         """
         for statement in statements.split(";"):

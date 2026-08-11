@@ -17,6 +17,7 @@ from scripts.repair_stale_positions import (
 from scripts.read_only_validate import ReadOnlyValidationError
 from src.orders.local_position_repair import (
     apply_plan, build_plan, local_candidates, remote_position_map,
+    build_account_activity_repairs, apply_account_activity_repairs,
 )
 from src.utils.database import DatabaseManager
 
@@ -160,6 +161,52 @@ def test_active_market_remains_manual_review(tmp_path):
     assert plan["manual_review"][0]["classification"] == "manual_review"
 
 
+def test_exact_paper_simulation_alert_is_preview_repair_only(tmp_path):
+    path = tmp_path / "ledger.db"
+    database(path)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "run.log").write_text(
+        "live_mode=False for market TEST-A\n"
+        "PAPER TRADE SIMULATED for TEST-A - No real money used\n",
+        encoding="utf-8",
+    )
+    plan = build_plan(
+        path, local_candidates(path, {}),
+        {"TEST-A": {"market": {"ticker": "TEST-A", "status": "active"}}},
+        preview_paper_simulation_alert_ids=[1], log_dir=logs,
+    )
+    assert plan["manual_review"] == []
+    repair = plan["repairs"][0]
+    assert repair["classification"] == "paper_simulation"
+    assert repair["alert_ids"] == [1]
+    assert repair["changes"]["reconciliation_status"]["after"] == (
+        "administratively_reconciled_paper_simulation"
+    )
+    assert repair["position_before"]["live"] == 1
+
+
+def test_paper_simulation_preview_fails_closed_on_exchange_history(tmp_path):
+    path = tmp_path / "ledger.db"
+    database(path)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "run.log").write_text(
+        "live_mode=False for market TEST-A\nPAPER TRADE SIMULATED for TEST-A\n",
+        encoding="utf-8",
+    )
+    exchange_order = SimpleNamespace(
+        market_id="TEST-A", order_id="exchange-1", client_order_id="client-1",
+        status="filled",
+    )
+    plan = build_plan(
+        path, local_candidates(path, {}), {"TEST-A": {"ticker": "TEST-A", "status": "active"}},
+        exchange_orders=[exchange_order], preview_paper_simulation_alert_ids=[1], log_dir=logs,
+    )
+    assert plan["repairs"] == []
+    assert "exchange order history" in " ".join(plan["manual_review"][0]["manual_review_reasons"])
+
+
 def test_duplicate_local_positions_require_manual_review(tmp_path):
     path = tmp_path / "ledger.db"
     database(path)
@@ -189,6 +236,93 @@ def test_changed_quantity_live_or_side_aborts(tmp_path, column, value):
         db.commit()
     with pytest.raises(RuntimeError, match="changed after preview"):
         apply_plan(path, plan)
+
+
+@pytest.mark.asyncio
+async def test_manual_exchange_position_is_separate_and_does_not_fabricate_fill_or_pnl(tmp_path):
+    path = tmp_path / "manual.db"
+    await DatabaseManager(str(path)).initialize()
+    with sqlite3.connect(path) as db:
+        db.execute("""
+            INSERT INTO reconciliation_alerts
+            (id, severity, kind, market_id, expected_value, observed_value,
+             first_seen_at, last_seen_at)
+            VALUES (25, 'critical', 'position_mismatch_yes', 'ATP', '0', '1.67', 'now', 'now')
+        """)
+        db.commit()
+    order = SimpleNamespace(market_id="ATP", order_id="manual-order", client_order_id="", status="executed")
+    fill = SimpleNamespace(market_id="ATP", order_id="manual-order", fill_id="manual-fill")
+    plan = build_account_activity_repairs(
+        path, {("ATP", "YES"): 1.67}, [order], [fill], {"ATP": {"status": "active"}},
+        manual_positions=[("ATP", "YES")],
+    )
+    assert plan["manual_review"] == []
+    assert plan["repairs"][0]["invented_bot_fill"] is False
+    assert plan["repairs"][0]["invented_pnl"] is False
+    assert apply_account_activity_repairs(path, plan) == 1
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT market_id, side, quantity, source FROM external_account_positions").fetchone() == (
+            "ATP", "YES", 1.67, "manual_exchange_activity"
+        )
+        assert db.execute("SELECT COUNT(*) FROM order_fills").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM trade_logs").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_unverified_order_requires_complete_history_absence(tmp_path):
+    path = tmp_path / "order.db"
+    await DatabaseManager(str(path)).initialize()
+    with sqlite3.connect(path) as db:
+        db.execute("""
+            INSERT INTO orders
+            (id, client_order_id, submission_fingerprint, environment, strategy, market_id, side, action,
+             order_type, requested_quantity, remaining_quantity, state, created_at)
+            VALUES (2, 'uncertain-client', 'fingerprint-1', 'production', 'test', 'FINAL', 'YES', 'sell',
+                    'limit', 30, 30, 'verification_failed', 'now')
+        """)
+        db.execute("""
+            INSERT INTO reconciliation_alerts
+            (id, severity, kind, order_id, market_id, first_seen_at, last_seen_at)
+            VALUES (18, 'critical', 'live_order_verification_failed', 2, 'FINAL', 'now', 'now')
+        """)
+        db.commit()
+    plan = build_account_activity_repairs(
+        path, {}, [], [], {"FINAL": {"status": "finalized", "result": "no"}},
+        terminal_order_alert_ids=[18],
+    )
+    assert plan["manual_review"] == []
+    assert plan["repairs"][0]["record_after"]["state"] == "expired"
+    assert apply_account_activity_repairs(path, plan) == 1
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT state, filled_quantity FROM orders WHERE id=2").fetchone() == ("expired", 0.0)
+        assert db.execute("SELECT COUNT(*) FROM order_fills").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_unverified_order_blocks_when_exchange_match_exists(tmp_path):
+    path = tmp_path / "order-match.db"
+    await DatabaseManager(str(path)).initialize()
+    with sqlite3.connect(path) as db:
+        db.execute("""
+            INSERT INTO orders
+            (id, client_order_id, submission_fingerprint, environment, strategy, market_id, side, action,
+             order_type, requested_quantity, remaining_quantity, state, created_at)
+            VALUES (2, 'uncertain-client', 'fingerprint-2', 'production', 'test', 'FINAL', 'YES', 'sell',
+                    'limit', 30, 30, 'verification_failed', 'now')
+        """)
+        db.execute("""
+            INSERT INTO reconciliation_alerts
+            (id, severity, kind, order_id, market_id, first_seen_at, last_seen_at)
+            VALUES (18, 'critical', 'live_order_verification_failed', 2, 'FINAL', 'now', 'now')
+        """)
+        db.commit()
+    remote = SimpleNamespace(market_id="FINAL", order_id="remote", client_order_id="uncertain-client", status="executed")
+    plan = build_account_activity_repairs(
+        path, {}, [remote], [], {"FINAL": {"status": "finalized", "result": "no"}},
+        terminal_order_alert_ids=[18],
+    )
+    assert plan["repairs"] == []
+    assert "authoritative order or fill exists" in " ".join(plan["manual_review"][0]["manual_review_reasons"])
 
 
 def test_only_exact_alert_ids_are_resolved(tmp_path):

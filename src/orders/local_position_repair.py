@@ -79,6 +79,31 @@ def active_order_snapshot(orders: Iterable[Any]) -> list[dict]:
     return sorted(result, key=lambda row: (row["market_id"], row["side"], row["order_id"]))
 
 
+def exchange_history_snapshot(records: Iterable[Any], record_type: str) -> list[dict]:
+    """Normalize identity-only order/fill history for fail-closed repair evidence."""
+    if record_type not in {"order", "fill"}:
+        raise ValueError("record_type must be order or fill")
+    result = []
+    for record in records:
+        market_id = str(getattr(record, "market_id", "") or "").strip()
+        order_id = str(getattr(record, "order_id", "") or "").strip()
+        if not market_id or not order_id:
+            raise ValueError(f"{record_type} history response is malformed")
+        row = {"market_id": market_id, "order_id": order_id}
+        if record_type == "order":
+            row.update({
+                "client_order_id": str(getattr(record, "client_order_id", "") or ""),
+                "status": str(getattr(record, "status", "") or "").lower(),
+            })
+        else:
+            fill_id = str(getattr(record, "fill_id", "") or "").strip()
+            if not fill_id:
+                raise ValueError("fill history response is malformed")
+            row["fill_id"] = fill_id
+        result.append(row)
+    return sorted(result, key=lambda row: tuple(str(row[key]) for key in sorted(row)))
+
+
 def local_candidates(db_path: Path, remote: dict[tuple[str, str], float]) -> list[dict]:
     with sqlite3.connect(db_path) as db:
         db.row_factory = sqlite3.Row
@@ -173,8 +198,13 @@ def market_snapshot(markets: dict[str, Any]) -> dict[str, dict]:
 def build_plan(
     db_path: Path, candidates: list[dict], markets: dict[str, Any],
     active_orders: Iterable[Any] = (), remote_positions: dict[tuple[str, str], float] | None = None,
+    exchange_orders: Iterable[Any] = (), exchange_fills: Iterable[Any] = (),
+    preview_paper_simulation_alert_ids: Iterable[int] = (), log_dir: Path | None = None,
 ) -> dict:
     active = active_order_snapshot(active_orders)
+    order_history = exchange_history_snapshot(exchange_orders, "order")
+    fill_history = exchange_history_snapshot(exchange_fills, "fill")
+    approved_paper_alerts = {int(value) for value in preview_paper_simulation_alert_ids}
     active_keys = {(row["market_id"], row["side"]) for row in active}
     counts: dict[tuple[str, str], int] = {}
     for position in candidates:
@@ -192,10 +222,57 @@ def build_plan(
                 blockers.append("authoritative active order exists for market and side")
             if counts[key] > 1:
                 blockers.append("duplicate local positions require manual review")
-            if not terminal:
-                blockers.append(reason)
             orders = _local_orders(db, position["id"], position["market_id"], side)
             alert_ids = _alert_ids(db, position["market_id"], side)
+            paper_approved = bool(alert_ids) and set(alert_ids) <= approved_paper_alerts
+            if paper_approved:
+                market = _market_payload(markets.get(position["market_id"], {}))
+                if str(market.get("ticker") or position["market_id"]) != position["market_id"]:
+                    blockers.append("authoritative market identity changed")
+                if orders:
+                    blockers.append("local exchange order history exists")
+                if any(row["market_id"] == position["market_id"] for row in order_history):
+                    blockers.append("authoritative exchange order history exists")
+                if any(row["market_id"] == position["market_id"] for row in fill_history):
+                    blockers.append("authoritative exchange fill history exists")
+                for table in ("order_fills", "position_fill_projections", "order_state_events", "trade_logs"):
+                    try:
+                        if table == "trade_logs":
+                            count = db.execute(
+                                "SELECT COUNT(*) FROM trade_logs WHERE market_id = ?",
+                                (position["market_id"],),
+                            ).fetchone()[0]
+                        else:
+                            count = db.execute(f"""
+                                SELECT COUNT(*) FROM {table} item
+                                JOIN orders linked ON linked.id = item.order_id
+                                WHERE linked.market_id = ?
+                            """, (position["market_id"],)).fetchone()[0]
+                    except sqlite3.OperationalError:
+                        count = 0
+                    if count:
+                        blockers.append(f"local {table} history exists")
+                log_text = ""
+                if log_dir and log_dir.is_dir():
+                    for path in sorted(log_dir.glob("*.log")):
+                        try:
+                            text = path.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        if position["market_id"] in text:
+                            log_text += text
+                required = (
+                    f"live_mode=False for market {position['market_id']}",
+                    f"PAPER TRADE SIMULATED for {position['market_id']}",
+                )
+                if not all(value in log_text for value in required):
+                    blockers.append("contemporaneous paper-simulation log evidence is incomplete")
+                if not blockers:
+                    classification = "paper_simulation"
+                    reason = "contemporaneous logs prove a paper simulation misclassified as live"
+                    terminal = True
+            if not terminal:
+                blockers.append(reason)
             before = {
                 "id": int(position["id"]), "market_id": position["market_id"],
                 "side": side, "live": int(position["live"]),
@@ -212,6 +289,11 @@ def build_plan(
             if blockers:
                 manual.append({**base, "manual_review_reasons": blockers})
                 continue
+            reconciliation_after = (
+                "administratively_reconciled_paper_simulation"
+                if classification == "paper_simulation"
+                else f"administratively_reconciled_exchange_zero_{classification}"
+            )
             repairs.append({
                 **base,
                 "why_it_remained_open": reason,
@@ -220,7 +302,7 @@ def build_plan(
                     "open_quantity": {"before": position["open_quantity"], "after": 0.0},
                     "reconciliation_status": {
                         "before": position["reconciliation_status"],
-                        "after": f"administratively_reconciled_exchange_zero_{classification}",
+                        "after": reconciliation_after,
                     },
                     "last_reconciled_at": {
                         "before": position["last_reconciled_at"], "after": "<apply_timestamp>",
@@ -233,6 +315,8 @@ def build_plan(
             for key, quantity in (remote_positions or {}).items()
         ], key=lambda row: (row["market_id"], row["side"])),
         "active_orders": active,
+        "orders": order_history,
+        "fills": fill_history,
         "markets": market_snapshot(markets),
     }
     canonical = json.dumps(
@@ -261,6 +345,180 @@ def ensure_audit_table(db: sqlite3.Connection) -> None:
             UNIQUE(plan_id, position_id)
         )
     """)
+
+
+def build_account_activity_repairs(
+    db_path: Path, remote_positions: dict[tuple[str, str], float],
+    exchange_orders: Iterable[Any], exchange_fills: Iterable[Any], markets: dict[str, Any],
+    manual_positions: Iterable[tuple[str, str]] = (), terminal_order_alert_ids: Iterable[int] = (),
+) -> dict:
+    """Plan explicit manual-position acknowledgements and terminal uncertain intents."""
+    order_history = exchange_history_snapshot(exchange_orders, "order")
+    fill_history = exchange_history_snapshot(exchange_fills, "fill")
+    repairs, manual_review = [], []
+    now_marker = "<apply_timestamp>"
+    with sqlite3.connect(db_path) as db:
+        db.row_factory = sqlite3.Row
+        for market_id, raw_side in sorted(set(manual_positions)):
+            side = raw_side.upper()
+            quantity = remote_positions.get((market_id, side))
+            alert = db.execute("""
+                SELECT id, expected_value, observed_value FROM reconciliation_alerts
+                WHERE resolved_at IS NULL AND severity = 'critical' AND market_id = ?
+                  AND kind = ? ORDER BY id DESC LIMIT 1
+            """, (market_id, f"position_mismatch_{side.lower()}")).fetchone()
+            related_orders = [row for row in order_history if row["market_id"] == market_id]
+            related_fills = [row for row in fill_history if row["market_id"] == market_id]
+            blockers = []
+            if quantity is None or quantity <= 0:
+                blockers.append("authoritative manual exchange position is absent")
+            if not related_orders or not related_fills:
+                blockers.append("complete exchange order/fill evidence is absent")
+            if alert is None:
+                blockers.append("exact unresolved position-mismatch alert is absent")
+            existing = db.execute("""
+                SELECT id, quantity, status FROM external_account_positions
+                WHERE market_id = ? AND side = ? AND status = 'active'
+            """, (market_id, side)).fetchone()
+            base = {
+                "repair_type": "manual_exchange_position", "market_id": market_id,
+                "side": side, "quantity": quantity, "alert_id": int(alert["id"]) if alert else None,
+                "alert_before": dict(alert) if alert else None,
+                "exchange_orders": related_orders, "exchange_fills": related_fills,
+            }
+            if any(row["status"] in ACTIVE_ORDER_STATES for row in related_orders):
+                blockers.append("authoritative active order exists for manual position")
+            if existing and float(existing["quantity"]) != float(quantity or 0):
+                blockers.append("existing manual-position acknowledgement differs")
+            if blockers:
+                manual_review.append({**base, "manual_review_reasons": blockers})
+            else:
+                repairs.append({
+                    **base, "record_before": dict(existing) if existing else None,
+                    "record_after": {
+                        "market_id": market_id, "side": side, "quantity": quantity,
+                        "source": "manual_exchange_activity", "status": "active",
+                        "last_verified_at": now_marker,
+                    },
+                    "invented_bot_fill": False, "invented_pnl": False,
+                })
+
+        for alert_id in sorted({int(value) for value in terminal_order_alert_ids}):
+            alert = db.execute("""
+                SELECT id, order_id, market_id, kind FROM reconciliation_alerts
+                WHERE id = ? AND resolved_at IS NULL AND severity = 'critical'
+            """, (alert_id,)).fetchone()
+            order = db.execute("SELECT * FROM orders WHERE id = ?", (alert["order_id"],)).fetchone() if alert and alert["order_id"] else None
+            blockers = []
+            if alert is None or alert["kind"] != "live_order_verification_failed":
+                blockers.append("exact unresolved live-order verification alert is absent")
+            if order is None or order["state"] != "verification_failed":
+                blockers.append("local order is not verification_failed")
+            market_id = str(alert["market_id"] if alert else (order["market_id"] if order else ""))
+            _, _, terminal = classify(markets.get(market_id, {}))
+            if not terminal:
+                blockers.append("market is not authoritatively terminal")
+            if order:
+                matches = [row for row in order_history if (
+                    (order["exchange_order_id"] and row["order_id"] == order["exchange_order_id"])
+                    or (order["client_order_id"] and row.get("client_order_id") == order["client_order_id"])
+                )]
+                fill_matches = [row for row in fill_history if order["exchange_order_id"] and row["order_id"] == order["exchange_order_id"]]
+                if matches or fill_matches:
+                    blockers.append("authoritative order or fill exists for uncertain submission")
+            base = {
+                "repair_type": "terminal_unverified_order", "alert_id": alert_id,
+                "order_id": int(order["id"]) if order else None, "market_id": market_id,
+                "alert_before": dict(alert) if alert else None,
+            }
+            if blockers:
+                manual_review.append({**base, "manual_review_reasons": blockers})
+            else:
+                repairs.append({
+                    **base, "record_before": {
+                        "id": int(order["id"]), "state": order["state"],
+                        "exchange_order_id": order["exchange_order_id"],
+                        "client_order_id": order["client_order_id"],
+                        "filled_quantity": order["filled_quantity"],
+                    },
+                    "record_after": {
+                        "state": "expired", "exchange_status": "no_record_in_complete_history",
+                        "terminal_at": now_marker,
+                    },
+                    "invented_fill": False, "invented_pnl": False,
+                })
+    canonical = json.dumps({"repairs": repairs, "manual_review": manual_review}, sort_keys=True, separators=(",", ":"))
+    return {"repairs": repairs, "manual_review": manual_review, "plan_id": hashlib.sha256(canonical.encode()).hexdigest()}
+
+
+def apply_account_activity_repairs(db_path: Path, plan: dict) -> int:
+    """Apply exact administrative repairs atomically without any exchange capability."""
+    now = utcnow()
+    applied = 0
+    with sqlite3.connect(db_path) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN IMMEDIATE")
+        for repair in plan["repairs"]:
+            alert = db.execute("SELECT * FROM reconciliation_alerts WHERE id = ?", (repair["alert_id"],)).fetchone()
+            if alert is None or alert["resolved_at"] is not None:
+                raise RuntimeError("exact approved alert changed after preview")
+            for key, value in (repair.get("alert_before") or {}).items():
+                if alert[key] != value:
+                    raise RuntimeError("exact approved alert changed after preview")
+            if repair["repair_type"] == "manual_exchange_position":
+                existing = db.execute("""
+                    SELECT id, quantity, status FROM external_account_positions
+                    WHERE market_id=? AND side=? AND status='active'
+                """, (repair["market_id"], repair["side"])).fetchone()
+                if (dict(existing) if existing else None) != repair.get("record_before"):
+                    raise RuntimeError("manual-position acknowledgement changed after preview")
+                db.execute("""
+                    INSERT INTO external_account_positions
+                    (market_id, side, quantity, source, exchange_order_id, exchange_fill_id,
+                     first_observed_at, last_verified_at, status, metadata_json)
+                    VALUES (?, ?, ?, 'manual_exchange_activity', ?, ?, ?, ?, 'active', ?)
+                    ON CONFLICT(market_id, side, status) DO UPDATE SET
+                        quantity=excluded.quantity, last_verified_at=excluded.last_verified_at,
+                        metadata_json=excluded.metadata_json
+                """, (
+                    repair["market_id"], repair["side"], repair["quantity"],
+                    repair["exchange_orders"][0]["order_id"], repair["exchange_fills"][0]["fill_id"],
+                    now, now, json.dumps({"bot_fill": False, "pnl": None}, sort_keys=True),
+                ))
+                record_type, record_id = "external_account_position", None
+            else:
+                row = db.execute("SELECT state, exchange_order_id, client_order_id, filled_quantity FROM orders WHERE id = ?", (repair["order_id"],)).fetchone()
+                expected = repair["record_before"]
+                current = {"id": repair["order_id"], **dict(row)} if row else None
+                if current != expected:
+                    raise RuntimeError("uncertain order changed after preview")
+                db.execute("""
+                    UPDATE orders SET state='expired', exchange_status='no_record_in_complete_history',
+                        terminal_at=?, verification_error='administratively expired after complete history verification'
+                    WHERE id=?
+                """, (now, repair["order_id"]))
+                db.execute("""
+                    INSERT INTO order_state_events
+                    (order_id, from_state, to_state, source, reason, exchange_status, created_at)
+                    VALUES (?, 'verification_failed', 'expired', 'administrative_reconciliation',
+                            'terminal market and no order/fill in complete exchange history',
+                            'no_record_in_complete_history', ?)
+                """, (repair["order_id"], now))
+                record_type, record_id = "order", repair["order_id"]
+            updated = db.execute("UPDATE reconciliation_alerts SET resolved_at=? WHERE id=? AND resolved_at IS NULL", (now, repair["alert_id"]))
+            if updated.rowcount != 1:
+                raise RuntimeError("exact approved alert could not be resolved")
+            db.execute("""
+                INSERT INTO reconciliation_admin_repair_audit
+                (plan_id, repair_type, alert_id, local_record_type, local_record_id,
+                 market_id, before_json, after_json, applied_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (plan["plan_id"], repair["repair_type"], repair["alert_id"], record_type,
+                  record_id, repair.get("market_id"), json.dumps(repair.get("record_before"), sort_keys=True),
+                  json.dumps(repair["record_after"], sort_keys=True), now))
+            applied += 1
+        db.commit()
+    return applied
 
 
 def apply_plan(db_path: Path, plan: dict) -> int:

@@ -599,6 +599,15 @@ class OrderRepository:
                 WHERE live = 1 AND status IN ('open', 'pending')
             """)
             risk = dict(await risk_cursor.fetchone())
+            try:
+                external_cursor = await db.execute("""
+                    SELECT COUNT(*) AS open_positions,
+                           COALESCE(SUM(quantity), 0) AS conservative_total_risk
+                    FROM external_account_positions WHERE status = 'active'
+                """)
+                external_risk = dict(await external_cursor.fetchone())
+            except aiosqlite.OperationalError:
+                external_risk = {"open_positions": 0, "conservative_total_risk": 0}
             pnl_cursor = await db.execute("""
                 SELECT COALESCE(SUM(pnl), 0) AS daily_pnl
                 FROM trade_logs WHERE substr(exit_timestamp, 1, 10) = ?
@@ -644,8 +653,8 @@ class OrderRepository:
                 except (TypeError, ValueError):
                     market_data_stale = True
             return {
-                "open_positions": int(risk["open_positions"]),
-                "total_risk": float(risk["total_risk"]),
+                "open_positions": int(risk["open_positions"]) + int(external_risk["open_positions"]),
+                "total_risk": float(risk["total_risk"]) + float(external_risk["conservative_total_risk"]),
                 "daily_pnl": daily_pnl + unrealized_pnl,
                 "consecutive_rejections": consecutive_rejections,
                 "market_data_stale": market_data_stale or any_open_market_stale,
@@ -800,4 +809,15 @@ class OrderRepository:
                 SELECT id, market_id, side, quantity, status, live
                 FROM positions WHERE live = 1 AND status IN ('open', 'pending')
             """)
-            return [dict(row) for row in await cursor.fetchall()]
+            positions = [dict(row) for row in await cursor.fetchall()]
+            try:
+                cursor = await db.execute("""
+                    SELECT id, market_id, side, quantity, status, 1 AS live
+                    FROM external_account_positions WHERE status = 'active'
+                """)
+                positions.extend(dict(row) for row in await cursor.fetchall())
+            except aiosqlite.OperationalError:
+                # Legacy databases are migrated before production reconciliation;
+                # retaining this fallback keeps read-only compatibility fail-neutral.
+                pass
+            return positions

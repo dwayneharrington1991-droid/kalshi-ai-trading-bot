@@ -218,6 +218,25 @@ async def test_shadow_mode_detects_position_mismatch_without_mutating_position(r
     assert after == before
 
 
+async def test_verified_manual_exchange_position_reconciles_without_bot_fill(repository):
+    async with aiosqlite.connect(repository.db_path) as db:
+        await db.execute("""
+            INSERT INTO external_account_positions
+            (market_id, side, quantity, source, exchange_order_id, exchange_fill_id,
+             first_observed_at, last_verified_at, status, metadata_json)
+            VALUES ('MANUAL', 'YES', 1.67, 'manual_exchange_activity', 'order-x', 'fill-x',
+                    'now', 'now', 'active', '{"bot_fill": false, "pnl": null}')
+        """)
+        await db.commit()
+    result = await OrderReconciler(
+        repository, FakeKalshiClient(positions=[{"ticker": "MANUAL", "position_fp": "1.67"}]),
+    ).reconcile(full=True)
+    assert result.mismatch_count == 0
+    async with aiosqlite.connect(repository.db_path) as db:
+        assert (await (await db.execute("SELECT COUNT(*) FROM order_fills")).fetchone())[0] == 0
+        assert (await (await db.execute("SELECT COUNT(*) FROM trade_logs")).fetchone())[0] == 0
+
+
 async def test_paper_mode_never_calls_exchange_or_writes_run(repository):
     client = FakeKalshiClient(failure=AssertionError("exchange must not be called"))
     result = await OrderReconciler(repository, client, paper_mode=True).reconcile()

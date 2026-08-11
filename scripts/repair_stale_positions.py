@@ -245,6 +245,8 @@ async def run(args, environment: dict[str, str], progress: dict | None = None) -
                 source, read_client, paper_alert_ids, manual_positions, terminal_order_alert_ids
             )
             assert_plan_unchanged(plan, second_plan)
+            progress["stage"] = "initialize_source_schema"
+            await DatabaseManager(str(source)).initialize()
             progress["stage"] = "apply_exact_plan"
             applied = apply_plan(source, plan)
             account_plan = {"plan_id": plan["plan_id"], "repairs": plan["account_activity_repairs"]}

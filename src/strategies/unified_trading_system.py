@@ -82,6 +82,13 @@ class TradingSystemConfig:
     profit_taking_threshold: float = 0.25  # Take profits at 25%
     loss_cutting_threshold: float = 0.10  # Cut losses at 10%
 
+    # Runtime safety.  Market making performs one API/model analysis per
+    # market, so it must never receive the entire persisted market universe.
+    # These controls affect analysis throughput only; they do not change any
+    # execution, sizing, probability, or risk policy.
+    market_making_scan_limit: int = 20
+    market_making_analysis_timeout_seconds: float = 20.0
+
 
 @dataclass
 class TradingSystemResults:
@@ -340,10 +347,35 @@ class UnifiedAdvancedTradingSystem:
         Execute market making strategy for spread profits.
         """
         try:
-            self.logger.info(f"🎯 Executing Market Making Strategy on {len(markets)} markets")
+            scan_limit = max(1, int(self.config.market_making_scan_limit))
+            bounded_markets = sorted(
+                markets,
+                key=lambda market: float(getattr(market, "volume", 0.0) or 0.0),
+                reverse=True,
+            )[:scan_limit]
+            timeout_seconds = max(
+                0.1, float(self.config.market_making_analysis_timeout_seconds)
+            )
+            self.logger.info(
+                "🎯 Executing Market Making Strategy on %s/%s markets "
+                "(scan_limit=%s, analysis_timeout_seconds=%.1f)",
+                len(bounded_markets), len(markets), scan_limit, timeout_seconds,
+            )
             
-            # Analyze market making opportunities
-            opportunities = await self.market_maker.analyze_market_making_opportunities(markets)
+            # The analysis phase is read-only.  Bound and cancel it before it
+            # can block the unified cycle indefinitely on a slow provider.
+            try:
+                opportunities = await asyncio.wait_for(
+                    self.market_maker.analyze_market_making_opportunities(bounded_markets),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    "Market-making analysis timed out after %.1fs; branch cancelled "
+                    "and returning an empty result",
+                    timeout_seconds,
+                )
+                return {'orders_placed': 0, 'expected_profit': 0.0}
             
             if not opportunities:
                 self.logger.warning("No market making opportunities found")

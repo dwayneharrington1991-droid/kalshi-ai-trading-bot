@@ -7,6 +7,22 @@ from typing import Any, Optional
 
 
 MAX_UNVALIDATED_PROBABILITY_GAP = 0.25
+MIN_DIRECTIONAL_MODEL_CONFIDENCE = 0.35
+
+
+def validate_directional_model_confidence(confidence: Any) -> tuple[bool, str]:
+    """Validate model self-confidence separately from trade economics."""
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return False, "model confidence is malformed"
+    value = float(confidence)
+    if not 0 <= value <= 1:
+        return False, "model confidence is outside 0%-100%"
+    if value < MIN_DIRECTIONAL_MODEL_CONFIDENCE:
+        return False, (
+            f"model confidence {value:.1%} below minimum "
+            f"{MIN_DIRECTIONAL_MODEL_CONFIDENCE:.1%}"
+        )
+    return True, f"model confidence {value:.1%} meets minimum"
 
 
 @dataclass(frozen=True)

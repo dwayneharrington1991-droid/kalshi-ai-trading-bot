@@ -25,6 +25,7 @@ from src.strategies.directional_policy import (
     classify_market_phase,
     evaluate_directional_candidate,
     executable_liquidity,
+    validate_directional_model_confidence,
 )
 from src.strategies.portfolio.immediate import _get_fast_ai_prediction
 from src.strategies.sports_markets import admit_event_exposure
@@ -112,7 +113,10 @@ async def run(max_model_calls: int, limit: int) -> int:
             liquidity = executable_liquidity(
                 orderbook, result.side, result.market_implied_probability
             )
-            if result.accepted and liquidity >= requested_quantity:
+            confidence_ok, _confidence_reason = validate_directional_model_confidence(
+                confidence
+            )
+            if result.accepted and confidence_ok and liquidity >= requested_quantity:
                 remaining_minutes = max(0.0, (market.expiration_ts - time.time()) / 60)
                 results.append((
                     result, confidence, market.title, market.category,

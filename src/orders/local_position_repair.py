@@ -376,10 +376,15 @@ def build_account_activity_repairs(
                 blockers.append("complete exchange order/fill evidence is absent")
             if alert is None:
                 blockers.append("exact unresolved position-mismatch alert is absent")
-            existing = db.execute("""
-                SELECT id, quantity, status FROM external_account_positions
-                WHERE market_id = ? AND side = ? AND status = 'active'
-            """, (market_id, side)).fetchone()
+            try:
+                existing = db.execute("""
+                    SELECT id, quantity, status FROM external_account_positions
+                    WHERE market_id = ? AND side = ? AND status = 'active'
+                """, (market_id, side)).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                existing = None
             base = {
                 "repair_type": "manual_exchange_position", "market_id": market_id,
                 "side": side, "quantity": quantity, "alert_id": int(alert["id"]) if alert else None,

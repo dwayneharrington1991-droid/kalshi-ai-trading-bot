@@ -6,6 +6,7 @@ former 1,300-line portfolio_optimization.py.
 """
 
 import logging
+from collections import Counter
 import numpy as np
 from dataclasses import replace
 from datetime import datetime
@@ -32,6 +33,50 @@ from src.strategies.directional_policy import (
 from src.strategies.sports_markets import classify_sports_market_type, event_correlation_group
 
 
+def select_directional_analysis_markets(
+    markets: List[Market],
+    *,
+    limit: int,
+    min_probability: float,
+    max_probability: float,
+) -> tuple[List[Market], int]:
+    """Choose a bounded AI shortlist without pre-approving any trade.
+
+    The former volume-only shortlist was incompatible with the directional
+    policy: the complete AI budget could be spent on markets whose *cached*
+    quote was already outside the policy's executable probability band.  This
+    helper uses the locally ingested midpoint only as a routing hint.  Every
+    chosen market is still re-read from Kalshi and must pass the unchanged
+    quote, probability, edge, EV, liquidity, freshness, and execution gates.
+
+    Returns the bounded shortlist and the number of inputs whose cached YES or
+    NO midpoint was in the preferred price band.
+    """
+    bounded_limit = max(1, int(limit))
+
+    def volume_key(market: Market) -> float:
+        try:
+            return float(market.volume or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def in_preferred_price_band(market: Market) -> bool:
+        for value in (market.yes_price, market.no_price):
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if min_probability <= price <= max_probability:
+                return True
+        return False
+
+    ranked = sorted(markets, key=volume_key, reverse=True)
+    preferred = [market for market in ranked if in_preferred_price_band(market)]
+    preferred_ids = {market.market_id for market in preferred}
+    fallback = [market for market in ranked if market.market_id not in preferred_ids]
+    return (preferred + fallback)[:bounded_limit], len(preferred)
+
+
 async def create_market_opportunities_from_markets(
     markets: List[Market],
     xai_client: XAIClient,
@@ -44,28 +89,43 @@ async def create_market_opportunities_from_markets(
     """
     logger = get_trading_logger("portfolio_opportunities")
     opportunities = []
+    rejection_counts: Counter[str] = Counter()
+    input_market_count = len(markets)
     
     # Limit markets to prevent excessive AI costs and focus on best opportunities
-    max_markets_to_analyze = 10  # REDUCED: More selective (was 20, now 10) to focus on highest quality
-    if len(markets) > max_markets_to_analyze:
-        # Sort by volume and take top markets
-        markets = sorted(markets, key=lambda m: m.volume, reverse=True)[:max_markets_to_analyze]
-        logger.info(f"Limited to top {max_markets_to_analyze} markets by volume for AI analysis")
+    max_markets_to_analyze = 10
+    markets, preferred_price_candidates = select_directional_analysis_markets(
+        markets,
+        limit=max_markets_to_analyze,
+        min_probability=settings.trading.min_preferred_probability,
+        max_probability=settings.trading.max_preferred_probability,
+    )
+    if input_market_count > max_markets_to_analyze:
+        logger.info(
+            "Directional AI shortlist selected %s/%s markets; %s had a cached "
+            "YES or NO midpoint in the existing preferred price band",
+            len(markets), input_market_count, preferred_price_candidates,
+        )
     
     for market in markets:
         try:
             # Get current market data
             market_data = await kalshi_client.get_market(market.market_id)
-            if not market_data:
+            if not isinstance(market_data, dict) or not market_data:
+                rejection_counts["market lookup returned no usable market response"] += 1
                 continue
             
             # FIXED: Extract from nested 'market' object (same fix as immediate trading)
             market_info = market_data.get('market', {})
+            if not isinstance(market_info, dict) or not market_info:
+                rejection_counts["market response missing market payload"] += 1
+                continue
             yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_info)
             market_prob = yes_ask
             
             # Skip markets with extreme prices (too risky for portfolio)
             if market_prob < 0.05 or market_prob > 0.95:
+                rejection_counts["YES executable price outside 5%-95% safety range"] += 1
                 continue
             
             # Get REAL AI prediction using fast analysis
@@ -76,6 +136,7 @@ async def create_market_opportunities_from_markets(
             # If AI analysis failed, skip this market
             if predicted_prob is None or confidence is None:
                 logger.warning(f"AI analysis failed for {market.market_id}, skipping")
+                rejection_counts["AI prediction unavailable or malformed"] += 1
                 continue
             
             sports_phase = classify_market_phase(
@@ -136,12 +197,18 @@ async def create_market_opportunities_from_markets(
                 )
             log_directional_evaluation(logger, evaluation)
             if not evaluation.accepted:
+                rejection_counts[evaluation.reason] += 1
                 continue
 
-            edge = predicted_prob - market_prob
+            # Normalize all downstream portfolio fields to the selected side.
+            # A valid NO trade previously retained the YES-relative edge and
+            # was then interpreted as a negative-edge bet by Kelly/allocation.
+            edge = evaluation.gross_edge
             expected_return = evaluation.estimated_net_return
-            volatility = np.sqrt(market_prob * (1 - market_prob))
-            max_loss = market_prob if edge > 0 else (1 - market_prob)
+            side_market_probability = evaluation.market_implied_probability
+            side_probability = evaluation.estimated_probability
+            volatility = np.sqrt(side_market_probability * (1 - side_market_probability))
+            max_loss = side_market_probability
             
             # Time to expiry
             time_to_expiry = 30.0  # Default 30 days
@@ -161,8 +228,8 @@ async def create_market_opportunities_from_markets(
                 opportunity = MarketOpportunity(
                     market_id=market.market_id,
                     market_title=market.title,
-                    predicted_probability=predicted_prob,
-                    market_probability=market_prob,
+                    predicted_probability=side_probability,
+                    market_probability=side_market_probability,
                     confidence=confidence,
                     edge=edge,
                     volatility=volatility,
@@ -177,8 +244,8 @@ async def create_market_opportunities_from_markets(
                     sortino_ratio=0.0,
                     max_drawdown_contribution=0.0,
                     recommended_side=evaluation.side,
-                    side_probability=evaluation.estimated_probability,
-                    side_market_probability=evaluation.market_implied_probability,
+                    side_probability=side_probability,
+                    side_market_probability=side_market_probability,
                     net_expected_return=evaluation.estimated_net_return,
                     ranking_score=evaluation.ranking_score,
                     category=market.category,
@@ -192,9 +259,10 @@ async def create_market_opportunities_from_markets(
                     proposed_quantity=evaluation.proposed_quantity,
                 )
                 
-                # Preserve the legacy YES-relative edge consumed by the optimizer.
+                # ``edge`` is side-aware so the optimizer never treats a valid
+                # NO opportunity as a negative-edge YES opportunity.
                 opportunity.edge = edge
-                opportunity.edge_percentage = abs(edge)
+                opportunity.edge_percentage = edge
                 opportunity.recommended_side = evaluation.side
                 
                 opportunities.append(opportunity)
@@ -208,15 +276,26 @@ async def create_market_opportunities_from_markets(
                 if db_manager:
                     await _evaluate_immediate_trade(opportunity, db_manager, kalshi_client, total_capital)
             else:
+                rejection_counts[confidence_reason] += 1
                 logger.info(
                     f"❌ MODEL CONFIDENCE FILTERED: {market.market_id} - "
                     f"{confidence_reason}"
                 )
             
         except Exception as e:
+            rejection_counts[f"unexpected {type(e).__name__}"] += 1
             logger.error(f"Error creating opportunity from {market.market_id}: {e}")
             continue
     
+    logger.info(
+        "DIRECTIONAL_OPPORTUNITY_SUMMARY input_markets=%s shortlisted=%s "
+        "cached_preferred_price_candidates=%s opportunities=%s rejection_counts=%s",
+        input_market_count,
+        len(markets),
+        preferred_price_candidates,
+        len(opportunities),
+        dict(sorted(rejection_counts.items())),
+    )
     logger.info(f"Created {len(opportunities)} opportunities from {len(markets)} markets")
     return opportunities
 
@@ -380,16 +459,23 @@ async def _evaluate_immediate_trade(
         
         # NO DOLLAR MINIMUM - we'll ensure at least 1 contract below
         
-        # Determine side based on edge direction
-        side = "NO" if opportunity.edge < 0 else "YES"  # Negative edge = market overpriced = bet NO
-        
-        # Calculate proper entry price (what we expect to pay)
-        if side == "YES":
-            entry_price = opportunity.market_probability  # Price for YES shares
-            shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
-        else:
-            entry_price = 1 - opportunity.market_probability  # Price for NO shares  
-            shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
+        # The opportunity is already normalized to the selected side.  Never
+        # infer a NO purchase from a negative YES-relative edge: that legacy
+        # convention would invert the executable entry price after a valid NO
+        # decision had cleared the centralized policy.
+        side = opportunity.recommended_side
+        entry_price = float(
+            opportunity.side_market_probability or opportunity.market_probability
+        )
+        if side not in {"YES", "NO"} or not 0 < entry_price < 1:
+            logger.warning(
+                "Skipping immediate trade with invalid selected-side quote",
+                market_id=opportunity.market_id,
+                side=side,
+                entry_price=entry_price,
+            )
+            return
+        shares = max(1, int(position_size / entry_price))
         
         # Verify we can afford at least 1 contract
         min_cost = shares * entry_price
@@ -485,17 +571,25 @@ async def _evaluate_immediate_trade(
 def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
     """Calculate simple Kelly fraction for immediate trading.
 
-    Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
-    the side selection (YES on positive edge, NO otherwise), the 20% cap, and
-    the legacy 5% fallback for degenerate market prices.
+    Uses the selected-side probability and selected-side executable price.
+    The 20% cap and legacy 5% fallback are retained for degenerate prices.
     """
     try:
-        if opportunity.edge > 0:  # Betting YES
-            p = opportunity.predicted_probability
-            b = binary_market_payout_odds(opportunity.market_probability, bet_yes=True)
-        else:  # Betting NO
-            p = 1 - opportunity.predicted_probability
-            b = binary_market_payout_odds(opportunity.market_probability, bet_yes=False)
+        side = str(getattr(opportunity, "recommended_side", "")).upper()
+        if side not in {"YES", "NO"}:
+            # Backward compatibility for persisted/legacy opportunities that
+            # predate selected-side fields.
+            side = "YES" if opportunity.edge >= 0 else "NO"
+        if opportunity.side_probability > 0 and opportunity.side_market_probability > 0:
+            p = float(opportunity.side_probability)
+            price = float(opportunity.side_market_probability)
+        elif side == "YES":
+            p = float(opportunity.predicted_probability)
+            price = float(opportunity.market_probability)
+        else:
+            p = 1.0 - float(opportunity.predicted_probability)
+            price = 1.0 - float(opportunity.market_probability)
+        b = binary_market_payout_odds(price, bet_yes=True)
 
         if b <= 0:
             return 0.05  # degenerate price (e.g. NO at P=0): keep legacy fallback

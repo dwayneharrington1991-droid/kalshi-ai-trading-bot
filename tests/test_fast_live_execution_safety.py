@@ -21,6 +21,7 @@ class FreshMarketClient:
             "yes_ask_dollars": str(self.yes_ask),
             "no_bid_dollars": str(1 - self.yes_ask - .02),
             "no_ask_dollars": str(1 - self.yes_ask),
+            "close_time": "2099-01-01T00:00:00Z",
         }}
 
     async def get_orderbook(self, ticker, depth=100):
@@ -73,3 +74,11 @@ async def test_fast_live_stale_model_fails_before_exchange_reads():
 async def test_fast_live_insufficient_executable_liquidity_blocks():
     with pytest.raises(ExecutionSafetyError, match="liquidity"):
         await service(FreshMarketClient(liquidity=4))._fresh_directional_gateway(intent())
+
+
+@pytest.mark.asyncio
+async def test_live_sports_without_structured_game_state_fails_closed():
+    with pytest.raises(ExecutionSafetyError, match="structured game state unavailable"):
+        await service(FreshMarketClient())._fresh_directional_gateway(
+            intent(market_category="Sports")
+        )

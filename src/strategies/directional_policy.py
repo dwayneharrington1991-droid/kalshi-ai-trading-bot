@@ -6,6 +6,9 @@ import logging
 from typing import Any, Optional
 
 
+MAX_UNVALIDATED_PROBABILITY_GAP = 0.25
+
+
 @dataclass(frozen=True)
 class DirectionalEvaluation:
     market_id: str
@@ -25,6 +28,8 @@ class DirectionalEvaluation:
     event_title: str = ""
     market_type: str = "OTHER"
     liquidity: float = 0.0
+    proposed_quantity: float = 0.0
+    structured_game_state_available: Optional[bool] = None
     existing_correlated_exposure: float = 0.0
 
     def safe_metadata(self) -> dict[str, Any]:
@@ -75,6 +80,10 @@ def evaluate_directional_candidate(
         accepted, reason = False, f"market-implied side probability {ask:.1%} below preferred minimum {min_probability:.1%}"
     elif gross_edge < min_edge:
         accepted, reason = False, f"gross edge {gross_edge:.1%} below minimum {min_edge:.1%}"
+    elif gross_edge > MAX_UNVALIDATED_PROBABILITY_GAP:
+        accepted, reason = False, (
+            f"extreme model-market discrepancy {gross_edge:.1%} requires additional validation"
+        )
     elif net_return <= 0:
         accepted, reason = False, "estimated return is not positive after spread, fees, and slippage"
     else:
@@ -95,13 +104,17 @@ def log_directional_evaluation(logger: logging.Logger, result: DirectionalEvalua
     logger.info(
         "DIRECTIONAL_CANDIDATE market=%s side=%s implied=%.4f estimated=%.4f "
         "edge=%.4f price=%.4f estimated_profit=%.4f net_return=%.4f net_ev=%.4f sports_phase=%s phase=%s "
-        "event=%s market_type=%s liquidity=%.2f correlated_exposure=%.2f outcome=%s reason=%s metadata=%s",
+        "event=%s market_type=%s liquidity=%.2f proposed_quantity=%.2f "
+        "structured_game_state_available=%s "
+        "correlated_exposure=%.2f outcome=%s reason=%s metadata=%s",
         result.market_id, result.side, result.market_implied_probability,
         result.estimated_probability, result.gross_edge,
         result.market_implied_probability, result.estimated_net_return,
         result.estimated_net_return, result.estimated_net_return, result.sports_phase,
         result.sports_phase, result.event_title,
-        result.market_type, result.liquidity, result.existing_correlated_exposure,
+        result.market_type, result.liquidity, result.proposed_quantity,
+        result.structured_game_state_available,
+        result.existing_correlated_exposure,
         "ACCEPTED" if result.accepted else "REJECTED",
         result.reason, result.safe_metadata(),
     )
@@ -121,20 +134,23 @@ def classify_market_phase(
 ) -> str:
     """Classify every open market; short-duration markets are FAST_LIVE."""
     now = now or datetime.now(timezone.utc)
-    if expiration_ts is None:
-        for key in ("expected_expiration_time", "expiration_time", "close_time"):
-            value = market_info.get(key)
-            if not isinstance(value, str) or not value:
-                continue
-            try:
-                expiration_ts = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-                break
-            except ValueError:
-                continue
+    # Trading close and expected resolution are different clocks. A rapid
+    # contract may close in minutes but settle hours later, so close_time must
+    # always participate in FAST_LIVE classification even when callers provide
+    # the separately persisted expected-resolution timestamp.
+    horizons = []
     if expiration_ts is not None:
-        remaining = expiration_ts - now.timestamp()
-        if 0 <= remaining <= fast_live_minutes * 60:
-            return "FAST_LIVE"
+        horizons.append(float(expiration_ts))
+    for key in ("close_time", "expected_expiration_time", "expiration_time"):
+        value = market_info.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            horizons.append(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            continue
+    if any(0 <= horizon - now.timestamp() <= fast_live_minutes * 60 for horizon in horizons):
+        return "FAST_LIVE"
     live_markers = (
         market_info.get("in_play"), market_info.get("is_live"),
         str(market_info.get("game_status", "")).casefold() in {"live", "in_progress"},
@@ -146,6 +162,32 @@ def classify_sports_phase(market_info: dict[str, Any], category: str = "") -> st
     """Backward-compatible sports classifier used by existing callers/tests."""
     is_sports = category.casefold() in {"sports", "esports"} or bool(market_info.get("_is_sports_market"))
     return classify_market_phase(market_info, category) if is_sports else "NOT_APPLICABLE"
+
+
+def is_sports_market(market_info: dict[str, Any], category: str = "") -> bool:
+    """Return whether discovery or category metadata identifies a sports market."""
+    return category.casefold() in {"sports", "esports"} or bool(
+        market_info.get("_is_sports_market")
+    )
+
+
+def has_current_structured_game_state(market_info: dict[str, Any]) -> bool:
+    """Require substantive structured state, not merely an in-play marker."""
+    for key in ("live_game_state", "game_state", "live_data", "scoreboard"):
+        value = market_info.get(key)
+        if isinstance(value, dict) and value:
+            return True
+    has_scores = all(
+        isinstance(market_info.get(key), (int, float, str))
+        and str(market_info.get(key)).strip() != ""
+        for key in ("home_score", "away_score")
+    )
+    has_clock = any(
+        isinstance(market_info.get(key), (int, float, str))
+        and str(market_info.get(key)).strip() != ""
+        for key in ("game_clock", "clock", "period", "inning")
+    )
+    return has_scores and has_clock
 
 
 def executable_liquidity(orderbook_response: Any, side: str, max_price: float) -> float:

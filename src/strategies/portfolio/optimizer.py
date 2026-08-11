@@ -247,6 +247,8 @@ class AdvancedPortfolioOptimizer:
                     existing_correlated_exposure=opp.existing_correlated_exposure,
                     correlation_reason=opp.correlation_reason,
                     proposed_risk=opp.proposed_risk,
+                    executable_liquidity=opp.executable_liquidity,
+                    proposed_quantity=opp.proposed_quantity,
                 )
                 
                 enhanced.append(enhanced_opp)

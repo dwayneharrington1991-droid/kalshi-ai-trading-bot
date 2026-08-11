@@ -107,6 +107,7 @@ async def _execute_verified_buy(position, db_manager, kalshi_client):
             estimated_probability=getattr(position, "model_probability", None),
             model_generated_at=getattr(position, "model_generated_at", None),
             market_phase=getattr(position, "market_phase", "NOT_APPLICABLE"),
+            market_category=getattr(position, "market_category", ""),
         ))
         projected = await db_manager.get_position_by_id(position.id)
         created = bool(

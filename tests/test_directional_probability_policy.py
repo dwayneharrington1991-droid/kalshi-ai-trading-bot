@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.config.settings import TradingConfig
+from src.strategies.portfolio.immediate import create_market_opportunities_from_markets
 from src.strategies.directional_policy import (
     classify_market_phase,
     classify_sports_phase,
@@ -12,6 +13,7 @@ from src.strategies.directional_policy import (
     executable_liquidity,
     log_directional_evaluation,
 )
+from src.utils.database import Market
 
 
 def evaluate(model, yes_bid, yes_ask, no_bid, no_ask, phase="NOT_APPLICABLE"):
@@ -50,6 +52,12 @@ def test_ninety_nine_percent_contract_is_not_automatically_favored():
     assert not result.accepted
 
 
+def test_extreme_model_market_discrepancy_requires_additional_validation():
+    result = evaluate(.95, .64, .65, .34, .35)
+    assert not result.accepted
+    assert "requires additional validation" in result.reason
+
+
 def test_pregame_sports_does_not_require_live_marker():
     assert classify_sports_phase({}, "Sports") == "PRE_GAME"
     result = evaluate(.80, .68, .70, .29, .31, "PRE_GAME")
@@ -70,6 +78,18 @@ def test_short_duration_open_market_is_fast_live_in_any_category():
     assert classify_market_phase({}, "Crypto", expiration_ts=expiry, now=now) == "FAST_LIVE"
 
 
+def test_btc_15_minute_uses_close_time_not_delayed_expected_resolution():
+    now = datetime(2026, 8, 11, 3, 42, 6, tzinfo=timezone.utc)
+    market = {
+        "close_time": "2026-08-11T03:45:00Z",
+        "expected_expiration_time": "2026-08-11T09:30:00Z",
+    }
+    delayed_resolution = datetime(2026, 8, 11, 9, 30, tzinfo=timezone.utc).timestamp()
+    assert classify_market_phase(
+        market, "Crypto", expiration_ts=delayed_resolution, now=now
+    ) == "FAST_LIVE"
+
+
 def test_executable_liquidity_uses_opposing_bids_for_buy_ask():
     orderbook = {"orderbook_fp": {
         "yes_dollars": [["0.30", "4"]],
@@ -77,6 +97,19 @@ def test_executable_liquidity_uses_opposing_bids_for_buy_ask():
     }}
     assert executable_liquidity(orderbook, "YES", .70) == 7
     assert executable_liquidity(orderbook, "NO", .70) == 4
+
+
+def test_executable_liquidity_handles_dollars_cents_and_empty_books():
+    dollars = {"orderbook_fp": {
+        "no_dollars": [["0.15", "12.50"], ["0.14", "99"]],
+        "yes_dollars": [["0.41", "8.25"], ["0.40", "99"]],
+    }}
+    assert executable_liquidity(dollars, "YES", .85) == 12.5
+    assert executable_liquidity(dollars, "NO", .59) == 8.25
+    cents = {"orderbook": {"no": [[15, 7]], "yes": [[41, 4]]}}
+    assert executable_liquidity(cents, "YES", .85) == 7
+    assert executable_liquidity(cents, "NO", .59) == 4
+    assert executable_liquidity({"orderbook_fp": {"yes_dollars": [], "no_dollars": []}}, "YES", .85) == 0
 
 
 def test_malformed_orderbook_fails_closed():
@@ -90,6 +123,45 @@ def test_candidate_log_contains_required_sports_fields(caplog):
     message = caplog.text
     for field in ("sports_phase=PRE_GAME", "implied=", "estimated=", "edge=", "price=", "net_return=", "reason="):
         assert field in message
+
+
+@pytest.mark.asyncio
+async def test_candidate_propagates_fresh_executable_liquidity(monkeypatch, capsys):
+    async def prediction(*_args, **_kwargs):
+        return .80, .90
+
+    class Client:
+        async def get_market(self, _ticker):
+            return {"market": {
+                "yes_bid_dollars": ".68", "yes_ask_dollars": ".70",
+                "no_bid_dollars": ".30", "no_ask_dollars": ".32",
+                "close_time": "2099-01-01T00:00:00Z",
+                "title": "Fixture",
+            }}
+
+        async def get_orderbook(self, _ticker, depth=100):
+            assert depth == 100
+            return {"orderbook_fp": {
+                "no_dollars": [[".30", "12"]], "yes_dollars": [],
+            }}
+
+    monkeypatch.setattr(
+        "src.strategies.portfolio.immediate._get_fast_ai_prediction", prediction
+    )
+    market = Market(
+        "TEST", "Fixture", .69, .31, 1000,
+        datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp(),
+        "Crypto", "active", datetime.now(), False,
+    )
+    opportunities = await create_market_opportunities_from_markets(
+        [market], object(), Client()
+    )
+    assert len(opportunities) == 1
+    assert opportunities[0].executable_liquidity == 12
+    assert opportunities[0].proposed_quantity == 7
+    output = capsys.readouterr().out
+    assert "liquidity=12.00 proposed_quantity=7.00" in output
+    assert "structured_game_state_available=None" in output
 
 
 def test_probability_band_defaults_and_canary_limits_are_preserved(monkeypatch):

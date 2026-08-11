@@ -7,6 +7,7 @@ from datetime import datetime
 import os
 from pathlib import Path
 import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -21,8 +22,9 @@ from src.clients.xai_client import XAIClient
 from src.config.settings import settings
 from src.markets.discovery import MarketDiscovery72h
 from src.strategies.directional_policy import (
-    classify_sports_phase,
+    classify_market_phase,
     evaluate_directional_candidate,
+    executable_liquidity,
 )
 from src.strategies.portfolio.immediate import _get_fast_ai_prediction
 from src.utils.database import Market
@@ -77,7 +79,22 @@ async def run(max_model_calls: int, limit: int) -> int:
             predicted, confidence = await _get_fast_ai_prediction(market, model, yes_ask)
             if predicted is None:
                 continue
-            phase = classify_sports_phase(raw, market.category)
+            quote_started = time.monotonic()
+            fresh_response = await client.get_market(market.market_id)
+            fresh = fresh_response.get("market") if isinstance(fresh_response, dict) else None
+            orderbook = await client.get_orderbook(market.market_id, depth=100)
+            quote_age = time.monotonic() - quote_started
+            if not isinstance(fresh, dict):
+                continue
+            fresh.update({
+                "_is_sports_market": raw.get("_is_sports_market", False),
+                "expected_expiration_time": raw.get("expected_expiration_time"),
+            })
+            yes_bid, yes_ask, no_bid, no_ask = get_market_prices(fresh)
+            phase = classify_market_phase(
+                fresh, market.category, expiration_ts=market.expiration_ts,
+                fast_live_minutes=settings.trading.fast_live_max_remaining_minutes,
+            )
             result = evaluate_directional_candidate(
                 market_id=market.market_id, predicted_yes_probability=predicted,
                 yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask,
@@ -88,8 +105,16 @@ async def run(max_model_calls: int, limit: int) -> int:
                 slippage_estimate=settings.trading.directional_slippage_estimate,
                 sports_phase=phase,
             )
-            if result.accepted:
-                results.append((result, confidence, market.title, market.category))
+            requested_quantity = max(1, int(5 / result.market_implied_probability)) if result.market_implied_probability else 0
+            liquidity = executable_liquidity(
+                orderbook, result.side, result.market_implied_probability
+            )
+            if result.accepted and liquidity >= requested_quantity:
+                remaining_minutes = max(0.0, (market.expiration_ts - time.time()) / 60)
+                results.append((
+                    result, confidence, market.title, market.category,
+                    remaining_minutes, liquidity, quote_age,
+                ))
         results.sort(key=lambda item: item[0].ranking_score, reverse=True)
 
         stats = discovery.stats.as_dict()
@@ -99,13 +124,13 @@ async def run(max_model_calls: int, limit: int) -> int:
         print(f"SPORTS_WITHIN_72H={stats['sports_markets_within_72h']}")
         print(f"MODELED_CANDIDATES={min(len(candidates), max_model_calls)}")
         print(f"QUALIFYING_CANDIDATES={len(results)}")
-        print("RANK | MARKET | CATEGORY | PHASE | SIDE | PRICE | MODEL | EDGE | NET | CONFIDENCE")
-        for rank, (result, confidence, _, category) in enumerate(results[:limit], 1):
+        print("RANK | MARKET | CATEGORY | PHASE | MIN_LEFT | SIDE | PRICE | MODEL | EDGE | NET | LIQUIDITY | QUOTE_AGE | CONFIDENCE")
+        for rank, (result, confidence, _, category, remaining, liquidity, quote_age) in enumerate(results[:limit], 1):
             print(
                 f"{rank:02d} | {result.market_id} | {category} | {result.sports_phase} | "
-                f"{result.side} | {result.market_implied_probability:.1%} | "
+                f"{remaining:.1f} | {result.side} | {result.market_implied_probability:.1%} | "
                 f"{result.estimated_probability:.1%} | {result.gross_edge:.1%} | "
-                f"{result.estimated_net_return:.1%} | {confidence:.1%}"
+                f"{result.estimated_net_return:.1%} | {liquidity:.0f} | {quote_age:.2f}s | {confidence:.1%}"
             )
         print("EXCHANGE_WRITES=IMPOSSIBLE")
         print("LIVE_TRADING=DISABLED")

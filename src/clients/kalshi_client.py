@@ -508,6 +508,14 @@ class KalshiClient(TradingLoggerMixin):
         return await self._make_authenticated_request(
             "GET", f"/trade-api/v2/markets/{ticker}", require_auth=False
         )
+
+    async def get_series(self, series_ticker: str) -> Dict[str, Any]:
+        """Get authoritative series metadata, including its current fee model."""
+        if not series_ticker or not series_ticker.strip():
+            raise ValueError("series_ticker is required")
+        return await self._make_authenticated_request(
+            "GET", f"/trade-api/v2/series/{series_ticker}", require_auth=False
+        )
     
     async def get_orderbook(self, ticker: str, depth: int = 100) -> Dict[str, Any]:
         """

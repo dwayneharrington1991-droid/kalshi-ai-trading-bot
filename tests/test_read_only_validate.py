@@ -54,6 +54,9 @@ class AccountClient:
         self.calls["fills"] += 1
         return []
 
+    async def get_series(self, series_ticker):
+        return {"series": {"ticker": series_ticker, "fee_type": "quadratic", "fee_multiplier": 1}}
+
     async def close(self):
         self.closed = True
 
@@ -141,6 +144,7 @@ async def test_write_methods_are_absent_and_non_get_is_rejected():
     with pytest.raises(AttributeError):
         getattr(facade, "_ReadOnlyAccountClient__client")
     assert not hasattr(facade, "__dict__")
+    assert (await facade.get_series("SERIES"))["series"]["fee_type"] == "quadratic"
 
 
 async def test_production_host_mismatch_closes_client(tmp_path):

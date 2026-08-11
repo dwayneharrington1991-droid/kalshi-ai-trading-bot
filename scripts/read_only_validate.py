@@ -26,7 +26,7 @@ INGESTION_GET_ENDPOINTS = {"/trade-api/v2/events"}
 NAMED_READ_METHODS = {
     "get_balance", "get_positions", "get_orders", "get_order", "get_fills",
     "get_all_orders", "get_all_fills", "get_markets", "get_market",
-    "get_events", "get_event", "get_milestones",
+    "get_events", "get_event", "get_milestones", "get_series",
     "get_orderbook",
     "_make_authenticated_request",
 }
@@ -123,6 +123,9 @@ class ReadOnlyAccountClient:
 
     async def get_market(self, *args, **kwargs):
         return await self.__read("get_market", *args, **kwargs)
+
+    async def get_series(self, *args, **kwargs):
+        return await self.__read("get_series", *args, **kwargs)
 
     async def get_events(self, *args, **kwargs):
         return await self.__read("get_events", *args, **kwargs)

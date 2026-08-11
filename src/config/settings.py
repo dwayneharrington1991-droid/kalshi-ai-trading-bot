@@ -211,7 +211,7 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MARKET_DATA_MAX_AGE_SECONDS", "120"))
     )
     min_preferred_probability: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PREFERRED_PROBABILITY", "0.65"))
+        default_factory=lambda: float(os.getenv("MIN_PREFERRED_PROBABILITY", "0.55"))
     )
     max_preferred_probability: float = field(
         default_factory=lambda: float(os.getenv("MAX_PREFERRED_PROBABILITY", "0.90"))

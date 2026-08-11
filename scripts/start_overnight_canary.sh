@@ -93,6 +93,18 @@ grep -q '^CRITICAL_ALERTS=0$' "$VALIDATION_OUT" || {
   exit 2
 }
 
+# Refresh after account validation so the strict 30-second checkpoint gate
+# measures current state rather than time spent scanning the account.
+if ! "$PYTHON" scripts/run_persistent_read_only_reconciliation.py \
+    >"$VALIDATION_OUT" 2>"$VALIDATION_ERR"; then
+  echo "BLOCKED: persistent read-only reconciliation refresh failed" >&2
+  exit 2
+fi
+grep -q '^PERSISTENT_RECONCILIATION=COMPLETE$' "$VALIDATION_OUT" || {
+  echo "BLOCKED: persistent read-only reconciliation did not complete" >&2
+  exit 2
+}
+
 "$PYTHON" - <<'PY' || exit 2
 import os, sqlite3
 from datetime import datetime, timezone

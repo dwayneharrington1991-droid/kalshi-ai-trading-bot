@@ -55,7 +55,7 @@ def test_failed_persistent_reconciliation_blocks_before_launch(tmp_path):
     environment["CANARY_PYTHON"] = str(fake_python)
     result = run_start("I_APPROVE_OVERNIGHT_CANARY", "production", environment=environment)
     assert result.returncode == 2
-    assert "persistent reconciliation failed" in result.stderr
+    assert "persistent read-only reconciliation refresh failed" in result.stderr
 
 
 def test_launcher_sets_exact_gates_and_all_canary_limits():
@@ -79,6 +79,8 @@ def test_launcher_sets_exact_gates_and_all_canary_limits():
     assert "CRITICAL_ALERTS=0" in source
     assert "RECONCILIATION_HEALTH=HEALTHY" in source
     assert "BALANCE=-?" in source
+    assert "scripts/run_persistent_read_only_reconciliation.py" in source
+    assert "PERSISTENT_RECONCILIATION=COMPLETE" in source
 
 
 @pytest.mark.skipif(os.name == "nt" or not BASH, reason="requires Linux /proc and bash")

@@ -263,6 +263,18 @@ class TradingConfig:
     kxbtc15m_min_liquidity: float = field(
         default_factory=lambda: float(os.getenv("KXBTC15M_MIN_LIQUIDITY", "1"))
     )
+    # BTC15M has a distinct, lower production canary envelope.  These values
+    # are caps, never requested order sizes, and must be enforced alongside
+    # the general verified-execution canary controls.
+    kxbtc15m_max_total_risk: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MAX_TOTAL_RISK", "5"))
+    )
+    kxbtc15m_max_market_risk: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MAX_MARKET_RISK", "1"))
+    )
+    kxbtc15m_max_daily_loss: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MAX_DAILY_LOSS", "2"))
+    )
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)

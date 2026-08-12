@@ -6,6 +6,7 @@ former 1,300-line portfolio_optimization.py.
 """
 
 import logging
+import math
 from collections import Counter
 import numpy as np
 from dataclasses import replace
@@ -60,21 +61,137 @@ def select_directional_analysis_markets(
         except (TypeError, ValueError):
             return 0.0
 
-    def in_preferred_price_band(market: Market) -> bool:
-        for value in (market.yes_price, market.no_price):
+    def cached_side_prices(market: Market) -> list[tuple[str, float]]:
+        values: list[tuple[str, float]] = []
+        for side, value in (("YES", market.yes_price), ("NO", market.no_price)):
             try:
                 price = float(value)
             except (TypeError, ValueError):
                 continue
-            if min_probability <= price <= max_probability:
-                return True
-        return False
+            if 0.0 < price < 1.0:
+                values.append((side, price))
+        return values
 
-    ranked = sorted(markets, key=volume_key, reverse=True)
-    preferred = [market for market in ranked if in_preferred_price_band(market)]
+    def preferred_prices(market: Market) -> list[tuple[str, float]]:
+        return [
+            (side, price) for side, price in cached_side_prices(market)
+            if min_probability <= price <= max_probability
+        ]
+
+    def freshness_key(market: Market) -> float:
+        value = getattr(market, "last_updated", None)
+        if isinstance(value, datetime):
+            return value.timestamp()
+        return 0.0
+
+    # Cached prices are not a prediction, so they must never approve an order.
+    # They are useful nevertheless for routing a scarce AI budget: a side above
+    # ``max_probability - min_edge`` cannot satisfy the *preferred* price +
+    # minimum-edge combination unless the model predicts outside the preferred
+    # band.  Prioritising feasible, fresher, liquid-market proxies prevents a
+    # handful of high-volume-but-poorly-priced markets from consuming all ten
+    # model calls.
+    min_edge = float(settings.trading.min_directional_edge)
+    preferred_ceiling_for_min_edge = max_probability - min_edge
+    target_price = min_probability + ((max_probability - min_probability) / 2.0)
+
+    def ranking_key(market: Market) -> tuple[float, ...]:
+        preferred = preferred_prices(market)
+        feasible = [price for _, price in preferred if price <= preferred_ceiling_for_min_edge]
+        best_distance = min(
+            (abs(price - target_price) for price in feasible),
+            default=1.0,
+        )
+        # Keep all tie breakers deterministic.  Volume is a liquidity proxy,
+        # not an executable-liquidity substitute; fresh order-book checks below
+        # remain mandatory before an opportunity can be accepted.
+        return (
+            1.0 if feasible else 0.0,
+            float(len(feasible)),
+            -best_distance,
+            freshness_key(market),
+            math.log1p(max(0.0, volume_key(market))),
+        )
+
+    ranked = sorted(markets, key=ranking_key, reverse=True)
+    preferred = [market for market in ranked if preferred_prices(market)]
     preferred_ids = {market.market_id for market in preferred}
     fallback = [market for market in ranked if market.market_id not in preferred_ids]
     return (preferred + fallback)[:bounded_limit], len(preferred)
+
+
+def _directional_shortlist_market_metadata(
+    market: Market,
+    *,
+    min_probability: float,
+    max_probability: float,
+) -> dict[str, object]:
+    """Describe cached routing data without misrepresenting it as a live quote."""
+    min_edge = float(settings.trading.min_directional_edge)
+    ceiling = max_probability - min_edge
+    candidates = []
+    for side, raw_price in (("YES", market.yes_price), ("NO", market.no_price)):
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            continue
+        if min_probability <= price <= max_probability:
+            candidates.append((side, price))
+    side, price = min(
+        candidates,
+        key=lambda item: abs(item[1] - (min_probability + max_probability) / 2),
+        default=("UNKNOWN", None),
+    )
+    try:
+        volume_proxy = float(market.volume or 0.0)
+    except (TypeError, ValueError):
+        volume_proxy = 0.0
+    feasible = isinstance(price, float) and price <= ceiling
+    return {
+        "market": market.market_id,
+        "side": side,
+        # This is intentionally not named executable_price.  A fresh Kalshi
+        # quote and order book are read later before model admission.
+        "cached_price": round(price, 4) if isinstance(price, float) else None,
+        "implied_probability": round(price, 4) if isinstance(price, float) else None,
+        "pre_model_score": None,
+        "volume_proxy": volume_proxy,
+        "ranking_reason": (
+            "cached preferred side leaves preferred-band minimum-edge headroom"
+            if feasible else "cached preferred side requires model probability above preferred band"
+        ),
+    }
+
+
+def directional_shortlist_diagnostics(
+    markets: List[Market],
+    *,
+    min_probability: float,
+    max_probability: float,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    """Return safe cached-quote routing metadata for the selected shortlist.
+
+    ``pre_model_score`` is deliberately ``None``: this code has no cheap
+    predictive model, and pretending that a price/volume heuristic is a model
+    probability would create an unsafe feedback loop.  The log identifies the
+    cached side and routing reason only; live quotes, liquidity, model output,
+    and every admission gate are still checked later.
+    """
+    selected, _ = select_directional_analysis_markets(
+        markets,
+        limit=limit,
+        min_probability=min_probability,
+        max_probability=max_probability,
+    )
+    return [
+        _directional_shortlist_market_metadata(
+            market,
+            min_probability=min_probability,
+            max_probability=max_probability,
+        )
+        for market in selected
+    ]
 
 
 async def create_market_opportunities_from_markets(
@@ -94,11 +211,38 @@ async def create_market_opportunities_from_markets(
     
     # Limit markets to prevent excessive AI costs and focus on best opportunities
     max_markets_to_analyze = 10
+    def safe_volume_proxy(market: Market) -> float:
+        try:
+            return float(getattr(market, "volume", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    volume_preview = sorted(markets, key=safe_volume_proxy, reverse=True)[:max_markets_to_analyze]
+    logger.info(
+        "DIRECTIONAL_SHORTLIST_PRE_RANK top_by_volume=%s",
+        [
+            _directional_shortlist_market_metadata(
+                market,
+                min_probability=settings.trading.min_preferred_probability,
+                max_probability=settings.trading.max_preferred_probability,
+            )
+            for market in volume_preview
+        ],
+    )
     markets, preferred_price_candidates = select_directional_analysis_markets(
         markets,
         limit=max_markets_to_analyze,
         min_probability=settings.trading.min_preferred_probability,
         max_probability=settings.trading.max_preferred_probability,
+    )
+    logger.info(
+        "DIRECTIONAL_SHORTLIST_POST_RANK candidates=%s",
+        directional_shortlist_diagnostics(
+            markets,
+            min_probability=settings.trading.min_preferred_probability,
+            max_probability=settings.trading.max_preferred_probability,
+            limit=max_markets_to_analyze,
+        ),
     )
     if input_market_count > max_markets_to_analyze:
         logger.info(

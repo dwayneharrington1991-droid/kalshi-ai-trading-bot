@@ -7,12 +7,14 @@ from src.strategies.kxbtc15m import (
     KXBTC15M_SERIES,
     KXBTC15MSettings,
     KXBTC15MSignalEngine,
+    KXBTC15MExecutionAdapter,
     KXBTC15MDiscovery,
     ReconstructedOrderBook,
     ReferencePrice,
     contract_close_time,
     authoritative_target_price,
     authoritative_settlement_reference,
+    parse_contract_metadata,
     discover_active_contract,
     position_action,
     seconds_to_expiration,
@@ -72,6 +74,25 @@ def test_contract_clock_uses_authoritative_metadata_not_ticker_text():
     assert authoritative_settlement_reference(candidate) == "CF Benchmarks"
 
 
+def test_contract_metadata_requires_documented_market_and_series_fields():
+    candidate = market()
+    candidate.update({
+        "floor_strike": 100000, "cap_strike": 100000, "strike_type": "greater",
+        "rules_primary": "The value uses the named source.", "rules_secondary": "At close time.",
+    })
+    series = {"settlement_sources": [{"name": "CF Benchmarks", "url": "https://example.invalid"}]}
+    parsed = parse_contract_metadata(candidate, series)
+    assert parsed is not None
+    assert parsed.target_price == 100000
+    assert parsed.yes_is_above_target
+    assert parsed.settlement_source == "CF Benchmarks"
+    assert parse_contract_metadata({**candidate, "cap_strike": 100001}, series) is None
+    assert parse_contract_metadata(candidate, {"settlement_sources": []}) is None
+    assert parse_contract_metadata({**candidate, "rules_primary": ""}, series) is None
+    below = parse_contract_metadata({**candidate, "strike_type": "less_or_equal"}, series)
+    assert below is not None and not below.yes_is_above_target
+
+
 def test_snapshot_delta_sequence_and_staleness_fail_closed():
     book = fresh_book()
     assert book.apply_delta({"side": "no", "price": .30, "delta": 2, "sequence": 11}, received_at=10)
@@ -89,6 +110,18 @@ def test_current_kalshi_websocket_fixed_point_schema_is_processed():
         "side": "no", "price_dollars": "0.3000", "delta_fp": "2.00",
     }}, received_at=2)
     assert book.executable_quantity("YES", .70) == pytest.approx(8)
+
+
+def test_unified_yes_price_orderbook_does_not_invert_yes_liquidity():
+    book = ReconstructedOrderBook()
+    assert book.apply_snapshot({"seq": 1, "msg": {
+        # With use_yes_price=true, a NO bid at 0.70 is an executable YES ask
+        # at 0.70, not 0.30.
+        "yes_dollars_fp": [["0.40", "2"]], "no_dollars_fp": [["0.70", "3"]],
+    }}, received_at=1, unified_yes_price=True)
+    assert book.executable_quantity("YES", .70) == pytest.approx(3)
+    assert book.executable_quantity("YES", .69) == 0
+    assert book.executable_quantity("NO", .60) == pytest.approx(2)
 
 
 def test_yes_and_no_executable_liquidity_use_opposing_bids():
@@ -145,3 +178,22 @@ def test_settings_default_to_disabled_execution():
     settings = KXBTC15MSettings()
     assert not settings.enabled
     assert not settings.live_execution_enabled
+
+
+@pytest.mark.asyncio
+async def test_execution_adapter_cannot_submit_until_both_dedicated_switches_are_enabled():
+    class Service:
+        async def execute(self, intent):  # pragma: no cover - must not be reached
+            raise AssertionError("disabled adapter attempted a submission")
+
+    metadata = parse_contract_metadata({**market(),
+        "floor_strike": 100000, "cap_strike": 100000, "strike_type": "greater",
+        "rules_primary": "Official rule.", "rules_secondary": "Official calculation.",
+    }, {"settlement_sources": [{"name": "Official source"}]})
+    assert metadata is not None
+    decision = _decision(reference=101.0, target=100.0)
+    with pytest.raises(RuntimeError, match="disabled"):
+        await KXBTC15MExecutionAdapter(Service(), KXBTC15MSettings()).submit_if_allowed(
+            metadata=metadata, decision=decision, quantity=1, limit_price=.65,
+            position_id=1, environment="production",
+        )

@@ -1,8 +1,9 @@
-"""Fail-closed, KXBTC15M-only market intelligence.
+"""Fail-closed, KXBTC15M-only market intelligence and execution adapter.
 
-This module deliberately contains no order submission code.  It is a narrow,
-testable data-and-decision layer that can only hand a verified decision to the
-existing execution boundary in a later, separately enabled integration phase.
+The strategy never constructs a Kalshi client.  A separately configured caller
+may hand a verified decision to the repository-backed execution service, whose
+own preflight, reconciliation, quote-refresh, balance, and duplicate-order
+checks remain the only submission path.
 """
 
 from __future__ import annotations
@@ -17,6 +18,17 @@ from typing import Any, Iterable, Optional
 
 KXBTC15M_SERIES = "KXBTC15M"
 OPEN_STATUSES = {"open", "active"}
+
+
+@dataclass(frozen=True)
+class KXBTC15MContractMetadata:
+    ticker: str
+    target_price: float
+    yes_is_above_target: bool
+    close_time: datetime
+    settlement_source: str
+    rules_primary: str
+    rules_secondary: str
 
 
 def _parse_time(value: Any) -> Optional[datetime]:
@@ -40,7 +52,20 @@ def contract_close_time(market: dict[str, Any]) -> Optional[datetime]:
 
 def authoritative_target_price(market: dict[str, Any]) -> Optional[float]:
     """Extract an explicit strike/target field; rules prose is never guessed."""
-    for key in ("strike_dollars", "strike_price", "floor_strike", "target_price"):
+    # Kalshi documents floor_strike/cap_strike as the numeric strike fields.
+    # A binary KXBTC15M contract must express a single unambiguous target.
+    floor, cap = market.get("floor_strike"), market.get("cap_strike")
+    if floor is not None or cap is not None:
+        try:
+            values = [float(value) for value in (floor, cap) if value is not None]
+        except (TypeError, ValueError):
+            return None
+        if len(set(values)) == 1 and values[0] > 0 and math.isfinite(values[0]):
+            return values[0]
+        # A range contract is not a simple UP/DOWN target and is deliberately
+        # outside this dedicated strategy until it has its own model.
+        return None
+    for key in ("strike_dollars", "strike_price", "target_price"):
         value = market.get(key)
         try:
             price = float(value)
@@ -58,6 +83,40 @@ def authoritative_settlement_reference(market: dict[str, Any]) -> Optional[str]:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def parse_contract_metadata(market: dict[str, Any], series: dict[str, Any]) -> Optional[KXBTC15MContractMetadata]:
+    """Join documented market and series fields; reject all ambiguity."""
+    if not isinstance(market, dict) or not isinstance(series, dict):
+        return None
+    if market.get("series_ticker") != KXBTC15M_SERIES:
+        return None
+    ticker = market.get("ticker")
+    target, close = authoritative_target_price(market), contract_close_time(market)
+    strike_type = str(market.get("strike_type", "")).casefold()
+    orientation = {
+        "greater": True, "greater_or_equal": True, "above": True,
+        "less": False, "less_or_equal": False, "below": False,
+    }
+    if strike_type not in orientation:
+        return None
+    sources = series.get("settlement_sources")
+    if not isinstance(sources, list) or len(sources) != 1:
+        return None
+    source = sources[0]
+    if not isinstance(source, dict) or not isinstance(source.get("name"), str) or not source["name"].strip():
+        return None
+    primary = market.get("rules_primary")
+    secondary = market.get("rules_secondary")
+    if not isinstance(ticker, str) or not ticker or target is None or close is None:
+        return None
+    if not isinstance(primary, str) or not primary.strip() or not isinstance(secondary, str) or not secondary.strip():
+        return None
+    return KXBTC15MContractMetadata(
+        ticker=ticker, target_price=target, yes_is_above_target=orientation[strike_type],
+        close_time=close, settlement_source=source["name"].strip(),
+        rules_primary=primary.strip(), rules_secondary=secondary.strip(),
+    )
 
 
 def seconds_to_expiration(market: dict[str, Any], now: Optional[datetime] = None) -> Optional[float]:
@@ -131,6 +190,10 @@ class ReconstructedOrderBook:
     sequence: Optional[int] = None
     received_at: Optional[float] = None
     valid: bool = False
+    # ``use_yes_price=true`` expresses both sides in YES-price terms.  The
+    # scale must be carried with the book; inferring it would risk inverting
+    # an executable ask.
+    unified_yes_price: bool = False
 
     @staticmethod
     def _levels(raw: Any) -> Optional[dict[float, float]]:
@@ -152,7 +215,10 @@ class ReconstructedOrderBook:
                 result[price] = quantity
         return result
 
-    def apply_snapshot(self, message: dict[str, Any], *, received_at: Optional[float] = None) -> bool:
+    def apply_snapshot(
+        self, message: dict[str, Any], *, received_at: Optional[float] = None,
+        unified_yes_price: bool = False,
+    ) -> bool:
         payload = message.get("msg", message.get("orderbook", message)) if isinstance(message, dict) else None
         if not isinstance(payload, dict):
             self.valid = False
@@ -164,6 +230,7 @@ class ReconstructedOrderBook:
             self.valid = False
             return False
         self.yes_bids, self.no_bids, self.sequence = yes, no, sequence
+        self.unified_yes_price = unified_yes_price
         self.received_at, self.valid = received_at or time.monotonic(), True
         return True
 
@@ -207,7 +274,11 @@ class ReconstructedOrderBook:
         source = self.no_bids if side.upper() == "YES" else self.yes_bids if side.upper() == "NO" else None
         if source is None or not self.valid or not 0 < maximum_price < 1:
             return 0.0
-        return sum(quantity for bid, quantity in source.items() if 1 - bid <= maximum_price + 1e-9)
+        def executable_price(bid: float) -> float:
+            if side.upper() == "YES" and self.unified_yes_price:
+                return bid
+            return 1 - bid
+        return sum(quantity for bid, quantity in source.items() if executable_price(bid) <= maximum_price + 1e-9)
 
 
 @dataclass(frozen=True)
@@ -316,6 +387,40 @@ class KXBTC15MSignalEngine:
         if liquidity < self.settings.min_liquidity:
             return KXBTC15MDecision("NO_TRADE", side, "insufficient executable order-book liquidity", **fields)
         return KXBTC15MDecision("TRADE_" + side, side, "strong compatible-reference BTC15M edge", **fields)
+
+
+class KXBTC15MExecutionAdapter:
+    """One narrow bridge to ``VerifiedExecutionService``; no parallel order path.
+
+    It is deliberately disabled unless *both* BTC15M switches are true.  The
+    existing verified service still applies its own reconciliation, balance,
+    duplicate-order, quote refresh, and canary gates before it can submit.
+    """
+
+    def __init__(self, execution_service: Any, settings: KXBTC15MSettings) -> None:
+        self.execution_service = execution_service
+        self.settings = settings
+
+    async def submit_if_allowed(
+        self, *, metadata: KXBTC15MContractMetadata, decision: KXBTC15MDecision,
+        quantity: float, limit_price: float, position_id: int, environment: str,
+    ) -> Any:
+        if not self.settings.enabled or not self.settings.live_execution_enabled:
+            raise RuntimeError("KXBTC15M automated execution is disabled")
+        if decision.action not in {"TRADE_YES", "TRADE_NO"} or decision.side is None:
+            raise RuntimeError("KXBTC15M decision is not eligible for submission")
+        if not (0 < quantity and 0 < limit_price < 1):
+            raise RuntimeError("KXBTC15M order quantity or limit is invalid")
+        # Import lazily to keep this strategy module testable without creating
+        # a client, database connection, or any network side effect.
+        from src.orders.execution_service import OrderIntent
+        return await self.execution_service.execute(OrderIntent(
+            market_id=metadata.ticker, side=decision.side, action="buy",
+            quantity=quantity, price=limit_price, order_type="limit",
+            position_id=position_id, environment=environment, strategy="kxbtc15m",
+            estimated_probability=decision.p_up,
+            model_generated_at=time.time(), market_phase="FAST_LIVE", market_category="Crypto",
+        ))
 
 
 def position_action(*, existing_side: Optional[str], existing_quantity: float, decision: KXBTC15MDecision, entry_probability: Optional[float]) -> str:

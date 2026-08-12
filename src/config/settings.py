@@ -231,6 +231,38 @@ class TradingConfig:
     fast_live_max_model_age_seconds: int = field(
         default_factory=lambda: int(os.getenv("FAST_LIVE_MAX_MODEL_AGE_SECONDS", "30"))
     )
+    # Dedicated BTC 15-minute strategy.  Both switches default off; merely
+    # adding this code can never change the existing canary's trading universe.
+    kxbtc15m_only_mode_enabled: bool = field(
+        default_factory=lambda: os.getenv("KXBTC15M_ONLY_MODE_ENABLED", "false").lower() == "true"
+    )
+    kxbtc15m_live_execution_enabled: bool = field(
+        default_factory=lambda: os.getenv("KXBTC15M_LIVE_EXECUTION_ENABLED", "false").lower() == "true"
+    )
+    kxbtc15m_entry_cutoff_seconds: int = field(
+        default_factory=lambda: int(os.getenv("KXBTC15M_ENTRY_CUTOFF_SECONDS", "60"))
+    )
+    kxbtc15m_ws_max_age_seconds: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_WS_MAX_AGE_SECONDS", "5"))
+    )
+    kxbtc15m_reference_max_age_seconds: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_REFERENCE_MAX_AGE_SECONDS", "5"))
+    )
+    kxbtc15m_reference_max_displacement_bps: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_REFERENCE_MAX_DISPLACEMENT_BPS", "25"))
+    )
+    kxbtc15m_min_confidence: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MIN_CONFIDENCE", "0.75"))
+    )
+    kxbtc15m_min_net_edge: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MIN_NET_EDGE", "0.05"))
+    )
+    kxbtc15m_max_spread: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MAX_SPREAD", "0.08"))
+    )
+    kxbtc15m_min_liquidity: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MIN_LIQUIDITY", "1"))
+    )
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)

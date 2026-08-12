@@ -38,6 +38,28 @@ def contract_close_time(market: dict[str, Any]) -> Optional[datetime]:
     return None
 
 
+def authoritative_target_price(market: dict[str, Any]) -> Optional[float]:
+    """Extract an explicit strike/target field; rules prose is never guessed."""
+    for key in ("strike_dollars", "strike_price", "floor_strike", "target_price"):
+        value = market.get(key)
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(price) and price > 0:
+            return price
+    return None
+
+
+def authoritative_settlement_reference(market: dict[str, Any]) -> Optional[str]:
+    """Require an explicit metadata source label, never an unrelated exchange tick."""
+    for key in ("settlement_source", "settlement_reference", "index_name", "reference_index"):
+        value = market.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def seconds_to_expiration(market: dict[str, Any], now: Optional[datetime] = None) -> Optional[float]:
     close = contract_close_time(market)
     if close is None:
@@ -135,9 +157,9 @@ class ReconstructedOrderBook:
         if not isinstance(payload, dict):
             self.valid = False
             return False
-        yes = self._levels(payload.get("yes_dollars", payload.get("yes", [])))
-        no = self._levels(payload.get("no_dollars", payload.get("no", [])))
-        sequence = payload.get("sequence", message.get("sequence") if isinstance(message, dict) else None)
+        yes = self._levels(payload.get("yes_dollars_fp", payload.get("yes_dollars", payload.get("yes", []))))
+        no = self._levels(payload.get("no_dollars_fp", payload.get("no_dollars", payload.get("no", []))))
+        sequence = message.get("seq", payload.get("sequence", message.get("sequence"))) if isinstance(message, dict) else None
         if yes is None or no is None or isinstance(sequence, bool) or not isinstance(sequence, int):
             self.valid = False
             return False
@@ -150,10 +172,10 @@ class ReconstructedOrderBook:
         if not self.valid or not isinstance(payload, dict):
             self.valid = False
             return False
-        sequence = payload.get("sequence")
+        sequence = message.get("seq", payload.get("sequence"))
         side = str(payload.get("side", "")).casefold()
         try:
-            price, delta = float(payload["price"]), float(payload["delta"])
+            price, delta = float(payload.get("price_dollars", payload.get("price"))), float(payload.get("delta_fp", payload.get("delta")))
         except (KeyError, TypeError, ValueError):
             self.valid = False
             return False

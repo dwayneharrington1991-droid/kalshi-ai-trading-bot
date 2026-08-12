@@ -11,6 +11,8 @@ from src.strategies.kxbtc15m import (
     ReconstructedOrderBook,
     ReferencePrice,
     contract_close_time,
+    authoritative_target_price,
+    authoritative_settlement_reference,
     discover_active_contract,
     position_action,
     seconds_to_expiration,
@@ -62,6 +64,12 @@ def test_contract_clock_uses_authoritative_metadata_not_ticker_text():
     candidate = market("KXBTC15M-WHATEVER", minutes=7)
     assert contract_close_time(candidate) == NOW + timedelta(minutes=7)
     assert seconds_to_expiration(candidate, NOW) == pytest.approx(420)
+    assert authoritative_target_price(candidate) is None
+    assert authoritative_settlement_reference(candidate) is None
+    candidate["strike_dollars"] = "100000.50"
+    candidate["settlement_reference"] = "CF Benchmarks"
+    assert authoritative_target_price(candidate) == 100000.5
+    assert authoritative_settlement_reference(candidate) == "CF Benchmarks"
 
 
 def test_snapshot_delta_sequence_and_staleness_fail_closed():
@@ -70,6 +78,17 @@ def test_snapshot_delta_sequence_and_staleness_fail_closed():
     assert book.executable_quantity("YES", .70) == pytest.approx(8)
     assert not book.apply_delta({"side": "no", "price": .30, "delta": 1, "sequence": 13}, received_at=11)
     assert not book.fresh(5, now=11)
+
+
+def test_current_kalshi_websocket_fixed_point_schema_is_processed():
+    book = ReconstructedOrderBook()
+    assert book.apply_snapshot({"type": "orderbook_snapshot", "seq": 2, "msg": {
+        "yes_dollars_fp": [["0.4000", "4.00"]], "no_dollars_fp": [["0.3000", "6.00"]],
+    }}, received_at=1)
+    assert book.apply_delta({"type": "orderbook_delta", "seq": 3, "msg": {
+        "side": "no", "price_dollars": "0.3000", "delta_fp": "2.00",
+    }}, received_at=2)
+    assert book.executable_quantity("YES", .70) == pytest.approx(8)
 
 
 def test_yes_and_no_executable_liquidity_use_opposing_bids():

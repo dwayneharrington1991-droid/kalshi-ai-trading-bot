@@ -8,6 +8,7 @@ from src.config.settings import TradingConfig
 from src.strategies.portfolio.immediate import (
     _calculate_simple_kelly,
     create_market_opportunities_from_markets,
+    directional_shortlist_diagnostics,
     select_directional_analysis_markets,
 )
 from src.strategies.directional_policy import (
@@ -70,6 +71,48 @@ def test_directional_shortlist_prioritizes_cached_prices_in_existing_band():
 
     assert preferred_count == 1
     assert [market.market_id for market in selected] == ["IN-BAND"]
+
+
+def test_directional_shortlist_prioritizes_preferred_band_edge_headroom_over_volume():
+    """A cached .88 side has little preferred-band edge headroom versus .70."""
+    now = datetime.now()
+    high_volume_late_price = Market(
+        "LATE-PRICE", "Expensive favorite", .88, .12, 1_000_000, 0,
+        "Other", "active", now,
+    )
+    feasible_lower_volume = Market(
+        "FEASIBLE", "Preferred favorite", .70, .30, 100, 0,
+        "Other", "active", now,
+    )
+
+    selected, preferred_count = select_directional_analysis_markets(
+        [high_volume_late_price, feasible_lower_volume],
+        limit=1,
+        min_probability=.55,
+        max_probability=.90,
+    )
+
+    assert preferred_count == 2
+    assert [market.market_id for market in selected] == ["FEASIBLE"]
+
+
+def test_directional_shortlist_diagnostics_do_not_claim_a_predictive_pre_model_score():
+    now = datetime.now()
+    market = Market("ROUTED", "Fixture", .70, .30, 100, 0, "Other", "active", now)
+
+    diagnostics = directional_shortlist_diagnostics(
+        [market], min_probability=.55, max_probability=.90,
+    )
+
+    assert diagnostics == [{
+        "market": "ROUTED",
+        "side": "YES",
+        "cached_price": .7,
+        "implied_probability": .7,
+        "pre_model_score": None,
+        "volume_proxy": 100.0,
+        "ranking_reason": "cached preferred side leaves preferred-band minimum-edge headroom",
+    }]
 
 
 def test_high_probability_without_positive_edge_is_rejected():

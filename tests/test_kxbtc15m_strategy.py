@@ -62,6 +62,50 @@ async def test_paginated_discovery_is_series_only_and_rejects_repeated_cursor():
         await KXBTC15MDiscovery(RepeatingClient()).active_contract(now=NOW)
 
 
+@pytest.mark.asyncio
+async def test_series_scoped_production_row_without_redundant_series_field_is_selected():
+    # Sanitized production shape: the official request is scoped to KXBTC15M,
+    # but the returned individual market row omits series_ticker.
+    production_row = {
+        "ticker": "KXBTC15M-EXAMPLE", "status": "active",
+        "open_time": "2026-08-12T23:30:00Z", "close_time": "2026-08-12T23:45:00Z",
+        "expected_expiration_time": "2026-08-12T23:50:00Z",
+        "floor_strike": 63344.84, "cap_strike": None,
+        "strike_type": "greater_or_equal", "event_ticker": "KXBTC15M-EXAMPLE-EVENT",
+        "rules_primary": "Official settlement rule.", "rules_secondary": "Official calculation.",
+    }
+    series = {"settlement_sources": [{"name": "CF Benchmarks"}]}
+
+    assert discover_active_contract([production_row], now=NOW) is None
+    assert parse_contract_metadata(production_row, series) is None
+    parsed = parse_contract_metadata(
+        production_row, series, scoped_series_ticker=KXBTC15M_SERIES,
+    )
+    assert parsed is not None and parsed.target_price == pytest.approx(63344.84)
+
+    class Client:
+        async def get_markets(self, **kwargs):
+            assert kwargs["series_ticker"] == KXBTC15M_SERIES
+            return {"markets": [production_row], "cursor": None}
+
+    selected = await KXBTC15MDiscovery(Client()).active_contract(now=NOW)
+    assert selected is production_row
+
+
+def test_equal_nearest_closes_are_ambiguous_and_fail_closed():
+    assert discover_active_contract([
+        market("ONE", minutes=15), market("TWO", minutes=15),
+    ], now=NOW) is None
+
+
+def test_scoped_series_never_overrides_an_explicit_conflicting_series():
+    conflicting = market("KXBTC15M-LOOKALIKE", minutes=15)
+    conflicting["series_ticker"] = "KXOTHER"
+    assert discover_active_contract(
+        [conflicting], now=NOW, scoped_series_ticker=KXBTC15M_SERIES,
+    ) is None
+
+
 def test_contract_clock_uses_authoritative_metadata_not_ticker_text():
     candidate = market("KXBTC15M-WHATEVER", minutes=7)
     assert contract_close_time(candidate) == NOW + timedelta(minutes=7)

@@ -85,11 +85,30 @@ def authoritative_settlement_reference(market: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def parse_contract_metadata(market: dict[str, Any], series: dict[str, Any]) -> Optional[KXBTC15MContractMetadata]:
+def _belongs_to_kxbtc15m(
+    market: dict[str, Any], *, scoped_series_ticker: Optional[str] = None,
+) -> bool:
+    """Validate series identity without inferring it from a ticker.
+
+    Kalshi's series-filtered market endpoint may omit ``series_ticker`` from
+    individual rows.  In that documented, server-scoped response only, the
+    request scope is the authoritative series identity.  A supplied row with a
+    conflicting series is always rejected.
+    """
+    value = market.get("series_ticker")
+    if isinstance(value, str) and value.strip():
+        return value.strip() == KXBTC15M_SERIES
+    return scoped_series_ticker == KXBTC15M_SERIES
+
+
+def parse_contract_metadata(
+    market: dict[str, Any], series: dict[str, Any], *,
+    scoped_series_ticker: Optional[str] = None,
+) -> Optional[KXBTC15MContractMetadata]:
     """Join documented market and series fields; reject all ambiguity."""
     if not isinstance(market, dict) or not isinstance(series, dict):
         return None
-    if market.get("series_ticker") != KXBTC15M_SERIES:
+    if not _belongs_to_kxbtc15m(market, scoped_series_ticker=scoped_series_ticker):
         return None
     ticker = market.get("ticker")
     target, close = authoritative_target_price(market), contract_close_time(market)
@@ -127,12 +146,17 @@ def seconds_to_expiration(market: dict[str, Any], now: Optional[datetime] = None
     return max(0.0, (close - current).total_seconds())
 
 
-def discover_active_contract(markets: Iterable[dict[str, Any]], *, now: Optional[datetime] = None) -> Optional[dict[str, Any]]:
+def discover_active_contract(
+    markets: Iterable[dict[str, Any]], *, now: Optional[datetime] = None,
+    scoped_series_ticker: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """Return the nearest still-open KXBTC15M contract, or ``None`` fail-closed."""
     current = now or datetime.now(timezone.utc)
     candidates: list[tuple[datetime, dict[str, Any]]] = []
     for market in markets:
-        if not isinstance(market, dict) or market.get("series_ticker") != KXBTC15M_SERIES:
+        if not isinstance(market, dict) or not _belongs_to_kxbtc15m(
+            market, scoped_series_ticker=scoped_series_ticker,
+        ):
             continue
         if str(market.get("status", "")).casefold() not in OPEN_STATUSES:
             continue
@@ -140,7 +164,14 @@ def discover_active_contract(markets: Iterable[dict[str, Any]], *, now: Optional
         if close is None or close <= current:
             continue
         candidates.append((close, market))
-    return min(candidates, key=lambda pair: pair[0])[1] if candidates else None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0])
+    # Distinct close timestamps create an authoritative rollover order. Equal
+    # nearest close times are ambiguous and must not select a contract.
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None
+    return candidates[0][1]
 
 
 class KXBTC15MDiscovery:
@@ -173,7 +204,12 @@ class KXBTC15MDiscovery:
             if not isinstance(next_cursor, str):
                 raise RuntimeError("invalid KXBTC15M market pagination cursor")
             cursor = next_cursor
-        return discover_active_contract(markets, now=now)
+        # The endpoint request itself is constrained to KXBTC15M.  Some live
+        # rows omit their redundant series_ticker field, so preserve that
+        # authoritative scope instead of parsing a ticker string.
+        return discover_active_contract(
+            markets, now=now, scoped_series_ticker=KXBTC15M_SERIES,
+        )
 
 
 @dataclass(frozen=True)

@@ -36,6 +36,8 @@ from src.strategies.unified_trading_system import (
 # Import individual jobs for fallback
 from src.jobs.decide import make_decision_for_market
 from src.jobs.execute import execute_position
+from src.jobs.kxbtc15m_shadow import run_kxbtc15m_shadow_cycle
+from src.strategies.kxbtc15m import KXBTC15MSettings
 
 
 async def run_trading_job() -> Optional[TradingSystemResults]:
@@ -57,6 +59,38 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
     try:
         logger.info("🚀 Starting Enhanced Trading Job - Beast Mode Activated!")
         
+        # The dedicated BTC15M path is GET-only during shadow validation.  It
+        # does not construct or call an execution adapter, so it cannot alter
+        # the existing unified production execution path.
+        if settings.trading.kxbtc15m_only_mode_enabled:
+            logger.info("KXBTC15M_SHADOW_START execution_disabled=true")
+            kalshi_client = KalshiClient()
+            try:
+                result = await run_kxbtc15m_shadow_cycle(
+                    kalshi_client,
+                    strategy_settings=KXBTC15MSettings(
+                        enabled=True,
+                        live_execution_enabled=False,
+                        cutoff_seconds=settings.trading.kxbtc15m_entry_cutoff_seconds,
+                        max_ws_age_seconds=settings.trading.kxbtc15m_ws_max_age_seconds,
+                        max_reference_age_seconds=settings.trading.kxbtc15m_reference_max_age_seconds,
+                        max_reference_displacement_bps=settings.trading.kxbtc15m_reference_max_displacement_bps,
+                        min_confidence=settings.trading.kxbtc15m_min_confidence,
+                        min_net_edge=settings.trading.kxbtc15m_min_net_edge,
+                        max_spread=settings.trading.kxbtc15m_max_spread,
+                        min_liquidity=settings.trading.kxbtc15m_min_liquidity,
+                    ),
+                    max_market_risk=settings.trading.kxbtc15m_max_market_risk,
+                    logger=logger,
+                )
+                logger.info(
+                    "KXBTC15M_SHADOW_SUMMARY ticker=%s action=%s reason=%s would_submit=%s",
+                    result.ticker, result.action, result.reason, result.would_submit,
+                )
+                return TradingSystemResults()
+            finally:
+                await kalshi_client.close()
+
         # Initialize clients
         db_manager = DatabaseManager()
         kalshi_client = KalshiClient()

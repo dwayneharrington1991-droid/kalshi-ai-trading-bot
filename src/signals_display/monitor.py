@@ -10,11 +10,14 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+from time import perf_counter
 from urllib.parse import urlencode, quote
 
 import httpx
 
 from .model import Display, evaluate, fee, number, timestamp
+from .edges import assess_edges
+from .reliability import metrics, wilson
 
 UTC = timezone.utc
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -30,13 +33,55 @@ class PublicFeed:
 
     def __init__(self, get=None):
         self.get = get or httpx.get
+        self.transport_diagnostics = []
+        self.candle_cache = None
+        self.candles_checked = None
 
     def _read(self, url):
+        started = perf_counter()
         response = self.get(
             url, timeout=10, follow_redirects=False, headers={"Accept": "application/json"}
         )
         response.raise_for_status()
+        self.transport_diagnostics.append(
+            {
+                "endpoint": url.split("?")[0],
+                "round_trip_ms": round((perf_counter() - started) * 1000, 2),
+                "received_at": utcnow().isoformat(),
+                "exchange_event_latency": "unknown; receipt timestamps only",
+            }
+        )
+        self.transport_diagnostics = self.transport_diagnostics[-8:]
         return response.json()
+
+    def candles(self, now):
+        if self.candles_checked is not None and (now - self.candles_checked).total_seconds() < 60:
+            return self.candle_cache or {}
+        self.candles_checked = now
+        url = (
+            "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles?"
+            + urlencode(
+                {
+                    "start": int(now.timestamp()) - 7200,
+                    "end": int(now.timestamp()),
+                    "granularity": "ONE_MINUTE",
+                    "limit": 120,
+                }
+            )
+        )
+        try:
+            data = self._read(url)
+            self.candle_cache = {
+                "candles": data["candles"],
+                "source": "Coinbase BTC-USD public one-minute candles (proxy)",
+                "received_at": utcnow().isoformat(),
+            }
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            return {
+                "error": "MISSING_CANDLES: public one-minute candle endpoint unavailable",
+                **(self.candle_cache or {}),
+            }
+        return self.candle_cache
 
     def resolved(self, ticker):
         data = self._read(KALSHI + "/markets/" + quote(ticker, safe=""))
@@ -115,6 +160,16 @@ class PublicFeed:
                     fee_type=series.get("fee_type"),
                     fee_multiplier=series.get("fee_multiplier"),
                     mapping_verified=orientation,
+                    averaging_rule_verified=(
+                        orientation
+                        and "CF Benchmarks" in source
+                        and str(raw.get("rules_primary", ""))
+                        .lower()
+                        .count("simple average of the sixty seconds")
+                        == 2
+                        and "at least" in str(raw.get("rules_primary", "")).lower()
+                        and "brti" in str(raw.get("rules_primary", "")).lower()
+                    ),
                 )
             )
         selected = active_market({"markets": result}, now)
@@ -160,8 +215,7 @@ class PublicFeed:
             "official": False,
         }
         warnings = [
-            "Official settlement-index feed and calibrated conditional model are not connected; "
-            "live probabilities remain unavailable."
+            "Coinbase is a proxy, not the official settlement index. Model estimates are UNVALIDATED."
         ]
         try:
             spot = self._read(COINBASE)["data"]
@@ -181,6 +235,8 @@ class PublicFeed:
             "warnings": warnings,
             "mode": "PUBLIC MARKET DATA",
             "evidence": {},
+            "btc_candles": self.candles(utcnow()),
+            "transport_diagnostics": list(self.transport_diagnostics),
         }
 
 
@@ -229,9 +285,13 @@ def levels(entry, multiplier, target, stop):
     return (min(targets) if targets else None, max(stops) if stops else None)
 
 
-def analyze(payload, now, target=0.05, stop=0.03, horizon=60):
+def analyze(payload, now, target=0.05, stop=0.03, horizon=60, model_result=None, model_info=None):
     market = active_market(payload, now)
-    result = evaluate(payload, now=now, target=target, stop=stop, horizon=horizon)
+    result = (
+        model_result
+        if model_result is not None
+        else evaluate(payload, now=now, target=target, stop=stop, horizon=horizon)
+    )
     if market and not market.get("mapping_verified", True):
         result = Display("WAIT", "YES/UP settlement mapping unverified")
     stale = True
@@ -282,7 +342,66 @@ def analyze(payload, now, target=0.05, stop=0.03, horizon=60):
         and (len(available) == 1 or available[0][1] > available[1][1])
     ):
         scalp = available[0][0].upper() + " SCALP"
+    scalp_lean = (
+        ("SCALP " + available[0][0].upper())
+        if available and (len(available) == 1 or available[0][1] > available[1][1])
+        else "WAIT"
+    )
+    edges = {}
+    if model_info and model_info.get("enabled") and market and not stale:
+        edges = assess_edges(market, result, model_info, now)
+        scalp = edges["scalp_call"]
+        for side, plan in plans.items():
+            execution = model_info.get("execution_assumptions", {})
+            slip = execution.get("slippage_per_leg", 0.01)
+            delay = execution.get("manual_delay_seconds", 3)
+            cap = plan["entry"] + slip
+            if cap >= 1:
+                continue
+            plan.update(
+                display_ask=plan["entry"],
+                entry=cap,
+                entry_fee=fee(cap, plan["multiplier"]),
+                manual_delay=delay,
+                slippage=slip,
+                model_version=model_info.get("version"),
+            )
+            target_bid, stop_bid = levels(cap, plan["multiplier"], target, stop)
+            plan["target_bid"] = (
+                target_bid + slip if target_bid is not None and target_bid + slip <= 1 else None
+            )
+            plan["stop_bid"] = (
+                stop_bid + slip if stop_bid is not None and stop_bid + slip <= 1 else None
+            )
+    overall_reason = (model_info or {}).get("overall_reason", result.reason)
+    scalp_reason = (model_info or {}).get("scalp_reason", result.reason)
+    if stale:
+        overall_reason = (
+            scalp_reason
+        ) = "STALE_OR_MISSING_CONTRACT: fresh unique contract snapshot required"
+    elif result.settlement_up is not None and direction == "UNCLEAR":
+        overall_reason += "; UNCLEAR: neither direction meets the 60% decision threshold"
+    if (
+        not stale
+        and result.scalp_up is not None
+        and result.scalp_down is not None
+        and scalp == "WAIT"
+    ):
+        scalp_reason += "; WAIT: no unique side at or above 60% with a feasible target"
+    if edges:
+        scalp_reason += "; " + (
+            "; ".join(
+                side.upper() + ": " + data["reason"]
+                for side, data in edges.get("scalp", {}).items()
+            )
+            or "WAIT: cost-adjusted scalp estimates unavailable"
+        )
     return dict(
+        transport_diagnostics=payload.get("transport_diagnostics", []),
+        edges=edges,
+        scalp_lean=scalp_lean,
+        settlement_qualification="WAIT" if edges else "UNVERIFIED",
+        model=model_info or {"version": "uploaded-scenarios", "validated": False},
         now=now.isoformat(),
         mode=payload.get("mode", "REPLAY / SIMULATED"),
         market=market,
@@ -296,15 +415,8 @@ def analyze(payload, now, target=0.05, stop=0.03, horizon=60):
         estimate=asdict(result),
         plans=plans,
         warnings=payload.get("warnings", []),
-        explanation=(
-            "Conditional scenarios only; UNVALIDATED. A 60% threshold selects direction."
-            if result.settlement_up is not None
-            else "No matched conditional settlement model. Quotes alone are not a settlement forecast."
-        ),
-        scalp_explanation=(
-            "Net target before stop/deadline using hypothetical ask entry and bid exit. "
-            "WAIT when evidence, fees, liquidity, or a unique probability leader is missing."
-        ),
+        explanation=overall_reason,
+        scalp_explanation=scalp_reason,
     )
 
 
@@ -330,6 +442,40 @@ class Journal:
             """
             )
 
+            columns = {row[1] for row in db.execute("PRAGMA table_info(simulations)")}
+            additions = {
+                "eligible_at": "TEXT",
+                "entry_cap": "REAL",
+                "manual_delay": "INTEGER NOT NULL DEFAULT 0",
+                "slippage": "REAL NOT NULL DEFAULT 0",
+                "holding_seconds": "INTEGER",
+                "model_version": "TEXT NOT NULL DEFAULT 'legacy-immediate-probe'",
+                "execution_at": "TEXT",
+                "call_at_prediction": "TEXT",
+            }
+            for name, spec in additions.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE simulations ADD COLUMN {name} {spec}")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS btc_candles (source TEXT,start INTEGER,payload TEXT,first_received_at TEXT,PRIMARY KEY(source,start))"
+            )
+
+    def record_candles(self, data, now):
+        if not data or not data.get("source"):
+            return
+        with self.connect() as db:
+            for bar in data.get("candles", []):
+                try:
+                    start = int(bar["start"])
+                    if start + 60 > now.timestamp():
+                        continue
+                    db.execute(
+                        "INSERT OR IGNORE INTO btc_candles VALUES (?,?,?,?)",
+                        (data["source"], start, json.dumps(bar), data["received_at"]),
+                    )
+                except (KeyError, ValueError, TypeError):
+                    continue
+
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
@@ -339,7 +485,9 @@ class Journal:
         now = timestamp(state["now"])
         market = state["market"]
         with self.connect() as db:
-            pending = db.execute("SELECT * FROM simulations WHERE status='PENDING'").fetchall()
+            pending = db.execute(
+                "SELECT * FROM simulations WHERE status IN ('PENDING','AWAITING_ENTRY')"
+            ).fetchall()
             for probe in pending:
                 last = timestamp(probe["last_at"])
                 deadline = timestamp(probe["deadline"])
@@ -363,17 +511,59 @@ class Journal:
                     status = "UNOBSERVED_TIME_LIMIT"
                 elif (now - last).total_seconds() > 5 or not same or bid is None:
                     status = "UNOBSERVED_DATA_GAP"
+                elif probe["status"] == "AWAITING_ENTRY":
+                    if now < timestamp(probe["eligible_at"]):
+                        db.execute(
+                            "UPDATE simulations SET last_at=? WHERE id=?",
+                            (now.isoformat(), probe["id"]),
+                        )
+                        continue
+                    ask = side_quote.get("ask")
+                    if ask is None or side_quote.get("ask_size", 0) < 1:
+                        status = "UNOBSERVED_ENTRY_DEPTH"
+                    elif (
+                        ask + probe["slippage"] > probe["entry_cap"] or ask + probe["slippage"] >= 1
+                    ):
+                        status = "SIMULATED_NO_ENTRY_PRICE_MOVED"
+                    elif (timestamp(market["closes_at"]) - now).total_seconds() < probe[
+                        "holding_seconds"
+                    ]:
+                        status = "SIMULATED_NO_ENTRY_TIME"
+                    else:
+                        entry = ask + probe["slippage"]
+                        entry_fee = fee(entry, probe["multiplier"])
+                        exit_bid = max(0, bid - probe["slippage"])
+                        pnl = exit_bid - entry - entry_fee - fee(exit_bid, probe["multiplier"])
+                        stopped = pnl <= -probe["stop"]
+                        db.execute(
+                            """UPDATE simulations SET entry=?,entry_fee=?,execution_at=?,last_at=?,deadline=?,status=?,
+                            exit_at=?,exit_bid=?,exit_fee=?,net_pnl=? WHERE id=?""",
+                            (
+                                entry,
+                                entry_fee,
+                                now.isoformat(),
+                                now.isoformat(),
+                                (now + timedelta(seconds=probe["holding_seconds"])).isoformat(),
+                                "SIMULATED_STOP" if stopped else "PENDING",
+                                now.isoformat() if stopped else None,
+                                exit_bid if stopped else None,
+                                fee(exit_bid, probe["multiplier"]) if stopped else None,
+                                pnl if stopped else None,
+                                probe["id"],
+                            ),
+                        )
+                        continue
                 else:
-                    bid = number(bid, 0, 1)
+                    bid = max(0, number(bid, 0, 1) - probe["slippage"])
                     pnl = bid - probe["entry"] - probe["entry_fee"] - fee(bid, probe["multiplier"])
-                    if pnl <= -probe["stop"]:
-                        status = "SIMULATED_STOP"
-                    elif now < deadline and pnl >= probe["target"]:
-                        status = "SIMULATED_TARGET"
-                    elif now >= deadline:
+                    if now >= deadline:
                         status = "SIMULATED_TIMEOUT"
+                    elif pnl <= -probe["stop"]:
+                        status = "SIMULATED_STOP"
+                    elif pnl >= probe["target"]:
+                        status = "SIMULATED_TARGET"
                 if status:
-                    observed = not status.startswith("UNOBSERVED")
+                    observed = not status.startswith(("UNOBSERVED", "SIMULATED_NO_ENTRY"))
                     db.execute(
                         """UPDATE simulations SET status=?,exit_at=?,exit_bid=?,exit_fee=?,net_pnl=?
                                   WHERE id=?""",
@@ -420,7 +610,8 @@ class Journal:
                 recent = db.execute(
                     """SELECT started_at FROM simulations WHERE mode=? AND ticker=?
                     AND side=? AND target=? AND stop=?
-                    AND ROUND((julianday(deadline)-julianday(started_at))*86400)=?
+                    AND COALESCE(holding_seconds,ROUND((julianday(deadline)-julianday(started_at))*86400))=?
+                    AND manual_delay=? AND slippage=?
                     ORDER BY id DESC LIMIT 1""",
                     (
                         state["mode"],
@@ -429,17 +620,72 @@ class Journal:
                         plan["net_target"],
                         plan["net_stop"],
                         plan["holding_seconds"],
+                        plan.get("manual_delay", 0),
+                        plan.get("slippage", 0),
                     ),
                 ).fetchone()
                 if recent and (now - timestamp(recent[0])).total_seconds() < 60:
                     continue
                 if (
-                    plan["holding_seconds"] > state["remaining_seconds"]
+                    plan["holding_seconds"] + plan.get("manual_delay", 0)
+                    > state["remaining_seconds"]
                     or plan["target_bid"] is None
                 ):
                     continue
                 quote = market["quotes"][side]
                 if quote.get("ask_size", 0) < 1 or quote.get("bid_size", 0) < 1:
+                    continue
+                if plan.get("model_version"):
+                    delay = plan.get("manual_delay", 0)
+                    slipped_bid = max(0, quote["bid"] - plan["slippage"])
+                    entry = plan["entry"] if delay == 0 else None
+                    entry_fee = fee(entry, plan["multiplier"]) if entry is not None else None
+                    net = (
+                        slipped_bid - entry - entry_fee - fee(slipped_bid, plan["multiplier"])
+                        if entry is not None
+                        else None
+                    )
+                    stopped = net is not None and net <= -plan["net_stop"]
+                    record = dict(
+                        prediction_id=prediction,
+                        mode=state["mode"],
+                        ticker=market["ticker"],
+                        side=side,
+                        started_at=now.isoformat(),
+                        last_at=now.isoformat(),
+                        deadline=(
+                            now + timedelta(seconds=delay + plan["holding_seconds"])
+                        ).isoformat(),
+                        multiplier=plan["multiplier"],
+                        target=plan["net_target"],
+                        stop=plan["net_stop"],
+                        status="AWAITING_ENTRY"
+                        if delay
+                        else ("SIMULATED_STOP" if stopped else "PENDING"),
+                        probability=plan["probability"],
+                        eligible_at=(now + timedelta(seconds=delay)).isoformat(),
+                        entry_cap=plan["entry"],
+                        manual_delay=delay,
+                        slippage=plan["slippage"],
+                        holding_seconds=plan["holding_seconds"],
+                        model_version=plan["model_version"],
+                        call_at_prediction=state["scalp"],
+                        entry=entry,
+                        entry_fee=entry_fee,
+                        execution_at=now.isoformat() if not delay else None,
+                        exit_at=now.isoformat() if stopped else None,
+                        exit_bid=slipped_bid if stopped else None,
+                        exit_fee=fee(slipped_bid, plan["multiplier"]) if stopped else None,
+                        net_pnl=net if stopped else None,
+                    )
+                    db.execute(
+                        "INSERT OR IGNORE INTO simulations ("
+                        + ",".join(record)
+                        + ") VALUES ("
+                        + ",".join("?" for _ in record)
+                        + ")",
+                        list(record.values()),
+                    )
                     continue
                 pnl = (
                     quote["bid"]
@@ -491,10 +737,18 @@ class Journal:
                         (int(yes_result == "yes"), row["id"]),
                     )
 
-    def performance(self):
+    def recent_states(self):
         with self.connect() as db:
             rows = db.execute(
-                """SELECT mode,ticker,direction,probability_up,settlement_up
+                "SELECT payload FROM predictions WHERE mode='PUBLIC MARKET DATA' ORDER BY id DESC LIMIT 600"
+            ).fetchall()
+        return [json.loads(row[0]) for row in reversed(rows)]
+
+    def performance(self):
+        with self.connect() as db:
+            research = metrics(db)
+            rows = db.execute(
+                """SELECT mode,ticker,direction,probability_up,settlement_up,COALESCE(json_extract(payload,'$.model.version'),'uploaded-scenarios') version
                 FROM predictions WHERE direction IN ('UP','DOWN')
                 AND probability_up IS NOT NULL AND settlement_up IS NOT NULL
                 ORDER BY timestamp,id"""
@@ -509,13 +763,31 @@ class Journal:
             result[mode] = dict(
                 contracts=len(samples),
                 correct=correct,
+                accuracy_sampling_interval=wilson(correct, len(samples)) if samples else None,
                 accuracy=correct / len(samples) if samples else None,
                 brier_score=sum((r["probability_up"] - r["settlement_up"]) ** 2 for r in samples)
                 / len(samples)
                 if samples
                 else None,
             )
+        by_model = {}
+        unique_model = {}
+        for row in rows:
+            unique_model.setdefault((row["mode"], row["version"], row["ticker"]), row)
+        for (mode, version, _), row in unique_model.items():
+            group = by_model.setdefault(
+                mode + " / " + version, {"contracts": 0, "correct": 0, "brier_score": 0}
+            )
+            group["contracts"] += 1
+            group["correct"] += int((row["direction"] == "UP") == bool(row["settlement_up"]))
+            group["brier_score"] += (row["probability_up"] - row["settlement_up"]) ** 2
+        for group in by_model.values():
+            group["accuracy"] = group["correct"] / group["contracts"]
+            group["brier_score"] /= group["contracts"]
+            group["accuracy_interval"] = wilson(group["correct"], group["contracts"])
+        research["settlement_by_model_and_mode"] = by_model
         return {
+            "research": research,
             "accuracy_goal": 0.9,
             "validated": False,
             "by_mode": result,

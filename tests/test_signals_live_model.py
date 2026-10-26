@@ -230,3 +230,13 @@ def test_monitor_wires_live_model_and_journals_both_probabilities(tmp_path, monk
         "src.signals_display.server.utcnow", lambda: timestamp(state["now"]) + timedelta(seconds=6)
     )
     assert monitor.snapshot()["stale"] and monitor.snapshot()["estimate"]["settlement_up"] is None
+
+
+def test_unknown_depth_is_reported_as_missing_data_not_zero_market_liquidity():
+    model, payload = trained()
+    payload["markets"][0][
+        "book_diagnostic"
+    ] = "MISSING_DEPTH: public orderbook unavailable (HTTPStatusError HTTP 429)"
+    result, info = estimate(model, payload)
+    assert result.settlement_up is not None and result.scalp_up is None
+    assert "MISSING_DEPTH" in info["scalp_reason"] and "429" in info["scalp_reason"]

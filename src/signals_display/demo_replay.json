@@ -1,0 +1,3398 @@
+[
+  {
+    "markets": [
+      {
+        "series": "KXBTC15M",
+        "status": "open",
+        "ticker": "KXBTC15M-MOCK",
+        "opens_at": "2026-10-26T12:00:00+00:00",
+        "closes_at": "2026-10-26T12:15:00+00:00",
+        "observed_at": "2026-10-26T12:05:00+00:00",
+        "strike": 100000,
+        "settlement_reference": "mock official index",
+        "up_definition": "reference_at_settlement > strike",
+        "fee_type": "quadratic",
+        "fee_multiplier": 1,
+        "quotes": {
+          "up": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          },
+          "down": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          }
+        }
+      }
+    ],
+    "evidence": {
+      "ticker": "KXBTC15M-MOCK",
+      "snapshot_at": "2026-10-26T12:05:00+00:00",
+      "strike": 100000,
+      "settlement_reference": "mock official index",
+      "method": "synthetic conditional paths for unit tests, not live evidence",
+      "paths": [
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        }
+      ]
+    },
+    "now": "2026-10-26T12:05:00+00:00",
+    "mode": "REPLAY / SIMULATED",
+    "reference": {
+      "price": 100020,
+      "source": "Synthetic official test reference",
+      "observed_at": "2026-10-26T12:05:00+00:00",
+      "official": true
+    },
+    "warnings": [
+      "SYNTHETIC REPLAY \u2014 no real market observations or fills."
+    ]
+  },
+  {
+    "markets": [
+      {
+        "series": "KXBTC15M",
+        "status": "open",
+        "ticker": "KXBTC15M-MOCK",
+        "opens_at": "2026-10-26T12:00:00+00:00",
+        "closes_at": "2026-10-26T12:15:00+00:00",
+        "observed_at": "2026-10-26T12:05:02+00:00",
+        "strike": 100000,
+        "settlement_reference": "mock official index",
+        "up_definition": "reference_at_settlement > strike",
+        "fee_type": "quadratic",
+        "fee_multiplier": 1,
+        "quotes": {
+          "up": {
+            "bid": 0.7,
+            "ask": 0.75,
+            "bid_size": 10,
+            "ask_size": 10
+          },
+          "down": {
+            "bid": 0.25,
+            "ask": 0.3,
+            "bid_size": 10,
+            "ask_size": 10
+          }
+        }
+      }
+    ],
+    "evidence": {},
+    "now": "2026-10-26T12:05:02+00:00",
+    "mode": "REPLAY / SIMULATED",
+    "reference": {
+      "price": 100020,
+      "source": "Synthetic official test reference",
+      "observed_at": "2026-10-26T12:05:02+00:00",
+      "official": true
+    },
+    "warnings": [
+      "SYNTHETIC REPLAY \u2014 no real market observations or fills."
+    ]
+  },
+  {
+    "markets": [
+      {
+        "series": "KXBTC15M",
+        "status": "open",
+        "ticker": "KXBTC15M-MOCK",
+        "opens_at": "2026-10-26T12:00:00+00:00",
+        "closes_at": "2026-10-26T12:15:00+00:00",
+        "observed_at": "2026-10-26T12:05:04+00:00",
+        "strike": 100000,
+        "settlement_reference": "mock official index",
+        "up_definition": "reference_at_settlement > strike",
+        "fee_type": "quadratic",
+        "fee_multiplier": 1,
+        "quotes": {
+          "up": {
+            "bid": 0.7,
+            "ask": 0.75,
+            "bid_size": 10,
+            "ask_size": 10
+          },
+          "down": {
+            "bid": 0.25,
+            "ask": 0.3,
+            "bid_size": 10,
+            "ask_size": 10
+          }
+        }
+      }
+    ],
+    "evidence": {},
+    "now": "2026-10-26T12:05:04+00:00",
+    "mode": "REPLAY / SIMULATED",
+    "reference": {
+      "price": 100020,
+      "source": "Synthetic official test reference",
+      "observed_at": "2026-10-26T12:05:04+00:00",
+      "official": true
+    },
+    "warnings": [
+      "SYNTHETIC REPLAY \u2014 no real market observations or fills."
+    ]
+  },
+  {
+    "markets": [
+      {
+        "series": "KXBTC15M",
+        "status": "open",
+        "ticker": "KXBTC15M-MOCK",
+        "opens_at": "2026-10-26T12:00:00+00:00",
+        "closes_at": "2026-10-26T12:15:00+00:00",
+        "observed_at": "2026-10-26T12:05:06+00:00",
+        "strike": 100000,
+        "settlement_reference": "mock official index",
+        "up_definition": "reference_at_settlement > strike",
+        "fee_type": "quadratic",
+        "fee_multiplier": 1,
+        "quotes": {
+          "up": {
+            "bid": 0.7,
+            "ask": 0.75,
+            "bid_size": 10,
+            "ask_size": 10
+          },
+          "down": {
+            "bid": 0.25,
+            "ask": 0.3,
+            "bid_size": 10,
+            "ask_size": 10
+          }
+        }
+      }
+    ],
+    "evidence": {},
+    "now": "2026-10-26T12:05:06+00:00",
+    "mode": "REPLAY / SIMULATED",
+    "reference": {
+      "price": 100020,
+      "source": "Synthetic official test reference",
+      "observed_at": "2026-10-26T12:05:06+00:00",
+      "official": true
+    },
+    "warnings": [
+      "SYNTHETIC REPLAY \u2014 no real market observations or fills."
+    ]
+  },
+  {
+    "markets": [
+      {
+        "series": "KXBTC15M",
+        "status": "open",
+        "ticker": "KXBTC15M-MOCK-NEXT",
+        "opens_at": "2026-10-26T12:15:00+00:00",
+        "closes_at": "2026-10-26T12:30:00+00:00",
+        "observed_at": "2026-10-26T12:15:00+00:00",
+        "strike": 100000,
+        "settlement_reference": "mock official index",
+        "up_definition": "reference_at_settlement > strike",
+        "fee_type": "quadratic",
+        "fee_multiplier": 1,
+        "quotes": {
+          "up": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          },
+          "down": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          }
+        }
+      }
+    ],
+    "evidence": {
+      "ticker": "KXBTC15M-MOCK-NEXT",
+      "snapshot_at": "2026-10-26T12:15:00+00:00",
+      "strike": 100000,
+      "settlement_reference": "mock official index",
+      "method": "synthetic conditional paths for unit tests, not live evidence",
+      "paths": [
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        }
+      ]
+    },
+    "now": "2026-10-26T12:15:00+00:00",
+    "mode": "REPLAY / SIMULATED",
+    "reference": {
+      "price": 100020,
+      "source": "Synthetic official test reference",
+      "observed_at": "2026-10-26T12:15:00+00:00",
+      "official": true
+    },
+    "settlements": {
+      "KXBTC15M-MOCK": "yes"
+    },
+    "warnings": [
+      "SYNTHETIC REPLAY \u2014 no real market observations or fills."
+    ]
+  },
+  {
+    "markets": [
+      {
+        "series": "KXBTC15M",
+        "status": "open",
+        "ticker": "KXBTC15M-MOCK-NEXT",
+        "opens_at": "2026-10-26T12:15:00+00:00",
+        "closes_at": "2026-10-26T12:30:00+00:00",
+        "observed_at": "2026-10-26T12:15:02+00:00",
+        "strike": 100000,
+        "settlement_reference": "mock official index",
+        "up_definition": "reference_at_settlement > strike",
+        "fee_type": "quadratic",
+        "fee_multiplier": 1,
+        "quotes": {
+          "up": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          },
+          "down": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          }
+        }
+      }
+    ],
+    "evidence": {
+      "ticker": "KXBTC15M-MOCK-NEXT",
+      "snapshot_at": "2026-10-26T12:15:02+00:00",
+      "strike": 100000,
+      "settlement_reference": "mock official index",
+      "method": "synthetic conditional paths for unit tests, not live evidence",
+      "paths": [
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        }
+      ]
+    },
+    "now": "2026-10-26T12:15:02+00:00",
+    "mode": "REPLAY / SIMULATED",
+    "reference": {
+      "price": 100020,
+      "source": "Synthetic official test reference",
+      "observed_at": "2026-10-26T12:15:02+00:00",
+      "official": true
+    },
+    "settlements": {
+      "KXBTC15M-MOCK": "yes"
+    },
+    "warnings": [
+      "SYNTHETIC REPLAY \u2014 no real market observations or fills."
+    ]
+  },
+  {
+    "markets": [
+      {
+        "series": "KXBTC15M",
+        "status": "open",
+        "ticker": "KXBTC15M-MOCK-NEXT",
+        "opens_at": "2026-10-26T12:15:00+00:00",
+        "closes_at": "2026-10-26T12:30:00+00:00",
+        "observed_at": "2026-10-26T12:15:04+00:00",
+        "strike": 100000,
+        "settlement_reference": "mock official index",
+        "up_definition": "reference_at_settlement > strike",
+        "fee_type": "quadratic",
+        "fee_multiplier": 1,
+        "quotes": {
+          "up": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          },
+          "down": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          }
+        }
+      }
+    ],
+    "evidence": {
+      "ticker": "KXBTC15M-MOCK-NEXT",
+      "snapshot_at": "2026-10-26T12:15:04+00:00",
+      "strike": 100000,
+      "settlement_reference": "mock official index",
+      "method": "synthetic conditional paths for unit tests, not live evidence",
+      "paths": [
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        }
+      ]
+    },
+    "now": "2026-10-26T12:15:04+00:00",
+    "mode": "REPLAY / SIMULATED",
+    "reference": {
+      "price": 100020,
+      "source": "Synthetic official test reference",
+      "observed_at": "2026-10-26T12:15:04+00:00",
+      "official": true
+    },
+    "settlements": {
+      "KXBTC15M-MOCK": "yes"
+    },
+    "warnings": [
+      "SYNTHETIC REPLAY \u2014 no real market observations or fills."
+    ]
+  },
+  {
+    "markets": [
+      {
+        "series": "KXBTC15M",
+        "status": "open",
+        "ticker": "KXBTC15M-MOCK-NEXT",
+        "opens_at": "2026-10-26T12:15:00+00:00",
+        "closes_at": "2026-10-26T12:30:00+00:00",
+        "observed_at": "2026-10-26T12:15:06+00:00",
+        "strike": 100000,
+        "settlement_reference": "mock official index",
+        "up_definition": "reference_at_settlement > strike",
+        "fee_type": "quadratic",
+        "fee_multiplier": 1,
+        "quotes": {
+          "up": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          },
+          "down": {
+            "bid": 0.48,
+            "ask": 0.52,
+            "bid_size": 10,
+            "ask_size": 10
+          }
+        }
+      }
+    ],
+    "evidence": {
+      "ticker": "KXBTC15M-MOCK-NEXT",
+      "snapshot_at": "2026-10-26T12:15:06+00:00",
+      "strike": 100000,
+      "settlement_reference": "mock official index",
+      "method": "synthetic conditional paths for unit tests, not live evidence",
+      "paths": [
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": true,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        },
+        {
+          "settlement_up": false,
+          "quotes": [
+            {
+              "seconds": 0,
+              "up_bid": 0.48,
+              "down_bid": 0.48
+            },
+            {
+              "seconds": 30,
+              "up_bid": 0.25,
+              "down_bid": 0.7
+            },
+            {
+              "seconds": 60,
+              "up_bid": 0.7,
+              "down_bid": 0.25
+            }
+          ]
+        }
+      ]
+    },
+    "now": "2026-10-26T12:15:06+00:00",
+    "mode": "REPLAY / SIMULATED",
+    "reference": {
+      "price": 100020,
+      "source": "Synthetic official test reference",
+      "observed_at": "2026-10-26T12:15:06+00:00",
+      "official": true
+    },
+    "settlements": {
+      "KXBTC15M-MOCK": "yes"
+    },
+    "warnings": [
+      "SYNTHETIC REPLAY \u2014 no real market observations or fills."
+    ]
+  }
+]

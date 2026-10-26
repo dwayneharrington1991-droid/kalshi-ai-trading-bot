@@ -1,0 +1,13 @@
+{
+  "name": "KXBTC15M signals-only monitor",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "forwardPorts": [8765],
+  "portsAttributes": {
+    "8765": {
+      "label": "KXBTC15M signals-only dashboard",
+      "protocol": "http",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "postCreateCommand": "python3 -m venv .venv && .venv/bin/python -m pip install httpx==0.27.0"
+}

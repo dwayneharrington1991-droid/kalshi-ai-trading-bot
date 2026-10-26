@@ -174,6 +174,9 @@ class PublicFeed:
             )
         selected = active_market({"markets": result}, now)
         if selected and selected["mapping_verified"]:
+            selected[
+                "book_diagnostic"
+            ] = "MISSING_DEPTH: public orderbook has an empty side or unsupported schema"
             try:
                 book = self._read(
                     KALSHI + "/markets/" + quote(selected["ticker"], safe="") + "/orderbook"
@@ -181,24 +184,27 @@ class PublicFeed:
                 if "orderbook_fp" in book:
                     fixed = book["orderbook_fp"]
                     yes = [
-                        (number(float(p), 0, 1), number(float(q), 0.000001, 1e12))
+                        (number(float(p), 0, 1), number(float(q), 0, 1e12))
                         for p, q in fixed.get("yes_dollars", [])
                     ]
                     no = [
-                        (number(float(p), 0, 1), number(float(q), 0.000001, 1e12))
+                        (number(float(p), 0, 1), number(float(q), 0, 1e12))
                         for p, q in fixed.get("no_dollars", [])
                     ]
                 else:
                     legacy = book.get("orderbook", {})
                     yes = [
-                        (number(p, 0, 100) / 100, number(q, 0.000001, 1e12))
+                        (number(p, 0, 100) / 100, number(q, 0, 1e12))
                         for p, q in (legacy.get("yes") or [])
                     ]
                     no = [
-                        (number(p, 0, 100) / 100, number(q, 0.000001, 1e12))
+                        (number(p, 0, 100) / 100, number(q, 0, 1e12))
                         for p, q in (legacy.get("no") or [])
                     ]
+                yes = [level for level in yes if level[1] > 0]
+                no = [level for level in no if level[1] > 0]
                 if yes and no:
+                    selected["book_diagnostic"] = None
                     y, n = max(yes), max(no)
                     selected["quotes"] = {
                         "up": dict(bid=y[0], ask=round(1 - n[0], 6), bid_size=y[1], ask_size=n[1]),
@@ -206,8 +212,15 @@ class PublicFeed:
                             bid=n[0], ask=round(1 - y[0], 6), bid_size=n[1], ask_size=y[1]
                         ),
                     }
-            except (httpx.HTTPError, ValueError, KeyError, TypeError):
-                pass  # Summary quotes remain visible; absent sizes prohibit simulations.
+            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                selected["book_diagnostic"] = (
+                    "MISSING_DEPTH: public orderbook unavailable ("
+                    + type(exc).__name__
+                    + (" HTTP " + str(status) if status else "")
+                    + ")"
+                )
+                # Summary quotes remain visible, but they never imply known executable depth.
         reference = {
             "price": None,
             "source": "Coinbase BTC-USD spot (proxy, NOT settlement index)",

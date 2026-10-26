@@ -257,6 +257,8 @@ class LiveEstimator:
         try:
             if horizon + self.manual_delay > remaining:
                 raise ValueError("INSUFFICIENT_TIME: holding limit exceeds contract lifetime")
+            if market.get("book_diagnostic"):
+                raise ValueError(market["book_diagnostic"])
             if market["fee_type"] not in {"quadratic", "quadratic_with_maker_fees"}:
                 raise ValueError("UNKNOWN_FEES: no supported series fee schedule")
             multiplier = number(market["fee_multiplier"], 0, 100)

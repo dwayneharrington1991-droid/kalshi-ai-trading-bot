@@ -9,14 +9,30 @@ from pathlib import Path
 import re
 import threading
 
+from .live_model import LiveEstimator
 from .model import Display, timestamp
-from .monitor import Journal, PublicFeed, ReplayFeed, analyze, utcnow
+from .monitor import Journal, PublicFeed, ReplayFeed, active_market, analyze, utcnow
 
 
 class Monitor:
-    def __init__(self, feed, journal, *, target=0.05, stop=0.10, horizon=60):
+    def __init__(
+        self,
+        feed,
+        journal,
+        *,
+        target=0.05,
+        stop=0.10,
+        horizon=60,
+        models_enabled=True,
+        manual_delay=3,
+        slippage=0.01,
+    ):
         self.feed, self.journal = feed, journal
         self.target, self.stop, self.horizon = target, stop, horizon
+        self.models_enabled = models_enabled
+        self.estimator = LiveEstimator(manual_delay=manual_delay, slippage=slippage)
+        if isinstance(feed, PublicFeed):
+            self.estimator.restore(journal.recent_states())
         self.lock = threading.Lock()
         self.state = dict(
             direction="UNCLEAR",
@@ -38,7 +54,26 @@ class Monitor:
         try:
             payload = self.feed.poll()
             now = timestamp(payload["clock"]) if "clock" in payload else utcnow()
-            state = analyze(payload, now, self.target, self.stop, self.horizon)
+            result, info = None, None
+            if isinstance(self.feed, PublicFeed):
+                if self.models_enabled:
+                    result, info = self.estimator.estimate(
+                        payload,
+                        active_market(payload, now),
+                        now,
+                        self.target,
+                        self.stop,
+                        self.horizon,
+                    )
+                else:
+                    result = Display("WAIT", "MODEL_DISABLED: started with --disable-model")
+                    info = {
+                        "enabled": False,
+                        "overall_reason": result.reason,
+                        "scalp_reason": result.reason,
+                    }
+            state = analyze(payload, now, self.target, self.stop, self.horizon, result, info)
+            self.journal.record_candles(payload.get("btc_candles", {}), now)
             self.journal.step(state)
             if isinstance(self.feed, PublicFeed):
                 if (
@@ -73,6 +108,8 @@ class Monitor:
                     "direction": "UNCLEAR",
                     "scalp": "WAIT",
                     "plans": {},
+                    "explanation": "MISSING_DATA: public feed failed; see access diagnostic",
+                    "scalp_explanation": "MISSING_DATA: public feed failed; no valid quote input",
                     "estimate": asdict(Display("WAIT", "Data unavailable; no usable estimate")),
                     "warnings": [f"Market-data failure ({type(exc).__name__}); retrying."],
                 }
@@ -95,7 +132,11 @@ class Monitor:
             market = state.get("market")
             if market:
                 elapsed = utcnow() - self.last_tick
-                clock = timestamp(state["now"]) + elapsed
+                clock = (
+                    utcnow()
+                    if state.get("mode") == "PUBLIC MARKET DATA"
+                    else timestamp(state["now"]) + elapsed
+                )
                 age = (clock - timestamp(market["observed_at"])).total_seconds()
                 state["remaining_seconds"] = max(
                     0, (timestamp(market["closes_at"]) - clock).total_seconds()
@@ -106,6 +147,8 @@ class Monitor:
                         direction="UNCLEAR",
                         scalp="WAIT",
                         plans={},
+                        explanation="STALE_DATA: snapshot older than 5s or contract expired",
+                        scalp_explanation="STALE_DATA: snapshot older than 5s or contract expired",
                         estimate=asdict(Display("WAIT", "Stale snapshot or expired contract")),
                     )
             return state
@@ -154,12 +197,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="KXBTC15M read-only public/replay monitor — no orders or credentials"
     )
+    parser.add_argument(
+        "--disable-model",
+        action="store_true",
+        help="Quotes-only mode; panels explicitly report MODEL_DISABLED",
+    )
     parser.add_argument("--mode", choices=["public", "replay"], default="replay")
     parser.add_argument("--replay", type=Path, default=Path(__file__).with_name("demo_replay.json"))
     parser.add_argument("--journal", type=Path, default=Path("signals_monitor.db"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--poll-seconds", type=float, default=2)
+    parser.add_argument("--manual-delay", type=int, default=3)
+    parser.add_argument("--slippage", type=float, default=0.01)
     parser.add_argument("--target", type=float, default=0.05)
     parser.add_argument("--stop", type=float, default=0.10)
     parser.add_argument("--horizon", type=int, default=60)
@@ -169,11 +219,20 @@ def main():
         and 0 < args.stop <= 1
         and 1 <= args.horizon <= 900
         and 1 <= args.poll_seconds <= 5
+        and 0 <= args.manual_delay <= 30
+        and 0 <= args.slippage <= 0.10
     ):
         parser.error("target/stop must be in (0,1], horizon 1..900s, polling 1..5s")
     feed = PublicFeed() if args.mode == "public" else ReplayFeed(args.replay)
     monitor = Monitor(
-        feed, Journal(args.journal), target=args.target, stop=args.stop, horizon=args.horizon
+        feed,
+        Journal(args.journal),
+        target=args.target,
+        stop=args.stop,
+        horizon=args.horizon,
+        models_enabled=not args.disable_model,
+        manual_delay=args.manual_delay,
+        slippage=args.slippage,
     )
     stop = threading.Event()
 

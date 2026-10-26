@@ -127,6 +127,8 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy):
             }
             if legacy:
                 payload = {"orderbook": {"yes": [[48, 12]], "no": [[48, 14]]}}
+        elif "/candles?" in url:
+            payload = {"candles": []}
         elif url == module.COINBASE:
             payload = {"data": {"amount": "100020", "base": "BTC", "currency": "USD"}}
         else:
@@ -135,7 +137,7 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy):
 
     monkeypatch.setattr(module, "utcnow", lambda: NOW)
     data = PublicFeed(get).poll()
-    assert len(calls) == 4
+    assert len(calls) == 5
     assert data["markets"][0]["quotes"]["up"]["ask_size"] == 14
     assert not data["reference"]["official"]
     assert analyze(data, NOW)["scalp"] == "WAIT"

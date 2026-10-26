@@ -78,3 +78,49 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_browser_shows_separate_live_model_diagnostics_and_estimates(tmp_path):
+    from tests.test_signals_live_model import trained, estimate
+    from src.signals_display.model import timestamp
+
+    model, payload = trained()
+    result, info = estimate(model, payload)
+    state = analyze(payload, timestamp(payload["now"]), 0.05, 0.10, 10, result, info)
+    # Replay the live-produced state with its virtual clock; no external API.
+    state["mode"] = "REPLAY / SIMULATED"
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    monitor.state = state
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#direction-reason")).to_contain_text("MODEL_ESTIMATE")
+            assert page.locator("#prob-up").inner_text() == "50.0%"
+            assert page.locator("#scalp-up").inner_text() != "unavailable"
+            assert page.locator("#scalp-down").inner_text() != "unavailable"
+            assert (
+                "zero Coinbase/CF Benchmarks basis"
+                in page.locator("#overall-diagnostics").text_content()
+            )
+            assert "frozen current spread" in page.locator("#scalp-diagnostics").text_content()
+            monitor.state = {
+                **state,
+                "explanation": "INSUFFICIENT_HISTORY: reference 1/61 samples, 0/120s span",
+                "scalp_explanation": "UNKNOWN_FEES: no supported series fee schedule",
+            }
+            playwright.expect(page.locator("#direction-reason")).to_contain_text(
+                "INSUFFICIENT_HISTORY"
+            )
+            playwright.expect(page.locator("#scalp-reason")).to_contain_text("UNKNOWN_FEES")
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

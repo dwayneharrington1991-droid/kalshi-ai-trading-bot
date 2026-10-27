@@ -7,6 +7,7 @@ import threading
 import zlib
 
 from .model import timestamp, number
+from .edge_reading import flow_metrics
 
 
 def utcnow():
@@ -93,7 +94,10 @@ class Flow:
             delta_60s=delta if ready else None,
             delta_fraction_60s=fraction,
             observed_trades_60s=len(recent),
-            hidden_bullish_accumulation_candidate=bool(flat and fraction >= 0.3),
+            hidden_bullish_accumulation_candidate=False,
+            passive_sell_absorption_candidate=bool(flat and fraction >= 0.3),
+            absorption_note="Flat price with net aggressive buys is an ambiguous absorption candidate, not established bullish accumulation or institutional selling. The earlier bullish label is suppressed.",
+            delta_efficiency_3m=flow_metrics(self.trades, self.started, now),
             bearish_divergence_candidate=bool(
                 ready and self.divergence and 0 <= (now - self.divergence).total_seconds() <= 180
             ),

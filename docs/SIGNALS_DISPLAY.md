@@ -1,5 +1,7 @@
 # KXBTC15M signals dashboard
 
+New to Codespaces? Follow [Open your dashboard on your laptop](OPEN_DASHBOARD.md).
+
 Experimental estimates; **edge unverified**. No profitable edge or 90% accuracy
 has been demonstrated. This application never submits, amends, cancels, transfers,
 or manages broker orders. You execute every trade yourself.
@@ -45,10 +47,18 @@ cannot verify your Codespaces port setting.
 
 ## Simple display and local manual tracking
 
-The two main cards keep settlement direction separate from trade qualification.
+The first card is **YOUR NEXT MOVE**: BUY UP / BUY DOWN / WAIT and SCALP YES / NO.
+The current version keeps this at **WAIT / NO** because a profitable edge has not
+been validated and no reviewed profitability-promotion protocol exists. An
+experimental forecast, favorable model EV or a user-supplied validation flag cannot
+open this gate. Entry, maximum risk and target stay unavailable, never invented.
+Actual connected holdings can still have cost-based exit warnings; those do not
+qualify a new entry.
+
+The forecast and scalp-check cards keep settlement direction separate from trade qualification.
 UP does not mean BUY. Unsupported probabilities read `unavailable`; WAIT has a
 plain reason. LIVE / STALE / WARMING UP reflects data/history readiness, not model
-validation. Qualifying scalp plans show entry cap, target, stop, maximum hold,
+validation. Experimental candidate scalp plans under Details show entry cap, target, stop, maximum hold,
 experimental success probability, timestamp and expiry. Signals expire after five
 seconds without a refreshed quote and cannot outlive their contract/holding window.
 
@@ -239,8 +249,11 @@ perpetual sequence gaps reset the stream. These are public market executions, no
 your account fills. Silent dropped spot trades cannot be independently recovered;
 no complete historical CVD claim is made.
 
-“Hidden bullish accumulation” is only an experimental candidate: observed 60s
-price change <=1bp and net buy-volume fraction >=30%. Bearish divergence compares
+The earlier “hidden bullish accumulation” flag is superseded by the newer
+absorption interpretation: observed 60s price change <=1bp and net buy-volume
+fraction >=30% flags an experimental passive-sell absorption candidate. It does
+not identify an iceberg, institutional seller or proven DOWN edge. The previous
+bullish flag is suppressed to avoid contradictory labels. Bearish divergence compares
 successive confirmed closed-minute price peaks and CVD at each high; a later
 minute must close before a peak can be used. Neither is a high-probability claim
 or independent Kalshi entry instruction.
@@ -264,3 +277,47 @@ so blocked or insufficient inputs remain unavailable. No trading authentication.
 Additional offline tests: `tests/test_signals_order_flow.py` covers signed CVD,
 deduplication, warm-up/staleness, confirmed divergence timing, checksum failure and
 full-depth requirements.
+
+
+## Edge Reading Core
+
+The exact `Edge Reading Core:` line appears under Details and in the scanner API
+and timestamped prediction journal. Main settlement/scalp cards stay simple. These
+are observable candidate signatures with **no automatic probability adjustment**,
+no 70% floor, no forced trade and no institutional/market-maker attribution. A
+signature's candidate lean is separate from forecast direction and trade qualification;
+opposing signatures yield UNCLEAR. Stale contract/reference data clears active
+signatures. An unavailable component remains explicitly unavailable.
+
+- Passive sell absorption: fresh net aggressive buys with flat price, under the
+  CVD module's existing coverage/volume thresholds. This pattern is ambiguous;
+  neither bullish accumulation nor hidden institutional sell orders are proven.
+- Liquidity sweeps: the latest **closed** one-minute proxy candle must sweep a
+  preexisting level, reclaim it, have range >=1.5 times the prior 20-bar median
+  range, exceed the level by max(1bp of candle open, 25% of median range), and
+  have volume below both the previous candle and preceding five-bar average.
+  Candidate bias opposes the sweep. These fixed heuristics are experimental;
+  public candles do not establish that retail stop orders actually executed.
+- Levels: a bounded Coinbase public daily-candle request supplies the previous
+  UTC day's high/low and current developing UTC-session high/low every 60s.
+  Daily receipt age must be <=150s. Current session extremes include the latest
+  move and are displayed only: they cannot become a retrospective pre-sweep
+  benchmark. A session sweep benchmark requires continuous pre-sweep closed
+  history from UTC midnight. Short-term levels exclude the tested candle.
+- Three-minute delta efficiency: dollar price change divided by signed net
+  executed volume, separately per venue/unit. Requires 180s since first trade,
+  >=60 trades, >=175s window coverage and a final trade <=5s old. Ratios are
+  unavailable when abs(net)/gross volume <5%, avoiding unstable denominators.
+  An upward-impact/taper candidate requires >=10bp price rise, 5–20% net-buy
+  fraction, and final-minute gross volume <70% of the preceding minute. It is
+  not proof of an illiquid pump or a successful short entry.
+- Final-three-minute target proximity is displayed using the actual target and
+  timestamped reference (proxy limitation retained). **Market-maker pinning is
+  unavailable**: public Kalshi depth/open interest does not reveal ownership,
+  hidden blocks or strike-clustered market-maker exposure. No “Flat Pin” bias
+  or breakout penalty is manufactured.
+
+Absorption/DEM features are collected as optional chronological-learning candidates
+with a separate validation ablation group. No incremental predictive value or
+profitable edge is established. Offline checks include
+`tests/test_signals_edge_reading.py`; run it alongside the scoped signals suite.

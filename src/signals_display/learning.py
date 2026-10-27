@@ -210,6 +210,12 @@ def compare(rows):
             "perpetual_cvd_delta_fraction",
             "spot_book_dominance",
         },
+        "edge_reading": {
+            "spot_absorption_candidate",
+            "perpetual_absorption_candidate",
+            "spot_delta_efficiency_3m",
+            "perpetual_delta_efficiency_3m",
+        },
         "candles": set(FEATURES[2:13]),
     }.items():
         keep = [i for i, name in enumerate(prep["names"]) if name not in names]

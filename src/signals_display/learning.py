@@ -386,6 +386,30 @@ def compare(rows, *, used_test_contracts=None):
     )
     ablations = {}
     for group, names in {
+        "advanced_technicals": {
+            name
+            for name in FEATURES
+            if name.startswith("advanced_")
+            and name
+            not in {
+                "advanced_vwap_deviation_fraction",
+                "advanced_flow_imbalance",
+                "advanced_cvd_slope",
+                "advanced_book_imbalance",
+                "advanced_effective_spread",
+                "advanced_trade_intensity",
+                "advanced_profile_threshold_concentration",
+            }
+        },
+        "executed_trade_microstructure": {
+            "advanced_vwap_deviation_fraction",
+            "advanced_flow_imbalance",
+            "advanced_cvd_slope",
+            "advanced_book_imbalance",
+            "advanced_effective_spread",
+            "advanced_trade_intensity",
+            "advanced_profile_threshold_concentration",
+        },
         "microstructure_horizons": {name for name in FEATURES if name.startswith("micro_")},
         "cross_venue": {"cross_venue_divergence", "spot_depth_imbalance"},
         "derivatives": {"derivatives_basis", "open_interest_change"},

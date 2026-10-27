@@ -7,6 +7,258 @@ from .model import timestamp, number
 from .scores import score, horizon, wilson_interval
 
 VERSION = "btc24h-final-average-v1"
+DIRECTION_POLICY = "display-tenth-percent-neutral-v1"
+
+
+def display_probability_pair(probability):
+    """Match browser half-up rounding; the displayed outcomes sum to 100%."""
+    try:
+        p = number(probability, 0, 1)
+    except (ValueError, TypeError):
+        return {"up": None, "down": None, "precision_percentage_points": 0.1}
+    tenths = math.floor(p * 1000 + 0.5)
+    return {"up": tenths / 10, "down": (1000 - tenths) / 10, "precision_percentage_points": 0.1}
+
+
+def direction_label(probability, unavailable="UNCLEAR"):
+    displayed = display_probability_pair(probability)["up"]
+    return (
+        unavailable
+        if displayed is None
+        else "UP"
+        if displayed > 50
+        else "DOWN"
+        if displayed < 50
+        else "NEUTRAL"
+    )
+
+
+def opening_diagnostics(opening, model_info=None):
+    """Explain saved model selection without editing immutable historical rows."""
+    opening, model_info = opening or {}, model_info or {}
+    selection = opening.get("model_selection", {})
+    learning = model_info.get("learning_status", {})
+    model = opening.get("model") or "UNRECORDED_OPENING_MODEL"
+    fallback = model.startswith("opening24h-zero-drift")
+    displayed = display_probability_pair(opening.get("up"))
+    audit = selection.get("audit_context", {})
+    count = audit.get("official_contracts", learning.get("official_contracts"))
+    minimum = audit.get("minimum_contracts", learning.get("minimum_contracts", 170))
+    live = learning.get("active", model_info.get("version", "unavailable"))
+    return {
+        "model_id": model,
+        "model_version": model,
+        "opening_model": "Experimental zero-drift, constant proxy/index opening-basis Gaussian final-average model"
+        if fallback
+        else model,
+        "live_model": live,
+        "live_ensemble_active": live == "ensemble",
+        "opening_ensemble_active": False
+        if fallback or not selection
+        else bool(selection.get("opening_ensemble_active", False)),
+        "validated": False,
+        "fallback_reason": selection.get("fallback_reason")
+        or (
+            "No separately validated opening-time model is active. A classifier selected on live-horizon features is not an opening model; post-opening observations are excluded."
+            if fallback
+            else "Saved opening model metadata does not establish validated predictive accuracy"
+        ),
+        "candidate_rejection": selection.get("candidate_rejection"),
+        "promotion_blocker": (
+            f"INSUFFICIENT_OFFICIAL_OUTCOMES: {count}/{minimum} official outcomes before opening-only feature/split checks"
+            if isinstance(count, (int, float)) and count < minimum
+            else "Opening-only frozen-feature labels and purged out-of-sample calibration must pass before any opening promotion"
+        ),
+        "official_contracts_at_generation": count,
+        "minimum_contracts": minimum,
+        "artifact_status": audit.get(
+            "artifact_status",
+            learning.get("artifact_status", "No opening-specific artifact selected"),
+        ),
+        "history_available_before_open": opening.get("data_quality", {}).get("closed_history_bars")
+        == 1440,
+        "closed_history_bars": opening.get("data_quality", {}).get("closed_history_bars"),
+        "history_received_at": opening.get("history_received_at"),
+        "history_last_close": opening.get("history_last_close"),
+        "frozen_feature_status": opening.get("frozen_features", {}).get(
+            "status", "NOT_RECORDED_LEGACY_OPENING"
+        ),
+        "frozen_feature_count": sum(
+            v is not None for v in opening.get("frozen_features", {}).get("values", {}).values()
+        ),
+        "raw_probability_up": opening.get("up"),
+        "displayed_probabilities": displayed,
+        "display_direction": direction_label(opening.get("up")),
+        "saved_direction": opening.get("direction"),
+        "direction_policy": DIRECTION_POLICY,
+        "near_neutral_reason": (
+            "Both probabilities round to 50.0% at the displayed 0.1-percentage-point precision; direction is NEUTRAL. The unrounded estimate is preserved."
+            if displayed["up"] == 50
+            else None
+        ),
+        "constant_probability": False if opening.get("probability_inputs") else None,
+        "probability_inputs": opening.get("probability_inputs"),
+        "probability_explanation": "The fallback is a computed Gaussian event probability, not a hard-coded 50%. With zero drift and a threshold-anchored opening basis, the projected mean is often very close to the threshold."
+        if fallback
+        else "The opening-specific calibrated classifier uses the saved frozen feature vector; the independent Gaussian baseline is retained separately for evaluation",
+        "generated_at": opening.get("generated_at"),
+        "data_cutoff": opening.get("data_cutoff"),
+        "opening_delay_seconds": opening.get("opening_delay_seconds"),
+        "threshold_received_at": opening.get("threshold_received_at"),
+        "delay_effect": "A later generation/metadata timestamp does not extend the BTC data cutoff or make a live model eligible at opening",
+        "immutable": True,
+    }
+
+
+def _opening_features(history, points, market, day, basis, opened, frozen_context=None):
+    """Opening-only learning inputs; no current/live post-opening feature borrow."""
+    from .features import FEATURES
+
+    values = {name: None for name in FEATURES}
+    values.update({name: value for name, value in day["features"].items() if name in values})
+    bars = sorted(
+        (
+            b
+            for b in history["candles"]
+            if day["first_start"] <= int(b["start"]) < day["last_close"]
+        ),
+        key=lambda b: int(b["start"]),
+    )
+    closes = [float(b["close"]) for b in bars]
+    returns = [math.log(b / a) for a, b in zip(closes, closes[1:])]
+    for minutes in (1, 5, 15):
+        if len(closes) > minutes:
+            values[f"return_{minutes}m"] = math.log(closes[-1] / closes[-minutes - 1])
+    latest = bars[-1]
+    o, high, low, close = [float(latest[k]) for k in ("open", "high", "low", "close")]
+    span = max(high - low, 1e-9)
+    values.update(
+        remaining_fraction=1.0,
+        distance_scaled=(points[-1][1] + basis["point"] - float(market["strike"])) / points[-1][1],
+        acceleration=returns[-1] - returns[-2],
+        body_fraction=(close - o) / span,
+        upper_wick=(high - max(close, o)) / span,
+        lower_wick=(min(close, o) - low) / span,
+        range_fraction=(high - low) / o,
+        breakout_distance=(close - max(float(b["high"]) for b in bars[-21:-1])) / o,
+    )
+    old_variance = sum(r * r for r in returns[-20:-5]) / 15
+    values["volatility_change"] = (
+        (sum(r * r for r in returns[-5:]) / 5) / old_variance if old_variance else None
+    )
+    old_volume = mean(float(b["volume"]) for b in bars[-21:-1])
+    values["relative_volume"] = float(latest["volume"]) / old_volume if old_volume else None
+    intervals = [(b[0] - a[0]).total_seconds() for a, b in zip(points, points[1:])]
+    observed_span = (points[-1][0] - points[0][0]).total_seconds()
+    if observed_span >= 55 and intervals and all(0 < v <= 5 for v in intervals):
+        values["micro_1m_return_fraction"] = points[-1][1] / points[0][1] - 1
+        values["micro_1m_velocity_dollars_per_second"] = (
+            points[-1][1] - points[0][1]
+        ) / observed_span
+    receipts = [timestamp(history["received_at"]), points[-1][0]]
+    optional_status = "UNAVAILABLE: no frozen microstructure context"
+    optional_receipts = {}
+    if frozen_context:
+        try:
+            context_cutoff = timestamp(frozen_context["cutoff"])
+            if context_cutoff > opened:
+                raise ValueError("POST_OPENING_CONTEXT_EXCLUDED")
+            if (
+                frozen_context.get("max_input_received_at")
+                and timestamp(frozen_context["max_input_received_at"]) > opened
+            ):
+                raise ValueError("POST_OPENING_CONTEXT_INPUT_EXCLUDED")
+            optional_values = {}
+            feature_receipts = {}
+            sources = frozen_context.get("sources", {})
+            primary = sources.get(frozen_context.get("primary_source"), {})
+
+            def receipt_for(name, raw):
+                receipt = timestamp(raw)
+                if receipt > context_cutoff or receipt > opened:
+                    raise ValueError("POST_OPENING_SOURCE_RECEIPT_EXCLUDED")
+                feature_receipts[name] = {"received_at": receipt.isoformat()}
+                return receipt
+
+            for name, value in frozen_context.get("candidate_features", {}).items():
+                if name in values and value is not None and name.startswith("micro_"):
+                    window_label = name.split("_", 2)[1]
+                    window = primary.get("windows", {}).get(window_label, {})
+                    if window.get("status") == "READY" and window.get("last_received_at"):
+                        receipt_for(name, window["last_received_at"])
+                        optional_values[name] = number(value, -1e15, 1e15)
+            spot = sources.get("Kraken BTC/USD stream", {})
+            if spot.get("status") == "LIVE":
+                window = spot.get("windows", {}).get("5s", {})
+                if window.get("status") == "READY":
+                    imbalance = window.get("features", {}).get("depth_imbalance")
+                    if imbalance is not None and window.get("last_received_at"):
+                        receipt_for("spot_depth_imbalance", window["last_received_at"])
+                        optional_values["spot_depth_imbalance"] = number(imbalance, -1, 1)
+            perpetual = sources.get("Kraken futures stream", {})
+            if (
+                perpetual.get("status") == "LIVE"
+                and perpetual.get("latest_price") is not None
+                and perpetual.get("data_age_seconds") is not None
+            ):
+                age = number(perpetual["data_age_seconds"], 0, 5)
+                receipt_for(
+                    "derivatives_basis", (context_cutoff - timedelta(seconds=age)).isoformat()
+                )
+                optional_values["derivatives_basis"] = (
+                    number(perpetual["latest_price"], 0.000001, 1e12) / points[-1][1] - 1
+                )
+            advanced = frozen_context.get("advanced_features", {})
+            if advanced:
+                if timestamp(advanced["cutoff"]) > opened:
+                    raise ValueError("POST_OPENING_ADVANCED_CONTEXT_EXCLUDED")
+                for name, value in advanced.get("candidate_features", {}).items():
+                    if name not in values or not name.startswith("advanced_") or value is None:
+                        continue
+                    proof = advanced.get("candidate_feature_sources", {}).get(name, {})
+                    receipt_for(name, proof["received_at"])
+                    if proof.get("event_at") and timestamp(proof["event_at"]) > opened:
+                        raise ValueError("POST_OPENING_ADVANCED_EVENT_EXCLUDED")
+                    optional_values[name] = number(value, -1e15, 1e15)
+            values.update(optional_values)
+            receipts.extend(timestamp(item["received_at"]) for item in feature_receipts.values())
+            optional_receipts["microstructure"] = {
+                "cutoff": context_cutoff.isoformat(),
+                "features": feature_receipts,
+                "cutoff_note": "Analysis boundary, not an observation receipt timestamp",
+            }
+            optional_status = "AS_OF_OPENING_CONTEXT: actual used source receipts recorded; analysis cutoff never refreshes an observation"
+        except (KeyError, ValueError, TypeError, AttributeError):
+            optional_status = "POST_OPENING_OR_UNVERIFIABLE_CONTEXT_EXCLUDED"
+    values = {
+        name: (float(value) if type(value) in (float, int) and math.isfinite(value) else None)
+        for name, value in values.items()
+    }
+    return {
+        "version": "opening-asof-features-v1",
+        "status": "FROZEN_AS_OF_OPENING",
+        "cutoff": opened.isoformat(),
+        "max_input_received_at": max(receipts).isoformat(),
+        "values": values,
+        "history_received_at": history["received_at"],
+        "reference_received_at": points[-1][0].isoformat(),
+        "sources": {
+            "candles": {"source": history.get("source"), "received_at": history["received_at"]},
+            "reference": {
+                "received_at": points[-1][0].isoformat(),
+                "source_location": "opening.reference_source",
+            },
+            **optional_receipts,
+        },
+        "closed_history_bars": day["closed_bars"],
+        "optional_context_status": optional_status,
+        "target_metadata_received_at": market.get(
+            "metadata_received_at", market.get("observed_at")
+        ),
+        "target_metadata_note": "Official event definition may arrive late; generation is labeled delayed and all BTC observations retain the opening cutoff",
+        "independence": "No Kalshi quote/odds input. Derivatives basis, when available, is as-of perpetual trade price versus the observed primary BTC/USD proxy; not pooled with spot volume.",
+        "feature_role": "Volatility enters the current fallback. Momentum, volume, liquidity and microstructure are frozen shadow-model candidates, not unvalidated directional boosts.",
+    }
 
 
 def ema(values, period):
@@ -142,6 +394,11 @@ def context24(data, now):
             features=features,
             timeframes=frames,
             vwap=vwap,
+            vwap_label="Legacy OHLC typical-price weighted approximation; not actual executed-trade VWAP",
+            feature_definitions={
+                "rsi_14": "Legacy simple-average 14-change RSI; advanced_*_wilder_rsi14 uses Wilder smoothing separately",
+                "vwap_deviation": "Legacy candle typical-price weighted approximation; actual-trade VWAP is in advanced_intelligence",
+            },
             volume_24h=volume,
             support=min(b["low"] for b in rows),
             resistance=max(b["high"] for b in rows),
@@ -197,7 +454,9 @@ def view(state, prior=None, opening=None, generated_at=None):
         data_cutoff=state.get("now"),
         analysis_24h=day,
         regime=day.get("regime", "unavailable"),
-        direction=("UP" if p > 0.5 else "DOWN" if p < 0.5 else "UNCLEAR") if ready else "UNCLEAR",
+        direction=direction_label(p) if ready else "UNCLEAR",
+        direction_policy=DIRECTION_POLICY,
+        displayed_probabilities=display_probability_pair(p if ready else None),
         confidence={
             "status": "UNCALIBRATED",
             "reason": "Experimental model probabilities; no validated accuracy or profitable edge",
@@ -235,6 +494,7 @@ def view(state, prior=None, opening=None, generated_at=None):
         "up": None,
         "reason": "No frozen opening inputs available",
     }
+    result["opening_diagnostics"] = opening_diagnostics(opening, model)
     if ready:
         previous = prior.get("latest") if prior else None
         result["previous_up"] = previous["up"] if previous else None
@@ -437,6 +697,8 @@ def record(db, state, wall_now):
         ),
         "quote_received_at": (state.get("market") or {}).get("observed_at"),
         "quote_event_at": (state.get("market") or {}).get("event_time"),
+        "direction_policy": DIRECTION_POLICY,
+        "direction": direction_label(engine["up"]),
     }
     db.execute(
         "INSERT OR IGNORE INTO btc_engine_predictions VALUES (?,?,?,?,?,?,?,?,?)",
@@ -553,8 +815,10 @@ def performance(db, now):
             probs = [r["up"] for r in rows]
             outcomes = [r["outcome"] for r in rows]
             metrics = score(probs, outcomes)
-            directional = [r for r in rows if abs(r["up"] - 0.5) > 1e-12]
-            correct = sum((r["up"] > 0.5) == bool(r["outcome"]) for r in directional)
+            directional = [r for r in rows if direction_label(r["up"]) in {"UP", "DOWN"}]
+            correct = sum(
+                (direction_label(r["up"]) == "UP") == bool(r["outcome"]) for r in directional
+            )
             metrics.update(
                 missing_initial=missing_initial,
                 correct=correct,
@@ -563,6 +827,11 @@ def performance(db, now):
                 accuracy=correct / len(directional) if directional else None,
                 accuracy_interval=wilson_interval(correct, len(directional)),
                 directional_coverage=len(directional) / len(rows) if rows else None,
+                directional_samples=len(directional),
+                directional_accuracy=correct / len(directional) if directional else None,
+                directional_accuracy_interval=wilson_interval(correct, len(directional)),
+                unclear_samples=len(rows) - len(directional),
+                neutral_policy=DIRECTION_POLICY,
             )
             metrics["baselines"] = {}
             for key in ("baseline_up", "market_implied_up"):
@@ -573,24 +842,16 @@ def performance(db, now):
                 ]
                 metrics["baselines"][key] = score([p for p, y in matched], [y for p, y in matched])
             metrics["by_regime"] = {
-                regime: score(
-                    [r["up"] for r in rows if r["regime"] == regime],
-                    [r["outcome"] for r in rows if r["regime"] == regime],
-                )
+                regime: _evaluate_rows([r for r in rows if r["regime"] == regime])
                 for regime in sorted({r["regime"] for r in rows})
             }
             metrics["by_probability_range"] = {
-                str(lo): score(
+                str(lo): _evaluate_rows(
                     [
-                        r["up"]
+                        r
                         for r in rows
                         if lo <= max(r["up"], 1 - r["up"]) < (1.000001 if lo == 0.9 else lo + 0.1)
-                    ],
-                    [
-                        r["outcome"]
-                        for r in rows
-                        if lo <= max(r["up"], 1 - r["up"]) < (1.000001 if lo == 0.9 else lo + 0.1)
-                    ],
+                    ]
                 )
                 for lo in (0.5, 0.6, 0.7, 0.8, 0.9)
             }
@@ -666,15 +927,15 @@ def performance(db, now):
                 "threshold": initial.get("threshold")
                 if initial
                 else latest_payload.get("threshold"),
-                "opening_correct": (initial_up > 0.5) == bool(outcome)
-                if outcome is not None and initial_up is not None and abs(initial_up - 0.5) > 1e-12
+                "opening_correct": (direction_label(initial_up) == "UP") == bool(outcome)
+                if outcome is not None and direction_label(initial_up) in {"UP", "DOWN"}
                 else None,
                 "opening_data_quality": initial.get("data_quality") if initial else None,
                 "latest_up": latest_up,
                 "latest_down": 1 - latest_up if latest_up is not None else None,
                 "latest_at": row["eligible_latest_at"],
-                "latest_correct": (latest_up > 0.5) == bool(outcome)
-                if outcome is not None and latest_up is not None and abs(latest_up - 0.5) > 1e-12
+                "latest_correct": (direction_label(latest_up) == "UP") == bool(outcome)
+                if outcome is not None and direction_label(latest_up) in {"UP", "DOWN"}
                 else None,
                 "latest_data_quality": latest_payload.get("data_quality"),
                 "latest_confidence": latest_payload.get("confidence"),
@@ -711,20 +972,26 @@ def performance(db, now):
         "archive_limit": 100,
         "archive_total": sum(c["total"] for c in cycle_counts),
         "by_mode": result,
-        "validation": "No validated accuracy or profitable edge claim. Initial/latest per contract; ties excluded from directional accuracy but included in Brier/log loss/calibration. Live and replay never pooled. No historical prediction backfill.",
+        "direction_scoring_policy": DIRECTION_POLICY,
+        "validation": "No validated accuracy or profitable edge claim. Initial/latest per contract; forecasts that display 50.0/50.0 are NEUTRAL and excluded from directional accuracy but included at original raw precision in Brier/log loss/calibration. Immutable historical raw probabilities and saved labels are unchanged. Live and replay never pooled. No historical prediction backfill.",
     }
 
 
 def _evaluate_rows(rows):
     metrics = score([r["up"] for r in rows], [r["outcome"] for r in rows])
-    directional = [r for r in rows if abs(r["up"] - 0.5) > 1e-12]
-    correct = sum((r["up"] > 0.5) == bool(r["outcome"]) for r in directional)
+    directional = [r for r in rows if direction_label(r["up"]) in {"UP", "DOWN"}]
+    correct = sum((direction_label(r["up"]) == "UP") == bool(r["outcome"]) for r in directional)
     metrics.update(
         correct=correct,
         incorrect=len(directional) - correct,
         accuracy=correct / len(directional) if directional else None,
         accuracy_interval=wilson_interval(correct, len(directional)),
         unclear=len(rows) - len(directional),
+        directional_samples=len(directional),
+        directional_accuracy=correct / len(directional) if directional else None,
+        directional_accuracy_interval=wilson_interval(correct, len(directional)),
+        unclear_samples=len(rows) - len(directional),
+        neutral_policy=DIRECTION_POLICY,
     )
     metrics["baselines"] = {}
     for key in ("baseline_up", "market_implied_up"):
@@ -745,7 +1012,16 @@ def _score_groups(rows, grouping):
     }
 
 
-def opening_forecast(market, history, reference_points, generated_at, reference_source=None):
+def opening_forecast(
+    market,
+    history,
+    reference_points,
+    generated_at,
+    reference_source=None,
+    audit_context=None,
+    frozen_context=None,
+    candidate_artifact=None,
+):
     """Event metadata may arrive late; no BTC observation received after open enters."""
     from .basis import estimate_basis
 
@@ -774,6 +1050,26 @@ def opening_forecast(market, history, reference_points, generated_at, reference_
         threshold_received_at=market.get("metadata_received_at", market.get("observed_at")),
         regime="unavailable",
         model="opening24h-zero-drift-final-average-v1",
+        direction_policy=DIRECTION_POLICY,
+        model_selection={
+            "opening_ensemble_active": False,
+            "status": "EXPERIMENTAL_OPENING_FALLBACK",
+            "fallback_reason": "No separately validated opening-time artifact is active. The live-horizon learner cannot be reused with post-opening features; the frozen zero-drift statistical model remains the opening fallback.",
+            "audit_context": {
+                k: v
+                for k, v in (audit_context or {}).items()
+                if k
+                in {
+                    "official_contracts",
+                    "minimum_contracts",
+                    "artifact_status",
+                    "live_model",
+                    "live_ensemble_active",
+                    "opening_candidate_status",
+                }
+            },
+            "historical_feature_role": "24h volatility is used; directional indicator coefficients are not validated. Correlated trend/momentum/volume features are collected for opening-only shadow evaluation.",
+        },
     )
     try:
         if not opened <= generated_at < closed:
@@ -829,7 +1125,20 @@ def opening_forecast(market, history, reference_points, generated_at, reference_
         result.update(
             up=p,
             down=1 - p,
-            direction="UP" if p > 0.5 else "DOWN" if p < 0.5 else "UNCLEAR",
+            direction=direction_label(p),
+            displayed_probabilities=display_probability_pair(p),
+            probability_inputs={
+                "method": "Gaussian final-average CDF, zero drift",
+                "projected_settlement_average": current + basis["point"],
+                "official_threshold": strike,
+                "projected_mean_minus_threshold": current + basis["point"] - strike,
+                "standard_deviation_final_average": deviation,
+                "z_score": (current + basis["point"] - strike) / deviation,
+                "sigma_dollars_per_sqrt_second": sigma,
+                "constant_proxy_index_basis": basis["point"],
+                "proxy_opening_average": basis.get("proxy_opening_average"),
+                "hard_coded_probability": False,
+            },
             settlement_price_estimate={
                 "mean": current + basis["point"],
                 "conditional_interval": [
@@ -857,7 +1166,79 @@ def opening_forecast(market, history, reference_points, generated_at, reference_
             history_last_close=day["last_close"],
             regime=day["regime"],
             basis=basis,
+            volatility_ratio=day.get("volatility_ratio"),
+            frozen_features=_opening_features(
+                history, points, market, day, basis, opened, frozen_context
+            ),
         )
+        result["baseline_probability_up"] = p
+        if candidate_artifact is not None:
+            from .opening_models import eligible_at_opening, predict as candidate_predict
+
+            if eligible_at_opening(candidate_artifact, opened):
+                candidate_p = number(
+                    candidate_predict(
+                        candidate_artifact["model"],
+                        result["frozen_features"]["values"],
+                        baseline_probability=p,
+                    ),
+                    0,
+                    1,
+                )
+                result.update(
+                    up=candidate_p,
+                    down=1 - candidate_p,
+                    direction=direction_label(candidate_p),
+                    displayed_probabilities=display_probability_pair(candidate_p),
+                    model="opening-candidate/" + candidate_artifact["model_id"],
+                    reason="Explicitly configured opening-only candidate passed chronological probabilistic gates; frozen as-of-opening features only; experimental, edge unverified",
+                )
+                result["model_selection"].update(
+                    status="EXPERIMENTAL_OPENING_CANDIDATE",
+                    opening_ensemble_active=candidate_artifact["model"]["kind"]
+                    == "opening_ensemble",
+                    candidate_kind=candidate_artifact["model"]["kind"],
+                    fallback_reason="No fallback: explicit opening-specific candidate was trained, available and loaded before cutoff; statistical gates do not establish a profitable edge",
+                    model_id=candidate_artifact["model_id"],
+                    labels_available_through=candidate_artifact["labels_available_through"],
+                    available_at=candidate_artifact["available_at"],
+                    loaded_at=candidate_artifact["runtime_loaded_at"],
+                    validation_status=candidate_artifact["report"]["status"],
+                )
+                result["confidence"] = {
+                    "status": "EXPERIMENTAL CALIBRATED CANDIDATE",
+                    "reason": "Validation-only calibration and opening-only held-out statistical gates passed; live calibration, model/basis error and profitable edge remain unverified",
+                }
+                result["settlement_price_estimate"][
+                    "label"
+                ] += "; price distribution is the independent statistical baseline, not the selected binary classifier"
+            else:
+                from .opening_models import validate_artifact
+
+                blocker = "OPENING_ARTIFACT_SCHEMA_OR_STATISTICAL_GATES_UNVERIFIED"
+                try:
+                    validate_artifact(candidate_artifact)
+                    if timestamp(candidate_artifact["labels_available_through"]) >= opened:
+                        blocker = "OPENING_ARTIFACT_LABELS_UNAVAILABLE_AT_OPENING"
+                    elif timestamp(candidate_artifact["created_at"]) > opened:
+                        blocker = "OPENING_ARTIFACT_CREATED_AFTER_OPENING"
+                    elif timestamp(candidate_artifact["available_at"]) > opened:
+                        blocker = "OPENING_ARTIFACT_AVAILABLE_AFTER_OPENING"
+                    elif not candidate_artifact.get("runtime_loaded_at"):
+                        blocker = "OPENING_ARTIFACT_RECEIPT_NOT_RECORDED"
+                    elif timestamp(candidate_artifact["runtime_loaded_at"]) > opened:
+                        blocker = "OPENING_ARTIFACT_LOADED_AFTER_OPENING"
+                except (KeyError, ValueError, TypeError, AttributeError, RecursionError):
+                    pass
+                rejection = (
+                    "OPENING_ARTIFACT_INELIGIBLE: "
+                    + blocker
+                    + "; delayed generation never advances the model cutoff"
+                )
+                result["model_selection"]["candidate_rejection"] = rejection
+                result["model_selection"]["fallback_reason"] = (
+                    rejection + "; retaining the frozen statistical fallback"
+                )
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         result["reason"] = str(exc)
     return result
@@ -899,7 +1280,9 @@ def save_opening(db, mode, opening, wall_now):
             "data_cutoff": saved["data_cutoff"],
             "kind": "opening",
             "threshold": saved.get("threshold"),
-            "baseline_up": saved["up"],
+            "baseline_up": saved.get("baseline_probability_up", saved["up"]),
+            "direction": direction_label(saved["up"]),
+            "direction_policy": DIRECTION_POLICY,
             "opens_at": saved.get("opens_at"),
             "data_quality": saved.get("data_quality", {}),
             "confidence": saved.get("confidence", {}),

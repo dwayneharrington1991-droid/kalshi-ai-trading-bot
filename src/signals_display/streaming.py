@@ -257,6 +257,7 @@ class StreamHub:
             "ask_depth": numeric(row["best_ask_quantity"])
             if row.get("best_ask_quantity") is not None
             else None,
+            "depth_levels": 1,
             "volume": None,
             "aggressor": None,
             "event_at": at.isoformat() if at else None,
@@ -383,6 +384,8 @@ class StreamHub:
                             "receipt_basis": "adapter sample time; original socket receipt timestamp unavailable",
                             "session_id": self.kraken_sessions.get("spot"),
                             "depth_levels": min(len(bids), len(asks)),
+                            "bids": [[float(p), float(book.bids[p])] for p in bids],
+                            "asks": [[float(p), float(book.asks[p])] for p in asks],
                         }
                     )
                     self.kraken_book_at = book.at

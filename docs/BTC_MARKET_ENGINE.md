@@ -25,16 +25,18 @@ reset, clean or remove databases to force an update.
 
 ## Screen layout
 
-1. **Opening prediction:** immutable UP/DOWN/UNCLEAR, actual contract ticker and
+1. **Opening prediction:** immutable UP/DOWN/NEUTRAL (or unavailable), actual contract ticker and
    threshold, both probabilities, exact generation/cutoff times, delay, countdown,
    data quality and experimental confidence. The optional price distribution is
    a conditional statistical estimate of the final settlement-reference average.
 2. **Live prediction:** fresh estimates, distance to threshold, change from the
    opening estimate, model/market comparison and a bounded probability chart.
-3. **Model vs. Market:** executable YES/NO bids, asks, depth, fees, assumed slippage
+3. **Scalping monitor:** engine/data/model/liquidity status, exact WAIT blockers,
+   experimental hypothetical plans, exposure and limits. No actual fill is assumed.
+4. **Model vs. Market:** executable YES/NO bids, asks, depth, fees, assumed slippage
    and theoretical settlement EV. **EDGE UNVERIFIED** remains visible even when
    calculated EV is positive. A favorable forecast is not a BUY instruction.
-4. **My Live Trades:** confirmed holdings, actual reconciled entry costs, broker
+5. **My Live Trades:** confirmed holdings, actual reconciled entry costs, broker
    cash and estimated exit P&L; pending and partially filled orders stay distinct.
    A same-contract experimental forecast is shown only when fresh and supported.
    A current-market forecast is never reused for an older held contract.
@@ -43,6 +45,10 @@ History is paginated and loads on request. Technical calculations and connection
 diagnostics stay under **Details**. Optional alerts have browser-local thresholds
 for probability changes, outages, volatility, settlement time, position value and
 existing explicit risk limits. They cannot change a position or guarantee a fill.
+
+The latest integrated indicator families, opening tie diagnosis, conservative
+paper replay, actual evidence limitations, safe full-suite command and deployment
+checks are documented in [QUANT_UPGRADE_VALIDATION.md](QUANT_UPGRADE_VALIDATION.md).
 
 ## Documented source selection
 

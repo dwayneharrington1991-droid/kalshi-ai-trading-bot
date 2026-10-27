@@ -219,3 +219,31 @@ def test_http_200_with_old_cache_age_is_not_accepted_as_fresh():
         f.transport_diagnostics[-1]["http_status"] == 200
         and f.transport_diagnostics[-1]["status"] == "FAILED"
     )
+
+
+def test_performance_endpoint_does_not_wait_for_legacy_history(tmp_path, monkeypatch):
+    from http.server import ThreadingHTTPServer
+    import threading, json
+    from urllib.request import urlopen
+    from src.signals_display.server import Monitor, make_handler
+
+    j = Journal(tmp_path / "j.db")
+    monitor = Monitor(None, j)
+
+    def forbidden():
+        raise AssertionError("Legacy history must not be requested")
+
+    monkeypatch.setattr(j, "history", forbidden)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/prediction-performance", timeout=3
+        ) as r:
+            data = json.load(r)
+        assert data["by_mode"]["PUBLIC MARKET DATA"]["all"]["settled_markets"] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

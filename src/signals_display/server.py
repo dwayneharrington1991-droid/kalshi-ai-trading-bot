@@ -18,7 +18,11 @@ from .account_state import AccountJournal, account_guidance, live_trade_cards
 from .scanner import context as scanner_context, qualify as scanner_qualify
 from .decision import assess as trade_decision
 from .market_health import selection_summary, diagnose as diagnose_market
-from .prediction_engine import view as engine_view, opening_forecast
+from .prediction_engine import (
+    view as engine_view,
+    opening_forecast,
+    performance as engine_performance,
+)
 from .manual import ManualJournal
 from .live_model import LiveEstimator
 from .learning import load_artifact, predict as learned_predict
@@ -623,6 +627,11 @@ def make_handler(monitor):
                 value = monitor.snapshot() if route == "/api/state" else monitor.journal.history()
                 if route == "/api/history":
                     value["manual_records"] = monitor.manual.records()
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/prediction-performance":
+                with monitor.journal.read() as db:
+                    value = engine_performance(db, utcnow())
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/health":

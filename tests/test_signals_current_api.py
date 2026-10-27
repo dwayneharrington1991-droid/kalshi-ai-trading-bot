@@ -79,13 +79,16 @@ def test_modern_fill_without_deprecated_fields_has_dollar_fees_and_correct_expos
     assert "economic normalization" in f["direction_basis"]
 
 
-def test_modern_fill_ignores_absent_legacy_action_but_rejects_conflicting_direction():
+def test_modern_fill_audits_legacy_disagreement_but_rejects_canonical_conflict():
     raw = canonical()
     raw["side"] = "yes"
     assert normalized_fill(raw)["side"] == "yes"
     raw["action"] = "sell"
-    with pytest.raises(AccountReadError, match="conflict"):
-        normalized_fill(raw)
+    resolved = normalized_fill(raw)
+    assert (
+        resolved["side"] == "yes"
+        and resolved["direction_warning"] == "CANONICAL_LEGACY_DIRECTION_DISAGREEMENT"
+    )
     raw = canonical()
     raw["book_side"] = "ask"
     with pytest.raises(AccountReadError, match="direction"):

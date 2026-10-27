@@ -4,6 +4,7 @@ from datetime import timedelta
 import json
 import math
 import sqlite3
+import hashlib
 
 from .account_readonly import (
     AccountReadError,
@@ -37,6 +38,11 @@ class AccountJournal:
                 CREATE TABLE IF NOT EXISTS monitor_account_events (id INTEGER PRIMARY KEY,holding_id INTEGER,kind TEXT,observed_at TEXT,quantity REAL);
                 CREATE TABLE IF NOT EXISTS monitor_account_guidance_events (id INTEGER PRIMARY KEY,holding_id INTEGER,guidance TEXT,quantity REAL,observed_at TEXT);
                 CREATE TABLE IF NOT EXISTS monitor_account_settings (name TEXT PRIMARY KEY,payload TEXT);
+                CREATE TABLE IF NOT EXISTS monitor_account_fill_audit (
+                    fill_id TEXT,fingerprint TEXT,payload_kind TEXT,ticker TEXT,status TEXT,reason TEXT,
+                    payload TEXT,observed_at TEXT,PRIMARY KEY(fill_id,fingerprint,payload_kind));
+                CREATE TABLE IF NOT EXISTS monitor_account_fill_resolution (
+                    fill_id TEXT PRIMARY KEY,ticker TEXT,order_id TEXT,status TEXT,reason TEXT,observed_at TEXT);
             """
             )
 
@@ -57,6 +63,8 @@ class AccountJournal:
                     "monitor_account_events",
                     "monitor_account_guidance_events",
                     "monitor_account_choices",
+                    "monitor_account_fill_audit",
+                    "monitor_account_fill_resolution",
                 )
                 empty = not any(
                     db.execute("SELECT EXISTS(SELECT 1 FROM " + table + ")").fetchone()[0]
@@ -121,9 +129,74 @@ class AccountJournal:
             raise AccountReadError("Incomplete snapshot cannot close/reconcile holdings")
         observed = snapshot["observed_at"]
         timestamp(observed)
-        normalized = [normalized_fill(f) for f in snapshot["fills"]]
-        if any(timestamp(f["at"]) > timestamp(observed) + timedelta(seconds=5) for f in normalized):
-            raise AccountReadError("Future-dated fill rejected; check account clock/schema")
+        entries = []
+        for raw in snapshot["fills"]:
+            payload = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(payload.encode()).hexdigest()
+            fields = raw if isinstance(raw, dict) else {}
+            identifier = str(
+                fields.get("fill_id") or fields.get("trade_id") or "unidentified:" + digest
+            )
+            ticker = fields.get("ticker") or fields.get("market_ticker") or ""
+            ticker = ticker if isinstance(ticker, str) else ""
+            item = dict(
+                fill_id=identifier,
+                ticker=ticker,
+                order_id=str(fields.get("order_id") or ""),
+                digest=digest,
+                payload=payload,
+                status="READY",
+                reason=None,
+                normalized=None,
+            )
+            try:
+                fill = normalized_fill(raw)
+                if not fill["ticker"]:
+                    raise AccountReadError("Missing confirmed fill ticker")
+                if timestamp(fill["at"]) > timestamp(observed) + timedelta(seconds=5):
+                    raise AccountReadError("Future-dated fill; clock verification required")
+                item["normalized"] = fill
+                if fill.get("direction_warning"):
+                    item.update(
+                        status="CANONICAL_WITH_LEGACY_WARNING", reason=fill["direction_warning"]
+                    )
+            except Exception as exc:
+                item.update(
+                    status="QUARANTINED",
+                    reason=str(exc)
+                    if isinstance(exc, AccountReadError)
+                    else "Unsupported fill schema: " + type(exc).__name__,
+                )
+            entries.append(item)
+        # Contradictory copies of the same immutable ID cannot be resolved by ordering.
+        by_id = {}
+        for item in entries:
+            f = item["normalized"]
+            if f is not None:
+                sign = (1 if f["side"] == "yes" else -1) * (1 if f["action"] == "buy" else -1)
+                economic = (
+                    f["ticker"],
+                    sign,
+                    f["quantity"],
+                    round(f["price"] if f["action"] == "buy" else 1 - f["price"], 12),
+                    f["fees"],
+                    f["at"],
+                    f["order_id"],
+                )
+                by_id.setdefault(item["fill_id"], set()).add(economic)
+        counts_by_id = {}
+        invalid_ids = set()
+        for item in entries:
+            identifier = item["fill_id"]
+            counts_by_id[identifier] = counts_by_id.get(identifier, 0) + 1
+            if item["status"] == "QUARANTINED":
+                invalid_ids.add(identifier)
+        for item in entries:
+            identifier = item["fill_id"]
+            if counts_by_id[identifier] > 1 and (
+                identifier in invalid_ids or len(by_id.get(identifier, set())) > 1
+            ):
+                item.update(status="QUARANTINED", reason="CONTRADICTORY_DUPLICATE_FILL_ID")
         positions = []
         for raw in snapshot["positions"]:
             ticker = raw.get("ticker") or raw.get("market_ticker")
@@ -135,14 +208,75 @@ class AccountJournal:
             raise AccountReadError("Duplicate position tickers; reconciliation withheld")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            for fill in normalized:
+            for item in entries:
+                db.execute(
+                    "INSERT OR IGNORE INTO monitor_account_fill_audit VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        item["fill_id"],
+                        item["digest"],
+                        "broker_fill",
+                        item["ticker"],
+                        item["status"],
+                        item["reason"],
+                        item["payload"],
+                        observed,
+                    ),
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO monitor_account_fill_resolution VALUES (?,?,?,?,?,?)",
+                    (
+                        item["fill_id"],
+                        item["ticker"],
+                        item["order_id"],
+                        item["status"],
+                        item["reason"],
+                        observed,
+                    ),
+                )
+                if item["status"] == "QUARANTINED":
+                    continue
+                fill = item["normalized"]
+                existing = db.execute(
+                    "SELECT payload FROM monitor_account_fills WHERE fill_id=?", (fill["id"],)
+                ).fetchone()
+                updated = json.dumps(fill)
+                if existing and existing[0] != updated:
+                    old_hash = hashlib.sha256(existing[0].encode()).hexdigest()
+                    db.execute(
+                        "INSERT OR IGNORE INTO monitor_account_fill_audit VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            fill["id"],
+                            old_hash,
+                            "previous_normalized",
+                            fill["ticker"],
+                            "SUPERSEDED_NORMALIZATION",
+                            "Previous cached interpretation retained",
+                            existing[0],
+                            observed,
+                        ),
+                    )
                 db.execute(
                     "INSERT OR REPLACE INTO monitor_account_fills VALUES (?,?)",
-                    (fill["id"], json.dumps(fill)),
+                    (fill["id"], updated),
                 )
             fills = [
-                json.loads(r[0]) for r in db.execute("SELECT payload FROM monitor_account_fills")
+                json.loads(r[0])
+                for r in db.execute(
+                    "SELECT f.payload FROM monitor_account_fills f LEFT JOIN monitor_account_fill_resolution r ON r.fill_id=f.fill_id WHERE COALESCE(r.status,'READY')!='QUARANTINED'"
+                )
             ]
+            quarantined = {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT ticker FROM monitor_account_fill_resolution WHERE status='QUARANTINED'"
+                )
+            }
+            legacy_warnings = {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT ticker FROM monitor_account_fill_resolution WHERE status='CANONICAL_WITH_LEGACY_WARNING'"
+                )
+            }
             prior = {
                 r["ticker"]: r
                 for r in db.execute("SELECT * FROM monitor_account_holdings WHERE status='OPEN'")
@@ -154,6 +288,16 @@ class AccountJournal:
                 side = "up" if signed > 0 else "down"
                 q = abs(signed)
                 basis = fifo_basis(fills, ticker, signed)
+                if ticker in quarantined or "" in quarantined:
+                    basis = {
+                        "verified": False,
+                        "reason": "Fill records quarantined; entry costs, fees and P&L unavailable until direction/history is resolved",
+                    }
+                elif ticker in legacy_warnings:
+                    basis["reason"] = (
+                        (basis.get("reason") or basis.get("method") or "")
+                        + "; valid canonical direction used; deprecated discrepancies preserved in fill audit"
+                    )
                 old = prior.get(ticker)
                 if old and old["side"] != side:
                     db.execute(
@@ -214,6 +358,22 @@ class AccountJournal:
                 for k in ("observed_at", "balance", "orders", "permissions", "complete")
             }
             public["fill_count"] = len(fills)
+            counts = {
+                r[0]: r[1]
+                for r in db.execute(
+                    "SELECT status,COUNT(*) FROM monitor_account_fill_resolution GROUP BY status"
+                )
+            }
+            public["fill_reconciliation"] = {
+                "broker_records_this_sync": len(entries),
+                "eligible_fills": len(fills),
+                "quarantined_fills": counts.get("QUARANTINED", 0),
+                "canonical_legacy_discrepancies": counts.get("CANONICAL_WITH_LEGACY_WARNING", 0),
+                "audit_records": db.execute(
+                    "SELECT COUNT(*) FROM monitor_account_fill_audit"
+                ).fetchone()[0],
+                "notice": "Canonical fields are authoritative. Deprecated conflicts are audited. Quarantined records are preserved and excluded from cost basis; no direction is guessed.",
+            }
             public["confirmed_fill_source"] = "portfolio/fills, not order status"
             db.execute(
                 "INSERT OR REPLACE INTO monitor_account_state VALUES (1,?)", (json.dumps(public),)
@@ -259,13 +419,13 @@ class AccountJournal:
             data["recent_fills"] = [
                 json.loads(r[0])
                 for r in db.execute(
-                    "SELECT payload FROM monitor_account_fills ORDER BY rowid DESC LIMIT 50"
+                    "SELECT f.payload FROM monitor_account_fills f LEFT JOIN monitor_account_fill_resolution r ON r.fill_id=f.fill_id WHERE COALESCE(r.status,'READY')!='QUARANTINED' ORDER BY f.rowid DESC LIMIT 50"
                 )
             ]
             data["recent_fills"] = [
                 json.loads(r[0])
                 for r in db.execute(
-                    "SELECT payload FROM monitor_account_fills ORDER BY rowid DESC LIMIT 50"
+                    "SELECT f.payload FROM monitor_account_fills f LEFT JOIN monitor_account_fill_resolution r ON r.fill_id=f.fill_id WHERE COALESCE(r.status,'READY')!='QUARANTINED' ORDER BY f.rowid DESC LIMIT 50"
                 )
             ]
             data["recent_events"] = [
@@ -277,8 +437,23 @@ class AccountJournal:
         all_fills = []
         with self.connect() as db:
             all_fills = [
-                json.loads(r[0]) for r in db.execute("SELECT payload FROM monitor_account_fills")
+                json.loads(r[0])
+                for r in db.execute(
+                    "SELECT f.payload FROM monitor_account_fills f LEFT JOIN monitor_account_fill_resolution r ON r.fill_id=f.fill_id WHERE COALESCE(r.status,'READY')!='QUARANTINED'"
+                )
             ]
+            bad_tickers = {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT ticker FROM monitor_account_fill_resolution WHERE status='QUARANTINED'"
+                )
+            }
+            bad_orders = {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT order_id FROM monitor_account_fill_resolution WHERE status='QUARANTINED'"
+                )
+            }
         unreconciled = {
             h["ticker"]
             for h in data["holdings"]
@@ -287,7 +462,10 @@ class AccountJournal:
         data["completed_trades"] = [
             c
             for c in confirmed_cycles(all_fills)
-            if c["status"] == "CLOSED" and c["ticker"] not in unreconciled
+            if c["status"] == "CLOSED"
+            and c["ticker"] not in unreconciled
+            and c["ticker"] not in bad_tickers
+            and "" not in bad_tickers
         ]
         data["pending_orders"] = []
         for order in data.get("orders", []):
@@ -299,8 +477,14 @@ class AccountJournal:
                 {
                     "order_id": order_id,
                     "ticker": order.get("ticker"),
-                    "status": "PARTIALLY FILLED" if actual else "PENDING / UNFILLED",
-                    "confirmed_filled_quantity": sum(f["quantity"] for f in actual),
+                    "status": "FILL DETAILS UNVERIFIED"
+                    if order_id in bad_orders or "" in bad_orders
+                    else "PARTIALLY FILLED"
+                    if actual
+                    else "PENDING / UNFILLED",
+                    "confirmed_filled_quantity": None
+                    if order_id in bad_orders or "" in bad_orders
+                    else sum(f["quantity"] for f in actual),
                     "remaining_quantity": order.get(
                         "remaining_count_fp", order.get("remaining_count")
                     ),

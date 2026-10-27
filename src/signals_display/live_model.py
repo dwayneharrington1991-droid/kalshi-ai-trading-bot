@@ -13,6 +13,7 @@ from .model import Display, fee, number, timestamp
 from .candles import candle_context
 from .basis import estimate_basis
 from .features import extract, DevelopingCandle
+from .prediction_engine import context24
 
 VERSION = "independent-basis-forecast-v3"
 MIN_SAMPLES = 61
@@ -142,7 +143,9 @@ class LiveEstimator:
         info["btc_context"], info["candle_diagnostic"] = candle_context(
             payload.get("btc_candles", {}), now
         )
+        info["analysis_24h"] = context24(payload.get("btc_candles", {}), now)
         info["candidate_features"] = extract(payload, market, now)
+        info["candidate_features"]["values"].update(info["analysis_24h"].get("features", {}))
         info["developing_candle"] = self.developing.update(payload.get("reference", {}), now)
         info["coverage"] = payload.get("coverage", {})
         info["learning_status"] = {
@@ -220,6 +223,14 @@ class LiveEstimator:
                 return reason + "; " + str(candle_error), None
             else:
                 info["volatility_method"] = "contiguous observed proxy tick history"
+            day = info.get("analysis_24h", {})
+            if day.get("status") == "READY":
+                sigma = max(sigma, day["sigma_dollars_per_sqrt_second"])
+                info["volatility_method"] += "; maximum of recent and measured 24h RMS volatility"
+                info["version"] += "/btc24h-v1"
+                info[
+                    "settlement_assumptions"
+                ] += " With complete 24h data, volatility is the maximum of recent and 24h RMS; no indicator votes or arbitrary directional drift."
             if remaining >= 60:
                 mean = current
                 variance = sigma * sigma * (remaining - 40)

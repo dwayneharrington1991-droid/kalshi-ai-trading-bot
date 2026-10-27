@@ -216,6 +216,15 @@ def compare(rows):
             "spot_delta_efficiency_3m",
             "perpetual_delta_efficiency_3m",
         },
+        "history_24h": {
+            "return_24h",
+            "rsi_14",
+            "macd_scaled",
+            "ema_gap",
+            "vwap_deviation",
+            "bollinger_z",
+            "volatility_24h",
+        },
         "candles": set(FEATURES[2:13]),
     }.items():
         keep = [i for i, name in enumerate(prep["names"]) if name not in names]
@@ -339,6 +348,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Offline independent forecast candidate comparison; official signal-journal labels only"
     )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Also write a separate expanding-window validation report",
+    )
     parser.add_argument("--journal", type=Path, default=Path("signals_monitor.db"))
     parser.add_argument("--output", type=Path, default=Path("signals_model.json"))
     args = parser.parse_args()
@@ -349,6 +363,10 @@ def main():
     finally:
         db.close()
     artifact, report = compare(rows)
+    if args.walk_forward:
+        args.output.with_suffix(".walkforward.json").write_text(
+            json.dumps(walk_forward_compare(rows), indent=2) + "\n"
+        )
     args.output.with_suffix(".report.json").write_text(json.dumps(report, indent=2) + "\n")
     if artifact:
         args.output.write_text(json.dumps(artifact, indent=2) + "\n")
@@ -362,6 +380,90 @@ def main():
         print(
             "No candidate artifact written; keep the simple baseline. Existing artifact is not overwritten."
         )
+
+
+def walk_forward_compare(rows, development_contracts=170, block_contracts=30):
+    """Expanding past-only train/validation, disjoint future evaluation blocks."""
+    contracts = sorted(
+        {r["ticker"] for r in rows},
+        key=lambda t: min(timestamp(r["closes_at"]) for r in rows if r["ticker"] == t),
+    )
+    report = {
+        "status": "INSUFFICIENT_OFFICIAL_LABELS",
+        "folds": [],
+        "note": "Expanding chronological development; disjoint future contract blocks. Training-only preprocessing, validation-only calibration/selection; labels unavailable at forecast time purged. No profitability claim.",
+    }
+    for index in range(
+        development_contracts, len(contracts) - block_contracts + 1, block_contracts
+    ):
+        past = set(contracts[:index])
+        future = set(contracts[index : index + block_contracts])
+        split = int(index * 0.8)
+        train_ids = set(contracts[:split])
+        val_ids = past - train_ids
+        test = [r for r in rows if r["ticker"] in future]
+        test_start = min(timestamp(r["timestamp"]) for r in test)
+        val = [
+            r
+            for r in rows
+            if r["ticker"] in val_ids
+            and timestamp(r["label_available_at"]) <= test_start
+            and timestamp(r["closes_at"]) < test_start
+        ]
+        if not val:
+            continue
+        val_start = min(timestamp(r["timestamp"]) for r in val)
+        train = [
+            r
+            for r in rows
+            if r["ticker"] in train_ids
+            and timestamp(r["label_available_at"]) <= val_start
+            and timestamp(r["closes_at"]) < val_start
+        ]
+        if len({r["ticker"] for r in train}) < 100 or len({r["ticker"] for r in val}) < 30:
+            continue
+        if (
+            min(sum(r["outcome"] == y for r in train) for y in (0, 1)) < 10
+            or min(sum(r["outcome"] == y for r in val) for y in (0, 1)) < 5
+        ):
+            continue
+        prep = preprocess(train)
+        if not prep["names"]:
+            continue
+        candidates = []
+        for kind in ("logistic", "ridge"):
+            for penalty in (0.1, 1.0):
+                model = fit(train, kind, penalty, prep)
+                calibrate(model, val)
+                metrics = score(
+                    [predict(model, r["features"]) for r in val], [r["outcome"] for r in val]
+                )
+                candidates.append((metrics["log_loss"], model, metrics))
+        _, chosen, validation = min(candidates, key=lambda r: r[0])
+        baseline = score([r["baseline"] for r in val], [r["outcome"] for r in val])
+        use_candidate = all(validation[k] < baseline[k] for k in ("brier", "log_loss"))
+        scored = score(
+            [predict(chosen, r["features"]) if use_candidate else r["baseline"] for r in test],
+            [r["outcome"] for r in test],
+        )
+        report["folds"].append(
+            {
+                "train_contracts": len({r["ticker"] for r in train}),
+                "validation_contracts": len({r["ticker"] for r in val}),
+                "test_contracts": sorted(future),
+                "test_first_prediction": test_start.isoformat(),
+                "train_last_label": max(r["label_available_at"] for r in train),
+                "validation_last_label": max(r["label_available_at"] for r in val),
+                "selected": chosen["kind"] if use_candidate else "zero_drift",
+                "validation": validation,
+                "test": scored,
+                "market_implied": score([r["market"] for r in test], [r["outcome"] for r in test]),
+                "zero_drift": score([r["baseline"] for r in test], [r["outcome"] for r in test]),
+            }
+        )
+    if report["folds"]:
+        report["status"] = "EXPERIMENTAL_WALK_FORWARD"
+    return report
 
 
 if __name__ == "__main__":

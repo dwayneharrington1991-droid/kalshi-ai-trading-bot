@@ -253,3 +253,51 @@ def test_blocked_permission_is_visible_instead_of_generic_account_off(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_path):
+    from tests.test_signals_prediction_engine import history, market, points
+    from src.signals_display import prediction_engine as engine
+
+    data = frame()
+    data["markets"] = [market()]
+    state = analyze(data, NOW)
+    state["model"] = {"analysis_24h": engine.context24(history(), NOW)}
+    state["estimate"]["settlement_up"] = 0.6
+    opening = engine.opening_forecast(
+        market(), history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=1)), points(), NOW
+    )
+    state["prediction_engine"] = engine.view(state, None, opening, NOW)
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    monitor.state = state
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#engine-up")).to_have_text("60.0%")
+            assert page.locator("#engine-down").inner_text() == "40.0%"
+            initial = page.locator("#engine-up-initial").inner_text()
+            monitor.state = {**state, "estimate": {**state["estimate"], "settlement_up": 0.4}}
+            monitor.state["prediction_engine"] = engine.view(
+                monitor.state, None, opening, NOW + timedelta(seconds=1)
+            )
+            playwright.expect(page.locator("#engine-up")).to_have_text("40.0%")
+            assert page.locator("#engine-up-initial").inner_text() == initial
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert (
+                page.evaluate("document.documentElement.scrollWidth<=window.innerWidth")
+                and not errors
+            )
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

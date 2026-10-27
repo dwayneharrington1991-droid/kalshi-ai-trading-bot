@@ -17,6 +17,7 @@ from urllib.parse import urlencode, quote
 import httpx
 
 from .coverage import FeedHub
+from . import prediction_engine
 from .model import Display, evaluate, fee, number, timestamp
 from .edges import assess_edges
 from .reliability import metrics, wilson
@@ -52,6 +53,8 @@ class PublicFeed:
             if (get is None if multi_venue is None else multi_venue)
             else None
         )
+        if self.candle_pool is not None:
+            self.sampled_candles(utcnow())
 
     def _read(self, url):
         started = perf_counter()
@@ -61,9 +64,36 @@ class PublicFeed:
         }
         try:
             response = self.get(
-                url, timeout=4, follow_redirects=False, headers={"Accept": "application/json"}
+                url,
+                timeout=4,
+                follow_redirects=False,
+                headers={"Accept": "application/json", "Cache-Control": "no-cache"},
             )
             diagnostic["http_status"] = response.status_code
+            from email.utils import parsedate_to_datetime
+
+            try:
+                date = parsedate_to_datetime(response.headers["Date"])
+                diagnostic["server_date"] = date.isoformat()
+                diagnostic["server_clock_difference_seconds"] = round(
+                    (date - utcnow()).total_seconds(), 3
+                )
+            except (KeyError, ValueError, TypeError):
+                pass
+            try:
+                cache_age = float(response.headers["Age"]) if "Age" in response.headers else None
+                diagnostic["http_cache_age_seconds"] = (
+                    cache_age if cache_age is not None and math.isfinite(cache_age) else None
+                )
+                if (
+                    cache_age is not None
+                    and cache_age > 5
+                    and (url == COINBASE or "/orderbook" in url)
+                ):
+                    diagnostic["failure_reason"] = "STALE_HTTP_CACHE"
+                    raise ValueError("STALE_HTTP_CACHE: live response Age exceeds five seconds")
+            except (TypeError, OverflowError):
+                pass
             response.raise_for_status()
             value = response.json()
             diagnostic["status"] = "OK"
@@ -162,23 +192,35 @@ class PublicFeed:
         if self.candles_checked is not None and (now - self.candles_checked).total_seconds() < 60:
             return self.candle_cache or {}
         self.candles_checked = now
-        url = (
-            "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles?"
-            + urlencode(
-                {
-                    "start": int(now.timestamp()) - 7200,
-                    "end": int(now.timestamp()),
-                    "granularity": "ONE_MINUTE",
-                    "limit": 120,
-                }
-            )
-        )
+        cutoff = int(now.timestamp()) // 60 * 60
         try:
-            data = self._read(url)
+            merged = {}
+            for chunk in range(5):
+                start = cutoff - 86400 + chunk * 288 * 60 - 60
+                end = (
+                    min(int(utcnow().timestamp()), cutoff - 86400 + (chunk + 1) * 288 * 60 + 60)
+                    if chunk < 4
+                    else int(utcnow().timestamp())
+                )
+                url = (
+                    "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles?"
+                    + urlencode(
+                        {"start": start, "end": end, "granularity": "ONE_MINUTE", "limit": 300}
+                    )
+                )
+                for bar in self._read(url)["candles"]:
+                    stamp = int(bar["start"])
+                    if stamp in merged and any(
+                        float(bar[k]) != float(merged[stamp][k])
+                        for k in ("open", "high", "low", "close", "volume")
+                    ):
+                        raise ValueError("Conflicting overlapping history candles")
+                    merged[stamp] = bar
+            received = utcnow()
             self.candle_cache = {
-                "candles": data["candles"],
-                "source": "Coinbase BTC-USD public one-minute candles (proxy)",
-                "received_at": utcnow().isoformat(),
+                "candles": [merged[t] for t in sorted(merged) if t + 60 <= received.timestamp()],
+                "source": "Coinbase BTC-USD public 24h one-minute candles (proxy)",
+                "received_at": received.isoformat(),
             }
         except (httpx.HTTPError, KeyError, TypeError, ValueError):
             return {
@@ -256,6 +298,7 @@ class PublicFeed:
                     closes_at=close.isoformat(),
                     observed_at=now.isoformat(),
                     strike=raw.get("floor_strike"),
+                    metadata_received_at=now.isoformat(),
                     settlement_reference=source,
                     up_definition="YES according to published contract settlement rules"
                     if orientation
@@ -569,6 +612,7 @@ class Journal:
 
     def __init__(self, path):
         self.path = str(path)
+        self._last_candle_batch = None
         with self.connect() as db:
             db.executescript(
                 """
@@ -608,6 +652,7 @@ class Journal:
             }.items():
                 if name not in prediction_columns:
                     db.execute(f"ALTER TABLE predictions ADD COLUMN {name} {spec}")
+            prediction_engine.create(db)
             db.execute(
                 "CREATE TABLE IF NOT EXISTS forecast_outcomes (ticker TEXT,origin TEXT,observed_at TEXT,outcome INTEGER,PRIMARY KEY(ticker,origin))"
             )
@@ -621,11 +666,16 @@ class Journal:
     def record_candles(self, data, now):
         if not data or not data.get("source"):
             return
+        batch = (data.get("source"), data.get("received_at"))
+        if batch == self._last_candle_batch:
+            return
         with self.connect() as db:
             for bar in data.get("candles", []):
                 try:
                     start = int(bar["start"])
-                    if start + 60 > now.timestamp():
+                    if start + 60 > min(
+                        now.timestamp(), timestamp(data["received_at"]).timestamp()
+                    ):
                         continue
                     db.execute(
                         "INSERT OR IGNORE INTO btc_candles VALUES (?,?,?,?)",
@@ -634,13 +684,19 @@ class Journal:
                 except (KeyError, ValueError, TypeError):
                     continue
 
+        self._last_candle_batch = batch
+
     def connect(self):
         return storage_connect(self.path)
+
+    def read(self):
+        return storage_connect(self.path, readonly=True)
 
     def step(self, state):
         now = timestamp(state["now"])
         market = state["market"]
         with self.connect() as db:
+            prediction_engine.record(db, state, utcnow())
             pending = db.execute(
                 "SELECT * FROM simulations WHERE status IN ('PENDING','AWAITING_ENTRY')"
             ).fetchall()
@@ -910,7 +966,7 @@ class Journal:
                     )
 
     def learning_readiness(self):
-        with self.connect() as db:
+        with self.read() as db:
             count = db.execute(
                 """SELECT COUNT(DISTINCT ticker) FROM predictions WHERE settlement_origin='official'
                 AND json_extract(payload,'$.model.candidate_features.values.return_1m') IS NOT NULL
@@ -922,16 +978,43 @@ class Journal:
             "reason": f"{count}/170 officially labeled contracts with recorded independent features. Train/validation/test are grouped and purged; minimum is not a guarantee of skill.",
         }
 
+    def opening_inputs(self, opened):
+        with self.read() as db:
+            rows = db.execute(
+                "SELECT source,payload,first_received_at FROM btc_candles WHERE start+60<=? AND julianday(first_received_at)<=julianday(?) AND source LIKE 'Coinbase%' ORDER BY start DESC LIMIT 1500",
+                (int(opened.timestamp()), opened.isoformat()),
+            ).fetchall()
+        unique = {}
+        for row in rows:
+            bar = json.loads(row[1])
+            unique.setdefault(int(bar["start"]), bar)
+        return {
+            "candles": list(unique.values()),
+            "source": "Coinbase frozen journal history",
+            "received_at": max((r[2] for r in rows), default=opened.isoformat()),
+        }
+
+    def opening_record(self, ticker, mode, candidate=None, wall_now=None):
+        with self.read() if candidate is None else self.connect() as db:
+            if candidate is not None:
+                prediction_engine.save_opening(db, mode, candidate, wall_now or utcnow())
+            return prediction_engine.get_opening(db, ticker, mode)
+
+    def engine_prior(self, ticker, mode):
+        with self.read() as db:
+            return prediction_engine.prior(db, ticker, mode)
+
     def recent_states(self):
-        with self.connect() as db:
+        with self.read() as db:
             rows = db.execute(
                 "SELECT payload FROM predictions WHERE mode='PUBLIC MARKET DATA' ORDER BY id DESC LIMIT 600"
             ).fetchall()
         return [json.loads(row[0]) for row in reversed(rows)]
 
     def performance(self):
-        with self.connect() as db:
+        with self.read() as db:
             research = metrics(db)
+            engine_metrics = prediction_engine.performance(db, utcnow())
             rows = db.execute(
                 """SELECT mode,ticker,direction,probability_up,settlement_up,COALESCE(json_extract(payload,'$.model.version'),'uploaded-scenarios') version
                 FROM predictions WHERE direction IN ('UP','DOWN')
@@ -973,6 +1056,7 @@ class Journal:
         research["settlement_by_model_and_mode"] = by_model
         return {
             "research": research,
+            "prediction_engine": engine_metrics,
             "accuracy_goal": 0.9,
             "validated": False,
             "by_mode": result,
@@ -982,7 +1066,7 @@ class Journal:
         }
 
     def history(self):
-        with self.connect() as db:
+        with self.read() as db:
             predictions = [
                 dict(row)
                 for row in db.execute(

@@ -74,3 +74,38 @@ def test_duplicate_port_is_rejected_before_creating_second_journal(tmp_path):
         assert not path.exists()
     finally:
         listener.close()
+
+
+def test_wal_history_snapshot_does_not_block_market_writer(tmp_path):
+    from threading import Event
+
+    path = tmp_path / "j.db"
+    with connect(path) as db:
+        db.execute("CREATE TABLE samples (id INTEGER)")
+        db.execute("INSERT INTO samples VALUES (1)")
+    ready = Event()
+    release = Event()
+
+    def reader():
+        with connect(path, readonly=True) as db:
+            assert db.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+            ready.set()
+            release.wait(5)
+            return db.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+
+    def writer():
+        with connect(path) as db:
+            db.execute("INSERT INTO samples VALUES (2)")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read = pool.submit(reader)
+        assert ready.wait(3)
+        try:
+            pool.submit(writer).result(timeout=3)
+        finally:
+            release.set()
+        assert read.result(timeout=3) == 1
+    with connect(path, readonly=True) as db:
+        assert db.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 2
+        with pytest.raises(sqlite3.OperationalError):
+            db.execute("INSERT INTO samples VALUES (3)")

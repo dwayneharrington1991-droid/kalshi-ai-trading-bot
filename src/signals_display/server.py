@@ -13,7 +13,7 @@ from datetime import timedelta
 from urllib.parse import urlsplit
 import uuid
 
-from .account_readonly import ReadOnlyKalshi, AccountReadError
+from .account_readonly import ReadOnlyKalshi, AccountReadError, credential_status
 from .account_state import AccountJournal, account_guidance, live_trade_cards
 from .scanner import context as scanner_context, qualify as scanner_qualify
 from .decision import assess as trade_decision
@@ -43,6 +43,7 @@ class Monitor:
         self.feed, self.journal = feed, journal
         self.target, self.stop, self.horizon = target, stop, horizon
         self.account_client = account_client
+        self.account_candidate = None
         self.account_journal = AccountJournal(account_store or journal.path)
         if account_client is not None:
             self.account_journal.bind(
@@ -51,6 +52,7 @@ class Monitor:
             Path(self.account_journal.path).chmod(0o600)
         self.account_connected = False
         self.account_error = None
+        self.startup_diagnostics = {}
         self.account_job = None
         self.account_started = None
         self.account_pool = ThreadPoolExecutor(
@@ -279,9 +281,44 @@ class Monitor:
             self.state = state
             self.last_tick = utcnow()
 
+    def authenticate_candidate(self):
+        permissions = self.account_candidate.permissions()
+        self.startup_diagnostics = permissions
+        if not permissions.get("read_only_verified"):
+            raise AccountReadError(
+                "Account monitoring disabled: "
+                + str(permissions.get("blocker"))
+                + "; absence of trading/transfer permission is not verified"
+            )
+        self.account_candidate.require_readonly = True
+        return self.account_candidate.snapshot()
+
     def update_account(self, now):
         if self.account_client is None:
-            return
+            if self.account_candidate is None:
+                return
+            if self.account_job and self.account_job.done():
+                try:
+                    batch = self.account_job.result()
+                    self.account_journal.bind(self.account_candidate.credential_binding)
+                    Path(self.account_journal.path).chmod(0o600)
+                    self.account_journal.reconcile(batch)
+                    self.account_client = self.account_candidate
+                    self.account_connected = True
+                    self.account_error = None
+                except AccountReadError as exc:
+                    self.account_error = str(exc)
+                except Exception:
+                    self.account_error = "Account reconciliation failed; response details redacted"
+                self.account_job = None
+            if self.account_client is None:
+                if self.account_job is None and (
+                    self.account_started is None
+                    or (now - self.account_started).total_seconds() >= 60
+                ):
+                    self.account_started = now
+                    self.account_job = self.account_pool.submit(self.authenticate_candidate)
+                return
         if self.account_job and self.account_job.done():
             try:
                 batch = self.account_job.result()
@@ -310,13 +347,18 @@ class Monitor:
     def account_view(self, state, now):
         if self.account_client is None:
             return {
-                "status": "PUBLIC_ONLY",
+                "status": "ACCOUNT_CONNECTING"
+                if self.account_candidate is not None and self.account_job is not None
+                else "PUBLIC_ONLY",
                 "reason": self.account_error
                 or "No account connection enabled. Public market data only; no positions/orders/fills are read.",
                 "holdings": [],
                 "guidance": [],
             }
         account = self.account_journal.snapshot()
+        cached_permissions = getattr(self.account_client, "_permissions_cache", None)
+        if cached_permissions is not None:
+            account["permissions"] = dict(cached_permissions)
         fresh = (
             self.account_connected
             and account.get("observed_at")
@@ -432,6 +474,18 @@ class Monitor:
                     scalp_explanation="EXPIRED_SIGNAL: waiting for a fresh qualifying setup",
                 )
             state["trade_decision"] = trade_decision(state)
+            state["connection_diagnostics"] = {
+                "credentials": credential_status(),
+                "account_enabled": self.account_client is not None,
+                "account_status": state["account"]["status"],
+                "account_reason": state["account"].get("reason"),
+                "permissions": state["account"].get("permissions") or self.startup_diagnostics,
+                "market_stale": state.get("stale", True),
+                "market_reason": state.get("explanation"),
+                "reference_received_at": state.get("reference", {}).get("observed_at"),
+                "quote_received_at": (state.get("market") or {}).get("observed_at"),
+                "public_requests": list(getattr(self.feed, "transport_diagnostics", [])),
+            }
             return state
 
 
@@ -613,28 +667,14 @@ def main():
             server.server_close()
             parser.error("Another dashboard owns this journal; no database changes made")
         guards.append(guard)
-    account_client = None
+    account_candidate = None
     disabled_reason = None
     if args.account_readonly:
         try:
-            account_client = ReadOnlyKalshi.from_environment()
-            if args.require_readonly_scope:
-                permissions = account_client.permissions()
-                if not permissions.get("read_only_verified"):
-                    raise AccountReadError(
-                        "Account connection withheld: "
-                        + permissions["status"]
-                        + ". Cannot confirm this key has no trading permission; continuing public data only."
-                    )
-                account_client.require_readonly = True
-                account_client.snapshot()  # Supported production authenticated GETs only.
-                print(
-                    "Production account read succeeded; metadata reports read-only scope.",
-                    flush=True,
-                )
+            account_candidate = ReadOnlyKalshi.from_environment()
+            disabled_reason = "Checking production authentication and broker read-only scope; account reads remain withheld until verified"
         except AccountReadError as exc:
             disabled_reason = str(exc)
-            account_client = None
             print(disabled_reason, flush=True)
     feed = PublicFeed() if args.mode == "public" else ReplayFeed(args.replay)
     monitor = Monitor(
@@ -647,10 +687,12 @@ def main():
         manual_delay=args.manual_delay,
         slippage=args.slippage,
         model_artifact=args.model_artifact,
-        account_client=account_client,
+        account_client=None,
         account_store=args.account_store,
     )
     monitor.account_error = disabled_reason
+    monitor.account_candidate = account_candidate
+    monitor.update_account(utcnow())
     stop = threading.Event()
     import signal
 
@@ -682,8 +724,11 @@ def main():
         thread.join(timeout=35)
         monitor.manual_pool.shutdown(wait=False, cancel_futures=True)
         monitor.account_pool.shutdown(wait=False, cancel_futures=True)
-        if isinstance(feed, PublicFeed) and feed.hub:
-            feed.hub.close()
+        if isinstance(feed, PublicFeed):
+            if feed.hub:
+                feed.hub.close()
+            if feed.candle_pool:
+                feed.candle_pool.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

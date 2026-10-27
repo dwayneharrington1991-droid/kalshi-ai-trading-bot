@@ -38,6 +38,15 @@ class PublicFeed:
         self.transport_diagnostics = []
         self.candle_cache = None
         self.candles_checked = None
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.candle_pool = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="public-candles")
+            if get is None
+            else None
+        )
+        self.candle_job = None
+        self.candle_started = None
         self.hub = (
             FeedHub(self._read, self._read_text)
             if (get is None if multi_venue is None else multi_venue)
@@ -46,20 +55,51 @@ class PublicFeed:
 
     def _read(self, url):
         started = perf_counter()
-        response = self.get(
-            url, timeout=10, follow_redirects=False, headers={"Accept": "application/json"}
-        )
-        response.raise_for_status()
-        self.transport_diagnostics.append(
-            {
-                "endpoint": url.split("?")[0],
-                "round_trip_ms": round((perf_counter() - started) * 1000, 2),
-                "received_at": utcnow().isoformat(),
-                "exchange_event_latency": "unknown; receipt timestamps only",
-            }
-        )
-        self.transport_diagnostics = self.transport_diagnostics[-8:]
-        return response.json()
+        diagnostic = {
+            "endpoint": url.split("?")[0],
+            "exchange_event_latency": "unknown; receipt timestamps only",
+        }
+        try:
+            response = self.get(
+                url, timeout=4, follow_redirects=False, headers={"Accept": "application/json"}
+            )
+            diagnostic["http_status"] = response.status_code
+            response.raise_for_status()
+            value = response.json()
+            diagnostic["status"] = "OK"
+            return value
+        except Exception as exc:
+            diagnostic["status"] = "FAILED"
+            diagnostic["error_type"] = type(exc).__name__
+            raise
+        finally:
+            diagnostic.update(
+                round_trip_ms=round((perf_counter() - started) * 1000, 2),
+                received_at=utcnow().isoformat(),
+            )
+            self.transport_diagnostics.append(diagnostic)
+            self.transport_diagnostics = self.transport_diagnostics[-20:]
+
+    def sampled_candles(self, now):
+        if self.candle_pool is None:
+            return self.candles(now)
+        if self.candle_job and self.candle_job.done():
+            try:
+                result = self.candle_job.result()
+                if isinstance(result, dict):
+                    self.candle_cache = result
+            except Exception as exc:
+                self.candle_cache = {
+                    **(self.candle_cache or {}),
+                    "error": "CANDLE_FETCH_FAILED: " + type(exc).__name__,
+                }
+            self.candle_job = None
+        if self.candle_job is None and (
+            self.candle_started is None or (now - self.candle_started).total_seconds() >= 60
+        ):
+            self.candle_started = now
+            self.candle_job = self.candle_pool.submit(self.candles, now)
+        return self.candle_cache or {}
 
     def _read_text(self, url):
         # Fixed public RSS source only; never arbitrary user URLs or auth headers.
@@ -274,6 +314,7 @@ class PublicFeed:
                 no = [level for level in no if level[1] > 0]
                 if yes and no:
                     selected["book_diagnostic"] = None
+                    selected["observed_at"] = utcnow().isoformat()
                     y, n = max(yes), max(no)
                     selected["quotes"] = {
                         "up": dict(bid=y[0], ask=round(1 - n[0], 6), bid_size=y[1], ask_size=n[1]),
@@ -317,7 +358,7 @@ class PublicFeed:
             "warnings": warnings,
             "mode": "PUBLIC MARKET DATA",
             "evidence": {},
-            "btc_candles": self.candles(utcnow()),
+            "btc_candles": self.sampled_candles(utcnow()),
             "transport_diagnostics": list(self.transport_diagnostics),
             "coverage": self.hub.snapshot(utcnow()) if self.hub else {},
         }

@@ -127,3 +127,55 @@ BrokenPipe/connection-reset errors usually occur when a tab closes, reloads or a
 proxy cancels an HTTP request. The server now treats these as client disconnects,
 not failed account syncs. The original Codespace traceback/process state was not
 accessible from this implementation environment, so its exact cause is unconfirmed.
+
+
+## Connection troubleshooting without exposing secrets
+
+After pulling the latest code, use the saved startup task or:
+
+```bash
+python3 scripts/start_dashboard.py --restart --private-dashboard
+```
+
+Open **Details → Connection Diagnostics**. Credential fields are only true/false:
+no API key ID or PEM is displayed. The report separates dashboard-server reachability,
+public market requests, production authentication, verified permissions, and account
+sync. A failed history request no longer marks live market/account state disconnected.
+History loads separately; live refreshes cannot overlap. Candle downloads run outside
+the quote polling path, retain original timestamps, and never refresh a stale candle's
+age just to make a signal appear.
+
+To run a fresh production check in a second Codespace terminal, using your existing
+server-side secrets and authenticated GETs only:
+
+```bash
+.venv/bin/python3 scripts/check_dashboard.py --account-check
+```
+
+This prints safe status, HTTP/error type, endpoint, booleans and record counts. It
+never prints secrets, response bodies, private keys or account/order identifiers.
+Account reads are withheld until key metadata explicitly proves exclusively `read`
+scope. The application's GET-only allowlist still blocks all order/transfer mutations.
+
+- Secret present = false: the running process did not receive that variable. Reopen
+  the existing Codespace after confirming its repository secret assignment; then
+  restart the dashboard. Do not create another key or paste one into a command.
+- HTTP 401/403: authenticated production metadata request rejected/forbidden. The
+  exact HTTP code is preserved; successful secret injection is not successful auth.
+- HTTP 429/5xx or transport errors: request failed; the report identifies the endpoint
+  and error type. Permission verification retries in the background every 60 seconds.
+- `KEY_METADATA_SCHEMA_UNSUPPORTED`, `CURRENT_KEY_NOT_IN_METADATA`, or
+  `READ_ONLY_SCOPE_NOT_PROVEN`: a successful response did not prove this key's
+  permissions. This may be an API metadata limitation; it does not prove your key
+  is bad. The monitor remains disabled rather than assuming read-only permission.
+- `MUTATION_SCOPE_PRESENT`: metadata reports trading/transfer capability. Account
+  monitoring stays disabled. No write request is sent to test that capability.
+- Public request failure: inspect the source, HTTP status and receipt time separately
+  from account auth. Coinbase is a proxy; the official BRTI stream remains unavailable.
+- Account checking: page is usable while authentication runs in the background.
+  A verified successful full account sync is required before balances/positions are
+  labeled connected. Failed schemas/history keep cost basis unavailable, not zero.
+
+Never delete the journal, WAL/SHM files or account store to fix a connection error.
+Actual authenticated compatibility must be checked in the Codespace containing the
+secrets; this development environment does not have access to that process or keys.

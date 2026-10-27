@@ -147,6 +147,8 @@ def main():
         "8765",
         "--journal",
         "signals_monitor.db",
+        "--processing-ms",
+        "100",
         "--stop",
         "0.10",
     ]

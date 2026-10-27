@@ -205,6 +205,11 @@ def compare(rows):
         "cross_venue": {"cross_venue_divergence", "spot_depth_imbalance"},
         "derivatives": {"derivatives_basis", "open_interest_change"},
         "macro_news": {"public_macro_release_count"},
+        "order_flow": {
+            "spot_cvd_delta_fraction",
+            "perpetual_cvd_delta_fraction",
+            "spot_book_dominance",
+        },
         "candles": set(FEATURES[2:13]),
     }.items():
         keep = [i for i, name in enumerate(prep["names"]) if name not in names]

@@ -4,66 +4,73 @@ import math
 from statistics import median
 
 from .model import number, timestamp
+from .advanced_indicators import FEATURE_NAMES as TECHNICAL_FEATURES
+from .advanced_flow import FEATURE_NAMES as FLOW_FEATURES
 
 FEATURES = (
-    "distance_scaled",
-    "remaining_fraction",
-    "return_1m",
-    "return_5m",
-    "return_15m",
-    "acceleration",
-    "body_fraction",
-    "upper_wick",
-    "lower_wick",
-    "range_fraction",
-    "breakout_distance",
-    "volatility_change",
-    "relative_volume",
-    "cross_venue_divergence",
-    "spot_depth_imbalance",
-    "derivatives_basis",
-    "open_interest_change",
-    "public_macro_release_count",
-    "spot_cvd_delta_fraction",
-    "perpetual_cvd_delta_fraction",
-    "spot_book_dominance",
-    "spot_absorption_candidate",
-    "perpetual_absorption_candidate",
-    "spot_delta_efficiency_3m",
-    "perpetual_delta_efficiency_3m",
-    "return_24h",
-    "rsi_14",
-    "macd_scaled",
-    "ema_gap",
-    "vwap_deviation",
-    "bollinger_z",
-    "volatility_24h",
-) + tuple(
-    "micro_" + window + "_" + feature
-    for window in (
-        "500ms",
-        "1s",
-        "5s",
-        "15s",
-        "30s",
-        "1m",
-        "3m",
-        "5m",
-        "15m",
-        "30m",
-        "1h",
-        "4h",
-        "24h",
+    (
+        "distance_scaled",
+        "remaining_fraction",
+        "return_1m",
+        "return_5m",
+        "return_15m",
+        "acceleration",
+        "body_fraction",
+        "upper_wick",
+        "lower_wick",
+        "range_fraction",
+        "breakout_distance",
+        "volatility_change",
+        "relative_volume",
+        "cross_venue_divergence",
+        "spot_depth_imbalance",
+        "derivatives_basis",
+        "open_interest_change",
+        "public_macro_release_count",
+        "spot_cvd_delta_fraction",
+        "perpetual_cvd_delta_fraction",
+        "spot_book_dominance",
+        "spot_absorption_candidate",
+        "perpetual_absorption_candidate",
+        "spot_delta_efficiency_3m",
+        "perpetual_delta_efficiency_3m",
+        "return_24h",
+        "rsi_14",
+        "macd_scaled",
+        "ema_gap",
+        "vwap_deviation",
+        "bollinger_z",
+        "volatility_24h",
     )
-    for feature in (
-        "return_fraction",
-        "velocity_dollars_per_second",
-        "acceleration_dollars_per_second_squared",
-        "realized_volatility_per_sqrt_second",
-        "trade_flow_imbalance",
-        "depth_imbalance",
-        "liquidity_withdrawal_fraction",
+    + tuple(
+        "micro_" + window + "_" + feature
+        for window in (
+            "500ms",
+            "1s",
+            "5s",
+            "15s",
+            "30s",
+            "1m",
+            "3m",
+            "5m",
+            "15m",
+            "30m",
+            "1h",
+            "4h",
+            "24h",
+        )
+        for feature in (
+            "return_fraction",
+            "velocity_dollars_per_second",
+            "acceleration_dollars_per_second_squared",
+            "realized_volatility_per_sqrt_second",
+            "trade_flow_imbalance",
+            "depth_imbalance",
+            "liquidity_withdrawal_fraction",
+        )
     )
+    + TECHNICAL_FEATURES
+    + FLOW_FEATURES
 )
 
 
@@ -82,6 +89,19 @@ def extract(payload, market, now):
     for name, value in payload.get("market_intelligence", {}).get("candidate_features", {}).items():
         if name in values and value is not None:
             values[name] = value
+    advanced = payload.get("advanced_intelligence", {})
+    for name, value in advanced.get("candidate_features", {}).items():
+        if name not in values or value is None:
+            continue
+        try:
+            proof = advanced["candidate_feature_sources"][name]
+            if timestamp(proof["received_at"]) > now or (
+                proof.get("event_at") and timestamp(proof["event_at"]) > now
+            ):
+                continue
+            values[name] = number(value, -1e15, 1e15)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
     diagnostics = []
     bars = []
     try:

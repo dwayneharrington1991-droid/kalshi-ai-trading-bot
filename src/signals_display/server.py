@@ -33,6 +33,8 @@ from .runtime import CachedReport, LatestPayload, RuntimeMeter
 from .intelligence import MarketIntelligence
 from .comparison import model_market
 from .alerts import MonitoringAlerts, risk_alerts
+from .scalp_monitor import diagnose as diagnose_scalp, ScalpCriteria
+from .advanced import AdvancedIntelligence, attach_reliability, refresh_status
 
 
 class Monitor:
@@ -51,6 +53,7 @@ class Monitor:
         account_client=None,
         account_store=None,
         model_registry=None,
+        opening_model_artifact=None,
     ):
         self.feed, self.journal = feed, journal
         self.target, self.stop, self.horizon = target, stop, horizon
@@ -87,6 +90,12 @@ class Monitor:
         self.signal_id = None
         self.models_enabled = models_enabled
         self.artifact, self.artifact_status = load_artifact(model_artifact)
+        from .opening_models import load_artifact as load_opening_artifact
+
+        self.opening_artifact, self.opening_artifact_status = load_opening_artifact(
+            opening_model_artifact
+        )
+        self.scalp_criteria = self.journal.scalp_criteria()
         self.readiness_at = None
         self.readiness = {}
         self.estimator = LiveEstimator(manual_delay=manual_delay, slippage=slippage)
@@ -111,6 +120,7 @@ class Monitor:
         self.state_version = 0
         self.last_cycle_started = None
         self.intelligence = MarketIntelligence()
+        self.advanced = AdvancedIntelligence()
         self.monitoring_alerts = MonitoringAlerts()
         self.last_proxy_observation = None
         self.runtime_meter = RuntimeMeter()
@@ -128,6 +138,11 @@ class Monitor:
         )
         self.research_report = CachedReport(
             self.journal.performance, interval=60, name="historical-research"
+        )
+        from .scalp_paper import evaluate_journal
+
+        self.scalp_paper_report = CachedReport(
+            lambda: evaluate_journal(self.journal.path), interval=60, name="book-replay-evaluation"
         )
         self.scheduled_learning = None
         if model_registry is not None:
@@ -194,10 +209,14 @@ class Monitor:
             market_now = active_market(payload, now)
             rejected = 0
             for observation in payload.get("stream_observations", []):
-                try:
-                    self.intelligence.observe(observation)
-                except (KeyError, ValueError, TypeError, AttributeError):
-                    rejected += 1
+                # Independent consumers must not discard valid trade-channel
+                # volume merely because the legacy price sampler rejected an
+                # older cross-channel event timestamp.
+                for consumer in (self.intelligence.observe, self.advanced.observe):
+                    try:
+                        consumer(observation)
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        rejected += 1
             primary = None
             if ref.get("transport") == "public WebSocket":
                 primary = (
@@ -225,6 +244,15 @@ class Monitor:
             )
             intelligence["rejected_observations_this_update"] = rejected
             payload["market_intelligence"] = intelligence
+            advanced_started = perf_counter()
+            advanced = self.advanced.summarize(
+                now,
+                candles=payload.get("btc_candles", {}),
+                primary_source=primary,
+                threshold=market_now.get("strike") if market_now else None,
+            )
+            payload["advanced_intelligence"] = advanced
+            phases["advanced_analysis"] = round((perf_counter() - advanced_started) * 1000, 2)
             coverage["Kalshi KXBTC15M public"] = {
                 "status": "CONNECTED" if market_now else "UNAVAILABLE",
                 "reason": "Public contract metadata and executable quotes only; no account access"
@@ -339,6 +367,15 @@ class Monitor:
                             "artifact_status"
                         ] = "Future-trained artifact rejected at this prediction time"
             state = analyze(payload, now, self.target, self.stop, self.horizon, result, info)
+            state["advanced_intelligence"] = self.advanced.decorate(
+                advanced,
+                info or {},
+                now,
+                artifact=self.artifact
+                if info and info.get("learning_status", {}).get("model_id")
+                else None,
+                probability=state.get("estimate", {}).get("settlement_up"),
+            )
             if info is not None:
                 scan = scanner_context(payload, market_now, info, now)
                 info["scanner"] = scan
@@ -376,6 +413,32 @@ class Monitor:
                         list(self.estimator.reference),
                         generated,
                         reference_source=self.estimator.reference_source,
+                        audit_context={
+                            "official_contracts": self.readiness.get("official_contracts"),
+                            "minimum_contracts": self.readiness.get("minimum_contracts", 170),
+                            "artifact_status": self.opening_artifact_status,
+                            "live_model": self.artifact.get("model", {}).get("kind")
+                            if self.artifact
+                            else "experimental statistical fallback",
+                            "live_ensemble_active": bool(
+                                self.artifact
+                                and self.artifact.get("model", {}).get("kind") == "ensemble"
+                            ),
+                            "opening_candidate_status": self.opening_artifact_status,
+                        },
+                        frozen_context={
+                            **self.intelligence.summarize(
+                                opened, candles=frozen, primary_source=primary
+                            ),
+                            "primary_source": primary,
+                            "advanced_features": self.advanced.summarize(
+                                opened,
+                                candles=frozen,
+                                primary_source=primary,
+                                threshold=m["strike"],
+                            ),
+                        },
+                        candidate_artifact=self.opening_artifact,
                     )
                     if state["mode"] == "PUBLIC MARKET DATA":
                         generated = utcnow()
@@ -395,6 +458,10 @@ class Monitor:
             state["model_market"] = model_market(
                 state, self.estimator.slippage, self.estimator.manual_delay
             )
+            state["generated_at"] = (
+                utcnow().isoformat() if state["mode"] == "PUBLIC MARKET DATA" else now.isoformat()
+            )
+            state["scalping_monitor"] = diagnose_scalp(state, self.scalp_criteria, now=now)
             state["monitor_alerts"] = self.monitoring_alerts.update(state)
             phases["prediction_calculation"] = round(
                 (perf_counter() - calculation_started) * 1000, 2
@@ -768,6 +835,10 @@ class Monitor:
             else timestamp(state["now"]) + (utcnow() - last_tick)
         )
         state["market_health"] = diagnose_market(state, health_clock)
+        if state.get("advanced_intelligence"):
+            state["advanced_intelligence"] = refresh_status(
+                state["advanced_intelligence"], health_clock
+            )
         if (
             not state["market_health"]["contract_quotes_fresh"]
             or not state["market_health"]["reference_fresh"]
@@ -795,6 +866,9 @@ class Monitor:
         state["trade_decision"] = trade_decision(state)
         state["model_market"] = model_market(
             state, self.estimator.slippage, self.estimator.manual_delay
+        )
+        state["scalping_monitor"] = diagnose_scalp(
+            state, self.scalp_criteria, account=state["account"], now=health_clock
         )
         state["connection_diagnostics"] = {
             "credentials": credential_status(),
@@ -856,6 +930,11 @@ def make_handler(monitor):
                         not in {"coverage", "scanner", "candidate_features", "market_intelligence"}
                     }
                     value.pop("coverage", None)
+                    value.pop("advanced_intelligence", None)
+                elif route == "/api/details" and value.get("advanced_intelligence"):
+                    value["advanced_intelligence"] = attach_reliability(
+                        value["advanced_intelligence"], monitor.engine_report.get()
+                    )
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route in {"/api/history-page", "/api/account-history"}:
@@ -884,6 +963,27 @@ def make_handler(monitor):
                         limit=limit, before_id=before or None
                     )
                 body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/scalp-criteria":
+                body = json.dumps(
+                    {
+                        "criteria": monitor.scalp_criteria.to_dict(),
+                        "notice": "Diagnostic criteria only; no evidence or account limits changed",
+                    }
+                ).encode()
+                content_type = "application/json"
+            elif route == "/api/scalp-paper-performance":
+                report = monitor.scalp_paper_report.get()
+                body = json.dumps(
+                    {
+                        "status": report["status"],
+                        "report": report["value"],
+                        "generated_at": report["generated_at"],
+                        "calculation_ms": report["calculation_ms"],
+                        "notice": "Public quote counterfactuals only, never actual account results or validated trade recommendations",
+                    },
+                    allow_nan=False,
+                ).encode()
                 content_type = "application/json"
             elif route in {"/api/history", "/api/research"}:
                 report = monitor.research_report.get()
@@ -953,6 +1053,7 @@ def make_handler(monitor):
                 "/api/manual/exit",
                 "/api/account/select",
                 "/api/account/limits",
+                "/api/scalp-criteria",
             ):
                 self.send_error(405, "No trading/write route")
                 return
@@ -978,7 +1079,15 @@ def make_handler(monitor):
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError("Journal record must be an object")
-                if self.path.startswith("/api/account/"):
+                if self.path == "/api/scalp-criteria":
+                    criteria = monitor.journal.scalp_criteria(data)
+                    monitor.scalp_criteria = criteria
+                    result = {
+                        "recorded": True,
+                        "criteria": criteria.to_dict(),
+                        "executed_trade": False,
+                    }
+                elif self.path.startswith("/api/account/"):
                     if monitor.account_client is None:
                         raise ValueError("Account mode is not enabled on the server")
                     if self.path.endswith("/select"):
@@ -1056,6 +1165,9 @@ def main():
         help="Refuse account monitoring unless authenticated key metadata verifies read-only scope",
     )
     parser.add_argument("--model-artifact", type=Path, default=Path("signals_model.json"))
+    parser.add_argument(
+        "--opening-model-artifact", type=Path, default=Path("signals_opening_model.json")
+    )
     parser.add_argument("--model-registry", type=Path, default=Path("signals_model_registry"))
     parser.add_argument(
         "--disable-scheduled-learning",
@@ -1123,6 +1235,7 @@ def main():
         model_artifact=args.model_artifact,
         account_client=None,
         account_store=args.account_store,
+        opening_model_artifact=args.opening_model_artifact,
         model_registry=args.model_registry
         if args.mode == "public" and not args.disable_model and not args.disable_scheduled_learning
         else None,
@@ -1238,6 +1351,7 @@ def main():
         monitor.readiness_pool.shutdown(wait=False, cancel_futures=True)
         monitor.engine_report.close()
         monitor.research_report.close()
+        monitor.scalp_paper_report.close()
         if monitor.scheduled_learning:
             monitor.scheduled_learning.close()
         if isinstance(feed, PublicFeed):

@@ -28,16 +28,17 @@ prediction accuracy. Rerun the command to measure your environment.
 
 | Operation | Samples | Median | 95th percentile |
 | --- | ---: | ---: | ---: |
-| Public message parsing plus intelligence-buffer ingestion | 3,001 | 0.0205 ms | 0.0749 ms |
-| Multi-horizon intelligence calculation | 601 | 0.8003 ms | 1.7514 ms |
-| Live prediction plus journal write, including warmed 60-second scalp simulation | 20 | 92.6619 ms | 103.1964 ms |
-| Main dashboard HTTP response | 10 | 1.2941 ms | 1.8667 ms |
-| Main HTTP response while research is deliberately blocked | 10 | 1.6019 ms | 2.6334 ms |
-| Bounded 20-record history HTTP page | 10 | 1.7569 ms | 4.3089 ms |
-| Direct indexed 20-record SQLite page | 20 | 0.4633 ms | 0.6965 ms |
+| Public message parsing plus intelligence-buffer ingestion | 3,001 | 0.0415 ms | 0.1210 ms |
+| Multi-horizon intelligence calculation | 601 | 0.8119 ms | 1.6573 ms |
+| Advanced executed-trade and cached multi-timeframe analysis | 601 | 5.5011 ms | 12.5945 ms |
+| Live prediction plus journal write, including warmed 60-second scalp simulation | 20 | 98.9316 ms | 107.9170 ms |
+| Main dashboard HTTP response | 10 | 2.0971 ms | 5.9183 ms |
+| Main HTTP response while research is deliberately blocked | 10 | 1.7609 ms | 2.5359 ms |
+| Bounded 20-record history HTTP page | 10 | 1.9426 ms | 2.5346 ms |
+| Direct indexed 20-record SQLite page | 20 | 0.4643 ms | 0.6359 ms |
 
-One synthetic opening calculation, including its journal write, took **47.733 ms**.
-One synthetic rollover, with metadata already supplied, took **41.497 ms**. The
+One synthetic opening calculation, including its journal write, took **57.418 ms**.
+One synthetic rollover, with metadata already supplied, took **62.881 ms**. The
 opening record for the previous contract remained identical after rollover.
 These timings exclude real discovery, official-threshold publication, provider
 delays, and Internet access; they do not promise an opening-second prediction.
@@ -46,16 +47,16 @@ Chromium results from the same run:
 
 | Browser fixture | Page load | First contract displayed | Explicit refresh |
 | --- | ---: | ---: | ---: |
-| Desktop, 1400 × 1100 | 159.121 ms | 209.219 ms | 19.490 ms |
-| Mobile, 390 × 844 | 119.925 ms | 169.417 ms | 26.121 ms |
+| Desktop, 1400 × 1100 | 130.902 ms | 175.975 ms | 15.061 ms |
+| Mobile, 390 × 844 | 151.344 ms | 188.111 ms | 14.143 ms |
 
 Both fixtures displayed the opening prediction first, had no horizontal overflow,
 raised no JavaScript errors, and made no external requests. These figures use a
 local ephemeral HTTP server and exclude GitHub's private forwarded-port network.
 
-The accelerated run took **4.867 seconds** of elapsed wall time and **3.118
-seconds** of Python process CPU time, equivalent to **64.06% of one CPU core**
-during the benchmark. Peak Python resident memory was **40.31 MiB**. Browser child
+The accelerated run took **8.516 seconds** of elapsed wall time and **6.940
+seconds** of Python process CPU time, equivalent to **81.50% of one CPU core**
+during the benchmark. Peak Python resident memory was **46.75 MiB**. Browser child
 process memory is excluded. The benchmark processes five simulated minutes as
 quickly as possible; these CPU measurements are not steady-state live utilization.
 
@@ -72,6 +73,12 @@ quickly as possible; these CPU measurements are not steady-state live utilizatio
 - Quote/reference history is warmed before measuring full live calculations. The
   report states whether both scalp probabilities were available and records the
   scalp holding horizon, rather than timing only an insufficient-data shortcut.
+- The advanced benchmark includes 3,001 explicitly synthetic executions, actual
+  quantity-weighted calculations and zero capture resets. VWAP/order flow are
+  READY; 30-second RSI correctly remains unavailable after only five minutes
+  (it needs 15 closed bars). Separate integration tests warm longer genuine
+  synthetic 30-second bars. Maximum advanced calculation in this run was
+  27.3254 ms; median and p95 are not worst-case guarantees.
 - One simulated disconnect/reconnect invalidates the old reference and accepts a
   fresh post-reconnect reference. Both checks passed in the example. This is one
   offline recovery case, not a live reconnection-reliability statistic.

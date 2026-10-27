@@ -571,3 +571,432 @@ def test_probability_history_cannot_restore_a_previous_contract_after_rollover(t
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promotion(tmp_path):
+    """Rounded ties stay neutral; hypothetical criteria cannot promote an entry."""
+    from copy import deepcopy
+    import json
+
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    state = analyze(frame(), NOW)
+    ticker = state["market"]["ticker"]
+    initial = {
+        "ticker": ticker,
+        "up": 0.49994,
+        "direction": "DOWN",  # Historical stored label remains immutable.
+        "model": "opening24h-zero-drift-final-average-v1",
+        "generated_at": NOW.isoformat(),
+        "data_cutoff": NOW.isoformat(),
+        "opening_delay_seconds": 2,
+        "status": "DELAYED",
+        "reason": "Frozen inputs; experimental zero-drift baseline.",
+        "threshold": 100000,
+    }
+    state["prediction_engine"] = {
+        "status": "EXPERIMENTAL",
+        "ticker": ticker,
+        "threshold": 100000,
+        "up": 0.49994,
+        "down": 0.50006,
+        "initial": deepcopy(initial),
+        "updated_at": NOW.isoformat(),
+        "reference": state["reference"],
+        "opening_diagnostics": {
+            "model_id": initial["model"],
+            "fallback_reason": "80 official outcomes; opening-specific validation minimum not met.",
+            "raw_probability_up": 0.49994,
+            "live_ensemble_active": False,
+            "opening_ensemble_active": False,
+        },
+    }
+    criteria = {
+        "quantity": 1.0,
+        "minimum_success_probability": 0.6,
+        "maximum_spread": 0.03,
+        "minimum_entered_paths": 200,
+        "minimum_net_ev": 0.0,
+        "maximum_data_age_seconds": 5.0,
+        "maximum_source_skew_seconds": 5.0,
+        "maximum_holding_seconds": 60,
+    }
+    state["scalping_monitor"] = {
+        "engine_status": "ACTIVE",
+        "data_status": "FRESH",
+        "model_status": "EXPERIMENTAL",
+        "liquidity_status": "SUFFICIENT",
+        "signal_status": "CANDIDATE",
+        "recommendation": "WAIT",
+        "actionable": False,
+        "exact_reason": "SCALP_PROMOTION_BLOCKED: no reviewed evidence after costs <img src=x onerror=alert(1)>",
+        "ticker": ticker,
+        "timestamp": NOW.isoformat(),
+        "model_version": "experimental-logit-diffusion",
+        "remaining_seconds": 600,
+        "criteria": criteria,
+        "data_ages": {"reference_seconds": 0.2, "quote_seconds": 0.1},
+        "exposure": {"confirmed_quantity": 2},
+        "sides": {
+            "up": {
+                "bid": 0.49,
+                "ask": 0.51,
+                "bid_size": 20,
+                "ask_size": 20,
+                "spread": 0.02,
+                "entry_fee": 0.02,
+                "slippage": 0.01,
+                "entry_cap": 0.52,
+                "target_bid": 0.61,
+                "stop_bid": 0.40,
+                "holding_seconds": 60,
+                "target_probability": 0.65,
+                "net_expected_profit": 0.02,
+                "hypothetical_candidate": True,
+                "reasons": ["Experimental Monte Carlo paths are not validated execution evidence."],
+            }
+        },
+    }
+    state["runtime"] = {"published_at": NOW.isoformat(), "state_version": 1}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page(viewport={"width": 1400, "height": 1100})
+            errors, writes = [], []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.route(
+                "**/api/state?*",
+                lambda route: route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps(state)
+                ),
+            )
+
+            def criteria_route(route):
+                if route.request.method == "POST":
+                    writes.append((route.request.url, route.request.post_data_json))
+                    criteria.update(route.request.post_data_json)
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"criteria": criteria}),
+                )
+
+            paper_requests = []
+
+            def paper_route(route):
+                paper_requests.append(route.request.url)
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "status": "READY",
+                            "generated_at": NOW.isoformat(),
+                            "report": {
+                                "status": "PAPER_REPLAY_ONLY",
+                                "coverage": {"accepted_book_records": 15},
+                                "strategies": {
+                                    "candidate": {
+                                        "opportunities": 2,
+                                        "simulated_trades": 1,
+                                        "win_rate_observed_only": 1.0,
+                                        "net_simulated_pnl": 0.15,
+                                        "maximum_drawdown": 0.0,
+                                        "average_net_return_per_observed_trade": 0.15,
+                                        "trades": [{"audit": "DO_NOT_RENDER_TRADE_ARRAY"}] * 2000,
+                                    }
+                                },
+                                "profitable_edge_demonstrated": False,
+                            },
+                        }
+                    ),
+                )
+
+            page.route("**/api/scalp-criteria", criteria_route)
+            page.route("**/api/scalp-paper-performance", paper_route)
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#opening-direction")).to_have_text("NEUTRAL")
+            assert page.locator("#opening-up-prob").inner_text() == "50.0%"
+            assert page.locator("#opening-down-prob").inner_text() == "50.0%"
+            assert page.locator("#live-direction").inner_text() == "NEUTRAL"
+            assert (
+                paper_requests == []
+            )  # Paper history is explicitly requested, never polled by the main view.
+            assert page.evaluate("directionLabel(0.5000000000000507)") == "NEUTRAL"
+            assert "80 official outcomes" in page.locator("#opening-model-summary").inner_text()
+            assert page.evaluate("lastState.prediction_engine.initial.direction") == "DOWN"
+            assert page.evaluate("lastState.prediction_engine.initial.up") == 0.49994
+            order = [
+                page.locator(selector).evaluate("e=>e.getBoundingClientRect().top")
+                for selector in (
+                    "#opening-prediction",
+                    "#btc-engine",
+                    "#scalping-monitor",
+                    "#model-market-panel",
+                    "#live-trades-panel",
+                )
+            ]
+            assert order == sorted(order)
+            assert page.locator("#scalp-monitor-signal").inner_text() == "CANDIDATE"
+            assert page.locator("#scalp-monitor-action").inner_text() == "WAIT"
+            assert page.locator("#trade-action").inner_text() == "🟡 WAIT"
+            assert page.locator("#scalp-monitor-model").inner_text() == "EXPERIMENTAL"
+            assert "SCALP_PROMOTION_BLOCKED" in page.locator("#scalp-monitor-reason").inner_text()
+            assert page.locator("#scalp-monitor-reason img").count() == 0
+            page.locator("#scalp-hypotheses > summary").click()
+            playwright.expect(page.locator("#scalp-hypothesis-plans")).to_contain_text("$0.52")
+            assert "hypothetical only" in page.locator("#scalp-hypothesis-plans").inner_text()
+            page.locator("#details > summary").click()
+            playwright.expect(page.locator("#opening-model-diagnostics")).to_contain_text(
+                "raw_probability_up"
+            )
+            assert paper_requests == []
+            page.locator("#load-scalp-paper").click()
+            playwright.expect(page.locator("#scalp-paper-status")).to_contain_text(
+                "EDGE UNVERIFIED"
+            )
+            assert len(paper_requests) == 1
+            assert "$0.15" in page.locator("#scalp-paper-rows").inner_text()
+            assert (
+                "DO_NOT_RENDER_TRADE_ARRAY" not in page.locator("#scalp-paper-details").inner_text()
+            )
+            assert page.locator("#trade-action").inner_text() == "🟡 WAIT"
+            page.locator("#scalp-criteria-details > summary").click()
+            playwright.expect(page.locator("#save-scalp-criteria")).to_be_enabled()
+            page.locator("input[name=minimum_success_probability]").fill("0.7")
+            page.locator("#save-scalp-criteria").click()
+            playwright.expect(page.locator("#scalp-criteria-status")).to_contain_text(
+                "Diagnostic criteria saved"
+            )
+            assert len(writes) == 1 and writes[0][1]["minimum_success_probability"] == 0.7
+            assert writes[0][0].endswith("/api/scalp-criteria")
+            assert page.locator("#trade-action").inner_text() == "🟡 WAIT"
+            state["prediction_engine"].update(up=0.7, down=0.3)
+            state["runtime"] = {
+                "published_at": (NOW + timedelta(seconds=1)).isoformat(),
+                "state_version": 2,
+            }
+            page.evaluate("refresh()")
+            playwright.expect(page.locator("#live-direction")).to_have_text("UP")
+            assert page.locator("#opening-direction").inner_text() == "NEUTRAL"
+            assert state["prediction_engine"]["initial"] == initial
+            page.evaluate("expired('Synthetic outage')")
+            assert page.locator("#scalp-monitor-data").inner_text() == "STALE"
+            assert page.locator("#scalp-monitor-signal").inner_text() == "BLOCKED"
+            assert "$0.49" not in page.locator("#scalp-monitor-quotes").inner_text()
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert page.evaluate("document.documentElement.scrollWidth<=window.innerWidth")
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_advanced_intelligence_is_lazy_safe_and_integrated_with_forecast_panels(tmp_path):
+    """All twelve diagnostics remain hidden until requested and cannot replace a forecast."""
+    import json
+
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    state = analyze(frame(), NOW)
+    ticker = state["market"]["ticker"]
+    opening = {
+        "ticker": ticker,
+        "up": 0.65,
+        "down": 0.35,
+        "direction": "UP",
+        "threshold": 100000,
+        "generated_at": NOW.isoformat(),
+        "data_cutoff": NOW.isoformat(),
+        "reason": "Synthetic frozen opening for this offline browser test.",
+    }
+    state["prediction_engine"] = {
+        "status": "EXPERIMENTAL",
+        "ticker": ticker,
+        "threshold": 100000,
+        "up": 0.4,
+        "down": 0.6,
+        "initial": opening,
+        "updated_at": NOW.isoformat(),
+        "reference": state["reference"],
+    }
+    names = (
+        "rsi", "macd", "vwap", "bollinger", "ema", "volume_profile",
+        "order_flow", "order_book", "cvd", "microstructure", "ensemble", "calibration",
+    )
+    state["advanced_intelligence"] = {
+        "status": "SHADOW",
+        "generated_at": NOW.isoformat(),
+        "strongest_validated_factors": [],
+        "families": {
+            name: {
+                "status": "EXPERIMENTAL" if index < 10 else "UNAVAILABLE",
+                "reading": {"1m": 52.125, "5m": "warming up"},
+                "interpretation": "NEUTRAL",
+                "as_of": NOW.isoformat(),
+                "age_seconds": 0.25,
+                "contributing": False,
+                "reason": "Shadow analysis only <img src=x onerror=alert(1)>",
+            }
+            for index, name in enumerate(names)
+        },
+    }
+    state["advanced_intelligence"]["families"]["vwap"].update(
+        reading=None, reason="Genuine executed trade volume unavailable; no substitute used."
+    )
+    monitor.state = state
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page(viewport={"width": 1400, "height": 1100})
+            errors, requests = [], []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+
+            def state_route(route):
+                requests.append(route.request.url)
+                route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps(state)
+                )
+
+            page.route("**/api/state?*", state_route)
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#opening-direction")).to_have_text("UP")
+            assert page.locator("#live-direction").inner_text() == "DOWN"
+            assert page.locator("#advanced-rows tr").count() == 0
+            assert page.locator("#reliability-chart").get_attribute("data-opening-points") is None
+            assert "Open this section" in page.locator("#advanced-full-json").text_content()
+            assert not any("view=details" in url for url in requests)
+            page.locator("#details > summary").click()
+            playwright.expect(page.locator("#opening-model-diagnostics")).to_have_text("{}")
+            assert page.locator("#advanced-rows tr").count() == 0
+            page.locator("#advanced-market-intelligence > summary").click()
+            playwright.expect(page.locator("#advanced-rows tr")).to_have_count(12)
+            assert "No advanced factors have been validated" in page.locator("#advanced-factors").inner_text()
+            assert "0.25s old" in page.locator("#advanced-rows").inner_text()
+            assert "No — shadow / diagnostic" in page.locator("#advanced-rows").inner_text()
+            assert "Genuine executed trade volume unavailable" in page.locator("#advanced-rows").inner_text()
+            assert page.locator("#advanced-rows img").count() == 0
+            assert page.locator("#reliability-chart").get_attribute("data-opening-points") == "0"
+            assert "no nonempty, valid official-outcome" in page.locator("#reliability-chart-status").inner_text()
+            assert "Open this section" in page.locator("#advanced-full-json").text_content()
+            state["advanced_intelligence"]["families"]["vwap"]["session_vwap"] = 100123.456
+            state["advanced_intelligence"]["families"]["vwap"]["trades"] = [{"DO_NOT_RENDER_RAW_TRADE": 1}] * 1000
+            page.evaluate("advancedState.advanced_intelligence.families.vwap.session_vwap=100123.456; advancedState.advanced_intelligence.families.vwap.trades=[{DO_NOT_RENDER_RAW_TRADE:1}]")
+            page.locator("#advanced-full-readings > summary").click()
+            playwright.expect(page.locator("#advanced-full-json")).to_contain_text("100123.456")
+            assert "DO_NOT_RENDER_RAW_TRADE" not in page.locator("#advanced-full-json").inner_text()
+            assert page.locator("#advanced-full-json img").count() == 0
+            assert page.locator("#opening-direction").inner_text() == "UP"
+            assert page.locator("#opening-up-prob").inner_text() == "65.0%"
+            assert page.locator("#live-direction").inner_text() == "DOWN"
+            assert page.locator("#trade-action").inner_text() == "🟡 WAIT"
+            # An unchanged full snapshot does not recreate twelve rows every refresh.
+            page.locator("#advanced-rows tr").first.evaluate("e => e.dataset.retained = 'yes'")
+            page.evaluate("advancedView(advancedState)")
+            assert page.locator("#advanced-rows tr").first.get_attribute("data-retained") == "yes"
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_reliability_diagram_uses_observed_bins_and_clears_unavailable_results(tmp_path):
+    """The chart plots supplied official bins only, never empty or invalid bins."""
+    import json
+
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    state = analyze(frame(), NOW)
+    state["advanced_intelligence"] = {
+        "status": "EXPERIMENTAL_SHADOW",
+        "generated_at": NOW.isoformat(),
+        "families": {
+            "calibration": {
+                "status": "EXPERIMENTAL",
+                "interpretation": "UNCALIBRATED",
+                "contributing": False,
+                "reading": {
+                    "opening": {
+                        "samples": 20,
+                        "brier": 0.16,
+                        "log_loss": 0.5,
+                        "expected_calibration_error": 0.1,
+                        "calibration": [
+                            {"samples": 10, "mean_probability": 0.2, "outcome_rate": 0.1,
+                             "outcome_rate_interval": [0.02, 0.4]},
+                            {"samples": 10, "mean_probability": 0.8, "outcome_rate": 0.9,
+                             "outcome_rate_interval": [0.6, 0.98]},
+                            {"samples": 0, "mean_probability": 0.55, "outcome_rate": 0.2},
+                            {"samples": 5, "mean_probability": None, "outcome_rate": 0.5},
+                        ],
+                    },
+                    "live": {
+                        "samples": 10,
+                        "brier": 0.24,
+                        "log_loss": 0.7,
+                        "expected_calibration_error": 0.1,
+                        "calibration": [
+                            {"samples": 10, "mean_probability": 0.4, "outcome_rate": 0.5,
+                             "outcome_rate_interval": [0.23, 0.77]},
+                            {"samples": 10, "mean_probability": 1.1, "outcome_rate": 0.5},
+                        ],
+                    },
+                },
+            }
+        },
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page(viewport={"width": 1400, "height": 1100})
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.route(
+                "**/api/state?*",
+                lambda route: route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps(state)
+                ),
+            )
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            page.locator("#details > summary").click()
+            assert page.locator("#reliability-chart").get_attribute("data-opening-points") is None
+            page.locator("#advanced-market-intelligence > summary").click()
+            playwright.expect(page.locator("#reliability-chart-status")).to_contain_text("20 scored outcomes")
+            assert page.locator("#reliability-chart").get_attribute("data-opening-points") == "2"
+            assert page.locator("#reliability-chart").get_attribute("data-live-points") == "1"
+            assert "Brier 0.1600" in page.locator("#reliability-chart-status").inner_text()
+            assert "Edge unverified" in page.locator("#reliability-chart").get_attribute("aria-label")
+            before = page.locator("#reliability-chart").evaluate("e => e.toDataURL()")
+            page.evaluate("advancedView(advancedState)")
+            assert page.locator("#reliability-chart").evaluate("e => e.toDataURL()") == before
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+            page.evaluate("advancedState.advanced_intelligence.families.calibration.reading={opening:{samples:0,calibration:[]},live:{samples:0,calibration:[]}}; advancedView(advancedState)")
+            playwright.expect(page.locator("#reliability-chart-status")).to_contain_text("unavailable")
+            assert page.locator("#reliability-chart").get_attribute("data-opening-points") == "0"
+            assert page.locator("#reliability-chart").get_attribute("data-live-points") == "0"
+            assert page.locator("#reliability-chart").evaluate("e => e.toDataURL()") != before
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

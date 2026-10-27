@@ -214,6 +214,10 @@ secrets.yaml
 /.private/
 /signals_model*.json
 /signals_model_registry/
+/signals_opening_model*.json
+/opening_shadow*.json
+/opening_shadow_registry/
+/signals_scalp_paper*.json
 
 # SQLite live sidecars and dashboard process guards
 *.db-wal

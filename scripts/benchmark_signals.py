@@ -28,6 +28,7 @@ from src.signals_display.intelligence import MarketIntelligence
 from src.signals_display.monitor import Journal, PublicFeed
 from src.signals_display.server import Monitor, make_handler
 from src.signals_display.streaming import StreamHub
+from src.signals_display.advanced import AdvancedIntelligence
 
 
 def distribution(values):
@@ -212,7 +213,9 @@ def run(args):
     base = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=5)
     stream = StreamHub(autostart=False)
     intelligence = MarketIntelligence()
-    ingest_ms, analysis_ms, analysis = [], [], {}
+    advanced = AdvancedIntelligence()
+    ingest_ms, analysis_ms, advanced_ms, analysis = [], [], [], {}
+    advanced_history, history_minute = None, None
     for index in range(args.events):
         event = base + timedelta(seconds=index * 0.1)
         receipt = event + timedelta(milliseconds=25)
@@ -239,11 +242,38 @@ def run(args):
         stream.process_coinbase(message, received_at=receipt, received_monotonic=1000 + index * 0.1)
         for observation in stream.drain_observations():
             intelligence.observe(observation)
+            advanced.observe(observation)
+        # Explicit synthetic executions exercise real-volume calculations rather
+        # than timing only quote-only/unavailable shortcuts.
+        advanced.observe(
+            dict(
+                source="Coinbase BTC/USD stream",
+                kind="trade",
+                price=price,
+                volume=0.25 + (index % 4) * 0.01,
+                aggressor="buy" if index % 3 else "sell",
+                trade_id="benchmark-" + str(index),
+                event_at=event.isoformat(),
+                received_at=receipt.isoformat(),
+                session_id=observation.get("session_id"),
+            )
+        )
         ingest_ms.append((perf_counter() - started) * 1000)
         if index % 5 == 0:
             started = perf_counter()
             analysis = intelligence.summarize(receipt, primary_source="Coinbase BTC/USD stream")
             analysis_ms.append((perf_counter() - started) * 1000)
+            minute = int(receipt.timestamp()) // 60
+            if minute != history_minute:
+                advanced_history, history_minute = history(receipt), minute
+            started = perf_counter()
+            advanced_result = advanced.summarize(
+                receipt,
+                candles=advanced_history,
+                primary_source="Coinbase BTC/USD stream",
+                threshold=100000,
+            )
+            advanced_ms.append((perf_counter() - started) * 1000)
     final_receipt = base + timedelta(seconds=(args.events - 1) * 0.1, milliseconds=25)
     source = analysis.get("sources", {}).get("Coinbase BTC/USD stream", {})
     stream.disconnected(RuntimeError("simulated outage"))
@@ -286,6 +316,18 @@ def run(args):
         },
         "ingestion_including_buffer_ms": distribution(ingest_ms),
         "intelligence_calculation_ms": distribution(analysis_ms),
+        "advanced_trade_and_technical_calculation_ms": distribution(advanced_ms),
+        "advanced_fixture": {
+            "vwap_status": advanced_result["families"]["vwap"]["status"],
+            "flow_status": advanced_result["families"]["order_flow"]["status"],
+            "capture_resets": advanced_result["sources"]["Coinbase BTC/USD stream"]["reset_count"],
+            "trade_records": advanced_result["sources"]["Coinbase BTC/USD stream"][
+                "retained_trade_records"
+            ],
+            "thirty_second_rsi_status": advanced_result["families"]["rsi"]["reading"]["30s"][
+                "status"
+            ],
+        },
         "retained_buffers": {
             k: source.get(k) for k in ("retained_fine_bins", "retained_minute_bins")
         },
@@ -377,6 +419,7 @@ def run(args):
             monitor.readiness_pool.shutdown(wait=True)
             monitor.engine_report.close()
             monitor.research_report.close()
+            monitor.scalp_paper_report.close()
     elapsed, cpu = perf_counter() - wall_started, process_time() - cpu_started
     report["resources"] = {
         "wall_seconds": round(elapsed, 3),

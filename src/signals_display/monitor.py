@@ -18,6 +18,7 @@ import httpx
 
 from .coverage import FeedHub
 from . import prediction_engine
+from . import scalp_paper
 from .model import Display, evaluate, fee, number, timestamp
 from .edges import assess_edges
 from .reliability import metrics, wilson
@@ -781,6 +782,7 @@ class Journal:
                 if name not in prediction_columns:
                     db.execute(f"ALTER TABLE predictions ADD COLUMN {name} {spec}")
             prediction_engine.create(db)
+            scalp_paper.create_schema(db)
             db.execute(
                 "CREATE TABLE IF NOT EXISTS forecast_outcomes (ticker TEXT,origin TEXT,observed_at TEXT,outcome INTEGER,PRIMARY KEY(ticker,origin))"
             )
@@ -802,6 +804,7 @@ class Journal:
                     PRIMARY KEY(mode,ticker));
                 CREATE INDEX IF NOT EXISTS settlement_due ON settlement_queue(mode,resolved,closes_at);
                 CREATE TABLE IF NOT EXISTS dashboard_migrations (name TEXT PRIMARY KEY,value TEXT);
+                CREATE TABLE IF NOT EXISTS dashboard_settings (name TEXT PRIMARY KEY,payload TEXT);
                 """
             )
 
@@ -834,11 +837,34 @@ class Journal:
     def read(self):
         return storage_connect(self.path, readonly=True)
 
+    def scalp_criteria(self, values=None):
+        from .scalp_monitor import ScalpCriteria
+
+        with self.read() if values is None else self.connect() as db:
+            if values is not None:
+                current = db.execute(
+                    "SELECT payload FROM dashboard_settings WHERE name='scalp_criteria'"
+                ).fetchone()
+                merged = {**(json.loads(current[0]) if current else {}), **values}
+                criteria = ScalpCriteria.from_mapping(merged)
+                db.execute(
+                    "INSERT OR REPLACE INTO dashboard_settings VALUES ('scalp_criteria',?)",
+                    (json.dumps(criteria.to_dict(), allow_nan=False),),
+                )
+                return criteria
+            row = db.execute(
+                "SELECT payload FROM dashboard_settings WHERE name='scalp_criteria'"
+            ).fetchone()
+        return ScalpCriteria.from_mapping(json.loads(row[0]) if row else None)
+
     def step(self, state):
         now = timestamp(state["now"])
         market = state["market"]
         with self.connect() as db:
             prediction_engine.record(db, state, utcnow())
+            scalp_paper.record(
+                db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+            )
             pending = db.execute(
                 "SELECT * FROM simulations WHERE status IN ('PENDING','AWAITING_ENTRY')"
             ).fetchall()
@@ -990,6 +1016,22 @@ class Journal:
                 persisted = {
                     **persisted,
                     "model": {**persisted["model"], "market_intelligence": compact},
+                }
+            advanced = state.get("advanced_intelligence")
+            if advanced:
+                persisted = {
+                    **persisted,
+                    "advanced_intelligence": {
+                        "status": advanced.get("status"),
+                        "generated_at": advanced.get("generated_at"),
+                        "primary_source": advanced.get("primary_source"),
+                        "family_status": {
+                            name: {k: family.get(k) for k in ("status", "as_of", "contributing")}
+                            for name, family in advanced.get("families", {}).items()
+                        },
+                        "feature_values_location": "model.candidate_features.values; captured before outcome",
+                        "validation": advanced.get("validation"),
+                    },
                 }
             db.execute(
                 """INSERT OR IGNORE INTO predictions

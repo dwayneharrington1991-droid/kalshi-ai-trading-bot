@@ -214,6 +214,9 @@ def test_explicitly_disabled_model_diagnoses_configuration(tmp_path, monkeypatch
     monkeypatch.setattr("src.signals_display.server.utcnow", lambda: NOW)
 
     class MockPublicFeed(PublicFeed):
+        def __init__(self):
+            super().__init__(get=lambda *_args, **_kwargs: None, multi_venue=False)
+
         def poll(self):
             return live_frame(0)
 
@@ -229,6 +232,9 @@ def test_monitor_wires_live_model_and_journals_both_probabilities(tmp_path, monk
     payloads = iter(live_frame(i) for i in range(61))
 
     class MockPublicFeed(PublicFeed):
+        def __init__(self):
+            super().__init__(get=lambda *_args, **_kwargs: None, multi_venue=False)
+
         def poll(self):
             return next(payloads)
 

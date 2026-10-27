@@ -29,7 +29,10 @@ from .live_model import LiveEstimator
 from .learning import load_artifact, predict as learned_predict
 from .model import Display, timestamp
 from .monitor import Journal, PublicFeed, ReplayFeed, active_market, analyze, utcnow
-from .runtime import CachedReport, LatestPayload
+from .runtime import CachedReport, LatestPayload, RuntimeMeter
+from .intelligence import MarketIntelligence
+from .comparison import model_market
+from .alerts import MonitoringAlerts, risk_alerts
 
 
 class Monitor:
@@ -47,6 +50,7 @@ class Monitor:
         model_artifact=None,
         account_client=None,
         account_store=None,
+        model_registry=None,
     ):
         self.feed, self.journal = feed, journal
         self.target, self.stop, self.horizon = target, stop, horizon
@@ -105,6 +109,11 @@ class Monitor:
         self.settlement_check = None
         self.last_tick = utcnow()
         self.state_version = 0
+        self.last_cycle_started = None
+        self.intelligence = MarketIntelligence()
+        self.monitoring_alerts = MonitoringAlerts()
+        self.last_proxy_observation = None
+        self.runtime_meter = RuntimeMeter()
         self.maintenance_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="settlement-results"
         )
@@ -120,6 +129,15 @@ class Monitor:
         self.research_report = CachedReport(
             self.journal.performance, interval=60, name="historical-research"
         )
+        self.scheduled_learning = None
+        if model_registry is not None:
+            from .model_registry import scheduled_evaluation
+
+            self.scheduled_learning = CachedReport(
+                lambda: scheduled_evaluation(self.journal.path, model_registry),
+                interval=3600,
+                name="scheduled-offline-model-comparison",
+            )
 
     def prediction_performance(self):
         with self.journal.read() as db:
@@ -174,6 +192,39 @@ class Monitor:
                 "reason": None if ref.get("price") is not None else "Public BTC proxy unavailable",
             }
             market_now = active_market(payload, now)
+            rejected = 0
+            for observation in payload.get("stream_observations", []):
+                try:
+                    self.intelligence.observe(observation)
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    rejected += 1
+            primary = None
+            if ref.get("transport") == "public WebSocket":
+                primary = (
+                    "Coinbase BTC/USD stream"
+                    if "Coinbase" in ref.get("source", "")
+                    else "Kraken BTC/USD stream"
+                )
+            elif ref.get("price") is not None and ref.get("observed_at"):
+                primary = ref.get("source", "BTC REST proxy")
+                key = (primary, ref["observed_at"])
+                if key != self.last_proxy_observation:
+                    try:
+                        self.intelligence.ingest(
+                            primary,
+                            ref["price"],
+                            event_at=ref.get("event_time"),
+                            received_at=ref["observed_at"],
+                            kind="quote",
+                        )
+                        self.last_proxy_observation = key
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        rejected += 1
+            intelligence = self.intelligence.summarize(
+                now, candles=payload.get("btc_candles", {}), primary_source=primary
+            )
+            intelligence["rejected_observations_this_update"] = rejected
+            payload["market_intelligence"] = intelligence
             coverage["Kalshi KXBTC15M public"] = {
                 "status": "CONNECTED" if market_now else "UNAVAILABLE",
                 "reason": "Public contract metadata and executable quotes only; no account access"
@@ -223,24 +274,52 @@ class Monitor:
                     "trained_candidate_loaded": self.artifact is not None,
                     "active": "experimental statistical fallback",
                 }
+                info["market_intelligence"] = intelligence
+                if self.scheduled_learning is not None:
+                    evaluation = self.scheduled_learning.get()
+                    info["learning_status"]["scheduled_evaluation"] = {
+                        "status": evaluation["status"],
+                        "last_completed_at": evaluation["generated_at"],
+                        "result": evaluation["value"],
+                        "active_model_changed": False,
+                    }
                 if self.artifact is not None and result.settlement_up is not None:
                     if timestamp(self.artifact["labels_available_through"]) < now:
                         p = learned_predict(
-                            self.artifact["model"], info["candidate_features"]["values"]
+                            self.artifact["model"],
+                            info["candidate_features"]["values"],
+                            baseline_probability=info.get("baseline_probability_up"),
                         )
                         from dataclasses import replace
 
                         result = replace(result, settlement_up=p, settlement_down=1 - p)
+                        if info.get("price_forecast"):
+                            info["price_forecast"] = {
+                                **info["price_forecast"],
+                                "forecast_model": "Independent zero-drift statistical baseline, separate from selected binary classifier",
+                                "interval_label": info["price_forecast"]["interval_label"]
+                                + "; price distribution belongs to the independent zero-drift baseline, not the selected binary classifier",
+                            }
                         sensitivity = [p]
                         inputs = info.get("settlement_inputs", {})
                         basis = info.get("basis", {})
-                        for bound in ("low", "high"):
+                        baseline_sensitivity = info.get("settlement_probability_sensitivity") or [
+                            None,
+                            None,
+                        ]
+                        for index, bound in enumerate(("low", "high")):
                             if inputs.get("proxy_price") and basis.get(bound) is not None:
                                 f = dict(info["candidate_features"]["values"])
                                 f["distance_scaled"] = (
                                     inputs["proxy_price"] + basis[bound] - inputs["strike"]
                                 ) / inputs["proxy_price"]
-                                sensitivity.append(learned_predict(self.artifact["model"], f))
+                                sensitivity.append(
+                                    learned_predict(
+                                        self.artifact["model"],
+                                        f,
+                                        baseline_probability=baseline_sensitivity[index],
+                                    )
+                                )
                         info["settlement_probability_sensitivity"] = [
                             min(sensitivity),
                             max(sensitivity),
@@ -265,6 +344,7 @@ class Monitor:
                 info["scanner"] = scan
                 scanner_qualify(state, scan)
             state["discovered_contracts"] = selection_summary(payload.get("markets", []), now)
+            state["streaming"] = payload.get("streaming", {})
             state["market_health"] = diagnose_market(state, now)
             prior = (
                 self.journal.engine_prior(state["market"]["ticker"], state["mode"])
@@ -312,6 +392,10 @@ class Monitor:
             state["prediction_engine"] = engine_view(
                 state, prior, opening, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
             )
+            state["model_market"] = model_market(
+                state, self.estimator.slippage, self.estimator.manual_delay
+            )
+            state["monitor_alerts"] = self.monitoring_alerts.update(state)
             phases["prediction_calculation"] = round(
                 (perf_counter() - calculation_started) * 1000, 2
             )
@@ -352,6 +436,7 @@ class Monitor:
                 for ticker, result in payload.get("settlements", {}).items():
                     self.journal.settle(ticker, result, state["mode"])
         except Exception as exc:
+            self.runtime_meter.error("prediction", type(exc).__name__)
             # Keep last context for diagnosis, but never keep a usable signal.
             with self.lock:
                 state = {
@@ -395,13 +480,18 @@ class Monitor:
                 "published_at": published_at.isoformat(),
                 "phases_ms": phases,
                 "processing_ms": round((perf_counter() - tick_started) * 1000, 2),
+                "update_interval_ms": round((tick_started - self.last_cycle_started) * 1000, 2)
+                if self.last_cycle_started is not None
+                else None,
                 "settlement_job_running": bool(
                     self.maintenance_job and not self.maintenance_job.done()
                 ),
                 "settlement_status": self.maintenance_error,
+                "resources": self.runtime_meter.sample(),
             }
             self.state = state
             self.last_tick = published_at
+            self.last_cycle_started = tick_started
 
     def authenticate_candidate(self):
         permissions = self.account_candidate.permissions()
@@ -449,6 +539,15 @@ class Monitor:
                     self.account_started = now
                     self.account_job = self.account_pool.submit(self.authenticate_candidate)
                 return
+        if (
+            isinstance(self.feed, PublicFeed)
+            and self.feed.kalshi_stream is None
+            and self.account_client is not None
+            and hasattr(self.account_client, "websocket_headers")
+        ):
+            from .kalshi_market_stream import KalshiMarketStream
+
+            self.feed.kalshi_stream = KalshiMarketStream(self.account_client)
         if self.account_job and self.account_job.done():
             try:
                 batch = self.account_job.result()
@@ -602,6 +701,27 @@ class Monitor:
                     self.manual_jobs[ticker] = self.manual_pool.submit(
                         self.feed.contract_quote, ticker
                     )
+        if isinstance(self.feed, PublicFeed) and self.feed.kalshi_stream is not None:
+            tickers = (
+                ([market["ticker"]] if market else [])
+                + [
+                    h["ticker"]
+                    for h in self.account_journal.snapshot().get("holdings", [])
+                    if h["status"] == "OPEN" and h["ticker"].startswith("KXBTC15M-")
+                ]
+                + [e["ticker"] for e in self.manual.records(open_only=True)["entries"]]
+            )
+            self.feed.kalshi_stream.set_tickers(list(dict.fromkeys(tickers))[:24])
+            for ticker, quote in list(self.manual_quotes.items()):
+                book = self.feed.kalshi_stream.snapshot(ticker, now)
+                if book.get("status") == "LIVE":
+                    self.manual_quotes[ticker] = {
+                        **quote,
+                        "quotes": book["quotes"],
+                        "observed_at": book["observed_at"],
+                        "quote_event_time": book.get("event_time"),
+                        "book_diagnostic": None,
+                    }
         self.manual.guidance(self.manual_quotes, now, state)
 
     def snapshot(self):
@@ -633,6 +753,9 @@ class Monitor:
         state["manual_guidance"] = self.manual.guidance(self.manual_quotes, utcnow(), state)
         state["manual_defaults"] = self.manual_defaults
         state["account"] = self.account_view(state, utcnow())
+        state["monitor_alerts"] = list(state.get("monitor_alerts", [])) + risk_alerts(
+            state["account"], utcnow()
+        )
         if state.get("signal") and utcnow() > timestamp(state["signal"]["expires_at"]):
             state.update(
                 scalp="WAIT",
@@ -645,7 +768,10 @@ class Monitor:
             else timestamp(state["now"]) + (utcnow() - last_tick)
         )
         state["market_health"] = diagnose_market(state, health_clock)
-        if not state["market_health"]["contract_quotes_fresh"]:
+        if (
+            not state["market_health"]["contract_quotes_fresh"]
+            or not state["market_health"]["reference_fresh"]
+        ):
             state.update(
                 stale=True,
                 direction="UNCLEAR",
@@ -653,7 +779,10 @@ class Monitor:
                 plans={},
                 estimate=asdict(Display("WAIT", "Stale or missing active-contract quotes")),
                 explanation="STALE_DATA: "
-                + "; ".join(state["market_health"]["contract_quote_reasons"]),
+                + "; ".join(
+                    state["market_health"]["contract_quote_reasons"]
+                    + state["market_health"]["reference_reasons"]
+                ),
             )
         if state.get("stale") and state.get("prediction_engine"):
             state["prediction_engine"] = {
@@ -664,6 +793,9 @@ class Monitor:
                 "reason": "Fresh unexpired contract/reference data required",
             }
         state["trade_decision"] = trade_decision(state)
+        state["model_market"] = model_market(
+            state, self.estimator.slippage, self.estimator.manual_delay
+        )
         state["connection_diagnostics"] = {
             "credentials": credential_status(),
             "account_enabled": self.account_client is not None,
@@ -683,6 +815,7 @@ class Monitor:
             "reference_received_at": state.get("reference", {}).get("observed_at"),
             "quote_received_at": (state.get("market") or {}).get("observed_at"),
             "public_requests": list(getattr(self.feed, "transport_diagnostics", [])),
+            "streaming": state.get("streaming", {}),
         }
         state["runtime"] = {
             **state.get("runtime", {}),
@@ -719,7 +852,8 @@ def make_handler(monitor):
                     value["model"] = {
                         k: v
                         for k, v in value.get("model", {}).items()
-                        if k not in {"coverage", "scanner", "candidate_features"}
+                        if k
+                        not in {"coverage", "scanner", "candidate_features", "market_intelligence"}
                     }
                     value.pop("coverage", None)
                 body = json.dumps(value, allow_nan=False).encode()
@@ -772,6 +906,24 @@ def make_handler(monitor):
                     "calculation_ms": report["calculation_ms"],
                     "refresh_in_progress": report["refresh_in_progress"],
                 }
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/probability-history":
+                ticker = query.get("ticker", [""])[0]
+                try:
+                    limit = int(query.get("limit", ["180"])[0])
+                    if (
+                        not re.fullmatch(r"KXBTC15M-[A-Za-z0-9_-]{1,100}", ticker)
+                        or not 2 <= limit <= 180
+                    ):
+                        raise ValueError("Invalid bounded history query")
+                except (ValueError, TypeError):
+                    self.send_error(400, "A KXBTC15M ticker and limit 2..180 are required")
+                    return
+                from .prediction_engine import probability_history
+
+                with monitor.journal.read() as db:
+                    value = probability_history(db, ticker, limit=limit, now=utcnow())
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/health":
@@ -880,6 +1032,12 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--poll-seconds", type=float, default=1)
+    parser.add_argument(
+        "--processing-ms",
+        type=int,
+        default=500,
+        help="Minimum interval between event-driven model updates (100..1000ms); provider cadence may be slower",
+    )
     parser.add_argument("--account-store", type=Path, default=Path("signals_account_monitor.db"))
     parser.add_argument(
         "--account-readonly",
@@ -898,6 +1056,12 @@ def main():
         help="Refuse account monitoring unless authenticated key metadata verifies read-only scope",
     )
     parser.add_argument("--model-artifact", type=Path, default=Path("signals_model.json"))
+    parser.add_argument("--model-registry", type=Path, default=Path("signals_model_registry"))
+    parser.add_argument(
+        "--disable-scheduled-learning",
+        action="store_true",
+        help="Disable background daily archive-only model comparisons; never affects read-only account protection",
+    )
     parser.add_argument("--manual-delay", type=int, default=3)
     parser.add_argument("--slippage", type=float, default=0.01)
     parser.add_argument("--target", type=float, default=0.05)
@@ -909,10 +1073,13 @@ def main():
         and 0 < args.stop <= 1
         and 1 <= args.horizon <= 900
         and 1 <= args.poll_seconds <= 5
+        and 100 <= args.processing_ms <= 1000
         and 0 <= args.manual_delay <= 30
         and 0 <= args.slippage <= 0.10
     ):
-        parser.error("target/stop must be in (0,1], horizon 1..900s, polling 1..5s")
+        parser.error(
+            "target/stop must be in (0,1], horizon 1..900s, REST polling 1..5s, processing 100..1000ms"
+        )
     if args.account_readonly and (not args.private_dashboard or args.mode != "public"):
         parser.error(
             "Account mode requires --mode public --private-dashboard and a Private forwarded port"
@@ -956,6 +1123,9 @@ def main():
         model_artifact=args.model_artifact,
         account_client=None,
         account_store=args.account_store,
+        model_registry=args.model_registry
+        if args.mode == "public" and not args.disable_model and not args.disable_scheduled_learning
+        else None,
     )
     monitor.account_error = disabled_reason
     monitor.account_requested = args.account_readonly
@@ -975,24 +1145,67 @@ def main():
     def collect():
         # Public IO has its own thread; prediction/research/account work never
         # delays a network refresh. No unbounded queue of obsolete frames.
+        last_success = None
         while not stop.is_set():
             started = utcnow()
             timer = perf_counter()
             try:
                 payload = feed.poll()
+                last_success = payload
             except Exception as exc:
-                payload = exc
+                monitor.runtime_meter.error("public_rest", type(exc).__name__)
+                payload = {
+                    **(
+                        last_success
+                        or {
+                            "markets": [],
+                            "reference": {},
+                            "mode": "PUBLIC MARKET DATA",
+                            "coverage": {},
+                        }
+                    ),
+                    "warnings": [
+                        "Public REST refresh failed ("
+                        + type(exc).__name__
+                        + "); cached receipts retain their original timestamps"
+                    ],
+                    "rest_poll_failed": True,
+                    "rest_error_type": type(exc).__name__,
+                    "btc_candles": feed.sampled_candles(utcnow()),
+                }
             elapsed = perf_counter() - timer
             mailbox.put((payload, started, utcnow(), elapsed * 1000))
             stop.wait(max(0, args.poll_seconds - elapsed))
 
     def poll():
         sequence = 0
+        previous = None
+        source_key = None
+        last_processed = -float("inf")
         while not stop.is_set():
             if isinstance(feed, PublicFeed):
-                sequence, collected = mailbox.get(sequence)
+                sequence, collected = mailbox.get(sequence, timeout=0.01)
                 if collected is not None:
-                    monitor.tick(collected)
+                    previous = collected
+                if previous is None:
+                    stop.wait(0.01)
+                    continue
+                stream_sequence = getattr(feed.streams, "sequence", 0)
+                book_sequence = getattr(feed.kalshi_stream, "sequence", 0)
+                key = (sequence, stream_sequence, book_sequence)
+                elapsed = monotonic() - last_processed
+                if elapsed < args.processing_ms / 1000 or (key == source_key and elapsed < 1):
+                    stop.wait(0.01)
+                    continue
+                source_key = key
+                base, started, completed, duration = previous
+                if isinstance(base, Exception):
+                    monitor.tick(previous)
+                else:
+                    now = utcnow()
+                    enriched = feed.enriched(base, now)
+                    monitor.tick((enriched, started, completed, duration))
+                last_processed = monotonic()
             else:
                 monitor.tick()
                 stop.wait(args.poll_seconds)
@@ -1025,7 +1238,13 @@ def main():
         monitor.readiness_pool.shutdown(wait=False, cancel_futures=True)
         monitor.engine_report.close()
         monitor.research_report.close()
+        if monitor.scheduled_learning:
+            monitor.scheduled_learning.close()
         if isinstance(feed, PublicFeed):
+            if feed.streams:
+                feed.streams.close()
+            if feed.kalshi_stream:
+                feed.kalshi_stream.close()
             if feed.hub:
                 feed.hub.close()
             if feed.candle_pool:

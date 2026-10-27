@@ -154,6 +154,22 @@ class ReadOnlyKalshi:
                 + "); credentials and response bodies are redacted"
             ) from None
 
+    def websocket_headers(self):
+        """Sign only the fixed market-data WebSocket GET handshake.
+
+        This does not expose a generic signer or permit REST mutations. The
+        separate consumer accepts only KXBTC15M order-book subscriptions.
+        """
+        permissions = self.permissions()
+        if not permissions.get("read_only_verified") or permissions.get("account_access_blocker"):
+            raise AccountReadError("Market stream disabled: read-only permissions are not verified")
+        stamp = str(int(time.time() * 1000))
+        return {
+            "KALSHI-ACCESS-KEY": self._key_id,
+            "KALSHI-ACCESS-TIMESTAMP": stamp,
+            "KALSHI-ACCESS-SIGNATURE": self._signer(stamp + "GET/trade-api/ws/v2"),
+        }
+
     def pages(self, path, key, params=None):
         items = []
         cursor = None

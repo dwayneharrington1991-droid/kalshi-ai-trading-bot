@@ -293,8 +293,12 @@ def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_pat
             assert page.locator("#opening-ticker").inner_text() == market()["ticker"]
             assert page.locator("#opening-generated").inner_text() == opening["generated_at"]
             assert page.locator("#opening-cutoff").inner_text() == NOW.isoformat()
-            assert page.locator("#opening-prediction").evaluate("e=>e.getBoundingClientRect().top") < page.locator("#btc-engine").evaluate("e=>e.getBoundingClientRect().top")
-            assert page.locator("#btc-engine").evaluate("e=>e.getBoundingClientRect().top") < page.locator("#next-move").evaluate("e=>e.getBoundingClientRect().top")
+            assert page.locator("#opening-prediction").evaluate(
+                "e=>e.getBoundingClientRect().top"
+            ) < page.locator("#btc-engine").evaluate("e=>e.getBoundingClientRect().top")
+            assert page.locator("#btc-engine").evaluate(
+                "e=>e.getBoundingClientRect().top"
+            ) < page.locator("#next-move").evaluate("e=>e.getBoundingClientRect().top")
             initial = page.locator("#engine-up-initial").inner_text()
             frozen_label = page.locator("#opening-direction").inner_text()
             frozen_probability = page.locator("#opening-up-prob").inner_text()
@@ -349,8 +353,13 @@ def test_main_forecasts_stay_responsive_while_requested_history_is_blocked(tmp_p
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#opening-ticker")).to_have_text("KXBTC15M-MOCK")
-            assert page.locator("#opening-direction").inner_text() == "OPENING PREDICTION UNAVAILABLE"
-            assert not any("history" in url or "view=details" in url or "/api/research" in url for url in requests)
+            assert (
+                page.locator("#opening-direction").inner_text() == "OPENING PREDICTION UNAVAILABLE"
+            )
+            assert not any(
+                "/api/history" in url or "view=details" in url or "/api/research" in url
+                for url in requests
+            )
             page.locator("#details > summary").click()
             page.locator("#load-history").click()
             assert history_entered.wait(timeout=2)
@@ -366,7 +375,9 @@ def test_main_forecasts_stay_responsive_while_requested_history_is_blocked(tmp_p
             playwright.expect(page.locator("#opening-ticker")).to_have_text("KXBTC15M-ROLLED")
             assert perf_counter() - started < 2
             assert not release_history.is_set()
-            assert page.locator("#opening-direction").inner_text() == "OPENING PREDICTION UNAVAILABLE"
+            assert (
+                page.locator("#opening-direction").inner_text() == "OPENING PREDICTION UNAVAILABLE"
+            )
             # A response bearing an older published version must not restore the old ticker.
             monitor.state = {
                 **newer,
@@ -382,6 +393,181 @@ def test_main_forecasts_stay_responsive_while_requested_history_is_blocked(tmp_p
             browser.close()
     finally:
         release_history.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_model_market_chart_alerts_and_costs_stay_experimental_and_readonly(tmp_path):
+    """Positive theoretical value never becomes a trade instruction; chart rejects future rows."""
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    state = analyze(frame(), NOW)
+    ticker = state["market"]["ticker"]
+    state["prediction_engine"] = {
+        "status": "EXPERIMENTAL",
+        "ticker": ticker,
+        "threshold": 100000,
+        "up": 0.65,
+        "down": 0.35,
+        "updated_at": NOW.isoformat(),
+        "data_cutoff": NOW.isoformat(),
+        "reference": state["reference"],
+        "calibration": "UNCALIBRATED — experimental; edge unverified",
+    }
+    state["market_comparison"] = {
+        "market_implied_up": 0.5,
+        "market_implied_down": 0.5,
+        "model_minus_market": 0.15,
+    }
+    # A missing executable ask size must stay unavailable after server-side
+    # comparison is recalculated; a hand-supplied derived panel is not authoritative.
+    state["market"]["quotes"]["down"]["ask_size"] = 0
+    state["market"]["quotes"]["up"]["ask_size"] = 12
+    state["model_market"] = {
+        "status": "EDGE UNVERIFIED",
+        "validated": False,
+        "reason": "Experimental cost-adjusted comparison. Profitable edge unverified.",
+        "uncertainty": "Unmeasured proxy/index basis and calibration error.",
+        "sides": {
+            "up": {
+                "model_probability": 0.65,
+                "bid": 0.48,
+                "ask": 0.52,
+                "spread": 0.04,
+                "ask_size": 12,
+                "entry_fee": 0.02,
+                "slippage": 0.01,
+                "net_ev": 0.10,
+                "sensitivity_net_ev": [-0.01, 0.15],
+                "executable": True,
+            },
+            "down": {"model_probability": 0.35, "executable": False},
+        },
+    }
+    state["monitor_alerts"] = [
+        {
+            "id": "risk-1",
+            "type": "RISK_LIMIT_BREACH",
+            "title": "Configured risk limit",
+            "reason": "Check manually <img src=x onerror=alert(1)>",
+            "timestamp": NOW.isoformat(),
+        }
+    ]
+    monitor.state = state
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.route(
+                "**/api/probability-history?*",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=__import__("json").dumps(
+                        {
+                            "ticker": ticker,
+                            "points": [
+                                {"timestamp": (NOW - timedelta(seconds=2)).isoformat(), "up": 0.6},
+                                {"timestamp": NOW.isoformat(), "up": 0.65},
+                                {
+                                    "timestamp": (NOW + timedelta(seconds=20)).isoformat(),
+                                    "up": 0.99,
+                                },
+                            ],
+                        }
+                    ),
+                ),
+            )
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#compare-up-ev")).to_have_text("$0.10 (experimental)")
+            assert page.locator("#model-market-status").inner_text() == "EDGE UNVERIFIED"
+            assert page.locator("#compare-down-ev").inner_text() == "unavailable"
+            assert page.locator("#trade-action").inner_text() == "🟡 WAIT"
+            assert page.locator("#scalp-yesno").inner_text() == "NO"
+            assert "+$20.00" in page.locator("#live-distance").inner_text()
+            playwright.expect(page.locator("#probability-history-status")).to_contain_text(
+                "2 recorded model points"
+            )
+            assert page.evaluate("probabilityPoints.every(point=>point.up<.99)")
+            order = [
+                page.locator(selector).evaluate("element=>element.getBoundingClientRect().top")
+                for selector in (
+                    "#opening-prediction",
+                    "#btc-engine",
+                    "#model-market-panel",
+                    "#live-trades-panel",
+                )
+            ]
+            assert order == sorted(order)
+            playwright.expect(page.locator("#monitor-alert-events")).to_contain_text(
+                "Configured risk limit"
+            )
+            assert page.locator("#monitor-alert-events img").count() == 0
+            for _ in range(3):
+                page.evaluate("monitorAlerts(lastState)")
+            assert page.locator("#monitor-alert-events li").count() == 1
+            page.locator("#alert-preferences > summary").click()
+            page.locator("#alert-probability-threshold").fill("12")
+            page.locator("#alert-settings-form button").click()
+            assert (
+                page.evaluate(
+                    "JSON.parse(localStorage.getItem('kxbtc-alert-preferences')).probabilityThreshold"
+                )
+                == 12
+            )
+            page.locator("#model-market-details > summary").click()
+            assert "12" in page.locator("#model-market-costs").inner_text()
+            assert "$0.02" in page.locator("#model-market-costs").inner_text()
+            page.evaluate("expired('Synthetic connection outage')")
+            assert page.locator("#compare-up-ev").inner_text() == "unavailable"
+            assert page.locator("#compare-up-ask").inner_text() == "unavailable"
+            assert page.locator("#model-market-status").inner_text() == "EDGE UNVERIFIED"
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert page.evaluate("document.documentElement.scrollWidth<=window.innerWidth")
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_probability_history_cannot_restore_a_previous_contract_after_rollover(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    monitor.state = analyze(frame(), NOW)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            pending = []
+            page.route("**/api/probability-history?*", lambda route: pending.append(route))
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#opening-ticker")).to_have_text("KXBTC15M-MOCK")
+            assert len(pending) == 1
+            newer = analyze(frame(1), NOW + timedelta(seconds=1))
+            newer["market"]["ticker"] = "KXBTC15M-NEXT"
+            monitor.state = newer
+            page.evaluate("refresh()")
+            playwright.expect(page.locator("#opening-ticker")).to_have_text("KXBTC15M-NEXT")
+            assert page.evaluate("probabilityTicker") == "KXBTC15M-NEXT"
+            assert page.evaluate("probabilityPoints.length") == 0
+            assert not errors
+            browser.close()
+    finally:
         server.shutdown()
         server.server_close()
         thread.join()

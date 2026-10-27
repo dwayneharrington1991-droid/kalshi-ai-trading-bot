@@ -158,6 +158,20 @@ def test_public_pagination_ambiguity_fails_closed():
         PublicFeed(lambda *a, **k: response).poll()
 
 
+def test_enriched_cached_rest_payload_advances_processing_clock_for_new_stream_receipts():
+    feed = PublicFeed(lambda *_args, **_kwargs: None, multi_venue=False)
+    cached = frame()
+    cached["clock"] = NOW.isoformat()
+    cached["now"] = NOW.isoformat()
+    cycle = NOW + timedelta(seconds=2)
+    enriched = feed.enriched(cached, cycle)
+    assert enriched["clock"] == cycle.isoformat()
+    assert enriched["now"] == cycle.isoformat()
+    # Source receipts remain unchanged; advancing the analysis clock must not
+    # fabricate a fresh REST quote.
+    assert enriched["reference"]["observed_at"] == cached["reference"]["observed_at"]
+
+
 def test_counterfactual_journal_deduplicates_and_includes_spread_and_fees(tmp_path):
     journal = Journal(tmp_path / "journal.db")
     first = analyze(frame(), NOW, stop=0.15)

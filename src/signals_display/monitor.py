@@ -292,7 +292,17 @@ class PublicFeed:
         Receipts retain their original times. An event never advances an older
         quote/reference timestamp or turns a metadata response into a fresh book.
         """
-        result = {**payload, "coverage": dict(payload.get("coverage", {}))}
+        result = {
+            **payload,
+            # The cached REST payload can be reused between polls while newer
+            # socket receipts arrive. Processing must use the current cycle
+            # clock or those valid receipts look future-dated and get rejected.
+            # Individual REST/stream observations retain their own immutable
+            # receipt timestamps below.
+            "clock": now.isoformat(),
+            "now": now.isoformat(),
+            "coverage": dict(payload.get("coverage", {})),
+        }
         result["markets"] = [dict(m) for m in payload.get("markets", [])]
         result["stream_observations"] = []
         diagnostics = {"processing_target_ms": 500, "actual_exchange_cadence": "Provider-dependent"}

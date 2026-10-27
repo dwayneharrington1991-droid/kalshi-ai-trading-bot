@@ -1,6 +1,6 @@
 """Unvalidated, timestamp-conditioned models; no network, credentials, or execution.
 
-Settlement: zero-drift dollar Brownian proxy, zero Coinbase/CF basis, final
+Settlement: zero-drift dollar Brownian proxy, opening-window anchored basis, final
 60-second arithmetic averaging. Scalp: zero-drift logit quote diffusion with
 frozen spreads/fees. These assumptions are not calibrated facts.
 """
@@ -11,8 +11,10 @@ import random
 
 from .model import Display, fee, number, timestamp
 from .candles import candle_context
+from .basis import estimate_basis
+from .features import extract, DevelopingCandle
 
-VERSION = "proxy-average-and-logit-diffusion-v2-delay-costs"
+VERSION = "independent-basis-forecast-v3"
 MIN_SAMPLES = 61
 MIN_SECONDS = 120
 MAX_GAP = 5
@@ -68,6 +70,7 @@ class LiveEstimator:
         self.reference = deque(maxlen=1800)
         self.quotes = {}
         self.reference_source = None
+        self.developing = DevelopingCandle()
 
     def restore(self, states):
         """Recover only observed inputs, never probabilities or fabricated paths."""
@@ -132,13 +135,20 @@ class LiveEstimator:
             "version": VERSION,
             "validated": False,
             "enabled": True,
-            "settlement_assumptions": "Zero-drift dollar Brownian motion fitted to up to 10m of Coinbase receipt-time samples; zero Coinbase/CF Benchmarks basis; proxy samples approximate the official final 60-second arithmetic average. Not an official-index forecast.",
+            "settlement_assumptions": "Zero-drift dollar Brownian motion fitted to up to 10m of Coinbase receipt-time samples; opening-window anchored proxy/index basis, assumed constant thereafter; OHLC4 is only an approximation when tick coverage is absent. Not an official-index forecast.",
             "scalp_assumptions": "Zero-drift logit midpoint diffusion fitted to this contract; frozen current spread and fee schedule; 1s Monte Carlo observations; future one-contract liquidity assumed. Intrapoll barriers/fills are unknown.",
             "timestamp_basis": "HTTP receipt timestamps, not exchange event timestamps; quote and reference freshness are checked separately.",
         }
         info["btc_context"], info["candle_diagnostic"] = candle_context(
             payload.get("btc_candles", {}), now
         )
+        info["candidate_features"] = extract(payload, market, now)
+        info["developing_candle"] = self.developing.update(payload.get("reference", {}), now)
+        info["coverage"] = payload.get("coverage", {})
+        info["learning_status"] = {
+            "status": "EXPERIMENTAL_FALLBACK",
+            "reason": "No validation-selected learned artifact loaded; official-label sufficiency checked by journal learner. No trained accuracy is claimed.",
+        }
         up = down = su = sd = None
         overall_reason = scalp_reason = "MISSING_DATA: no unique active contract"
         if market is not None:
@@ -237,12 +247,62 @@ class LiveEstimator:
                     area += (leftp + pb) / 2 * (b - left).total_seconds()
                 mean = (area + remaining * current) / 60
                 variance = sigma * sigma * remaining**3 / (3 * 60**2)
-            probability = 0.5 * (1 + math.erf((mean - strike) / math.sqrt(2 * variance)))
+            basis, basis_error = estimate_basis(payload, market, list(self.reference), now)
+            info["basis"] = basis
+            if basis_error:
+                return basis_error, None
+            deviation = math.sqrt(variance)
+
+            def event_probability(offset):
+                return 0.5 * (1 + math.erf((mean + offset - strike) / (math.sqrt(2) * deviation)))
+
+            probability = event_probability(basis["point"])
+            info["settlement_probability_sensitivity"] = [
+                event_probability(basis["low"]),
+                event_probability(basis["high"]),
+            ]
+            info["price_forecast"] = {
+                "terminal_proxy_spot_mean": current,
+                "terminal_proxy_spot_interval": [
+                    current - 1.96 * sigma * math.sqrt(remaining),
+                    current + 1.96 * sigma * math.sqrt(remaining),
+                ],
+                "settlement_average_mean": mean + basis["point"],
+                "settlement_average_conditional_interval": [
+                    mean + basis["low"] - 1.96 * deviation,
+                    mean + basis["high"] + 1.96 * deviation,
+                ],
+                "interval_label": "Experimental Gaussian 95% conditional interval plus opening-anchor sensitivity; NOT calibrated coverage; future basis drift unmeasured",
+                "comparison_operator": market.get("comparison_operator", ">="),
+                "averaging_seconds": 60,
+            }
+            info["candidate_features"]["values"]["distance_scaled"] = (
+                current + basis["point"] - strike
+            ) / current
+            info["baseline_probability_up"] = probability
+            info["factors"] = [
+                {
+                    "factor": "Basis-adjusted projected settlement average versus actual target",
+                    "value": mean + basis["point"] - strike,
+                    "role": "supports UP if positive, DOWN if negative",
+                },
+                {
+                    "factor": "Opening-anchor probability sensitivity",
+                    "value": info["settlement_probability_sensitivity"],
+                    "role": "opposes a strong lean when the range straddles neutral",
+                },
+                {
+                    "factor": "Momentum/volume/cross-venue features",
+                    "role": "candidate context only until a trained candidate beats baselines chronologically",
+                },
+            ]
+
             info["settlement_inputs"] = {
                 "proxy_price": current,
                 "strike": strike,
                 "remaining_seconds": remaining,
-                "mean_average": mean,
+                "mean_average": mean + basis["point"],
+                "proxy_mean_average": mean,
                 "standard_deviation_average": math.sqrt(variance),
                 "reference_observed_at": ref["observed_at"],
             }
@@ -372,6 +432,16 @@ class LiveEstimator:
                     "entered_paths": entered,
                     "paths": PATHS,
                     "entry_probability": entered / PATHS,
+                    "unconditional_probabilities": {
+                        o: total[o] / PATHS for o in ("target", "stop", "timeout", "no_entry")
+                    },
+                    "conditional_on_entry_probabilities": {
+                        o: total[o] / entered if entered else None
+                        for o in ("target", "stop", "timeout")
+                    },
+                    "net_expected_profit_given_entry": sum(values) / entered if entered else None,
+                    "partial_fill_probability": None,
+                    "liquidity_uncertainty": "Current one-contract depth verified; future depth/partial-fill/queue probability unmeasured. Model assumes all-or-no entry, not observed fills.",
                     "target_probability_given_entry": probabilities[side],
                     "target_count": total["target"],
                     "stop_count": total["stop"],

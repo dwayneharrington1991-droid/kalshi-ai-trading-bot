@@ -235,7 +235,7 @@ def test_read_only_browser_routes(tmp_path):
     thread.start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
-        assert b"OVERALL DIRECTION" in urlopen(base).read()
+        assert b"SETTLEMENT OUTLOOK" in urlopen(base).read()
         assert json.load(urlopen(base + "/api/state"))["scalp"] == "WAIT"
         for method in ("POST", "PUT", "DELETE", "PATCH"):
             with pytest.raises(HTTPError) as error:

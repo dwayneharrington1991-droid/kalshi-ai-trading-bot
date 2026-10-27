@@ -41,14 +41,19 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             page.route("**/*", route)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#direction")).to_have_text("UP")
-            assert page.locator("#scalp").inner_text() == "DOWN SCALP"
+            assert page.locator("#scalp").inner_text() == "SCALP DOWN"
             assert page.locator("#prob-up").inner_text() == "60.0%"
+            assert not page.locator("#details").get_attribute("open")
+            page.screenshot(path="/tmp/kxbtc15m-simple-main.png", full_page=True)
+            page.locator("#details > summary").click()
             assert "90% is a goal, not a claim" in page.locator("#accuracy-summary").inner_text()
             assert "$100000.00" in page.locator("#strike").inner_text()
             assert "hypothetical plan" in page.locator("#plans").inner_text()
-            assert page.get_by_role("button").all_text_contents() == [
-                "Download research journal JSON"
-            ]
+            assert "I entered — record manually" in page.get_by_role("button").all_text_contents()
+            assert not any(
+                text in ("Buy", "Sell", "Cancel order")
+                for text in page.get_by_role("button").all_text_contents()
+            )
             page.screenshot(path="/tmp/kxbtc15m-dashboard-desktop.png", full_page=True)
             data = frame(2)
             data["markets"][0]["quotes"]["up"].update(bid=0.70, ask=0.75)
@@ -106,7 +111,7 @@ def test_browser_shows_separate_live_model_diagnostics_and_estimates(tmp_path):
             assert page.locator("#scalp-up").inner_text() != "unavailable"
             assert page.locator("#scalp-down").inner_text() != "unavailable"
             assert (
-                "zero Coinbase/CF Benchmarks basis"
+                "opening-window anchored proxy/index basis"
                 in page.locator("#overall-diagnostics").text_content()
             )
             assert "frozen current spread" in page.locator("#scalp-diagnostics").text_content()
@@ -119,6 +124,61 @@ def test_browser_shows_separate_live_model_diagnostics_and_estimates(tmp_path):
                 "INSUFFICIENT_HISTORY"
             )
             playwright.expect(page.locator("#scalp-reason")).to_contain_text("UNKNOWN_FEES")
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_browser_actual_account_cards_pending_fills_and_local_selection(tmp_path):
+    from src.signals_display.monitor import utcnow
+    from tests.test_signals_account_readonly import snap
+
+    now = utcnow()
+    monitor = Monitor(
+        None,
+        Journal(tmp_path / "journal.db"),
+        account_client=object(),
+        account_store=tmp_path / "account.db",
+    )
+    monitor.state = analyze(frame(), NOW)
+    data = snap()
+    data["observed_at"] = now.isoformat()
+    data["orders"] = [
+        dict(order_id="order1", ticker="KXBTC15M-MOCK", status="resting", remaining_count_fp="8")
+    ]
+    monitor.account_journal.reconcile(data)
+    monitor.account_connected = True
+    quote = frame()["markets"][0]
+    quote.update(observed_at=now.isoformat(), closes_at=(now + timedelta(seconds=600)).isoformat())
+    monitor.manual_quotes["KXBTC15M-MOCK"] = quote
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#account-status")).to_contain_text(
+                "READ-ONLY CONNECTED"
+            )
+            playwright.expect(page.locator("#live-trade-cards")).to_contain_text("$0.82")
+            assert page.locator("#live-trade-cards .manual-record").count() == 1
+            assert "WAIT" in page.locator("#live-trade-cards").inner_text()
+            page.locator("#account-pending > summary").click()
+            assert "8" in page.locator("#account-order-rows").inner_text()
+            page.locator("#live-trade-cards button").click()
+            playwright.expect(page.locator("#live-trade-cards button")).to_contain_text(
+                "Stop guidance"
+            )
+            assert monitor.account_journal.snapshot()["holdings"][0]["selected"] == 1
+            assert not errors
             browser.close()
     finally:
         server.shutdown()

@@ -3,6 +3,7 @@
 No trading SDK, settings, environment loading, private API, or order operations.
 """
 from __future__ import annotations
+from .storage import connect as storage_connect
 
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -593,9 +594,7 @@ class Journal:
                     continue
 
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        return db
+        return storage_connect(self.path)
 
     def step(self, state):
         now = timestamp(state["now"])

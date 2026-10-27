@@ -41,9 +41,9 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             page.route("**/*", route)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#direction")).to_have_text("UP")
-            assert page.locator("#scalp").inner_text() == "WAIT"
+            assert page.locator("#scalp").text_content() == "WAIT"
             assert "DOWN SCALP" in page.locator("#model-scalp").text_content()
-            assert page.locator("#trade-action").inner_text() == "WAIT"
+            assert page.locator("#trade-action").inner_text() == "🟡 WAIT"
             assert page.locator("#scalp-yesno").inner_text() == "NO"
             assert page.locator("#simple-entry").inner_text() == "Not available"
             assert page.locator("#simple-risk").inner_text() == "Not available"
@@ -76,8 +76,8 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             playwright.expect(page.locator("#contract")).to_have_text("KXBTC15M-NEXT")
             monitor.state = analyze(data, NOW + timedelta(seconds=606))
             playwright.expect(page.locator("#freshness")).to_contain_text("STALE")
-            assert page.locator("#direction").inner_text() == "UNCLEAR"
-            assert page.locator("#scalp").inner_text() == "WAIT"
+            assert page.locator("#direction").text_content() == "UNCLEAR"
+            assert page.locator("#scalp").text_content() == "WAIT"
             assert page.locator("#prob-up").text_content() == "unavailable"
             page.set_viewport_size({"width": 390, "height": 844})
             page.screenshot(path="/tmp/kxbtc15m-dashboard-mobile.png", full_page=True)
@@ -175,7 +175,8 @@ def test_browser_actual_account_cards_pending_fills_and_local_selection(tmp_path
             )
             playwright.expect(page.locator("#live-trade-cards")).to_contain_text("$0.82")
             assert page.locator("#live-trade-cards .manual-record").count() == 1
-            assert "WAIT" in page.locator("#live-trade-cards").inner_text()
+            assert page.locator("#account-balance").inner_text() == "$1000.00"
+            assert "DATA UNAVAILABLE" in page.locator("#live-trade-cards").inner_text()
             page.locator("#account-pending > summary").click()
             assert "8" in page.locator("#account-order-rows").inner_text()
             page.locator("#live-trade-cards button").click()
@@ -183,6 +184,8 @@ def test_browser_actual_account_cards_pending_fills_and_local_selection(tmp_path
                 "Stop guidance"
             )
             assert monitor.account_journal.snapshot()["holdings"][0]["selected"] == 1
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
             assert not errors
             browser.close()
     finally:

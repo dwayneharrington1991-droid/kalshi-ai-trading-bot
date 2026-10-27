@@ -1,4 +1,5 @@
 """Confirmed account snapshots, explicit guidance opt-in, no execution capability."""
+from .storage import connect as storage_connect
 from datetime import timedelta
 import json
 import math
@@ -40,9 +41,7 @@ class AccountJournal:
             )
 
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        return db
+        return storage_connect(self.path)
 
     def bind(self, identity):
         with self.connect() as db:
@@ -445,6 +444,7 @@ def live_trade_cards(account, quotes, state, now, defaults, fresh):
             "contract": h["ticker"],
             "side": h["side"],
             "filled_quantity": q,
+            "conditional_winning_settlement_payout": q,
             "average_entry_price": entry,
             "entry_fees": fees,
             "total_entry_cost": cost,

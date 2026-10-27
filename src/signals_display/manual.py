@@ -1,4 +1,5 @@
 """User-reported journal + exit guidance ONLY. No broker/account/trading client."""
+from .storage import connect as storage_connect
 from datetime import timedelta
 import json
 import math
@@ -24,9 +25,7 @@ class ManualJournal:
             )
 
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        return db
+        return storage_connect(self.path)
 
     def enter(self, data, now, defaults):
         allowed = {

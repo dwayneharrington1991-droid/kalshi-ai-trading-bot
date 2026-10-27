@@ -41,8 +41,13 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             page.route("**/*", route)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#direction")).to_have_text("UP")
-            assert page.locator("#scalp").inner_text() == "SCALP DOWN"
-            assert page.locator("#prob-up").inner_text() == "60.0%"
+            assert page.locator("#scalp").inner_text() == "WAIT"
+            assert "DOWN SCALP" in page.locator("#model-scalp").text_content()
+            assert page.locator("#trade-action").inner_text() == "WAIT"
+            assert page.locator("#scalp-yesno").inner_text() == "NO"
+            assert page.locator("#simple-entry").inner_text() == "Not available"
+            assert page.locator("#simple-risk").inner_text() == "Not available"
+            assert page.locator("#prob-up").text_content() == "60.0%"
             assert not page.locator("#details").get_attribute("open")
             page.screenshot(path="/tmp/kxbtc15m-simple-main.png", full_page=True)
             page.locator("#details > summary").click()
@@ -73,7 +78,7 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             playwright.expect(page.locator("#freshness")).to_contain_text("STALE")
             assert page.locator("#direction").inner_text() == "UNCLEAR"
             assert page.locator("#scalp").inner_text() == "WAIT"
-            assert page.locator("#prob-up").inner_text() == "unavailable"
+            assert page.locator("#prob-up").text_content() == "unavailable"
             page.set_viewport_size({"width": 390, "height": 844})
             page.screenshot(path="/tmp/kxbtc15m-dashboard-mobile.png", full_page=True)
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
@@ -107,7 +112,7 @@ def test_browser_shows_separate_live_model_diagnostics_and_estimates(tmp_path):
             page = browser.new_page()
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#direction-reason")).to_contain_text("MODEL_ESTIMATE")
-            assert page.locator("#prob-up").inner_text() == "50.0%"
+            assert page.locator("#prob-up").text_content() == "50.0%"
             assert page.locator("#scalp-up").inner_text() != "unavailable"
             assert page.locator("#scalp-down").inner_text() != "unavailable"
             assert (

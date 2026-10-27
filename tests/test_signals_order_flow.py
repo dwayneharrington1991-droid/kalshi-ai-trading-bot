@@ -14,7 +14,8 @@ def test_cvd_aggressor_sign_duplicates_staleness_and_reconnect_reset():
         f.trade(str(i), at, 100000, 1, "sell" if i % 5 == 0 else "buy", at)
     s = f.snapshot(NOW + timedelta(seconds=60))
     assert s["status"] == "LIVE" and s["cvd_since_reconnect"] == 35
-    assert s["hidden_bullish_accumulation_candidate"] and s["probability_adjustment"] == 0
+    assert s["passive_sell_absorption_candidate"] and not s["hidden_bullish_accumulation_candidate"]
+    assert s["probability_adjustment"] == 0
     f.trade("60", NOW + timedelta(seconds=60), 100000, 100, "buy", NOW + timedelta(seconds=60))
     assert f.cumulative == 35
     assert f.snapshot(NOW + timedelta(seconds=66))["delta_60s"] is None

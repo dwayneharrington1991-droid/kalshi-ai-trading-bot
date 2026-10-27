@@ -1,5 +1,6 @@
 """Past-only scanner context. Missing proprietary inputs stay unavailable."""
 from .model import timestamp
+from .edge_reading import assess as edge_reading
 
 
 def context(payload, market, info, now):
@@ -43,6 +44,7 @@ def context(payload, market, info, now):
             except (ValueError, KeyError, TypeError):
                 pass
     return {
+        "edge_reading_core": edge_reading(payload, market, info, now),
         "official_60s_brti_twap": None,
         "official_twap_reason": "Unavailable: no licensed official BRTI tick stream. A proxy or OHLC4 is not official TWAP. No protected-average arbitrage claim is supported.",
         "timeframe_returns": changes,

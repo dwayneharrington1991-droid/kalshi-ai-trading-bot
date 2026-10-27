@@ -102,6 +102,41 @@ def public_news(read_text):
     }
 
 
+def coinbase_daily_levels(read):
+    now = now_utc()
+    day = int(now.timestamp()) // 86400 * 86400
+    data = read(
+        "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles?start="
+        + str(day - 172800)
+        + "&end="
+        + str(int(now.timestamp()))
+        + "&granularity=ONE_DAY&limit=3"
+    )
+    levels = {}
+    for bar in data["candles"]:
+        start = int(bar["start"])
+        if start not in (day - 86400, day):
+            continue
+        o, h, l, c = [
+            number(float(bar[k]), 0.000001, 1e12) for k in ("open", "high", "low", "close")
+        ]
+        if not l <= min(o, c) <= max(o, c) <= h:
+            raise ValueError("Invalid daily OHLC")
+        label = "previous_day" if start == day - 86400 else "session"
+        if label in levels:
+            raise ValueError("Duplicate daily candles")
+        levels[label] = dict(
+            high=h,
+            low=l,
+            start=start,
+            closed=label == "previous_day",
+            source="Coinbase BTC/USD proxy; UTC daily bars; current session developing",
+        )
+    if not levels:
+        raise ValueError("No matching UTC daily candles")
+    return dict(observed_at=now_utc().isoformat(), **levels)
+
+
 class FeedHub:
     def __init__(self, read, read_text=None):
         self.read = read
@@ -114,7 +149,11 @@ class FeedHub:
         self.order_flow = PublicOrderFlow()
 
     def snapshot(self, now):
-        collectors = {"Kraken spot": kraken_spot, "Kraken derivatives": kraken_derivatives}
+        collectors = {
+            "Kraken spot": kraken_spot,
+            "Kraken derivatives": kraken_derivatives,
+            "Coinbase UTC daily levels": coinbase_daily_levels,
+        }
         if self.read_text:
             collectors["Federal Reserve public releases"] = lambda _: public_news(self.read_text)
         for name, collect in collectors.items():
@@ -142,7 +181,11 @@ class FeedHub:
             if name not in self.jobs and (
                 last is None
                 or (now - last).total_seconds()
-                >= (60 if name == "Federal Reserve public releases" else 5)
+                >= (
+                    60
+                    if name in ("Federal Reserve public releases", "Coinbase UTC daily levels")
+                    else 5
+                )
             ):
                 self.jobs[name] = self.executor.submit(collect, self.read)
                 self.last_started[name] = now
@@ -158,11 +201,13 @@ class FeedHub:
             if feed.get("data"):
                 age = (now - timestamp(feed["data"]["observed_at"])).total_seconds()
                 feed["age_seconds"] = round(age, 2)
-                if not 0 <= age <= (180 if "releases" in name else 15):
+                if (
+                    not 0
+                    <= age
+                    <= (180 if "releases" in name else 150 if "daily levels" in name else 15)
+                ):
                     feed["status"] = "DELAYED"
-                    feed[
-                        "reason"
-                    ] = "Quote receipt older than 15s or future-dated; excluded from features"
+                    feed["reason"] = "Source receipt stale or future-dated; excluded from analysis"
         result["Binance BTC/USDT"] = {
             "status": "EXCLUDED",
             "reason": "No verified contemporaneous USDT/USD conversion feed; not treated as USD or an independent vote. No Binance geographic access claim.",

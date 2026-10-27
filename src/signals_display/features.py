@@ -27,6 +27,10 @@ FEATURES = (
     "spot_cvd_delta_fraction",
     "perpetual_cvd_delta_fraction",
     "spot_book_dominance",
+    "spot_absorption_candidate",
+    "perpetual_absorption_candidate",
+    "spot_delta_efficiency_3m",
+    "perpetual_delta_efficiency_3m",
 )
 
 
@@ -136,6 +140,14 @@ def extract(payload, market, now):
                 and 0 <= (now - timestamp(item["observed_at"])).total_seconds() <= 5
             ):
                 values[feature] = number(item["delta_fraction_60s"], -1, 1)
+                absorption = item.get("passive_sell_absorption_candidate")
+                if type(absorption) is bool:
+                    values[venue + "_absorption_candidate"] = int(absorption)
+                dem = item.get("delta_efficiency_3m", {})
+                if dem.get("status") == "LIVE" and dem.get("delta_efficiency") is not None:
+                    values[venue + "_delta_efficiency_3m"] = number(
+                        dem["delta_efficiency"], -1e15, 1e15
+                    )
         except (KeyError, ValueError, TypeError):
             pass
     item = flow.get("spot_book", {})

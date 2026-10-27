@@ -16,6 +16,7 @@ import uuid
 from .account_readonly import ReadOnlyKalshi, AccountReadError
 from .account_state import AccountJournal, account_guidance, live_trade_cards
 from .scanner import context as scanner_context, qualify as scanner_qualify
+from .decision import assess as trade_decision
 from .manual import ManualJournal
 from .live_model import LiveEstimator
 from .learning import load_artifact, predict as learned_predict
@@ -210,6 +211,7 @@ class Monitor:
             self.update_manual(state, now)
             self.journal.record_feeds(payload.get("coverage", {}))
             self.journal.record_candles(payload.get("btc_candles", {}), now)
+            state["trade_decision"] = trade_decision(state)
             self.journal.step(state)
             if isinstance(self.feed, PublicFeed):
                 if (
@@ -416,6 +418,7 @@ class Monitor:
                     signal=None,
                     scalp_explanation="EXPIRED_SIGNAL: waiting for a fresh qualifying setup",
                 )
+            state["trade_decision"] = trade_decision(state)
             return state
 
 

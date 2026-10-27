@@ -91,7 +91,7 @@ def test_pending_auth_never_enables_account_and_retries_only_after_interval(tmp_
         m.account_job.result(timeout=5)
     m.update_account(NOW + timedelta(seconds=1))
     assert m.account_client is None and "HTTP 403" in m.account_error
-    assert m.account_view({}, NOW)["status"] == "PUBLIC_ONLY"
+    assert m.account_view({}, NOW)["status"] == "ACCOUNT_BLOCKED"
     assert m.account_job is None
 
 

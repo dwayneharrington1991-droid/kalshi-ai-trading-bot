@@ -44,6 +44,7 @@ class Monitor:
         self.target, self.stop, self.horizon = target, stop, horizon
         self.account_client = account_client
         self.account_candidate = None
+        self.account_requested = account_client is not None
         self.account_journal = AccountJournal(account_store or journal.path)
         if account_client is not None:
             self.account_journal.bind(
@@ -300,7 +301,9 @@ class Monitor:
             if self.account_job and self.account_job.done():
                 try:
                     batch = self.account_job.result()
-                    self.account_journal.bind(self.account_candidate.credential_binding)
+                    self.account_journal.bind(
+                        self.account_candidate.credential_binding, allow_empty_rotation=True
+                    )
                     Path(self.account_journal.path).chmod(0o600)
                     self.account_journal.reconcile(batch)
                     self.account_client = self.account_candidate
@@ -346,14 +349,38 @@ class Monitor:
 
     def account_view(self, state, now):
         if self.account_client is None:
+            configured = credential_status()
+            present = configured["KALSHI_MONITOR_KEY_ID"] and (
+                configured["KALSHI_MONITOR_PRIVATE_KEY_PEM"]
+                or configured["KALSHI_MONITOR_PRIVATE_KEY_PATH"]
+            )
+            if self.account_candidate is not None:
+                status = "ACCOUNT_CONNECTING" if self.account_job is not None else "ACCOUNT_BLOCKED"
+                reason = self.account_error or "Verifying authenticated read-only access"
+            elif self.account_requested:
+                status = "ACCOUNT_BLOCKED" if present else "ACCOUNT_NOT_CONFIGURED"
+                reason = (
+                    self.account_error
+                    or "This process did not receive both monitoring secret settings; reopen Codespace and restart"
+                )
+            elif any(configured.values()) and not present:
+                status = "ACCOUNT_NOT_CONFIGURED"
+                reason = "Only part of the monitoring configuration reached this process; reopen Codespace and restart. See boolean secret-presence diagnostics."
+            elif present:
+                status = "ACCOUNT_NOT_ENABLED"
+                reason = "Monitoring secrets are present, but this process was launched without account monitoring. Use scripts/start_dashboard.py --restart --private-dashboard"
+            else:
+                status = "PUBLIC_ONLY"
+                reason = (
+                    self.account_error
+                    or "Public-data mode; this process has no configured account connection"
+                )
             return {
-                "status": "ACCOUNT_CONNECTING"
-                if self.account_candidate is not None and self.account_job is not None
-                else "PUBLIC_ONLY",
-                "reason": self.account_error
-                or "No account connection enabled. Public market data only; no positions/orders/fills are read.",
+                "status": status,
+                "reason": reason,
                 "holdings": [],
                 "guidance": [],
+                "permissions": self.startup_diagnostics,
             }
         account = self.account_journal.snapshot()
         cached_permissions = getattr(self.account_client, "_permissions_cache", None)
@@ -477,6 +504,7 @@ class Monitor:
             state["connection_diagnostics"] = {
                 "credentials": credential_status(),
                 "account_enabled": self.account_client is not None,
+                "account_requested": self.account_requested,
                 "account_status": state["account"]["status"],
                 "account_reason": state["account"].get("reason"),
                 "permissions": state["account"].get("permissions") or self.startup_diagnostics,
@@ -691,6 +719,7 @@ def main():
         account_store=args.account_store,
     )
     monitor.account_error = disabled_reason
+    monitor.account_requested = args.account_readonly
     monitor.account_candidate = account_candidate
     monitor.update_account(utcnow())
     stop = threading.Event()

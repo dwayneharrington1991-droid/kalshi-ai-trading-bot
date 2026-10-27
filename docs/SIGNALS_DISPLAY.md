@@ -106,7 +106,7 @@ Codespace's secure Secrets settings configure:
 - `KALSHI_MONITOR_PRIVATE_KEY_PEM` (complete PEM as a server-side secret)
 
 Restart the Codespace if necessary for secret injection. Alternatively configure
-`KALSHI_MONITOR_PRIVATE_KEY_PATH` pointing to a private RSA PEM outside Git; only
+`KALSHI_MONITOR_PRIVATE_KEY_PATH` pointing to a private RSA (>=2048-bit) or Ed25519 PEM outside Git; only
 owner permissions (`chmod 600`) are accepted. `.private/`, PEM files and `.env*`
 are ignored. Use one account store per account; a hash binding refuses accidental
 mixing of accounts. Never put keys in browser code. Keep the forwarded port Private.
@@ -324,3 +324,5 @@ Absorption/DEM features are collected as optional chronological-learning candida
 with a separate validation ablation group. No incremental predictive value or
 profitable edge is established. Offline checks include
 `tests/test_signals_edge_reading.py`; run it alongside the scoped signals suite.
+
+Current API compatibility and connection-state troubleshooting: [Open dashboard guide](OPEN_DASHBOARD.md#current-kalshi-api-compatibility-repair).

@@ -179,3 +179,41 @@ scope. The application's GET-only allowlist still blocks all order/transfer muta
 Never delete the journal, WAL/SHM files or account store to fix a connection error.
 Actual authenticated compatibility must be checked in the Codespace containing the
 secrets; this development environment does not have access to that process or keys.
+
+### Current Kalshi API compatibility repair
+
+The current official [OpenAPI schema](https://docs.kalshi.com/openapi.yaml)
+(version 3.35.0 when checked) documents RSA and Ed25519 signing, hierarchical key
+scopes, canonical `outcome_side`/`book_side` fill direction, and fixed-point dollar
+`fee_cost` strings. The monitor now handles these explicitly:
+
+- Broad `read` plus documented read-only children is accepted; **every `write` or
+  `write::*` scope is refused**. Unknown scopes still block verification. A balance-only
+  child scope cannot authorize this full positions/orders/fills monitor.
+- Both documented RSA-PSS/SHA256 and Ed25519 keys are loaded from existing server-side
+  secrets. No new key is created. The signature still covers timestamp + GET + path,
+  without the query string; credentials are never sent to the browser.
+- Canonical fills no longer require deprecated `side`/`action`. Direction is
+  normalized as equivalent economic exposure for FIFO accounting, not labeled as an
+  actual submitted purchase. Conflicting fields fail closed. Current string fee costs
+  are dollars; legacy integer-cent fees remain a separate explicitly handled format.
+- Positions, fills, orders and cash use the same primary or key-bound subaccount.
+  This prevents other subaccounts' fills from being mixed into a position's entry.
+  The monitor does not aggregate other subaccounts or manufacture missing history.
+- A genuinely empty account store left by a failed startup can adopt the verified
+  new key binding. A store containing any account history/settings remains protected
+  against mixing keys/accounts. Nothing is deleted to bypass that protection.
+
+Connection labels distinguish **ACCOUNT NOT ENABLED** (secrets present but launch
+mode disabled), **MONITORING SECRETS NOT LOADED**, **CHECKING KALSHI CONNECTION**,
+**ACCOUNT BLOCKED — SEE REASON**, and a verified connected/stale account. These
+states replace the misleading generic OFF label for every failure. No successful
+account connection is claimed merely because secrets exist.
+
+Official references: [API keys](https://docs.kalshi.com/api-reference/api-keys/get-api-keys),
+[order direction](https://docs.kalshi.com/getting_started/order_direction), and the
+OpenAPI `ApiKeyScope`, `ApiKeyType`, `Fill`, and subaccount query schemas. Live-key
+compatibility is still unverified until the Codespace holding those secrets runs
+the diagnostic check; the compatibility tests use generated keys and mocked data.
+
+Pending-order polling now requests documented `status=resting`; completed trade accounting still uses confirmed fills. This avoids repeatedly paging through canceled/executed order history during each live refresh.

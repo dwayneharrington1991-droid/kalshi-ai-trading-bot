@@ -43,12 +43,37 @@ class AccountJournal:
     def connect(self):
         return storage_connect(self.path)
 
-    def bind(self, identity):
+    def bind(self, identity, *, allow_empty_rotation=False):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT payload FROM monitor_account_settings WHERE name='credential_binding'"
             ).fetchone()
             if row and json.loads(row[0]) != identity:
+                tables = (
+                    "monitor_account_fills",
+                    "monitor_account_holdings",
+                    "monitor_account_state",
+                    "monitor_account_events",
+                    "monitor_account_guidance_events",
+                    "monitor_account_choices",
+                )
+                empty = not any(
+                    db.execute("SELECT EXISTS(SELECT 1 FROM " + table + ")").fetchone()[0]
+                    for table in tables
+                )
+                empty = (
+                    empty
+                    and not db.execute(
+                        "SELECT EXISTS(SELECT 1 FROM monitor_account_settings WHERE name!='credential_binding')"
+                    ).fetchone()[0]
+                )
+                if allow_empty_rotation and empty:
+                    db.execute(
+                        "UPDATE monitor_account_settings SET payload=? WHERE name='credential_binding'",
+                        (json.dumps(identity),),
+                    )
+                    return
                 raise AccountReadError(
                     "Monitoring key binding changed; use a separate account-store file to avoid mixing accounts. Existing records are preserved."
                 )

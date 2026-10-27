@@ -52,12 +52,13 @@ class ReadOnlyKalshi:
         self.credential_binding = hashlib.sha256(key_id.encode()).hexdigest()
         self._permissions_cache = None
         self._permissions_time = 0
+        self._subaccount = 0
 
     @classmethod
     def from_environment(cls):
         import os
 
-        key_id = os.environ.get("KALSHI_MONITOR_KEY_ID", "")
+        key_id = os.environ.get("KALSHI_MONITOR_KEY_ID", "").strip()
         pem = os.environ.get("KALSHI_MONITOR_PRIVATE_KEY_PEM", "")
         path = os.environ.get("KALSHI_MONITOR_PRIVATE_KEY_PATH", "")
         if not key_id or (not pem and not path):
@@ -77,11 +78,18 @@ class ReadOnlyKalshi:
 
             key = serialization.load_pem_private_key(pem.encode(), password=None)
             from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-            if not isinstance(key, RSAPrivateKey) or key.key_size < 2048:
-                raise AccountReadError("Monitoring key must be RSA with at least 2048 bits")
+            if not isinstance(key, (RSAPrivateKey, Ed25519PrivateKey)) or (
+                isinstance(key, RSAPrivateKey) and key.key_size < 2048
+            ):
+                raise AccountReadError(
+                    "Unsupported monitoring key: require RSA >=2048 bits or Ed25519"
+                )
 
             def sign(message):
+                if isinstance(key, Ed25519PrivateKey):
+                    return base64.b64encode(key.sign(message.encode())).decode()
                 return base64.b64encode(
                     key.sign(
                         message.encode(),
@@ -104,8 +112,18 @@ class ReadOnlyKalshi:
         if method != "GET" or path not in PATHS:
             raise AccountReadError("Endpoint/method blocked by read-only monitoring allowlist")
         params = params or {}
-        if set(params) - {"cursor", "limit", "min_ts"}:
+        if set(params) - {"cursor", "limit", "min_ts", "subaccount", "status"}:
             raise AccountReadError("Unsupported monitoring query parameter")
+        if "status" in params and (
+            path != "/trade-api/v2/portfolio/orders" or params["status"] != "resting"
+        ):
+            raise AccountReadError("Unsupported pending-order monitoring filter")
+        if "subaccount" in params and (
+            not path.startswith("/trade-api/v2/portfolio/")
+            or type(params["subaccount"]) is not int
+            or not 0 <= params["subaccount"] <= 63
+        ):
+            raise AccountReadError("Unsupported read-only account scope")
         stamp = str(int(time.time() * 1000))
         headers = {
             "KALSHI-ACCESS-KEY": self._key_id,
@@ -171,6 +189,7 @@ class ReadOnlyKalshi:
         return result
 
     def _verify_permissions(self):
+        data = {}
         result = {
             "status": "PERMISSIONS_UNVERIFIED",
             "read_only_verified": False,
@@ -181,7 +200,9 @@ class ReadOnlyKalshi:
         try:
             data = self.request("GET", "/trade-api/v2/api_keys")
             result["authentication"] = "AUTHENTICATED_GET_SUCCEEDED"
-            if not isinstance(data.get("api_keys"), list):
+            if not isinstance(data.get("api_keys"), list) or any(
+                not isinstance(k, dict) for k in data.get("api_keys", [])
+            ):
                 result["blocker"] = "KEY_METADATA_SCHEMA_UNSUPPORTED: response has no api_keys list"
             else:
                 current = next(
@@ -198,14 +219,19 @@ class ReadOnlyKalshi:
                     ] = "CURRENT_KEY_NOT_IN_METADATA: authenticated response did not identify this key"
                 else:
                     scopes = current.get("scopes")
-                    if isinstance(scopes, list) and scopes == ["read"]:
+                    valid_scopes = isinstance(scopes, list) and all(
+                        isinstance(scope, str) for scope in scopes
+                    )
+                    read_scopes = {"read", "read::portfolio_balance", "read::block_trade_accept"}
+                    if valid_scopes and "read" in scopes and set(scopes) <= read_scopes:
                         result.update(
                             status="READ_ONLY_SCOPE_REPORTED", read_only_verified=True, blocker=None
                         )
-                    elif isinstance(scopes, list) and any(
-                        scope
+                    elif valid_scopes and any(
+                        scope == "write"
+                        or scope.startswith("write::")
+                        or scope
                         in (
-                            "write",
                             "trade",
                             "trading",
                             "transfer",
@@ -222,9 +248,33 @@ class ReadOnlyKalshi:
                     else:
                         result[
                             "blocker"
-                        ] = "READ_ONLY_SCOPE_NOT_PROVEN: missing or unsupported scopes; no account reads enabled"
+                        ] = "READ_ONLY_SCOPE_NOT_PROVEN: broad read scope required for positions/orders/fills, with no unknown or mutation scopes; account reads withheld"
+                    bound = current.get("subaccount")
+                    if bound is not None:
+                        if type(bound) is not int or not 0 <= bound <= 63:
+                            result.update(
+                                status="PERMISSIONS_UNVERIFIED",
+                                read_only_verified=False,
+                                blocker="INVALID_SUBACCOUNT_BINDING: account scope cannot be verified",
+                            )
+                        else:
+                            self._subaccount = bound
+                            result["account_scope"] = "key-restricted subaccount"
+                    else:
+                        self._subaccount = 0
+                        result["account_scope"] = "primary account"
+                    if current.get("fcm_subtrader_id") is not None:
+                        result[
+                            "account_access_blocker"
+                        ] = "FCM_BOUND_KEY: official API documents this key binding as denied on every REST endpoint"
         except AccountReadError as exc:
             result["blocker"] = str(exc)  # request() emits only redacted, static diagnostics.
+        expiry = data.get("api_key_region_expiration_ts")
+        result["location_attestation"] = (
+            ("EXPIRED" if expiry < time.time() else "CURRENT")
+            if type(expiry) is int
+            else "NOT_REPORTED"
+        )
         result["checked_at"] = datetime.now(timezone.utc).isoformat()
         result["warning"] = (
             "API metadata reports exclusively read scope; GET allowlist still enforced"
@@ -242,13 +292,20 @@ class ReadOnlyKalshi:
                     "Read-only key permissions no longer verified; account sync withheld: "
                     + str(permissions.get("blocker"))
                 )
+            if permissions.get("account_access_blocker"):
+                raise AccountReadError(permissions["account_access_blocker"])
         # Never infer holdings/fills from order status. All pages must complete.
-        positions = self.pages("/trade-api/v2/portfolio/positions", "market_positions")
+        scoped = {"subaccount": self._subaccount}
+        positions = self.pages("/trade-api/v2/portfolio/positions", "market_positions", scoped)
         fills = self.pages(
-            "/trade-api/v2/portfolio/fills", "fills", {"min_ts": min_ts} if min_ts else None
+            "/trade-api/v2/portfolio/fills",
+            "fills",
+            {**scoped, **({"min_ts": min_ts} if min_ts else {})},
         )
-        orders = self.pages("/trade-api/v2/portfolio/orders", "orders")
-        balance = self.request("GET", "/trade-api/v2/portfolio/balance")
+        orders = self.pages(
+            "/trade-api/v2/portfolio/orders", "orders", {**scoped, "status": "resting"}
+        )
+        balance = self.request("GET", "/trade-api/v2/portfolio/balance", scoped)
         return {
             "positions": positions,
             "fills": fills,
@@ -272,8 +329,34 @@ def decimal(value):
 
 def normalized_fill(raw):
     identifier = raw.get("fill_id") or raw.get("trade_id")
-    side = raw.get("side") or raw.get("outcome_side") or raw.get("purchased_side")
-    action = raw.get("action")
+    legacy_side = raw.get("side")
+    legacy_action = raw.get("action")
+    outcome = raw.get("outcome_side")
+    book_side = raw.get("book_side")
+    direction_basis = "legacy side/action"
+    if outcome is not None or book_side is not None:
+        direction = outcome if outcome is not None else {"bid": "yes", "ask": "no"}.get(book_side)
+        if direction not in ("yes", "no") or (
+            book_side is not None and book_side != ("bid" if direction == "yes" else "ask")
+        ):
+            raise AccountReadError("Conflicting/unsupported canonical fill direction")
+        if (
+            legacy_side is not None
+            and legacy_side not in ("yes", "no")
+            or legacy_action is not None
+            and legacy_action not in ("buy", "sell")
+        ):
+            raise AccountReadError("Unsupported legacy fill direction")
+        if legacy_side is not None and legacy_action is not None:
+            expected = (
+                legacy_side if legacy_action == "buy" else ("no" if legacy_side == "yes" else "yes")
+            )
+            if expected != direction:
+                raise AccountReadError("Canonical and legacy fill direction conflict")
+        side, action = direction, "buy"
+        direction_basis = "canonical outcome exposure; buy is an economic normalization, not an inferred submitted order"
+    else:
+        side, action = legacy_side, legacy_action
     if not identifier or side not in ("yes", "no") or action not in ("buy", "sell"):
         raise AccountReadError("Fill schema/side/action unverified; cost basis withheld")
     quantity = decimal(raw.get("count_fp", raw.get("count")))
@@ -282,13 +365,21 @@ def normalized_fill(raw):
         if raw.get(side + "_price_dollars") is not None
         else decimal(raw[side + "_price"]) / 100
     )
-    fees = (
-        decimal(raw["fee_cost_dollars"])
-        if raw.get("fee_cost_dollars") is not None
-        else decimal(raw["fee_cost"]) / 100
-        if raw.get("fee_cost") is not None
-        else None
-    )
+    if raw.get("yes_price_dollars") is not None and raw.get("no_price_dollars") is not None:
+        if abs(decimal(raw["yes_price_dollars"]) + decimal(raw["no_price_dollars"]) - 1) > Decimal(
+            "0.000001"
+        ):
+            raise AccountReadError("Incompatible YES/NO fill prices")
+    if raw.get("fee_cost_dollars") is not None:
+        fees = decimal(raw["fee_cost_dollars"])
+    elif isinstance(raw.get("fee_cost"), str):
+        fees = decimal(raw["fee_cost"])  # Current FixedPointDollars schema.
+    elif type(raw.get("fee_cost")) is int and outcome is None and book_side is None:
+        fees = decimal(raw["fee_cost"]) / 100  # Legacy integer-cent payload.
+    elif raw.get("fee_cost") is None:
+        fees = None
+    else:
+        raise AccountReadError("Ambiguous fill fee units; cost basis withheld")
     if quantity <= 0 or not 0 <= price <= 1 or (fees is not None and fees < 0):
         raise AccountReadError("Invalid confirmed fill values")
     at = raw.get("created_time")
@@ -308,6 +399,7 @@ def normalized_fill(raw):
     at = timestamp(at).astimezone(timezone.utc).isoformat()
     return {
         "id": str(identifier),
+        "direction_basis": direction_basis,
         "ticker": str(raw.get("ticker", raw.get("market_ticker", ""))),
         "side": side,
         "action": action,

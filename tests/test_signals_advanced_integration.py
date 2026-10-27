@@ -80,7 +80,7 @@ def observations(end=NOW, seconds=900, *, source=SOURCE):
 
 
 def close_monitor(monitor):
-    for name in ("engine_report", "research_report", "scalp_paper_report", "scheduled_learning"):
+    for name in ("engine_report", "research_report", "scalp_paper_report", "edge_report", "scheduled_learning"):
         report = getattr(monitor, name, None)
         if report is not None:
             report.close()

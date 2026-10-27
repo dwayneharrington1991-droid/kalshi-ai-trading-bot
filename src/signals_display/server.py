@@ -35,6 +35,7 @@ from .comparison import model_market
 from .alerts import MonitoringAlerts, risk_alerts
 from .scalp_monitor import diagnose as diagnose_scalp, ScalpCriteria
 from .advanced import AdvancedIntelligence, attach_reliability, refresh_status
+from .edge_scanner import calculate as calculate_edge_scanner, performance as edge_performance
 
 
 class Monitor:
@@ -144,6 +145,9 @@ class Monitor:
         self.scalp_paper_report = CachedReport(
             lambda: evaluate_journal(self.journal.path), interval=60, name="book-replay-evaluation"
         )
+        self.edge_report = CachedReport(
+            self.edge_performance, interval=30, name="edge-performance"
+        )
         self.scheduled_learning = None
         if model_registry is not None:
             from .model_registry import scheduled_evaluation
@@ -157,6 +161,10 @@ class Monitor:
     def prediction_performance(self):
         with self.journal.read() as db:
             return engine_performance(db, utcnow())
+
+    def edge_performance(self):
+        with self.journal.read() as db:
+            return edge_performance(db)
 
     def maintain_settlements(self, now):
         self.journal.seed_settlement_queue()
@@ -217,6 +225,7 @@ class Monitor:
                         consumer(observation)
                     except (KeyError, ValueError, TypeError, AttributeError):
                         rejected += 1
+                self.estimator.observe_reference(observation, now)
             primary = None
             if ref.get("transport") == "public WebSocket":
                 primary = (
@@ -449,14 +458,30 @@ class Monitor:
                         if candidate.get("up") is not None:
                             candidate["status"] = "DELAYED" if generated > opened else "ON_TIME"
                     candidate["closes_at"] = m["closes_at"]
-                    opening = self.journal.opening_record(
-                        m["ticker"], state["mode"], candidate, generated
-                    )
+                    # Keep retrying briefly when asynchronous history/reference
+                    # delivery straddles rollover. Inputs remain cut off at the
+                    # opening instant; later observations can never be backfilled.
+                    retry_until = opened + timedelta(seconds=5)
+                    if candidate.get("up") is not None or generated >= retry_until:
+                        opening = self.journal.opening_record(
+                            m["ticker"], state["mode"], candidate, generated
+                        )
+                    else:
+                        candidate["status"] = "WARMING UP"
+                        candidate["reason"] += "; retrying receipt-proven pre-opening inputs for up to 5 seconds"
+                        candidate["retry_until"] = retry_until.isoformat()
+                        opening = candidate
             state["prediction_engine"] = engine_view(
                 state, prior, opening, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
             )
             state["model_market"] = model_market(
                 state, self.estimator.slippage, self.estimator.manual_delay
+            )
+            state["edge_scanner"] = calculate_edge_scanner(
+                state,
+                slippage=self.estimator.slippage,
+                manual_delay=self.estimator.manual_delay,
+                now=now,
             )
             state["generated_at"] = (
                 utcnow().isoformat() if state["mode"] == "PUBLIC MARKET DATA" else now.isoformat()
@@ -867,6 +892,45 @@ class Monitor:
         state["model_market"] = model_market(
             state, self.estimator.slippage, self.estimator.manual_delay
         )
+        state["edge_scanner"] = calculate_edge_scanner(
+            state,
+            slippage=self.estimator.slippage,
+            manual_delay=self.estimator.manual_delay,
+            account=state["account"],
+            now=health_clock,
+        )
+        reference = state.get("reference", {})
+        market = state.get("market") or {}
+        stream_public = state.get("streaming", {}).get("public", {})
+        state["feed_health"] = {
+            "status": "LIVE" if not state.get("stale") else "STALE",
+            "last_successful_btc_price_update": reference.get("observed_at"),
+            "last_kalshi_market_update": market.get("observed_at"),
+            "btc_source": reference.get("source"),
+            "btc_transport": reference.get("transport", "public REST fallback"),
+            "btc_age_seconds": state["market_health"].get("reference_age_seconds"),
+            "kalshi_age_seconds": state["market_health"].get("quote_age_seconds"),
+            "coinbase_websocket_status": (
+                "LIVE"
+                if reference.get("transport") == "public WebSocket"
+                and "Coinbase" in reference.get("source", "")
+                and not state.get("stale")
+                else "RECONNECTING_OR_FALLBACK"
+                if stream_public.get("connection_attempts")
+                else "UNAVAILABLE"
+            ),
+            "websocket_connection_attempts": stream_public.get("connection_attempts"),
+            "websocket_reconnects": stream_public.get("reconnects"),
+            "websocket_last_heartbeat": stream_public.get("last_heartbeat_received_at"),
+            "websocket_last_error_type": stream_public.get("last_error"),
+            "rest_status": state.get("streaming", {}).get("rest", {}).get("status"),
+            "prediction_engine_status": state.get("prediction_engine", {}).get("status"),
+            "prediction_unavailable_reason": state.get("prediction_engine", {}).get("reason"),
+            "opening_status": state.get("prediction_engine", {}).get("initial", {}).get("status"),
+            "opening_reason": state.get("prediction_engine", {}).get("initial", {}).get("reason"),
+            "last_processing_completed_at": last_tick.isoformat(),
+            "database": "WAL / serialized writes; responsive snapshot completed",
+        }
         state["scalping_monitor"] = diagnose_scalp(
             state, self.scalp_criteria, account=state["account"], now=health_clock
         )
@@ -1005,6 +1069,18 @@ def make_handler(monitor):
                     "report_generated_at": report["generated_at"],
                     "calculation_ms": report["calculation_ms"],
                     "refresh_in_progress": report["refresh_in_progress"],
+                }
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/edge-performance":
+                report = monitor.edge_report.get()
+                value = {
+                    "status": report["status"],
+                    "performance": report["value"],
+                    "generated_at": report["generated_at"],
+                    "calculation_ms": report["calculation_ms"],
+                    "refresh_in_progress": report["refresh_in_progress"],
+                    "notice": "Counterfactual edge observations are separate from actual account results and never imply real fills",
                 }
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
@@ -1352,6 +1428,7 @@ def main():
         monitor.engine_report.close()
         monitor.research_report.close()
         monitor.scalp_paper_report.close()
+        monitor.edge_report.close()
         if monitor.scheduled_learning:
             monitor.scheduled_learning.close()
         if isinstance(feed, PublicFeed):

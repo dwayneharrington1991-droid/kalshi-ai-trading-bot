@@ -171,6 +171,37 @@ def test_rollover_preserves_proxy_history_but_requires_new_quote_history():
     assert info["quote_history"]["samples"] == 1
 
 
+def test_stream_and_rest_labels_for_same_venue_preserve_reference_history():
+    model = LiveEstimator()
+    for i in range(3):
+        payload = live_frame(i)
+        payload["reference"]["source"] = (
+            "Coinbase BTC/USD stream" if i % 2 else
+            "Coinbase BTC/USD public WebSocket (proxy, NOT settlement index)"
+        )
+        model.observe(payload, timestamp(payload["now"]))
+    assert len(model.reference) == 3
+    assert model.reference_source == "Coinbase BTC/USD proxy"
+
+
+def test_drained_preopening_stream_observation_reaches_opening_estimator():
+    model = LiveEstimator()
+    now = NOW + timedelta(seconds=3)
+    observation = {
+        "source": "Coinbase BTC/USD stream",
+        "kind": "quote",
+        "price": 100001,
+        "received_at": (NOW - timedelta(seconds=1)).isoformat(),
+    }
+    assert model.observe_reference(observation, now) is True
+    assert model.reference[-1][0] < NOW
+    # A post-opening sample is retained for live estimates but cannot replace
+    # the receipt-proven sample selected by opening_forecast's opening cutoff.
+    post = {**observation, "price": 200000, "received_at": now.isoformat()}
+    assert model.observe_reference(post, now) is True
+    assert [point[1] for point in model.reference] == [100001, 200000]
+
+
 def test_stale_reference_and_stale_quotes_have_independent_reasons():
     model, payload = trained()
     payload["reference"]["observed_at"] = (

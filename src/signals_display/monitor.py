@@ -19,6 +19,7 @@ import httpx
 from .coverage import FeedHub
 from . import prediction_engine
 from . import scalp_paper
+from . import edge_scanner
 from .model import Display, evaluate, fee, number, timestamp
 from .edges import assess_edges
 from .reliability import metrics, wilson
@@ -783,6 +784,7 @@ class Journal:
                     db.execute(f"ALTER TABLE predictions ADD COLUMN {name} {spec}")
             prediction_engine.create(db)
             scalp_paper.create_schema(db)
+            edge_scanner.create_schema(db)
             db.execute(
                 "CREATE TABLE IF NOT EXISTS forecast_outcomes (ticker TEXT,origin TEXT,observed_at TEXT,outcome INTEGER,PRIMARY KEY(ticker,origin))"
             )
@@ -863,6 +865,9 @@ class Journal:
         with self.connect() as db:
             prediction_engine.record(db, state, utcnow())
             scalp_paper.record(
+                db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+            )
+            edge_scanner.record(
                 db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
             )
             pending = db.execute(

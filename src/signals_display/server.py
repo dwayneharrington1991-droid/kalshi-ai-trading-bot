@@ -416,12 +416,13 @@ class Monitor:
                         eligible = False
                     frozen = raw_history if eligible else self.journal.opening_inputs(opened)
                     generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+                    opening_points, opening_source = self.estimator.opening_points(opened)
                     candidate = opening_forecast(
                         m,
                         frozen,
-                        list(self.estimator.reference),
+                        opening_points,
                         generated,
-                        reference_source=self.estimator.reference_source,
+                        reference_source=opening_source,
                         audit_context={
                             "official_contracts": self.readiness.get("official_contracts"),
                             "minimum_contracts": self.readiness.get("minimum_contracts", 170),

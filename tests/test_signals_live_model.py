@@ -184,6 +184,23 @@ def test_stream_and_rest_labels_for_same_venue_preserve_reference_history():
     assert model.reference_source == "Coinbase BTC/USD proxy"
 
 
+def test_opening_receipts_survive_live_gap_reset_and_exclude_post_open_sample():
+    model = LiveEstimator()
+    opened = NOW + timedelta(seconds=10)
+    before = {
+        "source": "Coinbase BTC/USD stream", "kind": "quote", "price": 100000,
+        "received_at": (opened - timedelta(seconds=2)).isoformat(),
+    }
+    assert model.observe_reference(before, opened - timedelta(seconds=1))
+    # A later reconnect-sized gap clears strict live continuity.
+    after = {**before, "price": 200000, "received_at": (opened + timedelta(seconds=8)).isoformat()}
+    assert model.observe_reference(after, opened + timedelta(seconds=8))
+    assert list(model.reference) == [(timestamp(after["received_at"]), 200000)]
+    points, source = model.opening_points(opened)
+    assert source == "Coinbase BTC/USD proxy"
+    assert points == [(timestamp(before["received_at"]), 100000)]
+
+
 def test_drained_preopening_stream_observation_reaches_opening_estimator():
     model = LiveEstimator()
     now = NOW + timedelta(seconds=3)

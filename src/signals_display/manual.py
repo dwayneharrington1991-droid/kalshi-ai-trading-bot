@@ -21,6 +21,8 @@ class ManualJournal:
                 price REAL,quantity REAL,fees REAL,exited_at TEXT,recorded_at TEXT);
                 CREATE TABLE IF NOT EXISTS manual_alerts (id INTEGER PRIMARY KEY,entry_id INTEGER,
                 guidance TEXT,observed_at TEXT,payload TEXT);
+                CREATE INDEX IF NOT EXISTS manual_entries_status_id ON manual_entries(status,id DESC);
+                CREATE INDEX IF NOT EXISTS manual_exits_entry_id ON manual_exits(entry_id,id);
             """
             )
 
@@ -122,12 +124,52 @@ class ManualJournal:
             if abs(row["quantity"] - used - qty) < 1e-9:
                 db.execute("UPDATE manual_entries SET status='CLOSED' WHERE id=?", (row["id"],))
 
-    def records(self):
-        with self.connect() as db:
-            entries = [dict(r) for r in db.execute("SELECT * FROM manual_entries ORDER BY id DESC")]
-            exits = [dict(r) for r in db.execute("SELECT * FROM manual_exits ORDER BY id")]
+    def records(self, *, open_only=False, before=None, before_id=None, limit=None):
+        if before_id is not None:
+            if before is not None and before != before_id:
+                raise ValueError("Conflicting history cursors")
+            before = before_id
+        if before is not None and (type(before) is not int or before < 1):
+            raise ValueError("History cursor must be a positive integer")
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 100):
+            raise ValueError("History page size must be 1..100")
+        clauses, params = [], []
+        if open_only:
+            clauses.append("status='OPEN'")
+        if before is not None:
+            clauses.append("id<?")
+            params.append(before)
+        query = "SELECT * FROM manual_entries"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit + 1)
+        with storage_connect(self.path, readonly=True) as db:
+            entries = [dict(r) for r in db.execute(query, params)]
+            has_more = limit is not None and len(entries) > limit
+            if limit is not None:
+                entries = entries[:limit]
+            ids = [entry["id"] for entry in entries]
+            exits = (
+                [
+                    dict(r)
+                    for r in db.execute(
+                        "SELECT * FROM manual_exits WHERE entry_id IN ("
+                        + ",".join("?" for _ in ids)
+                        + ") ORDER BY id",
+                        ids,
+                    )
+                ]
+                if ids
+                else []
+            )
+        grouped = {}
+        for fill in exits:
+            grouped.setdefault(fill["entry_id"], []).append(fill)
         for entry in entries:
-            fills = [r for r in exits if r["entry_id"] == entry["id"]]
+            fills = grouped.get(entry["id"], [])
             used = sum(r["quantity"] for r in fills)
             entry["remaining_quantity"] = max(0, entry["quantity"] - used)
             entry["reported_realized_net_pnl"] = (
@@ -140,12 +182,14 @@ class ManualJournal:
         return {
             "entries": entries,
             "exits": exits,
+            "has_more": has_more,
+            "next_before_id": entries[-1]["id"] if has_more else None,
             "notice": "User-reported records, never broker-verified. No displayed signal or alert is a fill.",
         }
 
     def guidance(self, quotes, now, current_state):
         result = []
-        for entry in self.records()["entries"]:
+        for entry in self.records(open_only=True)["entries"]:
             if entry["status"] != "OPEN":
                 continue
             quote = quotes.get(entry["ticker"])

@@ -238,12 +238,170 @@ def test_performance_endpoint_does_not_wait_for_legacy_history(tmp_path, monkeyp
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with urlopen(
-            f"http://127.0.0.1:{server.server_port}/api/prediction-performance", timeout=3
-        ) as r:
-            data = json.load(r)
+        import time
+
+        deadline = time.monotonic() + 3
+        while True:
+            with urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/prediction-performance", timeout=3
+            ) as r:
+                data = json.load(r)
+            if data.get("report_status") == "READY" or data.get("by_mode"):
+                break
+            assert time.monotonic() < deadline, "Async performance report did not finish"
+            time.sleep(0.02)
         assert data["by_mode"]["PUBLIC MARKET DATA"]["all"]["settled_markets"] == 0
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_opening_panel_reports_supported_price_and_uncalibrated_quality_without_future_inputs():
+    h = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=1))
+    m = market()
+    opening = engine.opening_forecast(
+        m, h, points(), NOW + timedelta(seconds=2), reference_source="Mock Coinbase spot"
+    )
+    assert opening["direction"] in ("UP", "DOWN", "UNCLEAR")
+    assert opening["up"] + opening["down"] == pytest.approx(1)
+    assert opening["confidence"]["status"] == "UNCALIBRATED"
+    assert opening["data_quality"]["closed_history_bars"] == 1440
+    assert opening["reference_source"] == "Mock Coinbase spot"
+    assert opening["settlement_price_estimate"]["mean"] == pytest.approx(
+        points()[-1][1] + opening["basis"]["point"]
+    )
+    assert "NOT calibrated" in opening["settlement_price_estimate"]["label"]
+    assert engine.opening_forecast(m, h, points(), NOW - timedelta(seconds=1))["up"] is None
+    assert engine.opening_forecast(m, h, points(), NOW + timedelta(minutes=15))["up"] is None
+    # Receipt order must not change the result, but contradictory samples cannot
+    # be silently chosen by list order.
+    shuffled = engine.opening_forecast(m, h, list(reversed(points())), NOW + timedelta(seconds=2))
+    assert shuffled["up"] == opening["up"]
+    conflict = engine.opening_forecast(
+        m, h, points() + [(points()[-1][0], 1)], NOW + timedelta(seconds=2)
+    )
+    assert conflict["up"] is None and "Conflicting" in conflict["reason"]
+
+
+def test_live_panel_clears_current_estimate_without_overwriting_frozen_opening():
+    m = market()
+    opening = engine.opening_forecast(
+        m, history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=1)), points(), NOW
+    )
+    data = frame()
+    data["markets"] = [m]
+    state = analyze(data, NOW)
+    state.update(
+        stale=False,
+        estimate={"settlement_up": 0.6},
+        model={
+            "analysis_24h": engine.context24(history(), NOW),
+            "price_forecast": {
+                "settlement_average_mean": 100001,
+                "settlement_average_conditional_interval": [99900, 100100],
+                "interval_label": "Experimental",
+            },
+        },
+    )
+    live = engine.view(state, None, opening, NOW)
+    assert live["direction"] == "UP" and live["settlement_price_estimate"]["mean"] == 100001
+    assert live["initial"] == opening
+    state["stale"] = True
+    stale = engine.view(state, None, opening, NOW + timedelta(seconds=6))
+    assert stale["up"] is None and stale["settlement_price_estimate"] is None
+    assert stale["direction"] == "UNCLEAR" and stale["initial"] == opening
+
+
+def test_contract_summary_is_incremental_idempotent_and_retains_unavailable_openings(tmp_path):
+    j = Journal(tmp_path / "j.db")
+    m = market()
+    missing = engine.opening_forecast(m, history(), [], NOW)
+    j.opening_record(m["ticker"], "PUBLIC MARKET DATA", missing, NOW)
+    with j.connect() as db:
+        for i in range(300):
+            at = (NOW + timedelta(seconds=i + 1)).isoformat()
+            args = (
+                "PUBLIC MARKET DATA",
+                m["ticker"],
+                at,
+                at,
+                m["closes_at"],
+                0.6,
+                "similar volatility",
+                engine.VERSION,
+                '{"baseline_up":0.5}',
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO btc_engine_predictions VALUES (?,?,?,?,?,?,?,?,?)", args
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO btc_engine_predictions VALUES (?,?,?,?,?,?,?,?,?)", args
+            )
+        engine.create(db)
+        summary = db.execute("SELECT * FROM btc_engine_contracts").fetchone()
+        assert summary["revisions"] == 300
+        queries = []
+        db.set_trace_callback(queries.append)
+        prior = engine.prior(db, m["ticker"], "PUBLIC MARKET DATA")
+        db.set_trace_callback(None)
+        assert len(queries) == 2 and all("LIMIT 1" in q for q in queries)
+        assert prior["latest"]["up"] == 0.6
+        report = engine.performance(db, NOW)
+        assert report["archive_total"] == 1 and report["archive"][0]["revisions"] == 300
+        assert report["archive"][0]["initial"]["up"] is None
+    # An unavailable opening without a single supported live revision also
+    # remains in the archive, separate from scored predictions.
+    another = {**missing, "ticker": "KXBTC15M-UNAVAILABLE"}
+    j.opening_record(another["ticker"], "PUBLIC MARKET DATA", another, NOW)
+    with j.read() as db:
+        report = engine.performance(db, NOW)
+    assert report["archive_total"] == 2
+    assert any(
+        a["ticker"] == another["ticker"] and a["latest_up"] is None for a in report["archive"]
+    )
+
+
+def test_scoring_selects_last_eligible_revision_without_future_recording(tmp_path):
+    j = Journal(tmp_path / "j.db")
+    m = market()
+    opened = engine.opening_forecast(
+        m,
+        history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=1)),
+        points(),
+        NOW + timedelta(seconds=1),
+    )
+    j.opening_record(m["ticker"], "PUBLIC MARKET DATA", opened, NOW + timedelta(seconds=1))
+    with j.connect() as db:
+        # Last inserted revision is falsely dated before recording. It must not
+        # replace the last chronologically eligible forecast in accuracy stats.
+        for seconds, recorded, p in [(10, 10, 0.8), (20, 16 * 60, 0.99), (30, 29, 0.01)]:
+            at = (NOW + timedelta(seconds=seconds)).isoformat()
+            db.execute(
+                "INSERT INTO btc_engine_predictions VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    "PUBLIC MARKET DATA",
+                    m["ticker"],
+                    at,
+                    (NOW + timedelta(seconds=recorded)).isoformat(),
+                    m["closes_at"],
+                    p,
+                    "similar volatility",
+                    engine.VERSION,
+                    "{}",
+                ),
+            )
+    j.settle(
+        m["ticker"],
+        "yes",
+        "PUBLIC MARKET DATA",
+        observed_at=(NOW + timedelta(minutes=16)).isoformat(),
+    )
+    with j.read() as db:
+        queries = []
+        db.set_trace_callback(queries.append)
+        report = engine.performance(db, NOW + timedelta(minutes=17))
+    assert report["by_mode"]["PUBLIC MARKET DATA"]["all"]["latest"]["brier"] == pytest.approx(0.04)
+    # One scoring seek query plus bounded archive query and summary count;
+    # there are no per-contract SELECTs inside metric loops.
+    assert len([q for q in queries if q.lstrip().upper().startswith("SELECT")]) == 3

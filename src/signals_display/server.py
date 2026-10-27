@@ -10,7 +10,8 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
+from time import perf_counter, monotonic
 import uuid
 
 from .account_readonly import ReadOnlyKalshi, AccountReadError, credential_status
@@ -28,6 +29,7 @@ from .live_model import LiveEstimator
 from .learning import load_artifact, predict as learned_predict
 from .model import Display, timestamp
 from .monitor import Journal, PublicFeed, ReplayFeed, active_market, analyze, utcnow
+from .runtime import CachedReport, LatestPayload
 
 
 class Monitor:
@@ -102,10 +104,67 @@ class Monitor:
         )
         self.settlement_check = None
         self.last_tick = utcnow()
+        self.state_version = 0
+        self.maintenance_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="settlement-results"
+        )
+        self.maintenance_job = None
+        self.maintenance_error = None
+        self.readiness_job = None
+        self.readiness_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="learning-readiness"
+        )
+        self.engine_report = CachedReport(
+            self.prediction_performance, interval=30, name="prediction-performance"
+        )
+        self.research_report = CachedReport(
+            self.journal.performance, interval=60, name="historical-research"
+        )
 
-    def tick(self):
+    def prediction_performance(self):
+        with self.journal.read() as db:
+            return engine_performance(db, utcnow())
+
+    def maintain_settlements(self, now):
+        self.journal.seed_settlement_queue()
+        for ticker in self.journal.due_settlements(now):
+            self.journal.mark_settlement_attempt(ticker, now)
+            try:
+                self.journal.settle(ticker, self.feed.resolved(ticker), "PUBLIC MARKET DATA")
+            except Exception:
+                # No stale or fabricated outcome on HTTP failure.
+                self.maintenance_error = "Official settlement result pending or inaccessible"
+
+    def update_maintenance(self, now):
+        if self.maintenance_job is not None and self.maintenance_job.done():
+            try:
+                self.maintenance_job.result()
+            except Exception:
+                self.maintenance_error = (
+                    "Settlement maintenance unavailable; retrying in background"
+                )
+            self.maintenance_job = None
+        if self.maintenance_job is None and (
+            self.settlement_check is None or (now - self.settlement_check).total_seconds() >= 60
+        ):
+            self.settlement_check = now
+            self.maintenance_job = self.maintenance_pool.submit(self.maintain_settlements, now)
+
+    def tick(self, collected=None):
+        tick_started = perf_counter()
+        phases = {}
         try:
-            payload = self.feed.poll()
+            if collected is None:
+                collection_started = utcnow()
+                payload = self.feed.poll()
+                collection_completed = utcnow()
+                collection_ms = (perf_counter() - tick_started) * 1000
+            else:
+                payload, collection_started, collection_completed, collection_ms = collected
+                if isinstance(payload, Exception):
+                    raise payload
+            phases["market_collection"] = round(collection_ms, 2)
+            calculation_started = perf_counter()
             now = timestamp(payload["clock"]) if "clock" in payload else utcnow()
             coverage = payload.setdefault("coverage", {})
             ref = payload.get("reference", {})
@@ -147,8 +206,16 @@ class Monitor:
                         "scalp_reason": result.reason,
                     }
             if info is not None and isinstance(self.feed, PublicFeed):
-                if self.readiness_at is None or (now - self.readiness_at).total_seconds() >= 60:
-                    self.readiness = self.journal.learning_readiness()
+                if self.readiness_job is not None and self.readiness_job.done():
+                    try:
+                        self.readiness = self.readiness_job.result()
+                    except Exception:
+                        self.readiness = {"reason": "Historical readiness calculation unavailable"}
+                    self.readiness_job = None
+                if self.readiness_job is None and (
+                    self.readiness_at is None or (now - self.readiness_at).total_seconds() >= 60
+                ):
+                    self.readiness_job = self.readiness_pool.submit(self.journal.learning_readiness)
                     self.readiness_at = now
                 info["learning_status"] = {
                     **self.readiness,
@@ -224,14 +291,29 @@ class Monitor:
                     frozen = raw_history if eligible else self.journal.opening_inputs(opened)
                     generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
                     candidate = opening_forecast(
-                        m, frozen, list(self.estimator.reference), generated
+                        m,
+                        frozen,
+                        list(self.estimator.reference),
+                        generated,
+                        reference_source=self.estimator.reference_source,
                     )
+                    if state["mode"] == "PUBLIC MARKET DATA":
+                        generated = utcnow()
+                        candidate["timestamp"] = candidate["generated_at"] = generated.isoformat()
+                        candidate["opening_delay_seconds"] = max(
+                            0, (generated - opened).total_seconds()
+                        )
+                        if candidate.get("up") is not None:
+                            candidate["status"] = "DELAYED" if generated > opened else "ON_TIME"
                     candidate["closes_at"] = m["closes_at"]
                     opening = self.journal.opening_record(
                         m["ticker"], state["mode"], candidate, generated
                     )
             state["prediction_engine"] = engine_view(
                 state, prior, opening, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+            )
+            phases["prediction_calculation"] = round(
+                (perf_counter() - calculation_started) * 1000, 2
             )
             key = (
                 (state["market"]["ticker"], state["scalp"])
@@ -252,41 +334,20 @@ class Monitor:
                     "timestamp": now.isoformat(),
                     "expires_at": expires.isoformat(),
                 }
+            private_started = perf_counter()
             self.update_account(now)
             self.update_manual(state, now)
+            phases["account_manual_scheduling"] = round(
+                (perf_counter() - private_started) * 1000, 2
+            )
+            journal_started = perf_counter()
             self.journal.record_feeds(payload.get("coverage", {}))
             self.journal.record_candles(payload.get("btc_candles", {}), now)
             state["trade_decision"] = trade_decision(state)
             self.journal.step(state)
+            phases["journal_write"] = round((perf_counter() - journal_started) * 1000, 2)
             if isinstance(self.feed, PublicFeed):
-                if (
-                    self.settlement_check is None
-                    or (now - self.settlement_check).total_seconds() >= 60
-                ):
-                    self.settlement_check = now
-                    with self.journal.connect() as db:
-                        tickers = db.execute(
-                            """SELECT ticker FROM predictions
-                            WHERE mode='PUBLIC MARKET DATA' AND (settlement_up IS NULL OR settlement_origin='legacy_unknown')
-                            AND julianday(json_extract(payload,'$.market.closes_at'))<=julianday(?)
-                            GROUP BY ticker ORDER BY COALESCE(MAX(outcome_last_attempt),'') ASC,MIN(timestamp) ASC LIMIT 3""",
-                            (now.isoformat(),),
-                        ).fetchall()
-                    with self.journal.connect() as db:
-                        for row in tickers:
-                            db.execute(
-                                "UPDATE predictions SET outcome_last_attempt=? WHERE ticker=?",
-                                (now.isoformat(), row[0]),
-                            )
-                    for row in tickers:
-                        if state["market"] and row[0] == state["market"]["ticker"]:
-                            continue
-                        try:
-                            self.journal.settle(
-                                row[0], self.feed.resolved(row[0]), "PUBLIC MARKET DATA"
-                            )
-                        except Exception:
-                            state["warnings"].append("Settlement result pending or inaccessible")
+                self.update_maintenance(now)
             else:
                 for ticker, result in payload.get("settlements", {}).items():
                     self.journal.settle(ticker, result, state["mode"])
@@ -321,8 +382,26 @@ class Monitor:
             state["connection_error"] = True
             state["checked_at"] = utcnow().isoformat()
         with self.lock:
+            self.state_version += 1
+            published_at = utcnow()
+            state["runtime"] = {
+                "state_version": self.state_version,
+                "collection_started_at": collection_started.isoformat()
+                if "collection_started" in locals()
+                else None,
+                "collection_completed_at": collection_completed.isoformat()
+                if "collection_completed" in locals()
+                else None,
+                "published_at": published_at.isoformat(),
+                "phases_ms": phases,
+                "processing_ms": round((perf_counter() - tick_started) * 1000, 2),
+                "settlement_job_running": bool(
+                    self.maintenance_job and not self.maintenance_job.done()
+                ),
+                "settlement_status": self.maintenance_error,
+            }
             self.state = state
-            self.last_tick = utcnow()
+            self.last_tick = published_at
 
     def authenticate_candidate(self):
         permissions = self.account_candidate.permissions()
@@ -500,7 +579,7 @@ class Monitor:
                     pass  # Old quotes naturally expire; never refresh failed data.
                 del self.manual_jobs[ticker]
         if isinstance(self.feed, PublicFeed):
-            for entry in self.manual.records()["entries"]:
+            for entry in self.manual.records(open_only=True)["entries"]:
                 ticker = entry["ticker"]
                 if (
                     entry["status"] == "OPEN"
@@ -528,83 +607,89 @@ class Monitor:
     def snapshot(self):
         with self.lock:
             state = dict(self.state)
-            market = state.get("market")
-            if market:
-                elapsed = utcnow() - self.last_tick
-                clock = (
-                    utcnow()
-                    if state.get("mode") == "PUBLIC MARKET DATA"
-                    else timestamp(state["now"]) + elapsed
-                )
-                age = (clock - timestamp(market["observed_at"])).total_seconds()
-                state["remaining_seconds"] = max(
-                    0, (timestamp(market["closes_at"]) - clock).total_seconds()
-                )
-                if not 0 <= age <= 5 or not state["remaining_seconds"]:
-                    state.update(
-                        stale=True,
-                        direction="UNCLEAR",
-                        scalp="WAIT",
-                        plans={},
-                        explanation="STALE_DATA: snapshot older than 5s or contract expired",
-                        scalp_explanation="STALE_DATA: snapshot older than 5s or contract expired",
-                        estimate=asdict(Display("WAIT", "Stale snapshot or expired contract")),
-                    )
-            state["manual_guidance"] = self.manual.guidance(self.manual_quotes, utcnow(), state)
-            state["manual_defaults"] = self.manual_defaults
-            state["account"] = self.account_view(state, utcnow())
-            if state.get("signal") and utcnow() > timestamp(state["signal"]["expires_at"]):
-                state.update(
-                    scalp="WAIT",
-                    signal=None,
-                    scalp_explanation="EXPIRED_SIGNAL: waiting for a fresh qualifying setup",
-                )
-            health_clock = (
+            last_tick = self.last_tick
+        market = state.get("market")
+        if market:
+            elapsed = utcnow() - last_tick
+            clock = (
                 utcnow()
                 if state.get("mode") == "PUBLIC MARKET DATA"
-                else timestamp(state["now"]) + (utcnow() - self.last_tick)
+                else timestamp(state["now"]) + elapsed
             )
-            state["market_health"] = diagnose_market(state, health_clock)
-            if not state["market_health"]["contract_quotes_fresh"]:
+            age = (clock - timestamp(market["observed_at"])).total_seconds()
+            state["remaining_seconds"] = max(
+                0, (timestamp(market["closes_at"]) - clock).total_seconds()
+            )
+            if not 0 <= age <= 5 or not state["remaining_seconds"]:
                 state.update(
                     stale=True,
                     direction="UNCLEAR",
                     scalp="WAIT",
                     plans={},
-                    estimate=asdict(Display("WAIT", "Stale or missing active-contract quotes")),
-                    explanation="STALE_DATA: "
-                    + "; ".join(state["market_health"]["contract_quote_reasons"]),
+                    explanation="STALE_DATA: snapshot older than 5s or contract expired",
+                    scalp_explanation="STALE_DATA: snapshot older than 5s or contract expired",
+                    estimate=asdict(Display("WAIT", "Stale snapshot or expired contract")),
                 )
-            if state.get("stale") and state.get("prediction_engine"):
-                state["prediction_engine"] = {
-                    **state["prediction_engine"],
-                    "status": "INSUFFICIENT DATA",
-                    "up": None,
-                    "down": None,
-                    "reason": "Fresh unexpired contract/reference data required",
-                }
-            state["trade_decision"] = trade_decision(state)
-            state["connection_diagnostics"] = {
-                "credentials": credential_status(),
-                "account_enabled": self.account_client is not None,
-                "account_requested": self.account_requested,
-                "account_status": state["account"]["status"],
-                "account_reason": state["account"].get("reason"),
-                "permissions": state["account"].get("permissions") or self.startup_diagnostics,
-                "market_stale": state.get("stale", True),
-                "market_reason": state.get("explanation"),
-                "market_health": state["market_health"],
-                "last_poll_completed_at": self.last_tick.isoformat(),
-                "fill_reconciliation": state["account"].get("fill_reconciliation", {}),
-                "open_positions": sum(
-                    h.get("status") == "OPEN" for h in state["account"].get("holdings", [])
-                ),
-                "balance_available": state["account"].get("available_balance_dollars") is not None,
-                "reference_received_at": state.get("reference", {}).get("observed_at"),
-                "quote_received_at": (state.get("market") or {}).get("observed_at"),
-                "public_requests": list(getattr(self.feed, "transport_diagnostics", [])),
+        state["manual_guidance"] = self.manual.guidance(self.manual_quotes, utcnow(), state)
+        state["manual_defaults"] = self.manual_defaults
+        state["account"] = self.account_view(state, utcnow())
+        if state.get("signal") and utcnow() > timestamp(state["signal"]["expires_at"]):
+            state.update(
+                scalp="WAIT",
+                signal=None,
+                scalp_explanation="EXPIRED_SIGNAL: waiting for a fresh qualifying setup",
+            )
+        health_clock = (
+            utcnow()
+            if state.get("mode") == "PUBLIC MARKET DATA"
+            else timestamp(state["now"]) + (utcnow() - last_tick)
+        )
+        state["market_health"] = diagnose_market(state, health_clock)
+        if not state["market_health"]["contract_quotes_fresh"]:
+            state.update(
+                stale=True,
+                direction="UNCLEAR",
+                scalp="WAIT",
+                plans={},
+                estimate=asdict(Display("WAIT", "Stale or missing active-contract quotes")),
+                explanation="STALE_DATA: "
+                + "; ".join(state["market_health"]["contract_quote_reasons"]),
+            )
+        if state.get("stale") and state.get("prediction_engine"):
+            state["prediction_engine"] = {
+                **state["prediction_engine"],
+                "status": "INSUFFICIENT DATA",
+                "up": None,
+                "down": None,
+                "reason": "Fresh unexpired contract/reference data required",
             }
-            return state
+        state["trade_decision"] = trade_decision(state)
+        state["connection_diagnostics"] = {
+            "credentials": credential_status(),
+            "account_enabled": self.account_client is not None,
+            "account_requested": self.account_requested,
+            "account_status": state["account"]["status"],
+            "account_reason": state["account"].get("reason"),
+            "permissions": state["account"].get("permissions") or self.startup_diagnostics,
+            "market_stale": state.get("stale", True),
+            "market_reason": state.get("explanation"),
+            "market_health": state["market_health"],
+            "last_poll_completed_at": last_tick.isoformat(),
+            "fill_reconciliation": state["account"].get("fill_reconciliation", {}),
+            "open_positions": sum(
+                h.get("status") == "OPEN" for h in state["account"].get("holdings", [])
+            ),
+            "balance_available": state["account"].get("available_balance_dollars") is not None,
+            "reference_received_at": state.get("reference", {}).get("observed_at"),
+            "quote_received_at": (state.get("market") or {}).get("observed_at"),
+            "public_requests": list(getattr(self.feed, "transport_diagnostics", [])),
+        }
+        state["runtime"] = {
+            **state.get("runtime", {}),
+            "response_generated_at": utcnow().isoformat(),
+            "state_age_seconds": max(0, (utcnow() - last_tick).total_seconds()),
+        }
+        return state
 
 
 def make_handler(monitor):
@@ -619,19 +704,74 @@ def make_handler(monitor):
                 pass  # Client closed a tab/request; not a failed market/account sync.
 
         def do_GET(self):
-            route = self.path.split("?", 1)[0]
+            request_started = perf_counter()
+            parts = urlsplit(self.path)
+            route = parts.path
+            query = parse_qs(parts.query)
             if route == "/":
                 body = Path(__file__).with_name("dashboard.html").read_bytes()
                 content_type = "text/html; charset=utf-8"
-            elif route in {"/api/state", "/api/history"}:
-                value = monitor.snapshot() if route == "/api/state" else monitor.journal.history()
-                if route == "/api/history":
-                    value["manual_records"] = monitor.manual.records()
+            elif route in {"/api/state", "/api/details"}:
+                value = monitor.snapshot()
+                if route == "/api/state" and query.get("view") == ["main"]:
+                    # Large raw venue books/trade histories are already journaled;
+                    # retrieve them only while Details is open.
+                    value["model"] = {
+                        k: v
+                        for k, v in value.get("model", {}).items()
+                        if k not in {"coverage", "scanner", "candidate_features"}
+                    }
+                    value.pop("coverage", None)
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route in {"/api/history-page", "/api/account-history"}:
+                if route == "/api/account-history" and monitor.account_client is None:
+                    self.send_error(
+                        403, "Authenticated read-only account monitoring is not enabled"
+                    )
+                    return
+                try:
+                    before = int(query.get("before_id", ["0"])[0])
+                    limit = int(query.get("limit", ["20"])[0])
+                    if before < 0 or not 1 <= limit <= 100:
+                        raise ValueError("Invalid page")
+                except (ValueError, TypeError):
+                    self.send_error(400, "Use nonnegative before_id and limit 1..100")
+                    return
+                value = (
+                    monitor.journal.history_page(before_id=before, limit=limit)
+                    if route == "/api/history-page"
+                    else monitor.account_journal.completed_history(
+                        before=before or None, limit=limit
+                    )
+                )
+                if route == "/api/history-page":
+                    value["manual_records"] = monitor.manual.records(
+                        limit=limit, before_id=before or None
+                    )
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route in {"/api/history", "/api/research"}:
+                report = monitor.research_report.get()
+                value = {
+                    "status": report["status"],
+                    "performance": report["value"],
+                    "generated_at": report["generated_at"],
+                    "calculation_ms": report["calculation_ms"],
+                    "refresh_in_progress": report["refresh_in_progress"],
+                    "notice": "Research is calculated in the background. Use /api/history-page for bounded records.",
+                }
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/api/prediction-performance":
-                with monitor.journal.read() as db:
-                    value = engine_performance(db, utcnow())
+                report = monitor.engine_report.get()
+                value = {
+                    **(report["value"] or {"by_mode": {}, "archive": []}),
+                    "report_status": report["status"],
+                    "report_generated_at": report["generated_at"],
+                    "calculation_ms": report["calculation_ms"],
+                    "refresh_in_progress": report["refresh_in_progress"],
+                }
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/health":
@@ -643,6 +783,10 @@ def make_handler(monitor):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Server-Timing",
+                "dashboard;dur=" + str(round((perf_counter() - request_started) * 1000, 2)),
+            )
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header(
                 "Content-Security-Policy",
@@ -826,12 +970,39 @@ def main():
 
     signal.signal(signal.SIGTERM, terminate)
 
-    def poll():
+    mailbox = LatestPayload()
+
+    def collect():
+        # Public IO has its own thread; prediction/research/account work never
+        # delays a network refresh. No unbounded queue of obsolete frames.
         while not stop.is_set():
-            monitor.tick()
-            stop.wait(args.poll_seconds)
+            started = utcnow()
+            timer = perf_counter()
+            try:
+                payload = feed.poll()
+            except Exception as exc:
+                payload = exc
+            elapsed = perf_counter() - timer
+            mailbox.put((payload, started, utcnow(), elapsed * 1000))
+            stop.wait(max(0, args.poll_seconds - elapsed))
+
+    def poll():
+        sequence = 0
+        while not stop.is_set():
+            if isinstance(feed, PublicFeed):
+                sequence, collected = mailbox.get(sequence)
+                if collected is not None:
+                    monitor.tick(collected)
+            else:
+                monitor.tick()
+                stop.wait(args.poll_seconds)
 
     server.RequestHandlerClass = make_handler(monitor)
+    collector = (
+        threading.Thread(target=collect, daemon=True) if isinstance(feed, PublicFeed) else None
+    )
+    if collector:
+        collector.start()
     thread = threading.Thread(target=poll, daemon=True)
     thread.start()
     print(
@@ -846,8 +1017,14 @@ def main():
         stop.set()
         server.server_close()
         thread.join(timeout=35)
+        if collector:
+            collector.join(timeout=10)
         monitor.manual_pool.shutdown(wait=False, cancel_futures=True)
         monitor.account_pool.shutdown(wait=False, cancel_futures=True)
+        monitor.maintenance_pool.shutdown(wait=False, cancel_futures=True)
+        monitor.readiness_pool.shutdown(wait=False, cancel_futures=True)
+        monitor.engine_report.close()
+        monitor.research_report.close()
         if isinstance(feed, PublicFeed):
             if feed.hub:
                 feed.hub.close()

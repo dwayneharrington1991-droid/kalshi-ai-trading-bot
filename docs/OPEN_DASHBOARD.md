@@ -1,8 +1,9 @@
 # Open your dashboard on your laptop
 
-The dashboard helps you decide what to watch. It cannot place a trade. Kalshi is
-not connected yet. We will configure the optional read-only connection separately;
-never paste a key into chat or the webpage.
+The dashboard helps you decide what to watch. It cannot place a trade. The safe
+launcher uses your existing server-side monitoring secrets, if configured, and
+requires verified read-only permissions before connecting. Never paste a key into
+chat or the webpage.
 
 ## 1. Open your existing Codespace
 
@@ -20,16 +21,15 @@ never paste a key into chat or the webpage.
 3. If another terminal is running the old dashboard, click that terminal and press
    **Ctrl+C** once. This stops the dashboard, not your Codespace or saved journal.
 4. In the new terminal, paste the following block and press **Enter**. It updates
-   the code and starts public market-data monitoring. It does not connect Kalshi.
+   the code and starts the private dashboard, preserving your journals. Existing
+   monitoring secrets enable authenticated GET requests only after permission checks.
 
 ```bash
 cd /workspaces/kalshi-ai-trading-bot &&
 git fetch origin &&
 git switch codex/kxbtc15m-signals-display &&
 git pull --ff-only origin codex/kxbtc15m-signals-display &&
-python3 -m venv .venv &&
-.venv/bin/python3 -m pip install httpx==0.27.0 websockets==16.1.1 &&
-.venv/bin/python3 -m src.signals_display.server --mode public --host 0.0.0.0 --port 8765 --journal signals_monitor.db --target 0.05 --stop 0.10 --horizon 60 --manual-delay 3 --slippage 0.01
+python3 scripts/start_dashboard.py --restart --private-dashboard
 ```
 
 The standard GitHub Codespace checkout is `/workspaces/kalshi-ai-trading-bot`.
@@ -67,11 +67,22 @@ forwarded address. This chat environment cannot provide its own external preview
   support a trade plan. It does not mean a zero-dollar price or zero risk.
 - **Why** explains the recommendation in one sentence.
 - **LIVE / WARMING UP / STALE** explains data readiness. LIVE does not mean profitable.
-- **Settlement outlook** is an experimental forecast, separate from a buy signal.
+- **OPENING PREDICTION**, at the top, is frozen for this particular contract. Its
+  direction, probabilities, target, generation time and data cutoff remain fixed.
+  A cold start without pre-opening inputs says **OPENING PREDICTION UNAVAILABLE**;
+  the bot never backfills it using later prices. Leave the dashboard running to
+  prepare inputs before the next contract opens.
+- **LIVE PREDICTION**, immediately below, changes with fresh data. It never
+  replaces the opening prediction. Both are experimental forecasts, separate
+  from a buy signal. The predicted price is a model-dependent estimate of the
+  settlement reference average, not a guaranteed future BTC exchange price.
 - **MY LIVE TRADES** will show actual positions and estimated exit P&L after costs
   once the optional read-only account connection is securely configured. Before
   then, it says the account is not connected. Prices and fees may be unavailable.
 - **Details** expands the advanced analysis and experimental model estimates.
+  History loads only when you click **Load recent history**, with 20 records per
+  page. Full research metrics are an optional background calculation. They do not
+  hold up the main forecast cards.
 
 Any future entry would be a price cap, not a guaranteed fill. Stops and exit alerts
 cannot guarantee a maximum loss. You place every trade and exit manually.

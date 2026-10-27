@@ -5,6 +5,10 @@ launcher uses your existing server-side monitoring secrets, if configured, and
 requires verified read-only permissions before connecting. Never paste a key into
 chat or the webpage.
 
+The current streaming, model-comparison, alert and validation guide is
+[BTC market engine](BTC_MARKET_ENGINE.md). Measurements and their offline/live
+limitations are in [market-engine benchmarks](MARKET_ENGINE_BENCHMARKS.md).
+
 ## 1. Open your existing Codespace
 
 1. On your laptop, open your web browser and go to https://github.com/codespaces.

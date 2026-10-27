@@ -4,6 +4,10 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import threading
 from time import monotonic, perf_counter
+from time import process_time
+import logging
+import json
+import resource
 
 
 class CachedReport:
@@ -77,3 +81,47 @@ class LatestPayload:
         with self.condition:
             self.condition.wait_for(lambda: self.sequence > after, timeout)
             return self.sequence, self.item if self.sequence > after else None
+
+
+class RuntimeMeter:
+    def __init__(self):
+        self.wall = monotonic()
+        self.cpu = process_time()
+        self.logged = {}
+
+    def sample(self):
+        wall, cpu = monotonic(), process_time()
+        elapsed = wall - self.wall
+        result = {
+            "process_cpu_percent_one_core": round(100 * (cpu - self.cpu) / elapsed, 2)
+            if elapsed > 0
+            else None,
+            "peak_resident_mib": round(
+                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 2
+            ),
+            "memory_note": "Linux process high-water RSS, not current usage; CPU is process time / monotonic elapsed time",
+        }
+        self.wall, self.cpu = wall, cpu
+        return result
+
+    def error(self, component, error_type):
+        # Callers pass exception TYPE only; never exception messages, account
+        # payloads, authentication headers, file contents or arbitrary URLs.
+        if component not in {"public_rest", "account_sync", "settlement", "prediction"}:
+            return
+        if not isinstance(error_type, str) or not error_type.isidentifier():
+            error_type = "RedactedError"
+        key, now = (component, error_type), monotonic()
+        if now - self.logged.get(key, -1e9) < 30:
+            return
+        self.logged[key] = now
+        logging.getLogger("signals_display").warning(
+            json.dumps(
+                {
+                    "event": "read_only_monitor_error",
+                    "component": component,
+                    "error_type": error_type,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        )

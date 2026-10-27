@@ -11,7 +11,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
-from time import perf_counter
+from time import perf_counter, monotonic
 from urllib.parse import urlencode, quote
 
 import httpx
@@ -48,11 +48,18 @@ class PublicFeed:
         )
         self.candle_job = None
         self.candle_started = None
+        self.kalshi_stream = None
+        self.streams = None
+        self.http_backoff = {}
         self.hub = (
             FeedHub(self._read, self._read_text)
             if (get is None if multi_venue is None else multi_venue)
             else None
         )
+        if get is None:
+            from .streaming import StreamHub
+
+            self.streams = StreamHub(order_flow=self.hub.order_flow if self.hub else None)
         if self.candle_pool is not None:
             self.sampled_candles(utcnow())
 
@@ -63,6 +70,10 @@ class PublicFeed:
             "exchange_event_latency": "unknown; receipt timestamps only",
         }
         try:
+            retry = self.http_backoff.get(diagnostic["endpoint"], {})
+            if monotonic() < retry.get("until", 0):
+                diagnostic["retry_after_seconds"] = round(retry["until"] - monotonic(), 2)
+                raise ValueError("PUBLIC_HTTP_BACKOFF: waiting for provider retry interval")
             response = self.get(
                 url,
                 timeout=4,
@@ -70,6 +81,18 @@ class PublicFeed:
                 headers={"Accept": "application/json", "Cache-Control": "no-cache"},
             )
             diagnostic["http_status"] = response.status_code
+            if response.status_code == 429 or response.status_code >= 500:
+                attempts = retry.get("attempts", 0) + 1
+                delay = min(60, 2 ** min(attempts, 6))
+                try:
+                    delay = max(delay, min(120, float(response.headers.get("Retry-After", "0"))))
+                except ValueError:
+                    pass
+                self.http_backoff[diagnostic["endpoint"]] = {
+                    "until": monotonic() + delay,
+                    "attempts": attempts,
+                }
+                diagnostic["retry_after_seconds"] = delay
             from email.utils import parsedate_to_datetime
 
             try:
@@ -97,10 +120,20 @@ class PublicFeed:
             response.raise_for_status()
             value = response.json()
             diagnostic["status"] = "OK"
+            self.http_backoff.pop(diagnostic["endpoint"], None)
             return value
         except Exception as exc:
             diagnostic["status"] = "FAILED"
             diagnostic["error_type"] = type(exc).__name__
+            if isinstance(exc, httpx.TransportError):
+                previous = self.http_backoff.get(diagnostic["endpoint"], {})
+                attempts = previous.get("attempts", 0) + 1
+                delay = min(60, 2 ** min(attempts, 6))
+                self.http_backoff[diagnostic["endpoint"]] = {
+                    "until": monotonic() + delay,
+                    "attempts": attempts,
+                }
+                diagnostic["retry_after_seconds"] = delay
             raise
         finally:
             diagnostic.update(
@@ -194,14 +227,23 @@ class PublicFeed:
         self.candles_checked = now
         cutoff = int(now.timestamp()) // 60 * 60
         try:
-            merged = {}
-            for chunk in range(5):
-                start = cutoff - 86400 + chunk * 288 * 60 - 60
-                end = (
-                    min(int(utcnow().timestamp()), cutoff - 86400 + (chunk + 1) * 288 * 60 + 60)
-                    if chunk < 4
-                    else int(utcnow().timestamp())
-                )
+            merged = {
+                int(b["start"]): b
+                for b in (self.candle_cache or {}).get("candles", [])
+                if cutoff - 86400 <= int(b["start"]) and int(b["start"]) + 60 <= cutoff
+            }
+            missing = [t for t in range(cutoff - 86400, cutoff, 60) if t not in merged]
+            ranges = []
+            for stamp in missing:
+                if ranges and stamp == ranges[-1][1] and ranges[-1][1] - ranges[-1][0] < 288 * 60:
+                    ranges[-1][1] += 60
+                else:
+                    ranges.append([stamp, stamp + 60])
+            if not ranges:
+                return self.candle_cache or {}
+            for left, right in ranges[:5]:
+                start = left - 60
+                end = min(int(utcnow().timestamp()), right + 60)
                 url = (
                     "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles?"
                     + urlencode(
@@ -210,6 +252,8 @@ class PublicFeed:
                 )
                 for bar in self._read(url)["candles"]:
                     stamp = int(bar["start"])
+                    if not cutoff - 86400 <= stamp or stamp + 60 > cutoff:
+                        continue
                     if stamp in merged and any(
                         float(bar[k]) != float(merged[stamp][k])
                         for k in ("open", "high", "low", "close", "volume")
@@ -221,6 +265,12 @@ class PublicFeed:
                 "candles": [merged[t] for t in sorted(merged) if t + 60 <= received.timestamp()],
                 "source": "Coinbase BTC-USD public 24h one-minute candles (proxy)",
                 "received_at": received.isoformat(),
+                "refresh": {
+                    "method": "Initial 24h preload, then missing closed minutes only",
+                    "requests": min(5, len(ranges)),
+                    "retained_bars": len(merged),
+                    "maximum_requests_per_refresh": 5,
+                },
             }
         except (httpx.HTTPError, KeyError, TypeError, ValueError):
             return {
@@ -233,6 +283,58 @@ class PublicFeed:
         data = self._read(KALSHI + "/markets/" + quote(ticker, safe=""))
         market = data.get("market", {})
         return market.get("result") if market.get("status") in {"settled", "finalized"} else None
+
+    def enriched(self, payload, now):
+        """Combine current streaming observations with unchanged REST metadata.
+
+        Receipts retain their original times. An event never advances an older
+        quote/reference timestamp or turns a metadata response into a fresh book.
+        """
+        result = {**payload, "coverage": dict(payload.get("coverage", {}))}
+        result["markets"] = [dict(m) for m in payload.get("markets", [])]
+        result["stream_observations"] = []
+        diagnostics = {"processing_target_ms": 500, "actual_exchange_cadence": "Provider-dependent"}
+        diagnostics["rest"] = {
+            "status": "FAILED" if payload.get("rest_poll_failed") else "CONNECTED",
+            "error_type": payload.get("rest_error_type"),
+            "note": "REST fallback never advances a cached quote timestamp",
+        }
+        if self.streams is not None:
+            streamed = self.streams.snapshot(now)
+            diagnostics["public"] = streamed.get("diagnostics", {})
+            result["coverage"].update(streamed.get("feeds", {}))
+            candidate = streamed.get("reference") or {}
+            try:
+                if (
+                    candidate.get("price") is not None
+                    and 0 <= (now - timestamp(candidate["observed_at"])).total_seconds() <= 5
+                ):
+                    result["reference"] = candidate
+            except (KeyError, ValueError, TypeError, AttributeError):
+                pass
+            result["stream_observations"] = self.streams.drain_observations()
+        for market in result["markets"]:
+            if self.kalshi_stream is None:
+                continue
+            book = self.kalshi_stream.snapshot(market["ticker"], now)
+            if book.get("status") == "LIVE" and book.get("quotes"):
+                market.update(
+                    quotes=book["quotes"],
+                    observed_at=book["observed_at"],
+                    quote_event_time=book.get("event_time"),
+                    quote_source="Kalshi authenticated read-only WebSocket order book",
+                    book_diagnostic=None,
+                )
+            diagnostics.setdefault("kalshi", {})[market["ticker"]] = {
+                k: v for k, v in book.items() if k not in {"quotes", "levels"}
+            }
+        if self.kalshi_stream is None:
+            diagnostics["kalshi"] = {
+                "status": "REST_FALLBACK",
+                "reason": "Kalshi book streaming requires a verified read-only connection; public book REST remains available, normally once per second",
+            }
+        result["streaming"] = diagnostics
+        return result
 
     def poll(self):
         markets, cursor, seen = [], None, set()
@@ -335,7 +437,19 @@ class PublicFeed:
                 )
             )
         selected = active_market({"markets": result}, now)
-        if selected and selected["mapping_verified"]:
+        streaming_book = None
+        if selected and self.kalshi_stream is not None:
+            candidate = self.kalshi_stream.snapshot(selected["ticker"], now)
+            if candidate.get("status") == "LIVE" and candidate.get("quotes"):
+                streaming_book = candidate
+                selected.update(
+                    quotes=candidate["quotes"],
+                    observed_at=candidate["observed_at"],
+                    quote_event_time=candidate.get("event_time"),
+                    book_diagnostic=None,
+                    quote_source="Kalshi authenticated read-only WebSocket order book",
+                )
+        if selected and selected["mapping_verified"] and streaming_book is None:
             selected[
                 "book_diagnostic"
             ] = "MISSING_DEPTH: public orderbook has an empty side or unsupported schema"
@@ -393,18 +507,22 @@ class PublicFeed:
         warnings = [
             "Coinbase is a proxy, not the official settlement index. Model estimates are UNVALIDATED."
         ]
-        try:
-            spot = self._read(COINBASE)["data"]
-            if spot.get("currency") != "USD" or spot.get("base") != "BTC":
-                raise ValueError("unexpected reference currency")
-            reference.update(
-                price=number(float(spot["amount"]), 0.000001, 1e12),
-                observed_at=utcnow().isoformat(),
-            )
-        except (httpx.HTTPError, KeyError, ValueError, TypeError):
-            warnings.append(
-                "Public reference proxy unavailable; official settlement feed not connected."
-            )
+        streamed = self.streams.snapshot(utcnow()).get("reference") if self.streams else None
+        if streamed:
+            reference = streamed
+        else:
+            try:
+                spot = self._read(COINBASE)["data"]
+                if spot.get("currency") != "USD" or spot.get("base") != "BTC":
+                    raise ValueError("unexpected reference currency")
+                reference.update(
+                    price=number(float(spot["amount"]), 0.000001, 1e12),
+                    observed_at=utcnow().isoformat(),
+                )
+            except (httpx.HTTPError, KeyError, ValueError, TypeError):
+                warnings.append(
+                    "Public reference proxy unavailable; official settlement feed not connected."
+                )
         return {
             "markets": result,
             "reference": reference,
@@ -849,6 +967,30 @@ class Journal:
                 # Raw books/trade flow are stored once in feed_observations.
                 # Existing historical payloads are never rewritten or removed.
                 persisted = {**state, "model": {**state["model"], "coverage": summaries}}
+            intelligence = state.get("model", {}).get("market_intelligence")
+            if intelligence:
+                compact_sources = {}
+                for source, source_state in intelligence.get("sources", {}).items():
+                    compact_sources[source] = {
+                        **{k: v for k, v in source_state.items() if k != "windows"},
+                        "window_quality": {
+                            name: {k: v for k, v in details.items() if k != "features"}
+                            for name, details in source_state.get("windows", {}).items()
+                        },
+                    }
+                compact = {
+                    k: v
+                    for k, v in intelligence.items()
+                    if k not in {"sources", "candidate_features", "feature_availability"}
+                }
+                compact.update(
+                    sources=compact_sources,
+                    feature_values_location="model.candidate_features.values; captured before outcome",
+                )
+                persisted = {
+                    **persisted,
+                    "model": {**persisted["model"], "market_intelligence": compact},
+                }
             db.execute(
                 """INSERT OR IGNORE INTO predictions
                 (mode,ticker,timestamp,direction,scalp,probability_up,probability_down,payload)
@@ -1036,14 +1178,13 @@ class Journal:
     def learning_readiness(self):
         with self.read() as db:
             count = db.execute(
-                """SELECT COUNT(DISTINCT ticker) FROM predictions WHERE settlement_origin='official'
-                AND json_extract(payload,'$.model.candidate_features.values.return_1m') IS NOT NULL
-                AND json_extract(payload,'$.model.candidate_features.values.distance_scaled') IS NOT NULL"""
+                "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
             ).fetchone()[0]
         return {
-            "official_featured_contracts": count,
+            "official_contracts": count,
+            "official_featured_contracts": None,
             "minimum_contracts": 170,
-            "reason": f"{count}/170 officially labeled contracts with recorded independent features. Train/validation/test are grouped and purged; minimum is not a guarantee of skill.",
+            "reason": f"{count}/170 official outcomes before further feature/chronological eligibility checks. Feature eligibility is checked offline, not by rescanning the full journal each minute. Minimum count is not evidence of skill.",
         }
 
     def opening_inputs(self, opened):
@@ -1075,9 +1216,21 @@ class Journal:
     def recent_states(self):
         with self.read() as db:
             rows = db.execute(
-                "SELECT payload FROM predictions WHERE mode='PUBLIC MARKET DATA' ORDER BY id DESC LIMIT 600"
+                "SELECT timestamp,json_extract(payload,'$.reference'),json_extract(payload,'$.market'),"
+                "json_extract(payload,'$.model.version'),json_extract(payload,'$.estimate') "
+                "FROM predictions WHERE mode='PUBLIC MARKET DATA' ORDER BY id DESC LIMIT 600"
             ).fetchall()
-        return [json.loads(row[0]) for row in reversed(rows)]
+        return [
+            dict(
+                mode="PUBLIC MARKET DATA",
+                now=row[0],
+                reference=json.loads(row[1]) if row[1] else {},
+                market=json.loads(row[2]) if row[2] else None,
+                model={"version": row[3]},
+                estimate=json.loads(row[4]) if row[4] else {},
+            )
+            for row in reversed(rows)
+        ]
 
     def performance(self):
         with self.read() as db:

@@ -38,6 +38,32 @@ FEATURES = (
     "vwap_deviation",
     "bollinger_z",
     "volatility_24h",
+) + tuple(
+    "micro_" + window + "_" + feature
+    for window in (
+        "500ms",
+        "1s",
+        "5s",
+        "15s",
+        "30s",
+        "1m",
+        "3m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "4h",
+        "24h",
+    )
+    for feature in (
+        "return_fraction",
+        "velocity_dollars_per_second",
+        "acceleration_dollars_per_second_squared",
+        "realized_volatility_per_sqrt_second",
+        "trade_flow_imbalance",
+        "depth_imbalance",
+        "liquidity_withdrawal_fraction",
+    )
 )
 
 
@@ -53,6 +79,9 @@ def fresh(feed, now, limit):
 
 def extract(payload, market, now):
     values = {name: None for name in FEATURES}
+    for name, value in payload.get("market_intelligence", {}).get("candidate_features", {}).items():
+        if name in values and value is not None:
+            values[name] = value
     diagnostics = []
     bars = []
     try:

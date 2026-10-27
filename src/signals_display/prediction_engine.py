@@ -4,7 +4,7 @@ import json
 import math
 from statistics import mean, pstdev, median
 from .model import timestamp, number
-from .scores import score
+from .scores import score, horizon, wilson_interval
 
 VERSION = "btc24h-final-average-v1"
 
@@ -265,6 +265,11 @@ def create(db):
         "CREATE INDEX IF NOT EXISTS btc_engine_contracts_close ON btc_engine_contracts(closes_at DESC,mode,ticker)"
     )
     db.execute(
+        """CREATE TABLE IF NOT EXISTS btc_engine_horizons (
+        mode TEXT,ticker TEXT,horizon TEXT,timestamp TEXT,recorded_at TEXT,closes_at TEXT,
+        up REAL,regime TEXT,version TEXT,payload TEXT,PRIMARY KEY(mode,ticker,horizon))"""
+    )
+    db.execute(
         """
         CREATE TRIGGER IF NOT EXISTS btc_engine_revision_summary AFTER INSERT ON btc_engine_predictions
         BEGIN
@@ -319,6 +324,73 @@ def prior(db, ticker, mode):
     }
 
 
+def probability_history(db, ticker, mode="PUBLIC MARKET DATA", limit=180, now=None):
+    """Bounded chronological chart points, not thousands of raw revision payloads."""
+    from datetime import datetime, timezone
+
+    if not isinstance(ticker, str) or not ticker.startswith("KXBTC15M-") or len(ticker) > 120:
+        raise ValueError("A KXBTC15M contract ticker is required")
+    if mode not in ("PUBLIC MARKET DATA", "REPLAY / SIMULATED"):
+        raise ValueError("Unsupported forecast mode")
+    if type(limit) is not int or not 1 <= limit <= 180:
+        raise ValueError("Chart limit must be 1..180")
+    now = now or datetime.now(timezone.utc)
+    bins = max(1, limit - 1)
+    rows = db.execute(
+        """WITH valid AS (
+          SELECT timestamp FROM btc_engine_predictions
+          WHERE mode=? AND ticker=? AND up BETWEEN 0 AND 1
+            AND julianday(timestamp)<julianday(closes_at)
+            AND julianday(timestamp)<=julianday(?)
+            AND (mode!='PUBLIC MARKET DATA' OR
+              (julianday(timestamp)<=julianday(recorded_at)
+               AND julianday(recorded_at)<julianday(closes_at)
+               AND julianday(recorded_at)<=julianday(?)))
+        ), bounds AS (
+          SELECT MIN(julianday(timestamp)) lo,MAX(julianday(timestamp)) hi FROM valid
+        ), sampled AS (
+          SELECT MAX(timestamp) timestamp FROM valid,bounds
+          GROUP BY CASE WHEN hi=lo THEN 0 ELSE
+            MIN(?,CAST((julianday(timestamp)-lo)/(hi-lo)*? AS INTEGER)) END
+        ), chosen AS (
+          SELECT timestamp FROM sampled UNION SELECT MIN(timestamp) FROM valid
+        )
+        SELECT timestamp,recorded_at,up,payload FROM btc_engine_predictions
+        WHERE mode=? AND ticker=? AND timestamp IN (SELECT timestamp FROM chosen)
+        ORDER BY timestamp DESC LIMIT ?""",
+        (mode, ticker, now.isoformat(), now.isoformat(), bins - 1, bins, mode, ticker, limit),
+    ).fetchall()
+    points = []
+    for row in reversed(rows):
+        payload = json.loads(row["payload"])
+        if payload.get("data_cutoff") and timestamp(payload["data_cutoff"]) > timestamp(
+            row["timestamp"]
+        ):
+            continue
+        points.append(
+            {
+                "timestamp": row["timestamp"],
+                "recorded_at": row["recorded_at"],
+                "up": row["up"],
+                "down": 1 - row["up"],
+                "kind": payload.get("kind", "live"),
+                "data_cutoff": payload.get("data_cutoff"),
+            }
+        )
+    initial = get_opening(db, ticker, mode)
+    if initial and timestamp(initial["generated_at"]) > now:
+        initial = None
+    return {
+        "ticker": ticker,
+        "mode": mode,
+        "points": points,
+        "initial": initial,
+        "limit": limit,
+        "sampling": "Last observed forecast in each equal-time bucket plus the first observation. No interpolation; missing periods remain missing.",
+        "latest_at": points[-1]["timestamp"] if points else None,
+    }
+
+
 def record(db, state, wall_now):
     engine = state.get("prediction_engine", {})
     if engine.get("status") != "EXPERIMENTAL" or state.get("stale"):
@@ -331,6 +403,7 @@ def record(db, state, wall_now):
     try:
         if timestamp(engine["data_cutoff"]) > now:
             return
+        number(engine["up"], 0, 1)
     except (KeyError, ValueError, TypeError, AttributeError):
         return
     if db.execute(
@@ -345,6 +418,25 @@ def record(db, state, wall_now):
         "threshold": engine["threshold"],
         "baseline_up": state.get("model", {}).get("baseline_probability_up"),
         "market_implied_up": state.get("market_comparison", {}).get("market_implied_up"),
+        "opens_at": engine.get("opens_at"),
+        "remaining_seconds": (close - now).total_seconds(),
+        "horizon": horizon((close - now).total_seconds()),
+        "data_quality": engine.get("data_quality", {}),
+        "confidence": engine.get("confidence", {}),
+        "volatility_regime": state.get("model", {})
+        .get("analysis_24h", {})
+        .get("regime", "unavailable"),
+        "volatility_ratio": state.get("model", {}).get("analysis_24h", {}).get("volatility_ratio"),
+        "volatility_dollars_per_sqrt_second": state.get("model", {})
+        .get("analysis_24h", {})
+        .get("sigma_dollars_per_sqrt_second"),
+        "reference_source": state.get("reference", {}).get("source"),
+        "reference_received_at": state.get("reference", {}).get("observed_at"),
+        "reference_event_at": state.get("reference", {}).get(
+            "event_time", state.get("reference", {}).get("event_at")
+        ),
+        "quote_received_at": (state.get("market") or {}).get("observed_at"),
+        "quote_event_at": (state.get("market") or {}).get("event_time"),
     }
     db.execute(
         "INSERT OR IGNORE INTO btc_engine_predictions VALUES (?,?,?,?,?,?,?,?,?)",
@@ -352,6 +444,31 @@ def record(db, state, wall_now):
             mode,
             engine["ticker"],
             engine.get("updated_at", state["now"]),
+            wall_now.isoformat(),
+            engine["closes_at"],
+            engine["up"],
+            engine["regime"],
+            engine["version"],
+            json.dumps(payload),
+        ),
+    )
+    _record_horizon(db, mode, engine, wall_now, payload)
+
+
+def _record_horizon(db, mode, engine, wall_now, payload):
+    """Four bounded summary rows per contract, without rereading revision blobs."""
+    db.execute(
+        """INSERT INTO btc_engine_horizons VALUES (?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(mode,ticker,horizon) DO UPDATE SET
+          timestamp=excluded.timestamp,recorded_at=excluded.recorded_at,
+          closes_at=excluded.closes_at,up=excluded.up,regime=excluded.regime,
+          version=excluded.version,payload=excluded.payload
+        WHERE julianday(excluded.timestamp)>julianday(btc_engine_horizons.timestamp)""",
+        (
+            mode,
+            engine["ticker"],
+            payload["horizon"],
+            engine["updated_at"],
             wall_now.isoformat(),
             engine["closes_at"],
             engine["up"],
@@ -369,13 +486,25 @@ def performance(db, now):
     # unnecessary O(all-revisions) Python allocation on each dashboard refresh.
     for row in db.execute(
         """SELECT p.*,o.outcome,o.observed_at,b.payload opening_payload,
-            ip.payload initial_score_payload
+            ip.payload initial_score_payload,
+            (SELECT json_group_array(json_object(
+                'horizon',h.horizon,'timestamp',h.timestamp,'up',h.up,
+                'regime',h.regime,'version',h.version,'payload',json(h.payload)))
+             FROM btc_engine_horizons h WHERE h.mode=c.mode AND h.ticker=c.ticker
+               AND h.up BETWEEN 0 AND 1
+               AND julianday(h.timestamp)<julianday(h.closes_at)
+               AND julianday(h.closes_at)<=julianday(o.observed_at)
+               AND (h.mode!='PUBLIC MARKET DATA' OR
+                   (julianday(h.timestamp)<=julianday(h.recorded_at)
+                    AND julianday(h.recorded_at)<julianday(h.closes_at)))
+            ) horizon_records
         FROM btc_engine_contracts c
         JOIN forecast_outcomes o ON o.ticker=c.ticker
           AND o.origin=CASE WHEN c.mode='PUBLIC MARKET DATA' THEN 'official' ELSE 'replay' END
         JOIN btc_engine_predictions p ON p.rowid=(
             SELECT q.rowid FROM btc_engine_predictions q
             WHERE q.mode=c.mode AND q.ticker=c.ticker
+              AND q.up BETWEEN 0 AND 1
               AND julianday(q.timestamp)<julianday(q.closes_at)
               AND (q.mode!='PUBLIC MARKET DATA' OR (julianday(q.timestamp)<=julianday(q.recorded_at) AND julianday(q.recorded_at)<julianday(q.closes_at)))
               AND julianday(q.closes_at)<=julianday(o.observed_at)
@@ -393,6 +522,7 @@ def performance(db, now):
         record["initial_score_payload"] = (
             json.loads(record["initial_score_payload"]) if record["initial_score_payload"] else {}
         )
+        record["horizon_records"] = json.loads(record["horizon_records"] or "[]")
         grouped[(row["mode"], row["ticker"])] = [record]
 
     def summarize(groups):
@@ -431,6 +561,7 @@ def performance(db, now):
                 incorrect=len(directional) - correct,
                 unclear=len(rows) - len(directional),
                 accuracy=correct / len(directional) if directional else None,
+                accuracy_interval=wilson_interval(correct, len(directional)),
                 directional_coverage=len(directional) / len(rows) if rows else None,
             )
             metrics["baselines"] = {}
@@ -463,7 +594,28 @@ def performance(db, now):
                 )
                 for lo in (0.5, 0.6, 0.7, 0.8, 0.9)
             }
+            metrics["by_volatility_regime"] = _score_groups(
+                rows, lambda r: r["score_payload"].get("volatility_regime", "unavailable")
+            )
+            metrics["by_data_quality"] = _score_groups(
+                rows,
+                lambda r: r["score_payload"].get("data_quality", {}).get("status", "unavailable"),
+            )
             result[which] = metrics
+        horizon_rows = []
+        for group in groups:
+            latest = group[-1]
+            for item in latest.get("horizon_records", []):
+                horizon_rows.append(
+                    {**item, "outcome": latest["outcome"], "score_payload": item["payload"]}
+                )
+        result["by_time_remaining"] = {
+            band: _evaluate_rows([r for r in horizon_rows if r["horizon"] == band])
+            for band in (">10m", "5-10m", "2-5m", "<=2m")
+        }
+        result[
+            "horizon_sampling"
+        ] = "Last recorded eligible live forecast per contract/time-remaining band. Four incremental summary rows per contract; legacy revisions are not backfilled into new horizons."
         return result
 
     result = {}
@@ -476,10 +628,18 @@ def performance(db, now):
             )
     archive = []
     for row in db.execute(
-        """SELECT c.*,b.payload opening_payload,p.up latest_up,o.outcome
+        """SELECT c.*,b.payload opening_payload,p.up latest_up,p.timestamp eligible_latest_at,
+            p.payload latest_payload,o.outcome
         FROM (SELECT * FROM btc_engine_contracts ORDER BY closes_at DESC LIMIT 100) c
         LEFT JOIN btc_engine_opening b ON b.mode=c.mode AND b.ticker=c.ticker
-        LEFT JOIN btc_engine_predictions p ON p.mode=c.mode AND p.ticker=c.ticker AND p.timestamp=c.latest_at
+        LEFT JOIN btc_engine_predictions p ON p.rowid=(
+            SELECT q.rowid FROM btc_engine_predictions q
+            WHERE q.mode=c.mode AND q.ticker=c.ticker AND q.up BETWEEN 0 AND 1
+              AND julianday(q.timestamp)<julianday(q.closes_at)
+              AND (q.mode!='PUBLIC MARKET DATA' OR
+                   (julianday(q.timestamp)<=julianday(q.recorded_at)
+                    AND julianday(q.recorded_at)<julianday(q.closes_at)))
+            ORDER BY q.timestamp DESC LIMIT 1)
         LEFT JOIN forecast_outcomes o ON o.ticker=c.ticker
           AND o.origin=CASE WHEN c.mode='PUBLIC MARKET DATA' THEN 'official' ELSE 'replay' END
           AND julianday(o.observed_at)<=julianday(?)
@@ -487,6 +647,10 @@ def performance(db, now):
         (now.isoformat(),),
     ):
         outcome = row["outcome"]
+        initial = json.loads(row["opening_payload"]) if row["opening_payload"] else None
+        latest_payload = json.loads(row["latest_payload"]) if row["latest_payload"] else {}
+        initial_up = initial.get("up") if initial else None
+        latest_up = row["latest_up"]
         archive.append(
             {
                 "mode": row["mode"],
@@ -497,20 +661,87 @@ def performance(db, now):
                 else "AWAITING_OFFICIAL_RESULT"
                 if timestamp(row["closes_at"]) <= now
                 else "ACTIVE",
-                "initial": json.loads(row["opening_payload"]) if row["opening_payload"] else None,
-                "latest_up": row["latest_up"],
-                "latest_at": row["latest_at"],
+                "initial": initial,
+                "opens_at": initial.get("opens_at") if initial else latest_payload.get("opens_at"),
+                "threshold": initial.get("threshold")
+                if initial
+                else latest_payload.get("threshold"),
+                "opening_correct": (initial_up > 0.5) == bool(outcome)
+                if outcome is not None and initial_up is not None and abs(initial_up - 0.5) > 1e-12
+                else None,
+                "opening_data_quality": initial.get("data_quality") if initial else None,
+                "latest_up": latest_up,
+                "latest_down": 1 - latest_up if latest_up is not None else None,
+                "latest_at": row["eligible_latest_at"],
+                "latest_correct": (latest_up > 0.5) == bool(outcome)
+                if outcome is not None and latest_up is not None and abs(latest_up - 0.5) > 1e-12
+                else None,
+                "latest_data_quality": latest_payload.get("data_quality"),
+                "latest_confidence": latest_payload.get("confidence"),
                 "revisions": row["revisions"],
                 "outcome": outcome,
             }
         )
 
+    cycle_counts = [
+        dict(row)
+        for row in db.execute(
+            """SELECT c.mode,COUNT(*) total,
+          SUM(julianday(c.closes_at)<=julianday(?)) closed,
+          SUM(CASE WHEN julianday(o.observed_at)<=julianday(?) THEN 1 ELSE 0 END) settled
+        FROM btc_engine_contracts c LEFT JOIN forecast_outcomes o ON o.ticker=c.ticker
+          AND o.origin=CASE WHEN c.mode='PUBLIC MARKET DATA' THEN 'official' ELSE 'replay' END
+        GROUP BY c.mode""",
+            (now.isoformat(), now.isoformat()),
+        )
+    ]
+    for counts in cycle_counts:
+        mode_metrics = result.get(counts["mode"])
+        if mode_metrics:
+            scored = mode_metrics["all"]["settled_markets"]
+            mode_metrics["recorded_cycles"] = {
+                **counts,
+                "settled_without_supported_live": max(0, counts["settled"] - scored),
+                "settled_missing_initial": max(
+                    0, counts["settled"] - mode_metrics["all"]["initial"]["samples"]
+                ),
+            }
     return {
         "archive": archive,
         "archive_limit": 100,
-        "archive_total": db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0],
+        "archive_total": sum(c["total"] for c in cycle_counts),
         "by_mode": result,
         "validation": "No validated accuracy or profitable edge claim. Initial/latest per contract; ties excluded from directional accuracy but included in Brier/log loss/calibration. Live and replay never pooled. No historical prediction backfill.",
+    }
+
+
+def _evaluate_rows(rows):
+    metrics = score([r["up"] for r in rows], [r["outcome"] for r in rows])
+    directional = [r for r in rows if abs(r["up"] - 0.5) > 1e-12]
+    correct = sum((r["up"] > 0.5) == bool(r["outcome"]) for r in directional)
+    metrics.update(
+        correct=correct,
+        incorrect=len(directional) - correct,
+        accuracy=correct / len(directional) if directional else None,
+        accuracy_interval=wilson_interval(correct, len(directional)),
+        unclear=len(rows) - len(directional),
+    )
+    metrics["baselines"] = {}
+    for key in ("baseline_up", "market_implied_up"):
+        matched = [
+            (r["score_payload"].get(key), r["outcome"])
+            for r in rows
+            if r["score_payload"].get(key) is not None
+        ]
+        metrics["baselines"][key] = score([p for p, _ in matched], [y for _, y in matched])
+    return metrics
+
+
+def _score_groups(rows, grouping):
+    values = {grouping(r) or "unavailable" for r in rows}
+    return {
+        key: _evaluate_rows([r for r in rows if (grouping(r) or "unavailable") == key])
+        for key in sorted(values)
     }
 
 
@@ -669,6 +900,13 @@ def save_opening(db, mode, opening, wall_now):
             "kind": "opening",
             "threshold": saved.get("threshold"),
             "baseline_up": saved["up"],
+            "opens_at": saved.get("opens_at"),
+            "data_quality": saved.get("data_quality", {}),
+            "confidence": saved.get("confidence", {}),
+            "volatility_regime": saved.get("regime", "unavailable"),
+            "volatility_ratio": saved.get("volatility_ratio"),
+            "reference_source": saved.get("reference_source"),
+            "reference_received_at": saved.get("reference_received_at"),
         }
         db.execute(
             "INSERT OR IGNORE INTO btc_engine_predictions VALUES (?,?,?,?,?,?,?,?,?)",

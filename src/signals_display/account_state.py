@@ -792,6 +792,23 @@ def live_trade_cards(account, quotes, state, now, defaults, fresh):
             "source": "confirmed account position + confirmed fill history; distinct from dashboard setups/simulations",
             "selected": bool(h["selected"]),
         }
+        forecast = state.get("prediction_engine") or {}
+        model_ready = (
+            fresh
+            and not state.get("stale", True)
+            and forecast.get("ticker") == h["ticker"]
+            and forecast.get("status") == "EXPERIMENTAL"
+        )
+        probability = forecast.get(h["side"]) if model_ready else None
+        card["current_model_probability"] = probability
+        card["model_probability_note"] = (
+            "Experimental same-contract model estimate, not validated accuracy"
+            if probability is not None
+            else "No fresh supported forecast for this held contract"
+        )
+        card["expected_settlement_value_experimental"] = (
+            q * probability - cost if probability is not None and cost is not None else None
+        )
         if not fresh:
             card[
                 "reason"

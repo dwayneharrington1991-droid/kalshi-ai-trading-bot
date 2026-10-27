@@ -75,7 +75,11 @@ def main():
     if not python.exists():
         subprocess.run([sys.executable, "-m", "venv", str(ROOT / ".venv")], check=True)
     check = subprocess.run(
-        [str(python), "-c", "import httpx,websockets,cryptography"],
+        [
+            str(python),
+            "-c",
+            "import httpx,cryptography; from websockets.sync.client import connect; from importlib.metadata import version; assert int(version('websockets').split('.')[0]) >= 16",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

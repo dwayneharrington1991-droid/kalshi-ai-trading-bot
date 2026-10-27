@@ -213,6 +213,7 @@ secrets.yaml
 # Private monitor key directory and local fitted artifacts
 /.private/
 /signals_model*.json
+/signals_model_registry/
 
 # SQLite live sidecars and dashboard process guards
 *.db-wal

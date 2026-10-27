@@ -24,6 +24,9 @@ FEATURES = (
     "derivatives_basis",
     "open_interest_change",
     "public_macro_release_count",
+    "spot_cvd_delta_fraction",
+    "perpetual_cvd_delta_fraction",
+    "spot_book_dominance",
 )
 
 
@@ -121,12 +124,36 @@ def extract(payload, market, now):
             0 <= (now - timestamp(item["published_at"])).total_seconds() <= 3600
             for item in news["data"].get("items", [])
         )
+    flow = payload.get("coverage", {}).get("Kraken public order flow", {}).get("data", {})
+    for venue, feature in (
+        ("spot", "spot_cvd_delta_fraction"),
+        ("perpetual", "perpetual_cvd_delta_fraction"),
+    ):
+        item = flow.get(venue, {})
+        try:
+            if (
+                item.get("status") == "LIVE"
+                and 0 <= (now - timestamp(item["observed_at"])).total_seconds() <= 5
+            ):
+                values[feature] = number(item["delta_fraction_60s"], -1, 1)
+        except (KeyError, ValueError, TypeError):
+            pass
+    item = flow.get("spot_book", {})
+    try:
+        if (
+            item.get("status") == "LIVE"
+            and 0 <= (now - timestamp(item["observed_at"])).total_seconds() <= 5
+        ):
+            ratio = number(item["bid_ask_ratio"], 0, 1e12)
+            values["spot_book_dominance"] = (ratio - 1) / (ratio + 1)
+    except (KeyError, ValueError, TypeError):
+        pass
     return {
         "values": values,
         "diagnostics": diagnostics,
         "independence": "No Kalshi price/odds in settlement features. Coinbase is primary; Kraken divergence is context, not a second independent vote.",
         "unavailable_features": {
-            "trade_flow_imbalance": "No timestamped trade-side feed collected; not inferred from OHLCV",
+            "trade_flow_imbalance": "Available only from fresh per-venue WebSocket trade messages after warm-up; never inferred from OHLCV",
             "cross_market_lead_lag": "No validated lead/lag estimator; receipt-time cross-venue divergence is context only",
             "derivatives_predictive_effect": "Funding/basis/OI are context until validated",
         },

@@ -53,8 +53,11 @@ def context(payload, market, info, now):
         "confluence_note": "Past closed-bar returns only; alignment is not calibrated confidence. Structural sweep/reclaim filter is experimental; KDJ/exhaustion confidence is unavailable.",
         "liquidation_clusters": None,
         "liquidation_reason": "Unavailable: no reliable licensed liquidation-cluster feed; not inferred from open interest.",
+        "order_flow": payload.get("coverage", {})
+        .get("Kraken public order flow", {})
+        .get("data", {"status": "unavailable"}),
         "aggressive_trade_flow_ratio": None,
-        "flow_reason": "Unavailable: resting depth is not aggressive executed trade flow.",
+        "flow_reason": "See per-venue CVD diagnostics when live; resting depth is not aggressive executed trade flow. No pooled spot/perpetual ratio.",
         "spreads": spreads,
         "high_slippage_risk": any(v > 0.030000001 for v in spreads.values()),
         "macro_recent_release_timestamps": recent,

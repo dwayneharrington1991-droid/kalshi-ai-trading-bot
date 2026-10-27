@@ -19,7 +19,7 @@ git fetch origin
 git switch codex/kxbtc15m-signals-display
 git pull --ff-only origin codex/kxbtc15m-signals-display
 python3 -m venv .venv
-.venv/bin/python3 -m pip install httpx==0.27.0
+.venv/bin/python3 -m pip install httpx==0.27.0 websockets==16.1.1
 .venv/bin/python3 -m src.signals_display.server --mode public --host 0.0.0.0 --port 8765 --journal signals_monitor.db --target 0.05 --stop 0.10 --horizon 60 --manual-delay 3 --slippage 0.01
 ```
 
@@ -182,7 +182,7 @@ confidence. Qualifying scalps also require aligned return signs and an experimen
 5m sweep/reclaim of the preceding 20m high/low, using closed bars only. This fixed
 structural filter has no demonstrated predictive value; KDJ/exhaustion confidence
 is unavailable. Licensed
-liquidation clusters, aggressive futures trade flow, official running BRTI TWAP and
+liquidation clusters, official running BRTI TWAP and
 “mathematically protected” average arbitrage are unavailable; none is fabricated.
 A >10 percentage-point model/market difference is experimental divergence, not a
 high-probability mispricing claim. Spreads above three cents mute scalp calls.
@@ -200,7 +200,7 @@ Run only the scoped mocked/replayed signals tests (never the trading/live suites
 
 Development/browser tests need the repository's dev/dashboard dependencies,
 `playwright==1.64.1`, and Chromium at `/usr/bin/chromium`; production browser serving
-needs only httpx, plus cryptography for optional authentication.
+needs httpx and websockets, plus cryptography for optional authentication.
 
 Predictions precede outcomes in SQLite. Official labels and simulated/replayed
 results are kept distinct. Evaluation reports settlement accuracy, uncertainty,
@@ -225,3 +225,42 @@ and future-trained artifacts rejected at prediction time. This process has not y
 established a trained, calibrated live advantage; the statistical fallback remains
 experimental. Added feed features have **not** demonstrated incremental value without
 sufficient labeled observations. No present claim of 90% accuracy or profitable edge.
+
+
+## Experimental public order-flow module
+
+Public Kraken WebSockets add separate spot BTC/USD and PF_XBTUSD perpetual CVD.
+CVD uses provider taker-side trade messages, never candles or resting limits.
+Session CVD resets on reconnect/data errors. The 60s net buy/sell fraction requires
+at least 20 observed trades, 55s of coverage, 60s session warm-up and a last trade
+no older than five seconds. Spot BTC and raw perpetual quantity are not summed.
+Old subscription snapshots never seed current CVD. Duplicate fills are ignored;
+perpetual sequence gaps reset the stream. These are public market executions, not
+your account fills. Silent dropped spot trades cannot be independently recovered;
+no complete historical CVD claim is made.
+
+“Hidden bullish accumulation” is only an experimental candidate: observed 60s
+price change <=1bp and net buy-volume fraction >=30%. Bearish divergence compares
+successive confirmed closed-minute price peaks and CVD at each high; a later
+minute must close before a peak can be used. Neither is a high-probability claim
+or independent Kalshi entry instruction.
+
+A depth-25 Kraken spot book subscription calculates the best 20 levels in BTC,
+with Kraken CRC32 top-ten checksum verification, ordered updates, deletion handling,
+freshness checks and reconnect/reset on integrity failure. A bid/ask quantity ratio
+>2.5 flags UP dominance; <0.4 flags DOWN dominance. Quotes can be canceled or spoofed.
+**No fixed +8 percentage-point adjustment is applied.** Live CVD/OBI may enter
+chronologically evaluated learned candidates, with order-flow group ablations;
+they cannot change the fallback probabilities by an arbitrary constant or bypass
+existing spread/cost/data-quality/WAIT gates. Effectiveness remains unverified.
+
+Details > scanner diagnostics and feed coverage show each stream's status and
+limitations. Predictions store these diagnostics and feature values before outcomes.
+WebSockets require `ws.kraken.com` and `futures.kraken.com`; proxies may block an
+upgrade even when REST works. Initial cloud check: spot WebSocket was proxy-blocked;
+perpetual subscription and fresh PF_XBTUSD trade messages verified. Full spot-stream/CVD validation is incomplete,
+so blocked or insufficient inputs remain unavailable. No trading authentication.
+
+Additional offline tests: `tests/test_signals_order_flow.py` covers signed CVD,
+deduplication, warm-up/staleness, confirmed divergence timing, checksum failure and
+full-depth requirements.

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import math
 
 from .model import number, timestamp
+from .order_flow import PublicOrderFlow
 from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree
 
@@ -110,6 +111,7 @@ class FeedHub:
         self.feeds = {}
         self.last_started = {}
         self.previous_oi = None
+        self.order_flow = PublicOrderFlow()
 
     def snapshot(self, now):
         collectors = {"Kraken spot": kraken_spot, "Kraken derivatives": kraken_derivatives}
@@ -169,7 +171,16 @@ class FeedHub:
             "status": "UNAVAILABLE",
             "reason": "Official target/rules metadata connected through Kalshi; no legitimate live index stream configured",
         }
+        flow = self.order_flow.snapshot(now)
+        result["Kraken public order flow"] = {
+            "status": "CONNECTED"
+            if any(flow[k]["status"] == "LIVE" for k in ("spot", "perpetual", "spot_book"))
+            else "WARMING_UP_OR_UNAVAILABLE",
+            "data": flow,
+            "reason": "Public WebSocket CVD and checksum-verified top-20 spot depth; experimental context only",
+        }
         return result
 
     def close(self):
+        self.order_flow.close()
         self.executor.shutdown(wait=False, cancel_futures=True)

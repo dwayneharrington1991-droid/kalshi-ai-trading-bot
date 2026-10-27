@@ -1,4 +1,7 @@
+<!-- Current launcher supersedes earlier long launch examples. -->
 # KXBTC15M signals dashboard
+
+For one-click startup, use **Terminal → Run Task → Start private Kalshi dashboard** after setting port 8765 Private. The launcher uses existing Codespaces secrets, requires verified broker read-only scope, and preserves both journals. Authentication/permission failure keeps public monitoring available and explains why account reads were withheld.
 
 New to Codespaces? Follow [Open your dashboard on your laptop](OPEN_DASHBOARD.md).
 
@@ -117,7 +120,7 @@ Install the signing dependency without starting any trading application:
 After securely configuring secrets, stop public mode with Ctrl+C and start:
 
 ```bash
-.venv/bin/python3 -m src.signals_display.server --mode public --host 0.0.0.0 --port 8765 --journal signals_monitor.db --account-readonly --private-dashboard --account-store signals_account_monitor.db --target 0.05 --stop 0.10 --horizon 60 --manual-delay 3 --slippage 0.01
+.venv/bin/python3 -m src.signals_display.server --mode public --host 0.0.0.0 --port 8765 --journal signals_monitor.db --account-readonly --private-dashboard --require-readonly-scope --account-store signals_account_monitor.db --target 0.05 --stop 0.10 --horizon 60 --manual-delay 3 --slippage 0.01
 ```
 
 No account requests occur without `--account-readonly`. Removing that flag restores

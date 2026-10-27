@@ -179,6 +179,12 @@ class ReadOnlyKalshi:
         }
 
     def snapshot(self, min_ts=None):
+        if getattr(self, "require_readonly", False) and not self.permissions().get(
+            "read_only_verified"
+        ):
+            raise AccountReadError(
+                "Read-only key permissions no longer verified; account sync withheld"
+            )
         # Never infer holdings/fills from order status. All pages must complete.
         positions = self.pages("/trade-api/v2/portfolio/positions", "market_positions")
         fills = self.pages(

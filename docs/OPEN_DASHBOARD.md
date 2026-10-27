@@ -84,3 +84,46 @@ Browser**. If a page looks old after an update, refresh it. Keep the same journa
 and account-store files; restarting does not erase them.
 
 Advanced setup and read-only account security: [SIGNALS_DISPLAY.md](SIGNALS_DISPLAY.md).
+
+## One-click launcher after this update
+
+Use **Terminal → Run Task → Start private Kalshi dashboard**. The saved task stops
+only matching dashboard processes from this checkout on port 8765, installs missing
+monitoring dependencies, uses existing Codespaces secrets, and preserves both databases.
+Keep **Ports → 8765 → Port Visibility → Private**. The launcher attempts to enforce
+Private visibility with GitHub CLI; if that fails, the task relies on this explicit
+private-port confirmation and says so. It does not provide its own login service.
+
+The same action from a terminal is simply:
+
+```bash
+python3 scripts/start_dashboard.py --restart --private-dashboard
+```
+
+With secrets present, authenticated reads are attempted only after broker metadata
+verifies the key has exclusively `read` scope. Missing/unknown/trading-capable scope
+blocks account monitoring while the dashboard continues in public-only mode; it cannot honestly confirm read-only broker permissions.
+No write endpoint is ever tested to discover permissions. If blocked, public-only
+mode still works with `--public-only` added. The account data uses your existing
+`signals_account_monitor.db`; confirmed fills/positions remain separate from the
+signal journal. No database or WAL/SHM sidecar should be deleted to fix a lock.
+
+The launcher stays running in its terminal. When a Codespace sleeps, reopen it and
+run the saved task again, then click the port's globe icon. This avoids repeated
+long commands without silently starting account access in other environments.
+
+### What was fixed
+
+SQLite contexts now always close after commit/rollback, use WAL and a 30-second
+busy timeout, and serialize same-process access by database path. Server startup
+reserves its port before database initialization and holds journal-file locks to
+prevent another dashboard on another port from owning the same journal. These
+changes prevent common dashboard contention; they do not forcibly unlock another
+program's active transaction. The launcher reports/stops only matching dashboard
+servers, with a bounded wait and no forced kill. An active unrelated database writer
+can still exhaust the timeout; keep its transaction short or stop that writer safely.
+
+BrokenPipe/connection-reset errors usually occur when a tab closes, reloads or a
+proxy cancels an HTTP request. The server now treats these as client disconnects,
+not failed account syncs. The original Codespace traceback/process state was not
+accessible from this implementation environment, so its exact cause is unconfirmed.

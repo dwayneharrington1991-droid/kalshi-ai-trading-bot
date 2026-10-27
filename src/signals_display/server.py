@@ -311,7 +311,8 @@ class Monitor:
         if self.account_client is None:
             return {
                 "status": "PUBLIC_ONLY",
-                "reason": "No account connection enabled. Public market data only; no positions/orders/fills are read.",
+                "reason": self.account_error
+                or "No account connection enabled. Public market data only; no positions/orders/fills are read.",
                 "holdings": [],
                 "guidance": [],
             }
@@ -321,6 +322,18 @@ class Monitor:
             and account.get("observed_at")
             and 0 <= (now - timestamp(account["observed_at"])).total_seconds() <= 20
         )
+        balance = account.get("balance", {})
+        raw_balance = balance.get("balance_dollars")
+        account["available_balance_dollars"] = (
+            float(raw_balance)
+            if raw_balance is not None
+            else float(balance["balance"]) / 100
+            if balance.get("balance") is not None
+            else None
+        )
+        account[
+            "balance_note"
+        ] = "Broker cash balance; pending-order reserves/withdrawable cash may differ. Last-known when stale."
         account["status"] = "READ_ONLY_CONNECTED" if fresh else "ACCOUNT_STALE"
         account["reason"] = self.account_error or (
             "Confirmed read-only account snapshot"
@@ -426,6 +439,12 @@ def make_handler(monitor):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
+
+        def handle(self):
+            try:
+                super().handle()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass  # Client closed a tab/request; not a failed market/account sync.
 
         def do_GET(self):
             route = self.path.split("?", 1)[0]
@@ -551,6 +570,12 @@ def main():
         action="store_true",
         help="Acknowledge account dashboard is private; verify Codespaces port visibility yourself",
     )
+    parser.add_argument(
+        "--require-readonly-scope",
+        action="store_true",
+        default=True,
+        help="Refuse account monitoring unless authenticated key metadata verifies read-only scope",
+    )
     parser.add_argument("--model-artifact", type=Path, default=Path("signals_model.json"))
     parser.add_argument("--manual-delay", type=int, default=3)
     parser.add_argument("--slippage", type=float, default=0.01)
@@ -571,12 +596,46 @@ def main():
         parser.error(
             "Account mode requires --mode public --private-dashboard and a Private forwarded port"
         )
+    # Reserve port before opening/migrating journals or reading credentials.
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), make_handler(None))
+    except OSError:
+        parser.error("Dashboard port is already in use; use scripts/start_dashboard.py --restart")
+    import fcntl
+
+    guards = []
+    for path in (args.journal, args.account_store) if args.account_readonly else (args.journal,):
+        guard = open(str(path.resolve()) + ".dashboard.lock", "a")
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            guard.close()
+            server.server_close()
+            parser.error("Another dashboard owns this journal; no database changes made")
+        guards.append(guard)
     account_client = None
+    disabled_reason = None
     if args.account_readonly:
         try:
             account_client = ReadOnlyKalshi.from_environment()
+            if args.require_readonly_scope:
+                permissions = account_client.permissions()
+                if not permissions.get("read_only_verified"):
+                    raise AccountReadError(
+                        "Account connection withheld: "
+                        + permissions["status"]
+                        + ". Cannot confirm this key has no trading permission; continuing public data only."
+                    )
+                account_client.require_readonly = True
+                account_client.snapshot()  # Supported production authenticated GETs only.
+                print(
+                    "Production account read succeeded; metadata reports read-only scope.",
+                    flush=True,
+                )
         except AccountReadError as exc:
-            parser.error(str(exc))
+            disabled_reason = str(exc)
+            account_client = None
+            print(disabled_reason, flush=True)
     feed = PublicFeed() if args.mode == "public" else ReplayFeed(args.replay)
     monitor = Monitor(
         feed,
@@ -591,14 +650,22 @@ def main():
         account_client=account_client,
         account_store=args.account_store,
     )
+    monitor.account_error = disabled_reason
     stop = threading.Event()
+    import signal
+
+    def terminate(_signum, _frame):
+        stop.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, terminate)
 
     def poll():
         while not stop.is_set():
             monitor.tick()
             stop.wait(args.poll_seconds)
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(monitor))
+    server.RequestHandlerClass = make_handler(monitor)
     thread = threading.Thread(target=poll, daemon=True)
     thread.start()
     print(

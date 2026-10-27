@@ -356,3 +356,11 @@ def test_server_side_signing_with_generated_mock_key_never_needs_real_credential
     path.chmod(0o644)
     with pytest.raises(AccountReadError, match="owner-only"):
         ReadOnlyKalshi.from_environment()
+
+
+def test_strict_permission_gate_precedes_any_account_data_reads():
+    client = ReadOnlyKalshi("MOCK", lambda m: "MOCK")
+    client.require_readonly = True
+    client.permissions = lambda: {"read_only_verified": False}
+    with pytest.raises(AccountReadError, match="sync withheld"):
+        client.snapshot()

@@ -224,3 +224,32 @@ def test_history_failure_does_not_mark_public_or_account_state_disconnected(tmp_
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_blocked_permission_is_visible_instead_of_generic_account_off(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    monitor.state = analyze(frame(), NOW)
+    monitor.account_candidate = object()
+    monitor.account_error = (
+        "READ_ONLY_SCOPE_NOT_PROVEN: authenticated metadata has insufficient scopes"
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#account-status")).to_have_text(
+                "ACCOUNT BLOCKED — SEE REASON"
+            )
+            assert "READ_ONLY_SCOPE_NOT_PROVEN" in page.locator("#account-sync").inner_text()
+            assert page.locator("#account-balance").inner_text() == "unavailable"
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

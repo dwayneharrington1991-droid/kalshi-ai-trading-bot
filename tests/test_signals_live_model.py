@@ -21,6 +21,21 @@ def live_frame(i):
     mid = 0.5 + 0.04 * math.sin(i * 0.8)
     market["quotes"]["up"].update(bid=mid - 0.01, ask=mid + 0.01)
     market["quotes"]["down"].update(bid=1 - mid - 0.01, ask=1 - mid + 0.01)
+    opening = int(timestamp(market["opens_at"]).timestamp()) - 60
+    payload["btc_candles"] = {
+        "source": "Synthetic proxy",
+        "received_at": payload["now"],
+        "candles": [
+            dict(
+                start=str(opening),
+                open="100000",
+                high="100000",
+                low="100000",
+                close="100000",
+                volume="1",
+            )
+        ],
+    }
     payload["reference"].update(
         price=100000 + 5 * math.sin(i * 0.4), official=False, source="Coinbase synthetic proxy"
     )
@@ -63,11 +78,13 @@ def test_settlement_at_strike_is_half_and_does_not_require_scalp_fees():
     result, info = estimate(model, payload)
     assert result.settlement_up == result.settlement_down == 0.5
     assert result.scalp_up is None and "UNKNOWN_FEES" in info["scalp_reason"]
-    assert "zero Coinbase/CF Benchmarks basis" in info["settlement_assumptions"]
+    assert "opening-window anchored proxy/index basis" in info["settlement_assumptions"]
 
 
 def test_settlement_is_monotonic_in_strike_and_normal_formula_matches():
     model, payload = trained()
+    payload["reference"]["official"] = True
+    payload["markets"][0]["settlement_reference"] = payload["reference"]["source"]
     result, info = estimate(model, payload)
     inputs = info["settlement_inputs"]
     sigma = info["reference_history"]["volatility_per_sqrt_second"]

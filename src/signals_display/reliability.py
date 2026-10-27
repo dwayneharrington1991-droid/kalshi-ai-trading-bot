@@ -2,6 +2,9 @@
 import math
 
 from .live_model import wilson
+from .scores import score, horizon
+from .model import timestamp
+import json
 
 
 def metrics(db):
@@ -57,6 +60,82 @@ def metrics(db):
         group["mean_pnl_approximate_interval"] = (
             [mean - half, mean + half] if half is not None else None
         )
+    curves = {}
+    for row in db.execute(
+        "SELECT mode,model_version,net_pnl FROM simulations WHERE status IN ('SIMULATED_TARGET','SIMULATED_STOP','SIMULATED_TIMEOUT') ORDER BY exit_at,id"
+    ):
+        key = row["mode"] + " / " + row["model_version"]
+        curve = curves.setdefault(key, dict(cumulative=0.0, peak=0.0, maximum_drawdown=0.0))
+        curve["cumulative"] += row["net_pnl"] or 0
+        curve["peak"] = max(curve["peak"], curve["cumulative"])
+        curve["maximum_drawdown"] = max(
+            curve["maximum_drawdown"], curve["peak"] - curve["cumulative"]
+        )
+    for key, curve in curves.items():
+        groups[key]["simulated_maximum_drawdown"] = curve["maximum_drawdown"]
+    forecasts = {}
+    for row in db.execute(
+        "SELECT payload,settlement_up FROM predictions WHERE settlement_origin='official' AND probability_up IS NOT NULL AND settlement_up IS NOT NULL ORDER BY timestamp,id"
+    ):
+        state = json.loads(row["payload"])
+        if state.get("stale") or not state.get("market"):
+            continue
+        remaining = (
+            timestamp(state["market"]["closes_at"]) - timestamp(state["now"])
+        ).total_seconds()
+        if remaining <= 0:
+            continue
+        key = (
+            state["mode"],
+            state.get("model", {}).get("version", "legacy"),
+            state["market"]["ticker"],
+            horizon(remaining),
+        )
+        forecasts.setdefault(key, (state, int(row["settlement_up"])))
+    settlement = {}
+    for mode, version, _, band in forecasts:
+        key = mode + " / " + version + " / " + band
+        settlement.setdefault(key, [])
+    for (mode, version, _, band), (state, y) in forecasts.items():
+        settlement[mode + " / " + version + " / " + band].append((state, y))
+    settled_scores = {}
+    for key, samples in settlement.items():
+        entry = {
+            "model": score(
+                [s["estimate"]["settlement_up"] for s, y in samples], [y for s, y in samples]
+            )
+        }
+        for label, getter in (
+            ("zero_drift", lambda s: s.get("model", {}).get("baseline_probability_up")),
+            ("market_implied", lambda s: s.get("market_comparison", {}).get("market_implied_up")),
+        ):
+            matched = [(getter(s), y) for s, y in samples if getter(s) is not None]
+            entry[label] = score([p for p, y in matched], [y for p, y in matched])
+        settled_scores[key] = entry
+    condition_groups = {}
+    for (mode, version, _, band), (state, outcome) in forecasts.items():
+        ratio = (
+            state.get("model", {})
+            .get("candidate_features", {})
+            .get("values", {})
+            .get("volatility_change")
+        )
+        regime = (
+            "unavailable volatility regime"
+            if ratio is None
+            else "rising volatility"
+            if ratio > 1.5
+            else "falling volatility"
+            if ratio < 2 / 3
+            else "similar volatility"
+        )
+        condition_groups.setdefault(mode + " / " + version + " / " + regime, []).append(
+            (state["estimate"]["settlement_up"], outcome)
+        )
+    condition_scores = {
+        k: score([p for p, y in pairs], [y for p, y in pairs])
+        for k, pairs in condition_groups.items()
+    }
     coverage = {}
     rows = db.execute(
         """SELECT mode,COALESCE(json_extract(payload,'$.model.version'),'uploaded-scenarios') version,
@@ -76,6 +155,8 @@ def metrics(db):
         }
     return {
         "scalp_by_model_and_mode": groups,
+        "official_settlement_scores_by_horizon": settled_scores,
+        "official_settlement_scores_by_volatility_condition": condition_scores,
         "coverage_by_model_and_mode": coverage,
         "sampling_unit": "First fresh prediction per contract/minute for call coverage. Settlement uses one supported direction per contract.",
         "uncertainty_note": "Approximate sampling intervals only; correlated observations and informative missing-data censoring can invalidate nominal coverage. Observed-only target rate excludes unknown paths and is not a validated live probability.",

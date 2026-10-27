@@ -8,8 +8,17 @@ import json
 from pathlib import Path
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from urllib.parse import urlsplit
+import uuid
 
+from .account_readonly import ReadOnlyKalshi, AccountReadError
+from .account_state import AccountJournal, account_guidance, live_trade_cards
+from .scanner import context as scanner_context, qualify as scanner_qualify
+from .manual import ManualJournal
 from .live_model import LiveEstimator
+from .learning import load_artifact, predict as learned_predict
 from .model import Display, timestamp
 from .monitor import Journal, PublicFeed, ReplayFeed, active_market, analyze, utcnow
 
@@ -26,10 +35,44 @@ class Monitor:
         models_enabled=True,
         manual_delay=3,
         slippage=0.01,
+        model_artifact=None,
+        account_client=None,
+        account_store=None,
     ):
         self.feed, self.journal = feed, journal
         self.target, self.stop, self.horizon = target, stop, horizon
+        self.account_client = account_client
+        self.account_journal = AccountJournal(account_store or journal.path)
+        if account_client is not None:
+            self.account_journal.bind(
+                getattr(account_client, "credential_binding", "test-transport")
+            )
+            Path(self.account_journal.path).chmod(0o600)
+        self.account_connected = False
+        self.account_error = None
+        self.account_job = None
+        self.account_started = None
+        self.account_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="account-read-only"
+        )
+        self.manual = ManualJournal(journal.path)
+        self.manual_quotes = {}
+        self.manual_jobs = {}
+        self.manual_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="recorded-contract-public-quotes"
+        )
+        self.manual_defaults = {
+            "target": target,
+            "stop": stop,
+            "horizon": horizon,
+            "slippage": slippage,
+        }
+        self.signal_key = None
+        self.signal_id = None
         self.models_enabled = models_enabled
+        self.artifact, self.artifact_status = load_artifact(model_artifact)
+        self.readiness_at = None
+        self.readiness = {}
         self.estimator = LiveEstimator(manual_delay=manual_delay, slippage=slippage)
         if isinstance(feed, PublicFeed):
             self.estimator.restore(journal.recent_states())
@@ -54,6 +97,27 @@ class Monitor:
         try:
             payload = self.feed.poll()
             now = timestamp(payload["clock"]) if "clock" in payload else utcnow()
+            coverage = payload.setdefault("coverage", {})
+            ref = payload.get("reference", {})
+            coverage["Coinbase BTC/USD proxy"] = {
+                "status": "CONNECTED" if ref.get("price") is not None else "UNAVAILABLE",
+                "data": ref,
+                "reason": None if ref.get("price") is not None else "Public BTC proxy unavailable",
+            }
+            market_now = active_market(payload, now)
+            coverage["Kalshi KXBTC15M public"] = {
+                "status": "CONNECTED" if market_now else "UNAVAILABLE",
+                "reason": "Public contract metadata and executable quotes only; no account access"
+                if market_now
+                else "No unique current contract",
+            }
+            cross = coverage.get("Kraken spot", {})
+            if cross.get("status") == "CONNECTED" and ref.get("price"):
+                if abs(cross["data"]["price"] / ref["price"] - 1) > 0.02:
+                    cross.update(
+                        status="EXCLUDED",
+                        reason="Cross-venue price outlier above 2%; excluded from features",
+                    )
             result, info = None, None
             if isinstance(self.feed, PublicFeed):
                 if self.models_enabled:
@@ -72,7 +136,79 @@ class Monitor:
                         "overall_reason": result.reason,
                         "scalp_reason": result.reason,
                     }
+            if info is not None and isinstance(self.feed, PublicFeed):
+                if self.readiness_at is None or (now - self.readiness_at).total_seconds() >= 60:
+                    self.readiness = self.journal.learning_readiness()
+                    self.readiness_at = now
+                info["learning_status"] = {
+                    **self.readiness,
+                    "artifact_status": self.artifact_status,
+                    "trained_candidate_loaded": self.artifact is not None,
+                    "active": "experimental statistical fallback",
+                }
+                if self.artifact is not None and result.settlement_up is not None:
+                    if timestamp(self.artifact["labels_available_through"]) < now:
+                        p = learned_predict(
+                            self.artifact["model"], info["candidate_features"]["values"]
+                        )
+                        from dataclasses import replace
+
+                        result = replace(result, settlement_up=p, settlement_down=1 - p)
+                        sensitivity = [p]
+                        inputs = info.get("settlement_inputs", {})
+                        basis = info.get("basis", {})
+                        for bound in ("low", "high"):
+                            if inputs.get("proxy_price") and basis.get(bound) is not None:
+                                f = dict(info["candidate_features"]["values"])
+                                f["distance_scaled"] = (
+                                    inputs["proxy_price"] + basis[bound] - inputs["strike"]
+                                ) / inputs["proxy_price"]
+                                sensitivity.append(learned_predict(self.artifact["model"], f))
+                        info["settlement_probability_sensitivity"] = [
+                            min(sensitivity),
+                            max(sensitivity),
+                        ]
+                        info["learning_status"].update(
+                            active=self.artifact["model"]["kind"],
+                            heldout_report=self.artifact["report"],
+                            model_id=self.artifact["model_id"],
+                            labels_available_through=self.artifact["labels_available_through"],
+                        )
+                        info["version"] += "/" + self.artifact["model_id"]
+                        info[
+                            "overall_reason"
+                        ] = "EXPERIMENTAL_LEARNED_FORECAST: validation-selected independent classifier; see held-out scores; edge unverified"
+                    else:
+                        info["learning_status"][
+                            "artifact_status"
+                        ] = "Future-trained artifact rejected at this prediction time"
             state = analyze(payload, now, self.target, self.stop, self.horizon, result, info)
+            if info is not None:
+                scan = scanner_context(payload, market_now, info, now)
+                info["scanner"] = scan
+                scanner_qualify(state, scan)
+            key = (
+                (state["market"]["ticker"], state["scalp"])
+                if state["market"] and state["scalp"] != "WAIT" and not state["stale"]
+                else None
+            )
+            if key != self.signal_key:
+                self.signal_key = key
+                self.signal_id = str(uuid.uuid4()) if key else None
+            if key:
+                expires = min(
+                    timestamp(state["market"]["observed_at"]) + timedelta(seconds=5),
+                    timestamp(state["market"]["closes_at"])
+                    - timedelta(seconds=self.horizon + self.estimator.manual_delay),
+                )
+                state["signal"] = {
+                    "id": self.signal_id,
+                    "timestamp": now.isoformat(),
+                    "expires_at": expires.isoformat(),
+                }
+            self.update_account(now)
+            self.update_manual(state, now)
+            self.journal.record_feeds(payload.get("coverage", {}))
             self.journal.record_candles(payload.get("btc_candles", {}), now)
             self.journal.step(state)
             if isinstance(self.feed, PublicFeed):
@@ -83,10 +219,18 @@ class Monitor:
                     self.settlement_check = now
                     with self.journal.connect() as db:
                         tickers = db.execute(
-                            """SELECT DISTINCT ticker FROM predictions
-                            WHERE mode='PUBLIC MARKET DATA' AND settlement_up IS NULL
-                            ORDER BY id DESC LIMIT 3"""
+                            """SELECT ticker FROM predictions
+                            WHERE mode='PUBLIC MARKET DATA' AND (settlement_up IS NULL OR settlement_origin='legacy_unknown')
+                            AND julianday(json_extract(payload,'$.market.closes_at'))<=julianday(?)
+                            GROUP BY ticker ORDER BY COALESCE(MAX(outcome_last_attempt),'') ASC,MIN(timestamp) ASC LIMIT 3""",
+                            (now.isoformat(),),
                         ).fetchall()
+                    with self.journal.connect() as db:
+                        for row in tickers:
+                            db.execute(
+                                "UPDATE predictions SET outcome_last_attempt=? WHERE ticker=?",
+                                (now.isoformat(), row[0]),
+                            )
                     for row in tickers:
                         if state["market"] and row[0] == state["market"]["ticker"]:
                             continue
@@ -120,11 +264,123 @@ class Monitor:
                     + codes[0]
                     + "). Check egress/service access; no trading credentials are used."
                 )
+            # Account reconciliation and held-contract monitoring continue even if
+            # discovery/the main public contract is temporarily unavailable.
+            try:
+                self.update_account(utcnow())
+                self.update_manual(state, utcnow())
+            except Exception:
+                self.account_connected = False
             state["connection_error"] = True
             state["checked_at"] = utcnow().isoformat()
         with self.lock:
             self.state = state
             self.last_tick = utcnow()
+
+    def update_account(self, now):
+        if self.account_client is None:
+            return
+        if self.account_job and self.account_job.done():
+            try:
+                batch = self.account_job.result()
+                self.account_journal.reconcile(batch)
+                self.account_connected = True
+                self.account_error = None
+            except Exception as exc:
+                self.account_connected = False
+                self.account_error = (
+                    str(exc)
+                    if isinstance(exc, AccountReadError)
+                    else "Account reconciliation unavailable; private details redacted"
+                )
+            self.account_job = None
+        if self.account_job is None and (
+            self.account_started is None or (now - self.account_started).total_seconds() >= 5
+        ):
+            since = None
+            if self.account_connected:
+                recent = self.account_journal.snapshot().get("recent_fills", [])
+                if recent:
+                    since = max(0, int(max(timestamp(f["at"]).timestamp() for f in recent)) - 60)
+            self.account_started = now
+            self.account_job = self.account_pool.submit(self.account_client.snapshot, since)
+
+    def account_view(self, state, now):
+        if self.account_client is None:
+            return {
+                "status": "PUBLIC_ONLY",
+                "reason": "No account connection enabled. Public market data only; no positions/orders/fills are read.",
+                "holdings": [],
+                "guidance": [],
+            }
+        account = self.account_journal.snapshot()
+        fresh = (
+            self.account_connected
+            and account.get("observed_at")
+            and 0 <= (now - timestamp(account["observed_at"])).total_seconds() <= 20
+        )
+        account["status"] = "READ_ONLY_CONNECTED" if fresh else "ACCOUNT_STALE"
+        account["reason"] = self.account_error or (
+            "Confirmed read-only account snapshot"
+            if fresh
+            else "Waiting for fresh startup/reconnect reconciliation"
+        )
+        account["guidance"] = [
+            account_guidance(
+                h,
+                account,
+                self.manual_quotes.get(h["ticker"]),
+                state,
+                now,
+                self.manual_defaults,
+                bool(fresh),
+            )
+            for h in account.get("holdings", [])
+            if h["status"] == "OPEN" and h["selected"] and h["ticker"].startswith("KXBTC15M-")
+        ]
+        for guidance in account["guidance"]:
+            guidance["alert_id"] = self.account_journal.alert(guidance, now)
+        account["live_trade_cards"] = live_trade_cards(
+            account, self.manual_quotes, state, now, self.manual_defaults, bool(fresh)
+        )
+        return account
+
+    def update_manual(self, state, now):
+        market = state.get("market")
+        if market and not state.get("stale"):
+            self.manual_quotes[market["ticker"]] = market
+        for ticker, job in list(self.manual_jobs.items()):
+            if job.done():
+                try:
+                    self.manual_quotes[ticker] = job.result()
+                except Exception:
+                    pass  # Old quotes naturally expire; never refresh failed data.
+                del self.manual_jobs[ticker]
+        if isinstance(self.feed, PublicFeed):
+            for entry in self.manual.records()["entries"]:
+                ticker = entry["ticker"]
+                if (
+                    entry["status"] == "OPEN"
+                    and (not market or ticker != market["ticker"] or state.get("stale"))
+                    and ticker not in self.manual_jobs
+                ):
+                    self.manual_jobs[ticker] = self.manual_pool.submit(
+                        self.feed.contract_quote, ticker
+                    )
+        if self.account_client is not None:
+            for holding in self.account_journal.snapshot().get("holdings", []):
+                ticker = holding["ticker"]
+                if (
+                    holding["status"] == "OPEN"
+                    and ticker.startswith("KXBTC15M-")
+                    and (not market or ticker != market["ticker"] or state.get("stale"))
+                    and ticker not in self.manual_jobs
+                    and isinstance(self.feed, PublicFeed)
+                ):
+                    self.manual_jobs[ticker] = self.manual_pool.submit(
+                        self.feed.contract_quote, ticker
+                    )
+        self.manual.guidance(self.manual_quotes, now, state)
 
     def snapshot(self):
         with self.lock:
@@ -151,6 +407,15 @@ class Monitor:
                         scalp_explanation="STALE_DATA: snapshot older than 5s or contract expired",
                         estimate=asdict(Display("WAIT", "Stale snapshot or expired contract")),
                     )
+            state["manual_guidance"] = self.manual.guidance(self.manual_quotes, utcnow(), state)
+            state["manual_defaults"] = self.manual_defaults
+            state["account"] = self.account_view(state, utcnow())
+            if state.get("signal") and utcnow() > timestamp(state["signal"]["expires_at"]):
+                state.update(
+                    scalp="WAIT",
+                    signal=None,
+                    scalp_explanation="EXPIRED_SIGNAL: waiting for a fresh qualifying setup",
+                )
             return state
 
 
@@ -166,6 +431,8 @@ def make_handler(monitor):
                 content_type = "text/html; charset=utf-8"
             elif route in {"/api/state", "/api/history"}:
                 value = monitor.snapshot() if route == "/api/state" else monitor.journal.history()
+                if route == "/api/history":
+                    value["manual_records"] = monitor.manual.records()
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/health":
@@ -186,16 +453,78 @@ def make_handler(monitor):
             self.wfile.write(body)
 
         def do_POST(self):
-            self.send_error(405, "Read-only dashboard")
+            if self.path not in (
+                "/api/manual/entry",
+                "/api/manual/exit",
+                "/api/account/select",
+                "/api/account/limits",
+            ):
+                self.send_error(405, "No trading/write route")
+                return
+            origin = urlsplit(self.headers.get("Origin", ""))
+            hosts = {
+                self.headers.get("Host", ""),
+                self.headers.get("X-Forwarded-Host", "").split(",")[0].strip(),
+            }
+            if (
+                not origin.netloc
+                or origin.netloc not in hosts
+                or origin.scheme not in ("http", "https")
+            ):
+                self.send_error(403, "Same-origin journal requests only")
+                return
+            if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                self.send_error(415, "JSON manual records only")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 8192:
+                    raise ValueError("Invalid journal payload size")
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict):
+                    raise ValueError("Journal record must be an object")
+                if self.path.startswith("/api/account/"):
+                    if monitor.account_client is None:
+                        raise ValueError("Account mode is not enabled on the server")
+                    if self.path.endswith("/select"):
+                        if set(data) != {"holding_id", "enabled"}:
+                            raise ValueError("Invalid selection fields")
+                        monitor.account_journal.select(data["holding_id"], data["enabled"])
+                    elif data == {"disable": True}:
+                        with monitor.account_journal.connect() as db:
+                            db.execute("DELETE FROM monitor_account_settings WHERE name='limits'")
+                    else:
+                        monitor.account_journal.limits(data)
+                    result = {"recorded": True, "executed_trade": False}
+                elif self.path.endswith("/entry"):
+                    identifier = monitor.manual.enter(data, utcnow(), monitor.manual_defaults)
+                    result = {"recorded": True, "entry_id": identifier, "executed_trade": False}
+                else:
+                    monitor.manual.exit(data, utcnow())
+                    result = {"recorded": True, "executed_trade": False}
+                status = 200
+            except (KeyError, ValueError, TypeError) as exc:
+                result = {"error": str(exc), "executed_trade": False}
+                status = 422
+            body = json.dumps(result).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
 
-        do_PUT = do_PATCH = do_DELETE = do_POST
+        def do_PUT(self):
+            self.send_error(405, "No trading/write route")
+
+        do_PATCH = do_DELETE = do_PUT
 
     return Handler
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KXBTC15M read-only public/replay monitor — no orders or credentials"
+        description="KXBTC15M signals-only public/replay monitor with optional GET-only account monitoring"
     )
     parser.add_argument(
         "--disable-model",
@@ -208,6 +537,18 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--poll-seconds", type=float, default=2)
+    parser.add_argument("--account-store", type=Path, default=Path("signals_account_monitor.db"))
+    parser.add_argument(
+        "--account-readonly",
+        action="store_true",
+        help="Enable isolated authenticated GET-only account monitoring",
+    )
+    parser.add_argument(
+        "--private-dashboard",
+        action="store_true",
+        help="Acknowledge account dashboard is private; verify Codespaces port visibility yourself",
+    )
+    parser.add_argument("--model-artifact", type=Path, default=Path("signals_model.json"))
     parser.add_argument("--manual-delay", type=int, default=3)
     parser.add_argument("--slippage", type=float, default=0.01)
     parser.add_argument("--target", type=float, default=0.05)
@@ -223,6 +564,16 @@ def main():
         and 0 <= args.slippage <= 0.10
     ):
         parser.error("target/stop must be in (0,1], horizon 1..900s, polling 1..5s")
+    if args.account_readonly and (not args.private_dashboard or args.mode != "public"):
+        parser.error(
+            "Account mode requires --mode public --private-dashboard and a Private forwarded port"
+        )
+    account_client = None
+    if args.account_readonly:
+        try:
+            account_client = ReadOnlyKalshi.from_environment()
+        except AccountReadError as exc:
+            parser.error(str(exc))
     feed = PublicFeed() if args.mode == "public" else ReplayFeed(args.replay)
     monitor = Monitor(
         feed,
@@ -233,6 +584,9 @@ def main():
         models_enabled=not args.disable_model,
         manual_delay=args.manual_delay,
         slippage=args.slippage,
+        model_artifact=args.model_artifact,
+        account_client=account_client,
+        account_store=args.account_store,
     )
     stop = threading.Event()
 
@@ -256,6 +610,10 @@ def main():
         stop.set()
         server.server_close()
         thread.join(timeout=35)
+        monitor.manual_pool.shutdown(wait=False, cancel_futures=True)
+        monitor.account_pool.shutdown(wait=False, cancel_futures=True)
+        if isinstance(feed, PublicFeed) and feed.hub:
+            feed.hub.close()
 
 
 if __name__ == "__main__":

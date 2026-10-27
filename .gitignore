@@ -209,3 +209,7 @@ secrets.yaml
 *.pem
 *.key
 .env*
+
+# Private monitor key directory and local fitted artifacts
+/.private/
+/signals_model*.json

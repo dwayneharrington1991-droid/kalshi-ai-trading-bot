@@ -15,6 +15,7 @@ from urllib.parse import urlencode, quote
 
 import httpx
 
+from .coverage import FeedHub
 from .model import Display, evaluate, fee, number, timestamp
 from .edges import assess_edges
 from .reliability import metrics, wilson
@@ -31,11 +32,16 @@ def utcnow():
 class PublicFeed:
     """Only fixed public market-data GETs; never reads trading credentials."""
 
-    def __init__(self, get=None):
+    def __init__(self, get=None, multi_venue=None):
         self.get = get or httpx.get
         self.transport_diagnostics = []
         self.candle_cache = None
         self.candles_checked = None
+        self.hub = (
+            FeedHub(self._read, self._read_text)
+            if (get is None if multi_venue is None else multi_venue)
+            else None
+        )
 
     def _read(self, url):
         started = perf_counter()
@@ -53,6 +59,63 @@ class PublicFeed:
         )
         self.transport_diagnostics = self.transport_diagnostics[-8:]
         return response.json()
+
+    def _read_text(self, url):
+        # Fixed public RSS source only; never arbitrary user URLs or auth headers.
+        if url != "https://www.federalreserve.gov/feeds/press_all.xml":
+            raise ValueError("Unsupported public news source")
+        response = self.get(
+            url,
+            timeout=10,
+            follow_redirects=False,
+            headers={"Accept": "application/rss+xml, application/xml"},
+        )
+        response.raise_for_status()
+        if len(response.content) > 262144:
+            raise ValueError("Public feed exceeds size limit")
+        return response.text
+
+    def contract_quote(self, ticker):
+        if not ticker.startswith("KXBTC15M-"):
+            raise ValueError("Only KXBTC15M public quotes are supported")
+        raw = self._read(KALSHI + "/markets/" + quote(ticker, safe=""))["market"]
+        book = self._read(KALSHI + "/markets/" + quote(ticker, safe="") + "/orderbook")
+        fixed = book.get("orderbook_fp")
+        if fixed is not None:
+            yes = [
+                (number(float(p), 0, 1), number(float(q), 0, 1e12))
+                for p, q in fixed.get("yes_dollars", [])
+            ]
+            no = [
+                (number(float(p), 0, 1), number(float(q), 0, 1e12))
+                for p, q in fixed.get("no_dollars", [])
+            ]
+        else:
+            legacy = book.get("orderbook", {})
+            yes = [
+                (number(p, 0, 100) / 100, number(q, 0, 1e12)) for p, q in (legacy.get("yes") or [])
+            ]
+            no = [
+                (number(p, 0, 100) / 100, number(q, 0, 1e12)) for p, q in (legacy.get("no") or [])
+            ]
+        yes = [v for v in yes if v[1] > 0]
+        no = [v for v in no if v[1] > 0]
+        if not yes or not no:
+            raise ValueError("No executable two-sided recorded-contract book")
+        y, n = max(yes), max(no)
+        series = self.last_series
+        return dict(
+            ticker=ticker,
+            observed_at=utcnow().isoformat(),
+            closes_at=raw["close_time"],
+            fee_type=series.get("fee_type"),
+            fee_multiplier=series.get("fee_multiplier"),
+            book_diagnostic=None,
+            quotes={
+                "up": dict(bid=y[0], ask=1 - n[0], bid_size=y[1], ask_size=n[1]),
+                "down": dict(bid=n[0], ask=1 - y[0], bid_size=n[1], ask_size=y[1]),
+            },
+        )
 
     def candles(self, now):
         if self.candles_checked is not None and (now - self.candles_checked).total_seconds() < 60:
@@ -105,6 +168,7 @@ class PublicFeed:
         else:
             raise ValueError("Incomplete market discovery; refusing partial selection")
         series = self._read(KALSHI + "/series/KXBTC15M")["series"]
+        self.last_series = series
         now = utcnow()
         result = []
         sources = series.get("settlement_sources", [])
@@ -160,6 +224,10 @@ class PublicFeed:
                     fee_type=series.get("fee_type"),
                     fee_multiplier=series.get("fee_multiplier"),
                     mapping_verified=orientation,
+                    comparison_operator=">="
+                    if orientation and "at least" in str(raw.get("rules_primary", "")).lower()
+                    else None,
+                    averaging_seconds=60,
                     averaging_rule_verified=(
                         orientation
                         and "CF Benchmarks" in source
@@ -250,6 +318,7 @@ class PublicFeed:
             "evidence": {},
             "btc_candles": self.candles(utcnow()),
             "transport_diagnostics": list(self.transport_diagnostics),
+            "coverage": self.hub.snapshot(utcnow()) if self.hub else {},
         }
 
 
@@ -313,9 +382,12 @@ def analyze(payload, now, target=0.05, stop=0.03, horizon=60, model_result=None,
         stale = not 0 <= age <= 5
     direction = "UNCLEAR"
     if result.settlement_up is not None and not stale:
-        if result.settlement_up >= 0.6:
+        sensitivity = (model_info or {}).get(
+            "settlement_probability_sensitivity", [result.settlement_up, result.settlement_up]
+        )
+        if result.settlement_up >= 0.6 and sensitivity[0] >= 0.6:
             direction = "UP"
-        elif result.settlement_up <= 0.4:
+        elif result.settlement_up <= 0.4 and sensitivity[1] <= 0.4:
             direction = "DOWN"
     plans = {}
     if market and not stale and market.get("mapping_verified", True):
@@ -393,7 +465,9 @@ def analyze(payload, now, target=0.05, stop=0.03, horizon=60, model_result=None,
             scalp_reason
         ) = "STALE_OR_MISSING_CONTRACT: fresh unique contract snapshot required"
     elif result.settlement_up is not None and direction == "UNCLEAR":
-        overall_reason += "; UNCLEAR: neither direction meets the 60% decision threshold"
+        overall_reason += (
+            "; UNCLEAR: probability/basis sensitivity does not support a 60% directional lean"
+        )
     if (
         not stale
         and result.scalp_up is not None
@@ -409,7 +483,22 @@ def analyze(payload, now, target=0.05, stop=0.03, horizon=60, model_result=None,
             )
             or "WAIT: cost-adjusted scalp estimates unavailable"
         )
+    comparison = {}
+    if market and not stale:
+        q = market.get("quotes", {}).get("up", {})
+        if q.get("bid") is not None and q.get("ask") is not None:
+            implied = (q["bid"] + q["ask"]) / 2
+            comparison = {
+                "market_implied_up": implied,
+                "market_implied_down": 1 - implied,
+                "market_bid_ask_range": [q["bid"], q["ask"]],
+                "model_minus_market": result.settlement_up - implied
+                if result.settlement_up is not None
+                else None,
+                "note": "Market-implied quote price, not a calibrated win probability; not a settlement model input.",
+            }
     return dict(
+        market_comparison=comparison,
         transport_diagnostics=payload.get("transport_diagnostics", []),
         edges=edges,
         scalp_lean=scalp_lean,
@@ -469,6 +558,20 @@ class Journal:
             for name, spec in additions.items():
                 if name not in columns:
                     db.execute(f"ALTER TABLE simulations ADD COLUMN {name} {spec}")
+            prediction_columns = {r[1] for r in db.execute("PRAGMA table_info(predictions)")}
+            for name, spec in {
+                "settlement_origin": "TEXT NOT NULL DEFAULT 'legacy_unknown'",
+                "settled_at": "TEXT",
+                "outcome_last_attempt": "TEXT",
+            }.items():
+                if name not in prediction_columns:
+                    db.execute(f"ALTER TABLE predictions ADD COLUMN {name} {spec}")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS forecast_outcomes (ticker TEXT,origin TEXT,observed_at TEXT,outcome INTEGER,PRIMARY KEY(ticker,origin))"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS feed_observations (source TEXT,timestamp TEXT,payload TEXT,PRIMARY KEY(source,timestamp))"
+            )
             db.execute(
                 "CREATE TABLE IF NOT EXISTS btc_candles (source TEXT,start INTEGER,payload TEXT,first_received_at TEXT,PRIMARY KEY(source,start))"
             )
@@ -735,20 +838,49 @@ class Journal:
                     ),
                 )
 
-    def settle(self, ticker, yes_result, mode):
+    def settle(self, ticker, yes_result, mode, observed_at=None):
         if yes_result not in {"yes", "no"}:
             return
+        origin = "official" if mode == "PUBLIC MARKET DATA" else "replay"
+        seen = observed_at or utcnow().isoformat()
         with self.connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO forecast_outcomes VALUES (?,?,?,?)",
+                (ticker, origin, seen, int(yes_result == "yes")),
+            )
             rows = db.execute(
-                "SELECT id,payload FROM predictions WHERE ticker=? AND mode=? AND settlement_up IS NULL",
+                "SELECT id,payload FROM predictions WHERE ticker=? AND mode=? AND (settlement_up IS NULL OR settlement_origin='legacy_unknown')",
                 (ticker, mode),
             ).fetchall()
             for row in rows:
                 if json.loads(row["payload"])["market"].get("mapping_verified", True):
                     db.execute(
-                        "UPDATE predictions SET settlement_up=? WHERE id=?",
-                        (int(yes_result == "yes"), row["id"]),
+                        "UPDATE predictions SET settlement_up=?,settlement_origin=?,settled_at=? WHERE id=?",
+                        (int(yes_result == "yes"), origin, seen, row["id"]),
                     )
+
+    def record_feeds(self, coverage):
+        with self.connect() as db:
+            for name, feed in coverage.items():
+                data = feed.get("data", {})
+                if data.get("observed_at"):
+                    db.execute(
+                        "INSERT OR IGNORE INTO feed_observations VALUES (?,?,?)",
+                        (name, data["observed_at"], json.dumps(feed, allow_nan=False)),
+                    )
+
+    def learning_readiness(self):
+        with self.connect() as db:
+            count = db.execute(
+                """SELECT COUNT(DISTINCT ticker) FROM predictions WHERE settlement_origin='official'
+                AND json_extract(payload,'$.model.candidate_features.values.return_1m') IS NOT NULL
+                AND json_extract(payload,'$.model.candidate_features.values.distance_scaled') IS NOT NULL"""
+            ).fetchone()[0]
+        return {
+            "official_featured_contracts": count,
+            "minimum_contracts": 170,
+            "reason": f"{count}/170 officially labeled contracts with recorded independent features. Train/validation/test are grouped and purged; minimum is not a guarantee of skill.",
+        }
 
     def recent_states(self):
         with self.connect() as db:

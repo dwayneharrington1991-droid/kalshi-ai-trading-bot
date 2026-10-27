@@ -88,7 +88,7 @@ class LiveEstimator:
     def observe(self, payload, now):
         reference = payload.get("reference", {})
         try:
-            source = reference["source"]
+            source = self.reference_identity(reference["source"])
             when = timestamp(reference["observed_at"])
             price = number(reference["price"], 0.000001, 1e12)
             if 0 <= (now - when).total_seconds() <= MAX_GAP:
@@ -129,6 +129,42 @@ class LiveEstimator:
                 continue
         active = {m.get("ticker") for m in payload.get("markets", [])}
         self.quotes = {t: h for t, h in self.quotes.items() if t in active}
+
+    @staticmethod
+    def reference_identity(source):
+        """Keep REST/stream labels for the same venue from clearing valid history."""
+        source = str(source)
+        if "Coinbase" in source and "BTC" in source:
+            return "Coinbase BTC/USD proxy"
+        if "Kraken" in source and "BTC" in source and "futures" not in source.lower():
+            return "Kraken BTC/USD proxy"
+        return source
+
+    def observe_reference(self, observation, now):
+        """Retain every normalized spot sample drained between model updates."""
+        if observation.get("kind") not in {"quote", "trade"}:
+            return False
+        source = self.reference_identity(observation.get("source", ""))
+        if source not in {"Coinbase BTC/USD proxy", "Kraken BTC/USD proxy"}:
+            return False
+        try:
+            received = timestamp(observation["received_at"])
+            price = number(observation["price"], 0.000001, 1e12)
+            if not 0 <= (now - received).total_seconds() <= 65:
+                return False
+            if source != self.reference_source:
+                self.reference.clear()
+                self.reference_source = source
+            if self.reference and received < self.reference[-1][0]:
+                return False
+            if self.reference and (received - self.reference[-1][0]).total_seconds() > MAX_GAP:
+                self.reference.clear()
+            if not self.reference or received > self.reference[-1][0]:
+                self.reference.append((received, price))
+                return True
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+        return False
 
     def estimate(self, payload, market, now, target, stop, horizon):
         self.observe(payload, now)

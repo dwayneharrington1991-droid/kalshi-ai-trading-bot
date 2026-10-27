@@ -6,6 +6,7 @@ import pytest
 from src.signals_display import prediction_engine as engine
 from src.signals_display.market_health import diagnose, selection_summary
 from src.signals_display.monitor import Journal, analyze
+from src.signals_display.model import timestamp
 from tests.test_signals_monitor import frame
 from tests.test_signals_display import NOW
 
@@ -102,6 +103,60 @@ def test_actual_contract_rules_are_required_and_no_opening_data_means_unavailabl
     assert engine.opening_forecast(m, history(), points(), NOW)["up"] is None
     m = market()
     assert engine.opening_forecast(m, history(), [], NOW)["up"] is None
+
+
+def test_persisted_opening_snapshot_excludes_future_receipts_and_survives_time(tmp_path):
+    journal = Journal(tmp_path / "opening-snapshot.db")
+    contract = market()
+    opened = timestamp(contract["opens_at"])
+    before = (opened - timedelta(seconds=1), 100000)
+    after = (opened + timedelta(milliseconds=1), 200000)
+    first = journal.freeze_opening_snapshot(
+        contract, "PUBLIC MARKET DATA", history(), [before, after],
+        "Coinbase BTC/USD proxy", opened + timedelta(seconds=1), finalized=True,
+    )
+    assert first["reference_points"] == [[before[0].isoformat(), before[1]]]
+    assert first["data_cutoff"] == opened.isoformat()
+    much_later = journal.opening_snapshot(contract["ticker"], "PUBLIC MARKET DATA")
+    assert much_later == first
+    replacement = journal.freeze_opening_snapshot(
+        contract, "PUBLIC MARKET DATA", {}, [], None,
+        opened + timedelta(minutes=10), finalized=True,
+    )
+    assert replacement == first
+
+
+def test_one_hundred_consecutive_openings_get_distinct_immutable_snapshots(tmp_path):
+    journal = Journal(tmp_path / "hundred-openings.db")
+    for index in range(100):
+        opened = NOW + timedelta(minutes=15 * index)
+        contract = market()
+        contract.update(
+            ticker=f"KXBTC15M-SIM-{index}",
+            opens_at=opened.isoformat(),
+            closes_at=(opened + timedelta(minutes=15)).isoformat(),
+        )
+        frozen_history = history(opened - timedelta(minutes=1), opened - timedelta(seconds=1))
+        frozen_points = [
+            (opened - timedelta(seconds=65 - second), 100000 + math.sin(second))
+            for second in range(65)
+        ]
+        snapshot = journal.freeze_opening_snapshot(
+            contract, "REPLAY / SIMULATED", frozen_history, frozen_points,
+            "Coinbase synthetic proxy", opened, finalized=True,
+        )
+        opening = engine.opening_forecast(
+            contract,
+            snapshot["history"],
+            [(timestamp(t), p) for t, p in snapshot["reference_points"]],
+            opened,
+            reference_source=snapshot["reference_source"],
+        )
+        assert opening["up"] is not None
+        journal.opening_record(contract["ticker"], "REPLAY / SIMULATED", opening, opened)
+    with journal.read() as db:
+        assert db.execute("SELECT count(*) FROM opening_input_snapshots").fetchone()[0] == 100
+        assert db.execute("SELECT count(*) FROM btc_engine_opening").fetchone()[0] == 100
 
 
 def test_recording_revisions_and_official_scoring_do_not_backfill_or_duplicate(tmp_path):

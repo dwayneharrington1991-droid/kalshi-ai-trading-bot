@@ -817,6 +817,12 @@ class Journal:
                 CREATE INDEX IF NOT EXISTS settlement_due ON settlement_queue(mode,resolved,closes_at);
                 CREATE TABLE IF NOT EXISTS dashboard_migrations (name TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE IF NOT EXISTS dashboard_settings (name TEXT PRIMARY KEY,payload TEXT);
+                CREATE TABLE IF NOT EXISTS opening_input_snapshots (
+                    mode TEXT NOT NULL,ticker TEXT NOT NULL,opens_at TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,finalized INTEGER NOT NULL,payload TEXT NOT NULL,
+                    PRIMARY KEY(mode,ticker));
+                CREATE INDEX IF NOT EXISTS opening_input_snapshots_open
+                    ON opening_input_snapshots(mode,opens_at);
                 """
             )
 
@@ -1259,6 +1265,53 @@ class Journal:
             "source": "Coinbase frozen journal history",
             "received_at": max((r[2] for r in rows), default=opened.isoformat()),
         }
+
+    def opening_snapshot(self, ticker, mode):
+        with self.read() as db:
+            row = db.execute(
+                "SELECT payload FROM opening_input_snapshots WHERE mode=? AND ticker=?",
+                (mode, ticker),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def freeze_opening_snapshot(
+        self, market, mode, history, reference_points, reference_source, captured_at, finalized
+    ):
+        """Persist receipt-proven opening inputs independently from live freshness."""
+        opened = timestamp(market["opens_at"])
+        points = [
+            [when.isoformat(), price]
+            for when, price in reference_points
+            if when <= opened
+        ]
+        payload = {
+            "ticker": market["ticker"],
+            "opens_at": opened.isoformat(),
+            "captured_at": captured_at.isoformat(),
+            "data_cutoff": opened.isoformat(),
+            "history": history,
+            "reference_points": points,
+            "reference_source": reference_source,
+            "finalized": bool(finalized),
+            "future_data_excluded": True,
+        }
+        with self.connect() as db:
+            existing = db.execute(
+                "SELECT finalized,payload FROM opening_input_snapshots WHERE mode=? AND ticker=?",
+                (mode, market["ticker"]),
+            ).fetchone()
+            if existing and existing[0]:
+                return json.loads(existing[1])
+            db.execute(
+                """INSERT INTO opening_input_snapshots
+                   (mode,ticker,opens_at,captured_at,finalized,payload) VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(mode,ticker) DO UPDATE SET
+                     captured_at=excluded.captured_at,finalized=excluded.finalized,payload=excluded.payload
+                   WHERE opening_input_snapshots.finalized=0""",
+                (mode, market["ticker"], opened.isoformat(), captured_at.isoformat(),
+                 int(bool(finalized)), json.dumps(payload, allow_nan=False)),
+            )
+        return payload
 
     def opening_record(self, ticker, mode, candidate=None, wall_now=None):
         with self.read() if candidate is None else self.connect() as db:

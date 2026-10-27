@@ -226,6 +226,33 @@ class Monitor:
                     except (KeyError, ValueError, TypeError, AttributeError):
                         rejected += 1
                 self.estimator.observe_reference(observation, now)
+            # Freeze opening inputs before optional analytics. This artifact is
+            # independent of live-data freshness and remains usable when
+            # threshold metadata or model generation arrives later.
+            mode = payload.get("mode", "PUBLIC MARKET DATA")
+            for discovered in payload.get("markets", []):
+                try:
+                    opened = timestamp(discovered["opens_at"])
+                    if not opened <= now <= opened + timedelta(seconds=6):
+                        continue
+                    raw_history = payload.get("btc_candles", {})
+                    try:
+                        eligible = timestamp(raw_history["received_at"]) <= opened
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        eligible = False
+                    frozen_history = raw_history if eligible else self.journal.opening_inputs(opened)
+                    frozen_points, frozen_source = self.estimator.opening_points(opened)
+                    self.journal.freeze_opening_snapshot(
+                        discovered,
+                        mode,
+                        frozen_history,
+                        frozen_points,
+                        frozen_source,
+                        now,
+                        finalized=now >= opened + timedelta(seconds=5),
+                    )
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    continue
             primary = None
             if ref.get("transport") == "public WebSocket":
                 primary = (
@@ -409,20 +436,29 @@ class Monitor:
                     and m.get("comparison_operator") == ">="
                 ):
                     opened = timestamp(m["opens_at"])
-                    raw_history = payload.get("btc_candles", {})
-                    try:
-                        eligible = timestamp(raw_history["received_at"]) <= opened
-                    except (KeyError, ValueError, TypeError, AttributeError):
-                        eligible = False
-                    frozen = raw_history if eligible else self.journal.opening_inputs(opened)
+                    snapshot = self.journal.opening_snapshot(m["ticker"], state["mode"])
+                    if snapshot:
+                        frozen = snapshot.get("history", {})
+                        frozen_points = [
+                            (timestamp(point[0]), point[1])
+                            for point in snapshot.get("reference_points", [])
+                        ]
+                        frozen_source = snapshot.get("reference_source")
+                    else:
+                        raw_history = payload.get("btc_candles", {})
+                        try:
+                            eligible = timestamp(raw_history["received_at"]) <= opened
+                        except (KeyError, ValueError, TypeError, AttributeError):
+                            eligible = False
+                        frozen = raw_history if eligible else self.journal.opening_inputs(opened)
+                        frozen_points, frozen_source = self.estimator.opening_points(opened)
                     generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
-                    opening_points, opening_source = self.estimator.opening_points(opened)
                     candidate = opening_forecast(
                         m,
                         frozen,
-                        opening_points,
+                        frozen_points,
                         generated,
-                        reference_source=opening_source,
+                        reference_source=frozen_source,
                         audit_context={
                             "official_contracts": self.readiness.get("official_contracts"),
                             "minimum_contracts": self.readiness.get("minimum_contracts", 170),

@@ -75,7 +75,8 @@ def calculate(state, *, slippage=0.01, manual_delay=3, account=None, now=None):
         "remaining_seconds": state.get("remaining_seconds"),
         "data_status": "FRESH" if fresh else "STALE_OR_INCOMPLETE",
         "validation": validation,
-        "label": "NO VERIFIED EDGE — WAIT",
+        "label": "DATA UNAVAILABLE — WAIT",
+        "estimated_edge_status": "DATA_UNAVAILABLE",
         "actionable": False,
         "sides": {},
         "positions": [],
@@ -158,14 +159,33 @@ def calculate(state, *, slippage=0.01, manual_delay=3, account=None, now=None):
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             item["reason"] = str(exc)
         result["sides"][side] = item
-    verified = [x for x in result["sides"].values() if x["status"] == "VERIFIED_POSITIVE_EDGE"]
+    executable = [x for x in result["sides"].values() if x["executable"]]
+    verified = [x for x in executable if x["status"] == "VERIFIED_POSITIVE_EDGE"]
+    experimental = [x for x in executable if x["status"] == "EXPERIMENTAL_POSITIVE_EV"]
     if verified:
         best = max(verified, key=lambda x: x["net_expected_profit_per_contract"])
-        result["label"] = "POSITIVE EDGE — " + best["side"].upper()
+        result["label"] = "VERIFIED POSITIVE EDGE — " + best["side"].upper()
+        result["estimated_edge_status"] = "VERIFIED_POSITIVE_EDGE"
         result["actionable"] = True
         result["reason"] = best["reason"]
-    elif any(x["status"] == "EXPERIMENTAL_POSITIVE_EV" for x in result["sides"].values()):
-        result["reason"] = "Positive quote-time model EV exists, but edge remains experimental and unverified"
+    elif experimental:
+        best = max(experimental, key=lambda x: x["net_expected_profit_per_contract"])
+        result["label"] = "POSITIVE ESTIMATED EDGE — " + best["side"].upper()
+        result["estimated_edge_status"] = "EXPERIMENTAL_POSITIVE_EDGE"
+        result["reason"] = (
+            "Positive quote-time model EV exists after estimated costs, but predictive "
+            "advantage remains experimental and unverified"
+        )
+    elif executable:
+        result["label"] = "NO POSITIVE ESTIMATED EDGE — WAIT"
+        result["estimated_edge_status"] = "NO_POSITIVE_ESTIMATED_EDGE"
+        result["reason"] = (
+            "Fresh executable calculations completed; neither side exceeds its estimated "
+            "break-even probability after fees and slippage"
+        )
+    else:
+        reasons = [x["reason"] for x in result["sides"].values() if x.get("reason")]
+        result["reason"] = reasons[0] if reasons else "Required edge inputs are unavailable"
     result["positions"] = _positions(account or {}, result)
     return result
 

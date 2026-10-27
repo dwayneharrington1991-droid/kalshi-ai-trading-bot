@@ -55,7 +55,8 @@ def test_edge_uses_executable_ask_costs_depth_and_never_calls_it_verified():
     assert up["net_expected_profit_per_contract"] == pytest.approx(0.05)
     assert up["maximum_executable_quantity_at_displayed_price"] == 12
     assert up["status"] == "EXPERIMENTAL_POSITIVE_EV"
-    assert result["label"] == "NO VERIFIED EDGE — WAIT"
+    assert result["label"] == "POSITIVE ESTIMATED EDGE — UP"
+    assert result["estimated_edge_status"] == "EXPERIMENTAL_POSITIVE_EDGE"
     assert result["actionable"] is False
 
 
@@ -73,6 +74,7 @@ def test_stale_or_unsupported_inputs_fail_closed(change):
     result = calculate(value, now=NOW)
     assert result["actionable"] is False
     assert all(not side["executable"] for side in result["sides"].values())
+    assert result["estimated_edge_status"] == "DATA_UNAVAILABLE"
 
 
 def test_validation_gate_requires_explicit_matching_oos_protocol():
@@ -86,7 +88,16 @@ def test_validation_gate_requires_explicit_matching_oos_protocol():
     }
     result = calculate(value, now=NOW)
     assert result["validation"]["verified"] is True
-    assert result["label"] == "POSITIVE EDGE — UP"
+    assert result["label"] == "VERIFIED POSITIVE EDGE — UP"
+
+
+def test_fresh_complete_calculation_distinguishes_no_positive_estimated_edge():
+    value = state()
+    value["prediction_engine"].update(up=0.50, down=0.50)
+    result = calculate(value, now=NOW)
+    assert result["label"] == "NO POSITIVE ESTIMATED EDGE — WAIT"
+    assert result["estimated_edge_status"] == "NO_POSITIVE_ESTIMATED_EDGE"
+    assert all(side["executable"] for side in result["sides"].values())
 
 
 def test_position_comparison_uses_confirmed_account_values_separately():

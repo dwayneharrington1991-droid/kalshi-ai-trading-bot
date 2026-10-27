@@ -17,6 +17,8 @@ from .account_readonly import ReadOnlyKalshi, AccountReadError, credential_statu
 from .account_state import AccountJournal, account_guidance, live_trade_cards
 from .scanner import context as scanner_context, qualify as scanner_qualify
 from .decision import assess as trade_decision
+from .market_health import selection_summary, diagnose as diagnose_market
+from .prediction_engine import view as engine_view, opening_forecast
 from .manual import ManualJournal
 from .live_model import LiveEstimator
 from .learning import load_artifact, predict as learned_predict
@@ -191,6 +193,42 @@ class Monitor:
                 scan = scanner_context(payload, market_now, info, now)
                 info["scanner"] = scan
                 scanner_qualify(state, scan)
+            state["discovered_contracts"] = selection_summary(payload.get("markets", []), now)
+            state["market_health"] = diagnose_market(state, now)
+            prior = (
+                self.journal.engine_prior(state["market"]["ticker"], state["mode"])
+                if state.get("market")
+                else None
+            )
+            opening = None
+            if state.get("market") and self.models_enabled:
+                m = state["market"]
+                opening = self.journal.opening_record(m["ticker"], state["mode"])
+                if (
+                    opening is None
+                    and m.get("strike") is not None
+                    and m.get("mapping_verified")
+                    and m.get("averaging_rule_verified")
+                    and m.get("comparison_operator") == ">="
+                ):
+                    opened = timestamp(m["opens_at"])
+                    raw_history = payload.get("btc_candles", {})
+                    try:
+                        eligible = timestamp(raw_history["received_at"]) <= opened
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        eligible = False
+                    frozen = raw_history if eligible else self.journal.opening_inputs(opened)
+                    generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+                    candidate = opening_forecast(
+                        m, frozen, list(self.estimator.reference), generated
+                    )
+                    candidate["closes_at"] = m["closes_at"]
+                    opening = self.journal.opening_record(
+                        m["ticker"], state["mode"], candidate, generated
+                    )
+            state["prediction_engine"] = engine_view(
+                state, prior, opening, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+            )
             key = (
                 (state["market"]["ticker"], state["scalp"])
                 if state["market"] and state["scalp"] != "WAIT" and not state["stale"]
@@ -292,7 +330,18 @@ class Monitor:
                 + "; absence of trading/transfer permission is not verified"
             )
         self.account_candidate.require_readonly = True
-        return self.account_candidate.snapshot()
+        batch = self.account_candidate.snapshot()
+        self.account_journal.bind(
+            self.account_candidate.credential_binding, allow_empty_rotation=True
+        )
+        Path(self.account_journal.path).chmod(0o600)
+        self.account_journal.reconcile(batch)
+        return batch
+
+    def sync_account(self, since):
+        batch = self.account_client.snapshot(since)
+        self.account_journal.reconcile(batch)
+        return batch
 
     def update_account(self, now):
         if self.account_client is None:
@@ -301,11 +350,6 @@ class Monitor:
             if self.account_job and self.account_job.done():
                 try:
                     batch = self.account_job.result()
-                    self.account_journal.bind(
-                        self.account_candidate.credential_binding, allow_empty_rotation=True
-                    )
-                    Path(self.account_journal.path).chmod(0o600)
-                    self.account_journal.reconcile(batch)
                     self.account_client = self.account_candidate
                     self.account_connected = True
                     self.account_error = None
@@ -325,7 +369,6 @@ class Monitor:
         if self.account_job and self.account_job.done():
             try:
                 batch = self.account_job.result()
-                self.account_journal.reconcile(batch)
                 self.account_connected = True
                 self.account_error = None
             except Exception as exc:
@@ -345,7 +388,7 @@ class Monitor:
                 if recent:
                     since = max(0, int(max(timestamp(f["at"]).timestamp() for f in recent)) - 60)
             self.account_started = now
-            self.account_job = self.account_pool.submit(self.account_client.snapshot, since)
+            self.account_job = self.account_pool.submit(self.sync_account, since)
 
     def account_view(self, state, now):
         if self.account_client is None:
@@ -404,6 +447,18 @@ class Monitor:
             "balance_note"
         ] = "Broker cash balance; pending-order reserves/withdrawable cash may differ. Last-known when stale."
         account["status"] = "READ_ONLY_CONNECTED" if fresh else "ACCOUNT_STALE"
+        reconciliation = account.get("fill_reconciliation", {})
+        account["reconciliation_warning"] = (
+            (
+                str(reconciliation.get("quarantined_fills", 0))
+                + " quarantined fills; affected entry cost/P&L withheld. "
+                + str(reconciliation.get("canonical_legacy_discrepancies", 0))
+                + " canonical/legacy direction discrepancies audited."
+            )
+            if reconciliation.get("quarantined_fills")
+            or reconciliation.get("canonical_legacy_discrepancies")
+            else None
+        )
         account["reason"] = self.account_error or (
             "Confirmed read-only account snapshot"
             if fresh
@@ -500,6 +555,30 @@ class Monitor:
                     signal=None,
                     scalp_explanation="EXPIRED_SIGNAL: waiting for a fresh qualifying setup",
                 )
+            health_clock = (
+                utcnow()
+                if state.get("mode") == "PUBLIC MARKET DATA"
+                else timestamp(state["now"]) + (utcnow() - self.last_tick)
+            )
+            state["market_health"] = diagnose_market(state, health_clock)
+            if not state["market_health"]["contract_quotes_fresh"]:
+                state.update(
+                    stale=True,
+                    direction="UNCLEAR",
+                    scalp="WAIT",
+                    plans={},
+                    estimate=asdict(Display("WAIT", "Stale or missing active-contract quotes")),
+                    explanation="STALE_DATA: "
+                    + "; ".join(state["market_health"]["contract_quote_reasons"]),
+                )
+            if state.get("stale") and state.get("prediction_engine"):
+                state["prediction_engine"] = {
+                    **state["prediction_engine"],
+                    "status": "INSUFFICIENT DATA",
+                    "up": None,
+                    "down": None,
+                    "reason": "Fresh unexpired contract/reference data required",
+                }
             state["trade_decision"] = trade_decision(state)
             state["connection_diagnostics"] = {
                 "credentials": credential_status(),
@@ -510,6 +589,13 @@ class Monitor:
                 "permissions": state["account"].get("permissions") or self.startup_diagnostics,
                 "market_stale": state.get("stale", True),
                 "market_reason": state.get("explanation"),
+                "market_health": state["market_health"],
+                "last_poll_completed_at": self.last_tick.isoformat(),
+                "fill_reconciliation": state["account"].get("fill_reconciliation", {}),
+                "open_positions": sum(
+                    h.get("status") == "OPEN" for h in state["account"].get("holdings", [])
+                ),
+                "balance_available": state["account"].get("available_balance_dollars") is not None,
                 "reference_received_at": state.get("reference", {}).get("observed_at"),
                 "quote_received_at": (state.get("market") or {}).get("observed_at"),
                 "public_requests": list(getattr(self.feed, "transport_diagnostics", [])),
@@ -640,7 +726,7 @@ def main():
     parser.add_argument("--journal", type=Path, default=Path("signals_monitor.db"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--poll-seconds", type=float, default=2)
+    parser.add_argument("--poll-seconds", type=float, default=1)
     parser.add_argument("--account-store", type=Path, default=Path("signals_account_monitor.db"))
     parser.add_argument(
         "--account-readonly",

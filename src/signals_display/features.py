@@ -31,6 +31,13 @@ FEATURES = (
     "perpetual_absorption_candidate",
     "spot_delta_efficiency_3m",
     "perpetual_delta_efficiency_3m",
+    "return_24h",
+    "rsi_14",
+    "macd_scaled",
+    "ema_gap",
+    "vwap_deviation",
+    "bollinger_z",
+    "volatility_24h",
 )
 
 

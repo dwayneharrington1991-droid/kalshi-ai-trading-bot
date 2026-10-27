@@ -217,3 +217,90 @@ compatibility is still unverified until the Codespace holding those secrets runs
 the diagnostic check; the compatibility tests use generated keys and mocked data.
 
 Pending-order polling now requests documented `status=resting`; completed trade accounting still uses confirmed fills. This avoids repeatedly paging through canceled/executed order history during each live refresh.
+
+## Reconciliation audit and the dedicated 15-minute engine
+
+Kalshi's [direction migration guide](https://docs.kalshi.com/getting_started/order_direction)
+says new integrations should read **canonical `outcome_side` / `book_side`**, not
+require deprecated `action` / `side` to agree. `yes` is `bid`; `no` is `ask`.
+Buy YES / sell NO imply YES exposure; buy NO / sell YES imply NO exposure. The old
+parser wrongly made a deprecated-field disagreement fatal to the entire account sync.
+
+Valid canonical fields now determine exposure; legacy discrepancies are flagged
+and their complete raw records retained in the private account database. Conflicting
+canonical fields, unsupported legacy-only direction, future timestamps and inconsistent
+duplicate IDs are quarantined, not guessed or discarded. Affected entry costs,
+fees and P&L remain unavailable. Confirmed cash/position quantities remain available.
+Every source version and superseded cached interpretation is retained in additive
+audit tables. Corrected authoritative records can resolve quarantine on later sync.
+Existing journals are never reset. The account warning/Details show reconciliation
+counts. A mocked 2576-fill/10-position bootstrap is part of regression coverage.
+
+**BTC 15-MINUTE PREDICTION ENGINE** forecasts each individual KXBTC15M settlement,
+not a 24-hour future price. Background, bounded Coinbase requests preload a rolling
+24h candle cache before market openings. Quote polling runs independently, at a
+one-second requested cadence (actual interval includes request/processing time).
+Kalshi contract metadata and executable books use REST; Kraken public WebSockets
+provide available order-flow/depth context with reconnects. No Kalshi authenticated
+WebSocket or licensed BRTI stream is claimed. Failed streams remain unavailable.
+
+- Full 1440-bar contiguous historical windows are checked for alignment, freshness,
+  missing/duplicate intervals and OHLC validity. Only candles closed when received
+  are admitted. The latest complete window can end up to 120 seconds before cutoff,
+  reflecting provider publication latency, which is disclosed. Incomplete boundary
+  5m/15m/hourly bars are excluded.
+- RSI14 uses simple mean gains/losses, MACD uses EMA12/26 and EMA9 signal, EMA50,
+  volume-weighted typical-price VWAP and 20-close/two-population-SD Bollinger bands.
+  Trend/volume/momentum/acceleration/support/resistance/regime features are correlated
+  candidates, never independent confidence votes.
+- The transparent live fallback forecasts the final official 60-second average at
+  this contract's close, using actual threshold/rules, a constant opening-window
+  proxy/index basis assumption, zero drift and max(recent,24h RMS) volatility.
+  The opening forecast uses frozen pre-opening history/reference observations and
+  its own explicitly labeled 24h volatility baseline. Model estimates remain
+  **experimental, uncalibrated, and edge unverified**. Official BRTI is unavailable;
+  Coinbase remains a proxy. No indicators are converted into arbitrary percentages.
+- Opening estimates are stored separately and never overwritten. BTC inputs must
+  have been received by the opening cutoff. Official threshold metadata can arrive
+  late: its receipt time and actual generation delay are disclosed. No post-opening
+  BTC price/candle is substituted. If frozen inputs were unavailable (including a
+  cold start mid-contract), the initial estimate stays unavailable; it is not backfilled.
+- Latest revisions have their own generation timestamps/data cutoffs. UP/DOWN are
+  complementary only under verified exhaustive binary rules. Expired/stale quotes
+  suppress current estimates and all recommendations; recorded initial estimates
+  remain visible as historical forecasts. No profitable opportunity is validated,
+  so YOUR NEXT MOVE remains WAIT.
+- Prediction rows are uniquely keyed, recorded before close/outcome availability,
+  and compared with official results only. Initial/latest accuracy, Brier, log loss,
+  calibration, probability bands, volatility regimes and 1/7/30-day windows are
+  separate from simulations. Missing opening predictions are counted explicitly.
+  Prediction archives retain waiting/settled outcomes; no live predictions are
+  fabricated for earlier markets.
+
+The offline learner compares statistical/ML candidates against zero-drift and
+market-implied baselines, with train-only preprocessing, validation calibration,
+label-time purging and a separate holdout. Optional disjoint-block expanding-window
+walk-forward reports are available with:
+
+```bash
+.venv/bin/python3 -m src.signals_display.learning --journal signals_monitor.db --output signals_model.json --walk-forward
+```
+
+Insufficient official labels produce an insufficiency report, not trained weights
+or invented calibration. Do not repeatedly retune against the same test period.
+
+**MARKET DATA HEALTH** now reports active/expired/ambiguous selection, exact quote
+and BTC-reference ages, server UTC, known opening/close times, missing/future sample
+timestamps, HTTP cache Age and server Date/clock differences when supplied. HTTP
+200 alone never proves freshness. REST requests ask caches to revalidate; stale
+cache Age on live responses is rejected. HTTP Date is a coarse transport diagnostic,
+not NTP verification or a reason to rewrite event timestamps. No freshness threshold
+was widened. Large fill reconciliation now runs off the market-polling thread.
+
+Run all signals-only offline tests with `.venv/bin/python3 -m pytest -q tests/test_signals*.py`.
+Trading/execution/live-order suites are deliberately not run. Live production
+reconciliation still requires the existing Codespace with its injected secrets;
+this environment cannot access that Codespace. Your reported authentication success
+is accepted; a new key or broader permissions are not required by this repair.
+
+Performance/history reads now use isolated read-only WAL snapshots, so long-running scoring queries do not hold the market writer lock. Repeated unchanged candle batches are persisted once per receipt timestamp. Contract-metadata cache age is diagnosed separately from live book/spot cache age; HTTP 200 on metadata cannot refresh an expired contract or replace a fresh executable book.

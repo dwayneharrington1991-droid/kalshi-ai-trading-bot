@@ -334,25 +334,27 @@ def normalized_fill(raw):
     outcome = raw.get("outcome_side")
     book_side = raw.get("book_side")
     direction_basis = "legacy side/action"
+    legacy_warning = None
     if outcome is not None or book_side is not None:
         direction = outcome if outcome is not None else {"bid": "yes", "ask": "no"}.get(book_side)
         if direction not in ("yes", "no") or (
             book_side is not None and book_side != ("bid" if direction == "yes" else "ask")
         ):
             raise AccountReadError("Conflicting/unsupported canonical fill direction")
-        if (
-            legacy_side is not None
-            and legacy_side not in ("yes", "no")
-            or legacy_action is not None
-            and legacy_action not in ("buy", "sell")
-        ):
-            raise AccountReadError("Unsupported legacy fill direction")
-        if legacy_side is not None and legacy_action is not None:
-            expected = (
-                legacy_side if legacy_action == "buy" else ("no" if legacy_side == "yes" else "yes")
-            )
-            if expected != direction:
-                raise AccountReadError("Canonical and legacy fill direction conflict")
+        # Canonical fields are authoritative per the official migration guide.
+        # Deprecated disagreements are retained and audited, never used to flip direction.
+        legacy_warning = None
+        if legacy_side is not None or legacy_action is not None:
+            if legacy_side not in ("yes", "no") or legacy_action not in ("buy", "sell"):
+                legacy_warning = "DEPRECATED_DIRECTION_INCOMPLETE_OR_UNSUPPORTED"
+            else:
+                expected = (
+                    legacy_side
+                    if legacy_action == "buy"
+                    else ("no" if legacy_side == "yes" else "yes")
+                )
+                if expected != direction:
+                    legacy_warning = "CANONICAL_LEGACY_DIRECTION_DISAGREEMENT"
         side, action = direction, "buy"
         direction_basis = "canonical outcome exposure; buy is an economic normalization, not an inferred submitted order"
     else:
@@ -400,6 +402,7 @@ def normalized_fill(raw):
     return {
         "id": str(identifier),
         "direction_basis": direction_basis,
+        "direction_warning": legacy_warning,
         "ticker": str(raw.get("ticker", raw.get("market_ticker", ""))),
         "side": side,
         "action": action,

@@ -91,7 +91,7 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy):
     def get(url, **kwargs):
         calls.append(url)
         assert "auth" not in kwargs
-        assert kwargs["headers"] == {"Accept": "application/json"}
+        assert kwargs["headers"] == {"Accept": "application/json", "Cache-Control": "no-cache"}
         assert not kwargs["follow_redirects"]
         if "/markets?" in url:
             payload = {
@@ -137,7 +137,8 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy):
 
     monkeypatch.setattr(module, "utcnow", lambda: NOW)
     data = PublicFeed(get).poll()
-    assert len(calls) == 5
+    assert len(calls) == 9
+    assert sum("/candles?" in call for call in calls) == 5
     assert data["markets"][0]["quotes"]["up"]["ask_size"] == 14
     assert not data["reference"]["official"]
     assert analyze(data, NOW)["scalp"] == "WAIT"

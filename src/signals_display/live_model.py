@@ -5,6 +5,7 @@ Settlement: zero-drift dollar Brownian proxy, opening-window anchored basis, fin
 frozen spreads/fees. These assumptions are not calibrated facts.
 """
 from collections import deque
+from datetime import timedelta
 import hashlib
 import math
 import random
@@ -69,6 +70,10 @@ class LiveEstimator:
         self.manual_delay = manual_delay
         self.slippage = slippage
         self.reference = deque(maxlen=1800)
+        # Receipt audit used only for as-of-opening selection. Unlike the live
+        # volatility buffer, a reconnect/gap must not erase observations that
+        # were genuinely received before the contract opened.
+        self.opening_references = {}
         self.quotes = {}
         self.reference_source = None
         self.developing = DevelopingCandle()
@@ -92,6 +97,7 @@ class LiveEstimator:
             when = timestamp(reference["observed_at"])
             price = number(reference["price"], 0.000001, 1e12)
             if 0 <= (now - when).total_seconds() <= MAX_GAP:
+                self._audit_reference(source, when, price)
                 if source != self.reference_source:
                     self.reference.clear()
                     self.reference_source = source
@@ -140,6 +146,31 @@ class LiveEstimator:
             return "Kraken BTC/USD proxy"
         return source
 
+    def _audit_reference(self, source, received, price):
+        """Keep bounded source-specific receipts across live continuity resets."""
+        history = self.opening_references.setdefault(source, deque(maxlen=20000))
+        if history and received == history[-1][0]:
+            if price != history[-1][1]:
+                return False
+            return False
+        if history and received < history[-1][0]:
+            return False
+        history.append((received, price))
+        return True
+
+    def opening_points(self, opened):
+        """Select one proxy source using receipts at or before opening only."""
+        start = opened - timedelta(seconds=65)
+        candidates = []
+        for source, history in self.opening_references.items():
+            points = [(when, price) for when, price in history if start <= when <= opened]
+            if points:
+                candidates.append((points[-1][0], len(points), source, points))
+        if not candidates:
+            return [], None
+        _, _, source, points = max(candidates, key=lambda item: (item[0], item[1]))
+        return points, source
+
     def observe_reference(self, observation, now):
         """Retain every normalized spot sample drained between model updates."""
         if observation.get("kind") not in {"quote", "trade"}:
@@ -152,6 +183,7 @@ class LiveEstimator:
             price = number(observation["price"], 0.000001, 1e12)
             if not 0 <= (now - received).total_seconds() <= 65:
                 return False
+            self._audit_reference(source, received, price)
             if source != self.reference_source:
                 self.reference.clear()
                 self.reference_source = source

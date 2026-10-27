@@ -27,6 +27,19 @@ PATHS = frozenset(
 )
 
 
+def credential_status():
+    import os
+
+    return {
+        name: bool(os.environ.get(name))
+        for name in (
+            "KALSHI_MONITOR_KEY_ID",
+            "KALSHI_MONITOR_PRIVATE_KEY_PEM",
+            "KALSHI_MONITOR_PRIVATE_KEY_PATH",
+        )
+    }
+
+
 class AccountReadError(Exception):
     pass
 
@@ -106,7 +119,7 @@ class ReadOnlyKalshi:
             )
             if response.status_code != 200:
                 raise AccountReadError(
-                    f"Account read failed (HTTP {response.status_code}); no mutation attempted"
+                    f"Authenticated GET {path} failed (HTTP {response.status_code}); no mutation attempted"
                 )
             data = response.json()
             if not isinstance(data, dict):
@@ -114,9 +127,13 @@ class ReadOnlyKalshi:
             return data
         except AccountReadError:
             raise
-        except Exception:
+        except Exception as exc:
             raise AccountReadError(
-                "Account read unavailable; credentials and response bodies are redacted"
+                "Authenticated GET "
+                + path
+                + " unavailable ("
+                + type(exc).__name__
+                + "); credentials and response bodies are redacted"
             ) from None
 
     def pages(self, path, key, params=None):
@@ -144,7 +161,9 @@ class ReadOnlyKalshi:
         )
 
     def permissions(self):
-        if self._permissions_cache is not None and time.monotonic() - self._permissions_time < 60:
+        if self._permissions_cache is not None and time.monotonic() - self._permissions_time < (
+            60 if self._permissions_cache.get("read_only_verified") else 10
+        ):
             return self._permissions_cache
         result = self._verify_permissions()
         self._permissions_cache = result
@@ -152,39 +171,77 @@ class ReadOnlyKalshi:
         return result
 
     def _verify_permissions(self):
-        try:
-            keys = self.request("GET", "/trade-api/v2/api_keys").get("api_keys", [])
-            current = next(
-                (k for k in keys if k.get("api_key_id", k.get("id")) == self._key_id), None
-            )
-            scopes = current.get("scopes") if current else None
-            if isinstance(scopes, list) and set(scopes) == {"read"}:
-                return {
-                    "status": "READ_ONLY_SCOPE_REPORTED",
-                    "read_only_verified": True,
-                    "warning": "API metadata reports only read scope; GET allowlist is still enforced",
-                }
-            if isinstance(scopes, list) and "write" in scopes:
-                return {
-                    "status": "TRADING_CAPABLE_KEY",
-                    "read_only_verified": False,
-                    "warning": "This key permits trading outside this application. This separate client blocks all writes and transfers.",
-                }
-        except AccountReadError:
-            pass
-        return {
+        result = {
             "status": "PERMISSIONS_UNVERIFIED",
             "read_only_verified": False,
-            "warning": "Broker read-only permissions could not be verified. Treat the key as possibly trading-capable; this client enforces the GET-only allowlist.",
+            "authentication": "UNVERIFIED",
+            "endpoint": "/trade-api/v2/api_keys",
+            "origin": ORIGIN,
         }
+        try:
+            data = self.request("GET", "/trade-api/v2/api_keys")
+            result["authentication"] = "AUTHENTICATED_GET_SUCCEEDED"
+            if not isinstance(data.get("api_keys"), list):
+                result["blocker"] = "KEY_METADATA_SCHEMA_UNSUPPORTED: response has no api_keys list"
+            else:
+                current = next(
+                    (
+                        k
+                        for k in data["api_keys"]
+                        if k.get("api_key_id", k.get("id")) == self._key_id
+                    ),
+                    None,
+                )
+                if current is None:
+                    result[
+                        "blocker"
+                    ] = "CURRENT_KEY_NOT_IN_METADATA: authenticated response did not identify this key"
+                else:
+                    scopes = current.get("scopes")
+                    if isinstance(scopes, list) and scopes == ["read"]:
+                        result.update(
+                            status="READ_ONLY_SCOPE_REPORTED", read_only_verified=True, blocker=None
+                        )
+                    elif isinstance(scopes, list) and any(
+                        scope
+                        in (
+                            "write",
+                            "trade",
+                            "trading",
+                            "transfer",
+                            "transfers",
+                            "orders:write",
+                            "transfers:write",
+                        )
+                        for scope in scopes
+                    ):
+                        result.update(
+                            status="TRADING_CAPABLE_KEY",
+                            blocker="MUTATION_SCOPE_PRESENT: trading/transfer permissions are not read-only",
+                        )
+                    else:
+                        result[
+                            "blocker"
+                        ] = "READ_ONLY_SCOPE_NOT_PROVEN: missing or unsupported scopes; no account reads enabled"
+        except AccountReadError as exc:
+            result["blocker"] = str(exc)  # request() emits only redacted, static diagnostics.
+        result["checked_at"] = datetime.now(timezone.utc).isoformat()
+        result["warning"] = (
+            "API metadata reports exclusively read scope; GET allowlist still enforced"
+            if result["read_only_verified"]
+            else result["blocker"]
+            + ". Cannot verify absence of trading/transfer permission; account monitoring withheld."
+        )
+        return result
 
     def snapshot(self, min_ts=None):
-        if getattr(self, "require_readonly", False) and not self.permissions().get(
-            "read_only_verified"
-        ):
-            raise AccountReadError(
-                "Read-only key permissions no longer verified; account sync withheld"
-            )
+        if getattr(self, "require_readonly", False):
+            permissions = self.permissions()
+            if not permissions.get("read_only_verified"):
+                raise AccountReadError(
+                    "Read-only key permissions no longer verified; account sync withheld: "
+                    + str(permissions.get("blocker"))
+                )
         # Never infer holdings/fills from order status. All pages must complete.
         positions = self.pages("/trade-api/v2/portfolio/positions", "market_positions")
         fills = self.pages(

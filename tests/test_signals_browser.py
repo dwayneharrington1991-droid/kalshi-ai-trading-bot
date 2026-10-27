@@ -192,3 +192,35 @@ def test_browser_actual_account_cards_pending_fills_and_local_selection(tmp_path
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_history_failure_does_not_mark_public_or_account_state_disconnected(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    monitor.state = analyze(frame(), NOW)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            page.route(
+                "**/api/history",
+                lambda route: route.fulfill(status=503, body="{}", content_type="application/json"),
+            )
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#contract")).to_have_text("KXBTC15M-MOCK")
+            playwright.expect(page.locator("#journal-notice")).to_contain_text(
+                "History refresh delayed"
+            )
+            playwright.expect(page.locator("#account-status")).to_have_text(
+                "PUBLIC MODE · ACCOUNT OFF"
+            )
+            assert page.locator("#freshness").text_content() == "LIVE"
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

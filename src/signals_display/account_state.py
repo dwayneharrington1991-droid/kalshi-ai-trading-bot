@@ -5,6 +5,8 @@ import json
 import math
 import sqlite3
 import hashlib
+import threading
+from copy import deepcopy
 
 from .account_readonly import (
     AccountReadError,
@@ -27,6 +29,13 @@ REQUIRED_LIMITS = (
 class AccountJournal:
     def __init__(self, path):
         self.path = str(path)
+        # Reconciliation owns expensive FIFO history work; request threads copy
+        # a bounded immutable view instead of rescanning every confirmed fill.
+        self._view_lock = threading.RLock()
+        self._snapshot_cache = None
+        self._completed_cache = []
+        self._cycles_signature = None
+        self._cycles_cache = []
         with self.connect() as db:
             db.executescript(
                 """CREATE TABLE IF NOT EXISTS monitor_account_fills (fill_id TEXT PRIMARY KEY,payload TEXT);
@@ -43,6 +52,11 @@ class AccountJournal:
                     payload TEXT,observed_at TEXT,PRIMARY KEY(fill_id,fingerprint,payload_kind));
                 CREATE TABLE IF NOT EXISTS monitor_account_fill_resolution (
                     fill_id TEXT PRIMARY KEY,ticker TEXT,order_id TEXT,status TEXT,reason TEXT,observed_at TEXT);
+                CREATE TABLE IF NOT EXISTS monitor_account_completed_index (
+                    id INTEGER PRIMARY KEY,cycle_id TEXT NOT NULL UNIQUE);
+                CREATE INDEX IF NOT EXISTS monitor_account_holdings_status_id ON monitor_account_holdings(status,id DESC);
+                CREATE INDEX IF NOT EXISTS monitor_account_resolution_status_ticker ON monitor_account_fill_resolution(status,ticker);
+                CREATE INDEX IF NOT EXISTS monitor_account_guidance_holding_id ON monitor_account_guidance_events(holding_id,id DESC);
             """
             )
 
@@ -91,6 +105,16 @@ class AccountJournal:
             )
 
     def select(self, identifier, enabled):
+        with self._view_lock:
+            self._select(identifier, enabled)
+            if self._snapshot_cache is not None:
+                updated = deepcopy(self._snapshot_cache)
+                for holding in updated.get("holdings", []):
+                    if holding["id"] == identifier:
+                        holding["selected"] = int(enabled)
+                self._snapshot_cache = updated
+
+    def _select(self, identifier, enabled):
         if not isinstance(identifier, int) or type(enabled) is not bool:
             raise ValueError("Invalid monitoring selection")
         with self.connect() as db:
@@ -105,7 +129,16 @@ class AccountJournal:
             )
 
     def limits(self, data=None):
-        with self.connect() as db:
+        with self._view_lock:
+            result = self._limits(data)
+            if data is not None and self._snapshot_cache is not None:
+                updated = deepcopy(self._snapshot_cache)
+                updated["limits"] = deepcopy(result)
+                self._snapshot_cache = updated
+            return result
+
+    def _limits(self, data=None):
+        with storage_connect(self.path, readonly=data is None) as db:
             if data is not None:
                 if set(data) != set(REQUIRED_LIMITS):
                     raise ValueError(
@@ -125,6 +158,13 @@ class AccountJournal:
             return json.loads(row[0]) if row else None
 
     def reconcile(self, snapshot):
+        with self._view_lock:
+            fills = self._reconcile(snapshot)
+            # This runs in the account worker. Keep the prior view readable
+            # until its complete replacement has been built and committed.
+            self._refresh_snapshot(fills)
+
+    def _reconcile(self, snapshot):
         if snapshot.get("complete") is not True:
             raise AccountReadError("Incomplete snapshot cannot close/reconcile holdings")
         observed = snapshot["observed_at"]
@@ -378,6 +418,7 @@ class AccountJournal:
             db.execute(
                 "INSERT OR REPLACE INTO monitor_account_state VALUES (1,?)", (json.dumps(public),)
             )
+        return fills
 
     def alert(self, guidance, now):
         if guidance["guidance"] == "WAIT":
@@ -406,20 +447,48 @@ class AccountJournal:
             return cur.lastrowid
 
     def snapshot(self):
-        with self.connect() as db:
+        cached = self._snapshot_cache
+        if cached is None:
+            with self._view_lock:
+                if self._snapshot_cache is None:
+                    self._refresh_snapshot()
+                cached = self._snapshot_cache
+        # Callers add transient quotes/guidance; never mutate the cached account.
+        return deepcopy(cached)
+
+    def completed_history(self, before=None, limit=20):
+        if before is not None and (type(before) is not int or before < 1):
+            raise ValueError("History cursor must be a positive integer")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("History page size must be 1..100")
+        self.snapshot()  # Rehydrate once after restart, never on every request.
+        rows = self._completed_cache
+        eligible = [r for r in rows if before is None or r["history_id"] < before]
+        page = eligible[:limit]
+        return deepcopy(
+            {
+                "trades": page,
+                "next_before_id": page[-1]["history_id"] if len(eligible) > limit else None,
+                "has_more": len(eligible) > limit,
+                "total": len(rows),
+                "notice": "Actual confirmed-fill FIFO history, separate from simulations. Unknown fees remain unavailable.",
+            }
+        )
+
+    def _refresh_snapshot(self, all_fills=None):
+        with storage_connect(self.path, readonly=True) as db:
             row = db.execute("SELECT payload FROM monitor_account_state WHERE id=1").fetchone()
             data = json.loads(row[0]) if row else {}
+            # The main view needs every open holding, plus only recent closed
+            # cards. Full economic history remains in the database.
             data["holdings"] = [
                 dict(r)
                 for r in db.execute(
                     """SELECT h.*,COALESCE(c.enabled,0) selected FROM monitor_account_holdings h
-                LEFT JOIN monitor_account_choices c ON c.holding_id=h.id ORDER BY h.id DESC"""
-                )
-            ]
-            data["recent_fills"] = [
-                json.loads(r[0])
-                for r in db.execute(
-                    "SELECT f.payload FROM monitor_account_fills f LEFT JOIN monitor_account_fill_resolution r ON r.fill_id=f.fill_id WHERE COALESCE(r.status,'READY')!='QUARANTINED' ORDER BY f.rowid DESC LIMIT 50"
+                    LEFT JOIN monitor_account_choices c ON c.holding_id=h.id
+                    WHERE h.status='OPEN' OR h.id IN
+                        (SELECT id FROM monitor_account_holdings WHERE status='CLOSED' ORDER BY id DESC LIMIT 50)
+                    ORDER BY h.id DESC"""
                 )
             ]
             data["recent_fills"] = [
@@ -434,14 +503,13 @@ class AccountJournal:
                     "SELECT * FROM monitor_account_events ORDER BY id DESC LIMIT 30"
                 )
             ]
-        all_fills = []
-        with self.connect() as db:
-            all_fills = [
-                json.loads(r[0])
-                for r in db.execute(
-                    "SELECT f.payload FROM monitor_account_fills f LEFT JOIN monitor_account_fill_resolution r ON r.fill_id=f.fill_id WHERE COALESCE(r.status,'READY')!='QUARANTINED'"
-                )
-            ]
+            if all_fills is None:
+                all_fills = [
+                    json.loads(r[0])
+                    for r in db.execute(
+                        "SELECT f.payload FROM monitor_account_fills f LEFT JOIN monitor_account_fill_resolution r ON r.fill_id=f.fill_id WHERE COALESCE(r.status,'READY')!='QUARANTINED'"
+                    )
+                ]
             bad_tickers = {
                 r[0]
                 for r in db.execute(
@@ -454,25 +522,70 @@ class AccountJournal:
                     "SELECT DISTINCT order_id FROM monitor_account_fill_resolution WHERE status='QUARANTINED'"
                 )
             }
+            limits = db.execute(
+                "SELECT payload FROM monitor_account_settings WHERE name='limits'"
+            ).fetchone()
+            data["limits"] = json.loads(limits[0]) if limits else None
         unreconciled = {
             h["ticker"]
             for h in data["holdings"]
             if h["status"] == "OPEN" and not h["basis_verified"]
         }
-        data["completed_trades"] = [
+        economic_fields = (
+            "id",
+            "ticker",
+            "side",
+            "action",
+            "quantity",
+            "price",
+            "fees",
+            "at",
+            "order_id",
+        )
+        signature = frozenset(tuple(fill.get(key) for key in economic_fields) for fill in all_fills)
+        if signature != self._cycles_signature:
+            self._cycles_cache = confirmed_cycles(all_fills)
+            self._cycles_signature = signature
+        completed = [
             c
-            for c in confirmed_cycles(all_fills)
+            for c in self._cycles_cache
             if c["status"] == "CLOSED"
             and c["ticker"] not in unreconciled
             and c["ticker"] not in bad_tickers
             and "" not in bad_tickers
         ]
+        # Stable journal-local IDs make history pagination independent of
+        # newly arriving fills. This is an additive derived index, never a fill.
+        with self.connect() as db:
+            db.executemany(
+                "INSERT OR IGNORE INTO monitor_account_completed_index(cycle_id) VALUES (?)",
+                [
+                    (c["cycle_id"],)
+                    for c in sorted(completed, key=lambda c: (c["closed_at"], c["cycle_id"]))
+                ],
+            )
+            identities = {
+                r["cycle_id"]: r["id"]
+                for r in db.execute("SELECT * FROM monitor_account_completed_index")
+            }
+        for cycle in completed:
+            cycle["history_id"] = identities[cycle["cycle_id"]]
+        completed.sort(key=lambda c: c["history_id"], reverse=True)
+        data["completed_trades"] = completed[:50]
+        data["completed_trades_total"] = len(completed)
+        data["completed_history_has_more"] = len(completed) > 50
+        data["completed_history_next_before_id"] = (
+            completed[49]["history_id"] if len(completed) > 50 else None
+        )
+        by_order = {}
+        for fill in all_fills:
+            by_order.setdefault(fill["order_id"], []).append(fill)
         data["pending_orders"] = []
         for order in data.get("orders", []):
             if order.get("status") not in ("resting", "pending"):
                 continue
             order_id = order.get("order_id")
-            actual = [f for f in all_fills if f["order_id"] == order_id]
+            actual = by_order.get(order_id, [])
             data["pending_orders"].append(
                 {
                     "order_id": order_id,
@@ -492,8 +605,8 @@ class AccountJournal:
                     "note": "Only confirmed fills contribute to holding cost; remaining quantity is not invested.",
                 }
             )
-        data["limits"] = self.limits()
-        return data
+        self._completed_cache = completed
+        self._snapshot_cache = data
 
 
 def account_guidance(holding, account, quote, state, now, defaults, fresh_reconciliation):

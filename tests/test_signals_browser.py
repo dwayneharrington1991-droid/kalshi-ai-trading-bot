@@ -42,7 +42,6 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#direction")).to_have_text("UP")
             assert page.locator("#scalp").text_content() == "WAIT"
-            assert "DOWN SCALP" in page.locator("#model-scalp").text_content()
             assert page.locator("#trade-action").inner_text() == "🟡 WAIT"
             assert page.locator("#scalp-yesno").inner_text() == "NO"
             assert page.locator("#simple-entry").inner_text() == "Not available"
@@ -51,6 +50,7 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             assert not page.locator("#details").get_attribute("open")
             page.screenshot(path="/tmp/kxbtc15m-simple-main.png", full_page=True)
             page.locator("#details > summary").click()
+            playwright.expect(page.locator("#model-scalp")).to_contain_text("DOWN SCALP")
             assert "90% is a goal, not a claim" in page.locator("#accuracy-summary").inner_text()
             assert "$100000.00" in page.locator("#strike").inner_text()
             assert "hypothetical plan" in page.locator("#plans").inner_text()
@@ -65,6 +65,7 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             data["markets"][0]["quotes"]["down"].update(bid=0.25, ask=0.30)
             monitor.state = analyze(data, NOW + timedelta(seconds=2), stop=0.15)
             monitor.journal.step(monitor.state)
+            page.locator("#load-history").click()
             playwright.expect(page.locator("#outcomes")).to_contain_text("SIMULATED_TARGET")
             data = frame(600)
             data["markets"][0].update(
@@ -111,6 +112,7 @@ def test_browser_shows_separate_live_model_diagnostics_and_estimates(tmp_path):
             )
             page = browser.new_page()
             page.goto(f"http://127.0.0.1:{server.server_port}/")
+            page.locator("#details > summary").click()
             playwright.expect(page.locator("#direction-reason")).to_contain_text("MODEL_ESTIMATE")
             assert page.locator("#prob-up").text_content() == "50.0%"
             assert page.locator("#scalp-up").inner_text() != "unavailable"
@@ -125,6 +127,7 @@ def test_browser_shows_separate_live_model_diagnostics_and_estimates(tmp_path):
                 "explanation": "INSUFFICIENT_HISTORY: reference 1/61 samples, 0/120s span",
                 "scalp_explanation": "UNKNOWN_FEES: no supported series fee schedule",
             }
+            page.evaluate("refreshDetails()")
             playwright.expect(page.locator("#direction-reason")).to_contain_text(
                 "INSUFFICIENT_HISTORY"
             )
@@ -178,7 +181,7 @@ def test_browser_actual_account_cards_pending_fills_and_local_selection(tmp_path
             assert page.locator("#account-balance").inner_text() == "$1000.00"
             assert "DATA UNAVAILABLE" in page.locator("#live-trade-cards").inner_text()
             page.locator("#account-pending > summary").click()
-            assert "8" in page.locator("#account-order-rows").inner_text()
+            playwright.expect(page.locator("#account-order-rows")).to_contain_text("8")
             page.locator("#live-trade-cards button").click()
             playwright.expect(page.locator("#live-trade-cards button")).to_contain_text(
                 "Stop guidance"
@@ -207,11 +210,13 @@ def test_history_failure_does_not_mark_public_or_account_state_disconnected(tmp_
             )
             page = browser.new_page()
             page.route(
-                "**/api/history",
+                "**/api/history-page?*",
                 lambda route: route.fulfill(status=503, body="{}", content_type="application/json"),
             )
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#contract")).to_have_text("KXBTC15M-MOCK")
+            page.locator("#details > summary").click()
+            page.locator("#load-history").click()
             playwright.expect(page.locator("#journal-notice")).to_contain_text(
                 "History refresh delayed"
             )
@@ -284,13 +289,24 @@ def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_pat
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#engine-up")).to_have_text("60.0%")
             assert page.locator("#engine-down").inner_text() == "40.0%"
+            assert page.locator("#opening-direction").inner_text() in ("UP", "DOWN")
+            assert page.locator("#opening-ticker").inner_text() == market()["ticker"]
+            assert page.locator("#opening-generated").inner_text() == opening["generated_at"]
+            assert page.locator("#opening-cutoff").inner_text() == NOW.isoformat()
+            assert page.locator("#opening-prediction").evaluate("e=>e.getBoundingClientRect().top") < page.locator("#btc-engine").evaluate("e=>e.getBoundingClientRect().top")
+            assert page.locator("#btc-engine").evaluate("e=>e.getBoundingClientRect().top") < page.locator("#next-move").evaluate("e=>e.getBoundingClientRect().top")
             initial = page.locator("#engine-up-initial").inner_text()
+            frozen_label = page.locator("#opening-direction").inner_text()
+            frozen_probability = page.locator("#opening-up-prob").inner_text()
             monitor.state = {**state, "estimate": {**state["estimate"], "settlement_up": 0.4}}
             monitor.state["prediction_engine"] = engine.view(
                 monitor.state, None, opening, NOW + timedelta(seconds=1)
             )
             playwright.expect(page.locator("#engine-up")).to_have_text("40.0%")
             assert page.locator("#engine-up-initial").inner_text() == initial
+            assert page.locator("#opening-direction").inner_text() == frozen_label
+            assert page.locator("#opening-up-prob").inner_text() == frozen_probability
+            assert page.locator("#live-direction").inner_text() == "DOWN"
             page.set_viewport_size({"width": 390, "height": 844})
             assert (
                 page.evaluate("document.documentElement.scrollWidth<=window.innerWidth")
@@ -298,6 +314,74 @@ def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_pat
             )
             browser.close()
     finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_main_forecasts_stay_responsive_while_requested_history_is_blocked(tmp_path):
+    """A slow read must not block new contract state or overwrite it later."""
+    from time import perf_counter
+
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    monitor.state = analyze(frame(), NOW)
+    monitor.state["runtime"] = {"state_version": 2, "published_at": NOW.isoformat()}
+    history_entered, release_history = threading.Event(), threading.Event()
+    original_page = monitor.journal.history_page
+
+    def slow_page(**kwargs):
+        history_entered.set()
+        release_history.wait(timeout=10)
+        return original_page(**kwargs)
+
+    monitor.journal.history_page = slow_page
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
+            requests, errors = [], []
+            page.on("request", lambda request: requests.append(request.url))
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#opening-ticker")).to_have_text("KXBTC15M-MOCK")
+            assert page.locator("#opening-direction").inner_text() == "OPENING PREDICTION UNAVAILABLE"
+            assert not any("history" in url or "view=details" in url or "/api/research" in url for url in requests)
+            page.locator("#details > summary").click()
+            page.locator("#load-history").click()
+            assert history_entered.wait(timeout=2)
+            newer = analyze(frame(1), NOW + timedelta(seconds=1))
+            newer["market"]["ticker"] = "KXBTC15M-ROLLED"
+            newer["runtime"] = {
+                "state_version": 3,
+                "published_at": (NOW + timedelta(seconds=1)).isoformat(),
+            }
+            monitor.state = newer
+            started = perf_counter()
+            page.evaluate("refresh()")
+            playwright.expect(page.locator("#opening-ticker")).to_have_text("KXBTC15M-ROLLED")
+            assert perf_counter() - started < 2
+            assert not release_history.is_set()
+            assert page.locator("#opening-direction").inner_text() == "OPENING PREDICTION UNAVAILABLE"
+            # A response bearing an older published version must not restore the old ticker.
+            monitor.state = {
+                **newer,
+                "market": {**newer["market"], "ticker": "KXBTC15M-OLD"},
+                "runtime": {"state_version": 2, "published_at": NOW.isoformat()},
+            }
+            page.evaluate("refresh()")
+            assert page.locator("#opening-ticker").inner_text() == "KXBTC15M-ROLLED"
+            release_history.set()
+            playwright.expect(page.locator("#history-page-status")).to_contain_text("Page 1")
+            assert page.locator("#opening-ticker").inner_text() == "KXBTC15M-ROLLED"
+            assert not errors
+            browser.close()
+    finally:
+        release_history.set()
         server.shutdown()
         server.server_close()
         thread.join()

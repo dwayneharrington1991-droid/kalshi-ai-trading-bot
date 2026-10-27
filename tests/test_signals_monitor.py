@@ -94,6 +94,12 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy):
         assert kwargs["headers"] == {"Accept": "application/json", "Cache-Control": "no-cache"}
         assert not kwargs["follow_redirects"]
         if "/markets?" in url:
+            from urllib.parse import parse_qs, urlsplit
+
+            query = parse_qs(urlsplit(url).query)
+            assert "status" not in query  # incompatible with official close-time filters
+            assert int(query["min_close_ts"][0]) == int(NOW.timestamp())
+            assert int(query["max_close_ts"][0]) == int(NOW.timestamp()) + 1800
             payload = {
                 "markets": [
                     dict(

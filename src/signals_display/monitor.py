@@ -236,8 +236,18 @@ class PublicFeed:
 
     def poll(self):
         markets, cursor, seen = [], None, set()
+        discovery_time = int(utcnow().timestamp())
         for _ in range(20):
-            params = {"series_ticker": "KXBTC15M", "status": "open", "limit": 200}
+            # Official close-time filters are compatible with an omitted status,
+            # not status=open. The static open-only page can lag a rollover even
+            # while a direct market reports active. Select active timestamps
+            # ourselves and never infer a ticker or an unpublished threshold.
+            params = {
+                "series_ticker": "KXBTC15M",
+                "min_close_ts": discovery_time,
+                "max_close_ts": discovery_time + 1800,
+                "limit": 200,
+            }
             if cursor:
                 params["cursor"] = cursor
             page = self._read(KALSHI + "/markets?" + urlencode(params))
@@ -662,6 +672,20 @@ class Journal:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS btc_candles (source TEXT,start INTEGER,payload TEXT,first_received_at TEXT,PRIMARY KEY(source,start))"
             )
+            db.executescript(
+                """CREATE INDEX IF NOT EXISTS predictions_ticker_mode ON predictions(ticker,mode);
+                CREATE INDEX IF NOT EXISTS predictions_mode_id ON predictions(mode,id DESC);
+                CREATE INDEX IF NOT EXISTS simulations_pending ON simulations(status);
+                CREATE INDEX IF NOT EXISTS simulations_probe ON simulations(mode,ticker,side,id DESC);
+                CREATE INDEX IF NOT EXISTS simulations_prediction ON simulations(prediction_id,id DESC);
+                CREATE INDEX IF NOT EXISTS btc_candles_start ON btc_candles(start DESC);
+                CREATE TABLE IF NOT EXISTS settlement_queue (
+                    mode TEXT,ticker TEXT,closes_at TEXT,last_attempt TEXT,resolved INTEGER DEFAULT 0,
+                    PRIMARY KEY(mode,ticker));
+                CREATE INDEX IF NOT EXISTS settlement_due ON settlement_queue(mode,resolved,closes_at);
+                CREATE TABLE IF NOT EXISTS dashboard_migrations (name TEXT PRIMARY KEY,value TEXT);
+                """
+            )
 
     def record_candles(self, data, now):
         if not data or not data.get("source"):
@@ -795,7 +819,36 @@ class Journal:
                     )
             if not market or not market.get("mapping_verified", True):
                 return
+            db.execute(
+                "INSERT OR IGNORE INTO settlement_queue(mode,ticker,closes_at) VALUES (?,?,?)",
+                (state["mode"], market["ticker"], market["closes_at"]),
+            )
             e = state["estimate"]
+            persisted = state
+            coverage = state.get("model", {}).get("coverage", {})
+            if coverage:
+                summaries = {}
+                for source, item in coverage.items():
+                    observed = item.get("data", {}).get("observed_at")
+                    archived = (
+                        observed
+                        and db.execute(
+                            "SELECT 1 FROM feed_observations WHERE source=? AND timestamp=?",
+                            (source, observed),
+                        ).fetchone()
+                    )
+                    summaries[source] = (
+                        {
+                            "status": item.get("status"),
+                            "reason": item.get("reason"),
+                            "raw_observation": {"source": source, "timestamp": observed},
+                        }
+                        if archived
+                        else item
+                    )
+                # Raw books/trade flow are stored once in feed_observations.
+                # Existing historical payloads are never rewritten or removed.
+                persisted = {**state, "model": {**state["model"], "coverage": summaries}}
             db.execute(
                 """INSERT OR IGNORE INTO predictions
                 (mode,ticker,timestamp,direction,scalp,probability_up,probability_down,payload)
@@ -808,7 +861,7 @@ class Journal:
                     state["scalp"],
                     e["settlement_up"],
                     e["settlement_down"],
-                    json.dumps(state, allow_nan=False),
+                    json.dumps(persisted, allow_nan=False),
                 ),
             )
             prediction = db.execute(
@@ -944,16 +997,31 @@ class Journal:
                 "INSERT OR IGNORE INTO forecast_outcomes VALUES (?,?,?,?)",
                 (ticker, origin, seen, int(yes_result == "yes")),
             )
-            rows = db.execute(
-                "SELECT id,payload FROM predictions WHERE ticker=? AND mode=? AND (settlement_up IS NULL OR settlement_origin='legacy_unknown')",
-                (ticker, mode),
-            ).fetchall()
-            for row in rows:
-                if json.loads(row["payload"])["market"].get("mapping_verified", True):
-                    db.execute(
-                        "UPDATE predictions SET settlement_up=?,settlement_origin=?,settled_at=? WHERE id=?",
-                        (int(yes_result == "yes"), origin, seen, row["id"]),
-                    )
+            db.execute(
+                "UPDATE settlement_queue SET resolved=1 WHERE ticker=? AND mode=?", (ticker, mode)
+            )
+        after = 0
+        while True:
+            with self.read() as db:
+                rows = db.execute(
+                    "SELECT id,payload FROM predictions WHERE ticker=? AND mode=? AND id>? "
+                    "AND (settlement_up IS NULL OR settlement_origin='legacy_unknown') ORDER BY id LIMIT 50",
+                    (ticker, mode, after),
+                ).fetchall()
+            if not rows:
+                break
+            # Decode outside the writer lock. Preserve legacy mapping safeguards.
+            updates = [
+                (int(yes_result == "yes"), origin, seen, row["id"])
+                for row in rows
+                if json.loads(row["payload"])["market"].get("mapping_verified", True)
+            ]
+            with self.connect() as db:
+                db.executemany(
+                    "UPDATE predictions SET settlement_up=?,settlement_origin=?,settled_at=? WHERE id=?",
+                    updates,
+                )
+            after = rows[-1]["id"]
 
     def record_feeds(self, coverage):
         with self.connect() as db:
@@ -1084,3 +1152,101 @@ class Journal:
             "notice": "COUNTERFACTUAL one-contract probes only — never real fills or trades. "
             "Polling can miss intrapoll barriers; unknown gaps are excluded, not wins.",
         }
+
+    def history_page(self, *, before_id=0, limit=20):
+        """Indexed bounded records only. Research scans are a separate opt-in job."""
+        limit = max(1, min(int(limit), 100))
+        before_id = max(0, int(before_id))
+        with self.read() as db:
+            rows = db.execute(
+                "SELECT id,mode,ticker,timestamp,direction,scalp,probability_up,probability_down,settlement_up "
+                "FROM predictions WHERE id<? ORDER BY id DESC LIMIT ?",
+                (before_id or 9223372036854775807, limit + 1),
+            ).fetchall()
+            predictions = [dict(row) for row in rows[:limit]]
+            ids = [row["id"] for row in predictions]
+            simulations = (
+                [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT * FROM simulations WHERE prediction_id IN ("
+                        + ",".join("?" for _ in ids)
+                        + ") ORDER BY id DESC LIMIT ?",
+                        (*ids, limit * 2),
+                    )
+                ]
+                if ids
+                else []
+            )
+        return {
+            "predictions": predictions,
+            "simulations": simulations,
+            "pagination": {
+                "limit": limit,
+                "before_id": before_id,
+                "has_more": len(rows) > limit,
+                "next_before_id": predictions[-1]["id"] if len(rows) > limit else None,
+            },
+            "notice": "COUNTERFACTUAL probes are simulated, never actual fills. History loads only on request.",
+        }
+
+    def seed_settlement_queue(self):
+        """One-time bounded legacy migration in the maintenance worker, never live polling."""
+        with self.read() as db:
+            done = db.execute(
+                "SELECT value FROM dashboard_migrations WHERE name='settlement_queue_v1'"
+            ).fetchone()
+            if done and done[0] == "done":
+                return
+            # Only one payload per contract is needed, even with millions of revisions.
+            rows = db.execute(
+                "SELECT mode,ticker,MIN(id) id FROM predictions GROUP BY mode,ticker"
+            ).fetchall()
+        for start in range(0, len(rows), 50):
+            batch = []
+            with self.read() as db:
+                for row in rows[start : start + 50]:
+                    raw = db.execute(
+                        "SELECT payload FROM predictions WHERE id=?", (row["id"],)
+                    ).fetchone()
+                    try:
+                        close = json.loads(raw[0])["market"]["closes_at"]
+                        timestamp(close)
+                        origin = "official" if row["mode"] == "PUBLIC MARKET DATA" else "replay"
+                        resolved = (
+                            db.execute(
+                                "SELECT 1 FROM forecast_outcomes WHERE ticker=? AND origin=?",
+                                (row["ticker"], origin),
+                            ).fetchone()
+                            is not None
+                        )
+                        batch.append((row["mode"], row["ticker"], close, int(resolved)))
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        continue
+            with self.connect() as db:
+                db.executemany(
+                    "INSERT OR IGNORE INTO settlement_queue(mode,ticker,closes_at,resolved) VALUES (?,?,?,?)",
+                    batch,
+                )
+        with self.connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO dashboard_migrations VALUES ('settlement_queue_v1','done')"
+            )
+
+    def due_settlements(self, now, limit=3):
+        with self.read() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT ticker FROM settlement_queue WHERE mode='PUBLIC MARKET DATA' AND resolved=0 "
+                    "AND closes_at<=? ORDER BY COALESCE(last_attempt,''),closes_at LIMIT ?",
+                    (now.isoformat(), limit),
+                )
+            ]
+
+    def mark_settlement_attempt(self, ticker, now):
+        with self.connect() as db:
+            db.execute(
+                "UPDATE settlement_queue SET last_attempt=? WHERE mode='PUBLIC MARKET DATA' AND ticker=?",
+                (now.isoformat(), ticker),
+            )

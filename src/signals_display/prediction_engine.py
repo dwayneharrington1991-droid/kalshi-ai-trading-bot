@@ -197,6 +197,27 @@ def view(state, prior=None, opening=None, generated_at=None):
         data_cutoff=state.get("now"),
         analysis_24h=day,
         regime=day.get("regime", "unavailable"),
+        direction=("UP" if p > 0.5 else "DOWN" if p < 0.5 else "UNCLEAR") if ready else "UNCLEAR",
+        confidence={
+            "status": "UNCALIBRATED",
+            "reason": "Experimental model probabilities; no validated accuracy or profitable edge",
+        },
+        data_quality={
+            "status": "SUPPORTED PROXY INPUTS" if ready else "INSUFFICIENT DATA",
+            "history_status": day.get("status", "INSUFFICIENT DATA"),
+            "reference_source": state.get("reference", {}).get("source"),
+            "reference_received_at": state.get("reference", {}).get("observed_at"),
+            "limitation": "Proxy exchange prices and an assumed constant opening basis do not measure the official settlement index",
+        },
+        settlement_price_estimate={
+            "mean": model["price_forecast"]["settlement_average_mean"],
+            "conditional_interval": model["price_forecast"].get(
+                "settlement_average_conditional_interval"
+            ),
+            "label": model["price_forecast"].get("interval_label"),
+        }
+        if ready and model.get("price_forecast", {}).get("settlement_average_mean") is not None
+        else None,
         calibration="UNCALIBRATED — experimental model estimate; edge unverified",
         reason="Independent final-average estimate; proxy/index basis and zero-drift assumptions remain unvalidated"
         if ready
@@ -233,16 +254,61 @@ def create(db):
         mode TEXT,ticker TEXT,timestamp TEXT,recorded_at TEXT,closes_at TEXT,up REAL,regime TEXT,version TEXT,payload TEXT,
         PRIMARY KEY(mode,ticker,timestamp))"""
     )
+    # One small indexed row per contract. Revision blobs never need to be loaded
+    # just to list archives or find the current contract's first/latest forecast.
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS btc_engine_contracts (
+        mode TEXT,ticker TEXT,closes_at TEXT,revisions INTEGER NOT NULL DEFAULT 0,
+        latest_at TEXT,PRIMARY KEY(mode,ticker))"""
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS btc_engine_contracts_close ON btc_engine_contracts(closes_at DESC,mode,ticker)"
+    )
+    db.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS btc_engine_revision_summary AFTER INSERT ON btc_engine_predictions
+        BEGIN
+            INSERT INTO btc_engine_contracts(mode,ticker,closes_at,revisions,latest_at)
+            VALUES(NEW.mode,NEW.ticker,NEW.closes_at,1,NEW.timestamp)
+            ON CONFLICT(mode,ticker) DO UPDATE SET
+                revisions=revisions+1,
+                latest_at=CASE WHEN latest_at IS NULL OR excluded.latest_at>latest_at THEN excluded.latest_at ELSE latest_at END;
+        END;
+    """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS btc_engine_opening_summary AFTER INSERT ON btc_engine_opening
+        BEGIN
+            INSERT OR IGNORE INTO btc_engine_contracts(mode,ticker,closes_at,revisions,latest_at)
+            VALUES(NEW.mode,NEW.ticker,NEW.closes_at,0,NULL);
+        END;
+    """
+    )
+    # Additive, idempotent migration for journals created before these summaries.
+    # Existing immutable predictions and all raw history remain untouched.
+    db.execute(
+        """INSERT OR IGNORE INTO btc_engine_contracts
+        SELECT mode,ticker,closes_at,COUNT(*),MAX(timestamp)
+        FROM btc_engine_predictions GROUP BY mode,ticker"""
+    )
+    db.execute(
+        """INSERT OR IGNORE INTO btc_engine_contracts
+        SELECT mode,ticker,closes_at,0,NULL FROM btc_engine_opening"""
+    )
 
 
 def prior(db, ticker, mode):
-    rows = db.execute(
-        "SELECT timestamp,up,payload FROM btc_engine_predictions WHERE ticker=? AND mode=? ORDER BY timestamp",
-        (ticker, mode),
-    ).fetchall()
-    if not rows:
+    first = db.execute(
+        "SELECT timestamp,up,payload FROM btc_engine_predictions WHERE mode=? AND ticker=? ORDER BY timestamp LIMIT 1",
+        (mode, ticker),
+    ).fetchone()
+    if not first:
         return None
-    first, last = rows[0], rows[-1]
+    last = db.execute(
+        "SELECT timestamp,up FROM btc_engine_predictions WHERE mode=? AND ticker=? ORDER BY timestamp DESC LIMIT 1",
+        (mode, ticker),
+    ).fetchone()
     return {
         "initial": {
             "timestamp": first[0],
@@ -260,7 +326,12 @@ def record(db, state, wall_now):
     mode = state["mode"]
     now = timestamp(engine.get("updated_at", state["now"]))
     close = timestamp(engine["closes_at"])
-    if now >= close or (mode == "PUBLIC MARKET DATA" and wall_now >= close):
+    if now >= close or (mode == "PUBLIC MARKET DATA" and (wall_now >= close or now > wall_now)):
+        return
+    try:
+        if timestamp(engine["data_cutoff"]) > now:
+            return
+    except (KeyError, ValueError, TypeError, AttributeError):
         return
     if db.execute(
         "SELECT 1 FROM forecast_outcomes WHERE ticker=? AND origin=?",
@@ -293,22 +364,36 @@ def record(db, state, wall_now):
 
 def performance(db, now):
     grouped = {}
+    # Start from small per-contract rows and use a primary-key reverse seek for
+    # the last eligible revision. Fetching every second's JSON payload was an
+    # unnecessary O(all-revisions) Python allocation on each dashboard refresh.
     for row in db.execute(
-        """SELECT p.*,o.outcome,o.observed_at FROM btc_engine_predictions p JOIN forecast_outcomes o ON p.ticker=o.ticker
-       AND o.origin=CASE WHEN p.mode='PUBLIC MARKET DATA' THEN 'official' ELSE 'replay' END ORDER BY p.timestamp"""
+        """SELECT p.*,o.outcome,o.observed_at,b.payload opening_payload,
+            ip.payload initial_score_payload
+        FROM btc_engine_contracts c
+        JOIN forecast_outcomes o ON o.ticker=c.ticker
+          AND o.origin=CASE WHEN c.mode='PUBLIC MARKET DATA' THEN 'official' ELSE 'replay' END
+        JOIN btc_engine_predictions p ON p.rowid=(
+            SELECT q.rowid FROM btc_engine_predictions q
+            WHERE q.mode=c.mode AND q.ticker=c.ticker
+              AND julianday(q.timestamp)<julianday(q.closes_at)
+              AND (q.mode!='PUBLIC MARKET DATA' OR (julianday(q.timestamp)<=julianday(q.recorded_at) AND julianday(q.recorded_at)<julianday(q.closes_at)))
+              AND julianday(q.closes_at)<=julianday(o.observed_at)
+            ORDER BY q.timestamp DESC LIMIT 1)
+        LEFT JOIN btc_engine_opening b ON b.mode=c.mode AND b.ticker=c.ticker
+        LEFT JOIN btc_engine_predictions ip ON ip.mode=b.mode AND ip.ticker=b.ticker AND ip.timestamp=b.generated_at
+        WHERE julianday(o.observed_at)<=julianday(?)""",
+        (now.isoformat(),),
     ):
-        if (
-            not timestamp(row["timestamp"])
-            < timestamp(row["closes_at"])
-            <= timestamp(row["observed_at"])
-            <= now
-        ):
-            continue
-        if row["mode"] == "PUBLIC MARKET DATA" and timestamp(row["recorded_at"]) >= timestamp(
-            row["closes_at"]
-        ):
-            continue
-        grouped.setdefault((row["mode"], row["ticker"]), []).append(dict(row))
+        record = dict(row)
+        record["score_payload"] = json.loads(record["payload"])
+        record["opening"] = (
+            json.loads(record["opening_payload"]) if record["opening_payload"] else None
+        )
+        record["initial_score_payload"] = (
+            json.loads(record["initial_score_payload"]) if record["initial_score_payload"] else {}
+        )
+        grouped[(row["mode"], row["ticker"])] = [record]
 
     def summarize(groups):
         result = {"settled_markets": len(groups)}
@@ -317,20 +402,22 @@ def performance(db, now):
             if which == "initial":
                 initial_rows = []
                 for row in rows:
-                    opening = db.execute(
-                        "SELECT payload FROM btc_engine_opening WHERE mode=? AND ticker=?",
-                        (row["mode"], row["ticker"]),
-                    ).fetchone()
-                    if opening:
-                        initial = json.loads(opening[0])
-                        if initial.get("up") is not None:
-                            initial_rows.append(
-                                {
-                                    **row,
-                                    "up": initial["up"],
-                                    "regime": initial.get("regime", "unavailable"),
-                                }
-                            )
+                    initial = row.get("opening")
+                    if (
+                        initial
+                        and initial.get("up") is not None
+                        and timestamp(initial["generated_at"]) < timestamp(row["closes_at"])
+                        and timestamp(initial["data_cutoff"])
+                        <= timestamp(initial.get("opens_at", initial["data_cutoff"]))
+                    ):
+                        initial_rows.append(
+                            {
+                                **row,
+                                "up": initial["up"],
+                                "regime": initial.get("regime", "unavailable"),
+                                "score_payload": row["initial_score_payload"],
+                            }
+                        )
                 rows = initial_rows
             missing_initial = len(groups) - len(rows) if which == "initial" else 0
             probs = [r["up"] for r in rows]
@@ -349,9 +436,9 @@ def performance(db, now):
             metrics["baselines"] = {}
             for key in ("baseline_up", "market_implied_up"):
                 matched = [
-                    (json.loads(r["payload"]).get(key), r["outcome"])
+                    (r["score_payload"].get(key), r["outcome"])
                     for r in rows
-                    if json.loads(r["payload"]).get(key) is not None
+                    if r["score_payload"].get(key) is not None
                 ]
                 metrics["baselines"][key] = score([p for p, y in matched], [y for p, y in matched])
             metrics["by_regime"] = {
@@ -389,42 +476,45 @@ def performance(db, now):
             )
     archive = []
     for row in db.execute(
-        "SELECT mode,ticker,MAX(timestamp) latest_at,closes_at,COUNT(*) revisions FROM btc_engine_predictions GROUP BY mode,ticker ORDER BY closes_at DESC LIMIT 100"
+        """SELECT c.*,b.payload opening_payload,p.up latest_up,o.outcome
+        FROM (SELECT * FROM btc_engine_contracts ORDER BY closes_at DESC LIMIT 100) c
+        LEFT JOIN btc_engine_opening b ON b.mode=c.mode AND b.ticker=c.ticker
+        LEFT JOIN btc_engine_predictions p ON p.mode=c.mode AND p.ticker=c.ticker AND p.timestamp=c.latest_at
+        LEFT JOIN forecast_outcomes o ON o.ticker=c.ticker
+          AND o.origin=CASE WHEN c.mode='PUBLIC MARKET DATA' THEN 'official' ELSE 'replay' END
+          AND julianday(o.observed_at)<=julianday(?)
+        ORDER BY c.closes_at DESC""",
+        (now.isoformat(),),
     ):
-        opening = get_opening(db, row["ticker"], row["mode"])
-        latest = db.execute(
-            "SELECT up,timestamp FROM btc_engine_predictions WHERE mode=? AND ticker=? ORDER BY timestamp DESC LIMIT 1",
-            (row["mode"], row["ticker"]),
-        ).fetchone()
-        outcome = db.execute(
-            "SELECT outcome FROM forecast_outcomes WHERE ticker=? AND origin=?",
-            (row["ticker"], "official" if row["mode"] == "PUBLIC MARKET DATA" else "replay"),
-        ).fetchone()
+        outcome = row["outcome"]
         archive.append(
             {
                 "mode": row["mode"],
                 "ticker": row["ticker"],
                 "closes_at": row["closes_at"],
                 "status": "SETTLED"
-                if outcome
+                if outcome is not None
                 else "AWAITING_OFFICIAL_RESULT"
                 if timestamp(row["closes_at"]) <= now
                 else "ACTIVE",
-                "initial": opening,
-                "latest_up": latest[0],
-                "latest_at": latest[1],
+                "initial": json.loads(row["opening_payload"]) if row["opening_payload"] else None,
+                "latest_up": row["latest_up"],
+                "latest_at": row["latest_at"],
                 "revisions": row["revisions"],
-                "outcome": outcome[0] if outcome else None,
+                "outcome": outcome,
             }
         )
+
     return {
         "archive": archive,
+        "archive_limit": 100,
+        "archive_total": db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0],
         "by_mode": result,
         "validation": "No validated accuracy or profitable edge claim. Initial/latest per contract; ties excluded from directional accuracy but included in Brier/log loss/calibration. Live and replay never pooled. No historical prediction backfill.",
     }
 
 
-def opening_forecast(market, history, reference_points, generated_at):
+def opening_forecast(market, history, reference_points, generated_at, reference_source=None):
     """Event metadata may arrive late; no BTC observation received after open enters."""
     from .basis import estimate_basis
 
@@ -432,12 +522,21 @@ def opening_forecast(market, history, reference_points, generated_at):
     closed = timestamp(market["closes_at"])
     result = dict(
         ticker=market["ticker"],
+        opens_at=market["opens_at"],
         closes_at=market["closes_at"],
         timestamp=generated_at.isoformat(),
         generated_at=generated_at.isoformat(),
         data_cutoff=opened.isoformat(),
         opening_delay_seconds=max(0, (generated_at - opened).total_seconds()),
         up=None,
+        down=None,
+        direction="UNCLEAR",
+        settlement_price_estimate=None,
+        confidence={
+            "status": "UNCALIBRATED",
+            "reason": "Experimental model probabilities; no validated accuracy or profitable edge",
+        },
+        data_quality={"status": "INSUFFICIENT DATA"},
         status="INSUFFICIENT DATA",
         reason="No valid frozen opening inputs",
         threshold=market.get("strike"),
@@ -446,6 +545,10 @@ def opening_forecast(market, history, reference_points, generated_at):
         model="opening24h-zero-drift-final-average-v1",
     )
     try:
+        if not opened <= generated_at < closed:
+            raise ValueError(
+                "Opening forecast must be generated during the active contract, never before opening or after settlement"
+            )
         if (
             not market.get("mapping_verified")
             or not market.get("averaging_rule_verified")
@@ -459,9 +562,17 @@ def opening_forecast(market, history, reference_points, generated_at):
         day = context24(history, opened)
         if day["status"] != "READY":
             raise ValueError(day["reason"])
-        points = [
-            (t, p) for t, p in reference_points if opened - timedelta(seconds=65) <= t <= opened
-        ]
+        by_time = {}
+        for t, raw_price in reference_points:
+            if not opened - timedelta(seconds=65) <= t <= opened:
+                continue
+            price = number(raw_price, 0.000001, 1e12)
+            if t in by_time and by_time[t] != price:
+                raise ValueError(
+                    "Conflicting pre-opening reference observations at the same timestamp"
+                )
+            by_time[t] = price
+        points = sorted(by_time.items())
         if not points or (opened - points[-1][0]).total_seconds() > 5:
             raise ValueError("No fresh BTC reference received by opening")
         basis, error = estimate_basis(
@@ -486,6 +597,28 @@ def opening_forecast(market, history, reference_points, generated_at):
         p = 0.5 * (1 + math.erf((current + basis["point"] - strike) / (math.sqrt(2) * deviation)))
         result.update(
             up=p,
+            down=1 - p,
+            direction="UP" if p > 0.5 else "DOWN" if p < 0.5 else "UNCLEAR",
+            settlement_price_estimate={
+                "mean": current + basis["point"],
+                "conditional_interval": [
+                    current + basis["low"] - 1.96 * deviation,
+                    current + basis["high"] + 1.96 * deviation,
+                ],
+                "label": "Experimental zero-drift projected final-60s official-index average using an assumed constant proxy/index opening basis; Gaussian 95% conditional range is NOT calibrated coverage",
+            },
+            reference_price=current,
+            reference_source=reference_source or "BTC proxy feed (sample source not recorded)",
+            data_quality={
+                "status": "SUPPORTED PROXY INPUTS",
+                "closed_history_bars": day["closed_bars"],
+                "history_received_at": history["received_at"],
+                "reference_received_at": points[-1][0].isoformat(),
+                "reference_source": reference_source
+                or "BTC proxy feed (sample source not recorded)",
+                "reference_age_at_open_seconds": (opened - points[-1][0]).total_seconds(),
+                "limitation": "Proxy exchange prices and an assumed constant opening basis do not measure the official settlement index",
+            },
             status="DELAYED" if generated_at > opened else "ON_TIME",
             reason="Frozen pre-opening BTC inputs only; official threshold metadata arrival disclosed; experimental constant-basis Gaussian final-60s-average model",
             reference_received_at=points[-1][0].isoformat(),

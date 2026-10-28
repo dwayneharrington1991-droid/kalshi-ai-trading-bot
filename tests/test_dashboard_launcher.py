@@ -94,3 +94,43 @@ def test_open_dashboard_uses_codespaces_url(monkeypatch):
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda command, **kwargs: calls.append(command))
     assert launcher.open_dashboard() is True
     assert calls == [["code", "--open-url", "https://mysterious-haunting-8765.app.github.dev/"]]
+
+
+def test_supervisor_stops_child_cleanly_and_never_spawns_duplicate(monkeypatch):
+    class Child:
+        def __init__(self):
+            self.returncode = None
+            self.signals = []
+
+        def poll(self):
+            return self.returncode
+
+        def send_signal(self, value):
+            self.signals.append(value)
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    child = Child()
+    spawned = []
+
+    def popen(command, **kwargs):
+        spawned.append(command)
+        return child
+
+    monkeypatch.setattr(launcher.time, "sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
+    assert launcher.supervise(["safe-server"], health=lambda: True, popen=popen) == 0
+    assert spawned == [["safe-server"]]
+    assert child.signals == [launcher.signal.SIGTERM]
+
+
+def test_dashboard_uses_bounded_adaptive_polling_instead_of_250ms_full_renders():
+    html = (ROOT / "src/signals_display/dashboard.html").read_text()
+    assert "setInterval(refresh,250)" not in html
+    assert "scheduleRefresh(backoff)" in html
+    assert "document.hidden?5000:1000" in html
+    assert "setInterval(refreshDetails,10000)" in html

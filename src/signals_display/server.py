@@ -36,6 +36,7 @@ from .alerts import MonitoringAlerts, risk_alerts
 from .scalp_monitor import diagnose as diagnose_scalp, ScalpCriteria
 from .advanced import AdvancedIntelligence, attach_reliability, refresh_status
 from .edge_scanner import calculate as calculate_edge_scanner, performance as edge_performance
+from .multi_asset import MarketStrip
 
 
 class Monitor:
@@ -123,6 +124,7 @@ class Monitor:
         self.intelligence = MarketIntelligence()
         self.advanced = AdvancedIntelligence()
         self.monitoring_alerts = MonitoringAlerts()
+        self.market_strip = MarketStrip()
         self.last_proxy_observation = None
         self.runtime_meter = RuntimeMeter()
         self.maintenance_pool = ThreadPoolExecutor(
@@ -434,6 +436,12 @@ class Monitor:
                             "artifact_status"
                         ] = "Future-trained artifact rejected at this prediction time"
             state = analyze(payload, now, self.target, self.stop, self.horizon, result, info)
+            strip_markets = list(payload.get("multi_asset_markets", []))
+            strip_references = dict(payload.get("multi_asset_references", {}))
+            strip_histories = dict(payload.get("multi_asset_histories", {}))
+            state["market_strip"] = self.market_strip.update(
+                strip_markets, strip_references, strip_histories, now
+            )
             state["advanced_intelligence"] = self.advanced.decorate(
                 advanced,
                 info or {},
@@ -1526,6 +1534,8 @@ def main():
                 feed.hub.close()
             if feed.candle_pool:
                 feed.candle_pool.shutdown(wait=False, cancel_futures=True)
+            if feed.multi_asset_pool:
+                feed.multi_asset_pool.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

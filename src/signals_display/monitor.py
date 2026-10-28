@@ -9,6 +9,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import json
 import math
+import re
 from pathlib import Path
 import sqlite3
 from time import perf_counter, monotonic
@@ -23,6 +24,7 @@ from . import edge_scanner
 from .model import Display, evaluate, fee, number, timestamp
 from .edges import assess_edges
 from .reliability import metrics, wilson
+from .multi_asset import asset_of, ALIASES
 
 UTC = timezone.utc
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -50,6 +52,14 @@ class PublicFeed:
         )
         self.candle_job = None
         self.candle_started = None
+        self.multi_asset_cache = {"markets": [], "references": {}, "histories": {}}
+        self.multi_series_cache = {}
+        self.multi_asset_pool = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="public-multi-asset")
+            if get is None else None
+        )
+        self.multi_asset_job = None
+        self.multi_asset_started = None
         self.kalshi_stream = None
         self.streams = None
         self.http_backoff = {}
@@ -288,6 +298,137 @@ class PublicFeed:
                 **(self.candle_cache or {}),
             }
         return self.candle_cache
+
+    def sampled_multi_assets(self, now):
+        """Run bounded discovery/history preparation away from the primary BTC poll."""
+        if self.multi_asset_pool is None:
+            return self.multi_asset_cache
+        if self.multi_asset_job is not None and self.multi_asset_job.done():
+            try:
+                self.multi_asset_cache = self.multi_asset_job.result()
+            except Exception:
+                pass
+            self.multi_asset_job = None
+        if self.multi_asset_job is None and (
+            self.multi_asset_started is None
+            or (now - self.multi_asset_started).total_seconds() >= 3
+        ):
+            self.multi_asset_started = now
+            self.multi_asset_job = self.multi_asset_pool.submit(self._load_multi_assets, now)
+        return self.multi_asset_cache
+
+    def _load_multi_assets(self, now):
+        rows, cursor, seen = [], None, set()
+        for _ in range(10):
+            params = {
+                "min_close_ts": int(now.timestamp()),
+                "max_close_ts": int(now.timestamp()) + 1800,
+                "limit": 1000,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            page = self._read(KALSHI + "/markets?" + urlencode(params))
+            rows.extend(page.get("markets", []))
+            cursor = page.get("cursor")
+            if not cursor:
+                break
+            if cursor in seen:
+                raise ValueError("Repeated multi-asset discovery cursor")
+            seen.add(cursor)
+        else:
+            raise ValueError("Multi-asset discovery exceeded the safe pagination limit")
+        candidates = []
+        for raw in rows:
+            series_ticker = str(raw.get("series_ticker", ""))
+            asset = asset_of({**raw, "series": series_ticker})
+            if not asset or "15M" not in series_ticker.upper():
+                continue
+            try:
+                close = timestamp(raw["close_time"])
+                opened = max(timestamp(raw["open_time"]), close - timedelta(minutes=15))
+                # Discover just before the effective 15-minute window so the
+                # immutable history/reference snapshot is already warm when
+                # MarketStrip activates the card at the opening boundary.
+                if not opened - timedelta(minutes=5) <= now < close or not 60 <= (close-opened).total_seconds() <= 900:
+                    continue
+                series = self.multi_series_cache.get(series_ticker)
+                if series is None:
+                    series = self._read(
+                        KALSHI + "/series/" + quote(series_ticker, safe="")
+                    )["series"]
+                    self.multi_series_cache[series_ticker] = series
+                sources = series.get("settlement_sources") or []
+                source = "; ".join(str(x.get("name", "")) for x in sources if x.get("name"))
+                rules = str(raw.get("rules_primary", ""))
+                orientation = raw.get("strike_type") in {"greater", "greater_or_equal", "above"}
+                verified = bool(
+                    orientation and source and rules and "at least" in rules.lower()
+                    and "average" in rules.lower()
+                    and any(
+                        re.search(r"\b" + re.escape(word) + r"\b", rules.upper())
+                        for word in ALIASES[asset]
+                    )
+                )
+                candidates.append({
+                    "asset": asset, "ticker": raw["ticker"], "series": series_ticker,
+                    "title": raw.get("title"), "opens_at": opened.isoformat(),
+                    "closes_at": close.isoformat(), "strike": raw.get("floor_strike"),
+                    "mapping_verified": orientation,
+                    "settlement_rules_verified": verified,
+                    "settlement_reference": source or "unavailable", "rules": rules,
+                    "status": "open",
+                })
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+        references = {}
+        histories = dict(self.multi_asset_cache.get("histories", {}))
+        for asset in sorted({m["asset"] for m in candidates if m["asset"] not in {"GOLD", "SILVER"}}):
+            product = asset + "-USD"
+            try:
+                spot = self._read(f"https://api.coinbase.com/v2/prices/{product}/spot")["data"]
+                references[asset] = {
+                    "price": number(float(spot["amount"]), 0.000001, 1e15),
+                    "observed_at": utcnow().isoformat(),
+                    "source": f"Coinbase {product} public proxy; not official settlement index",
+                }
+                cutoff = int(now.timestamp()) // 60 * 60
+                previous = histories.get(asset, {})
+                merged = {
+                    int(bar["start"]): bar for bar in previous.get("candles", [])
+                    if cutoff - 86400 <= int(bar["start"]) < cutoff
+                }
+                expected = set(range(cutoff - 86400, cutoff, 60))
+                if set(merged) == expected:
+                    # The immutable closed-minute window is already complete.
+                    # Keep its original receipt time and avoid repeatedly
+                    # downloading 1,440 bars during sub-minute spot refreshes.
+                    histories[asset] = previous
+                    continue
+                ends = (
+                    range(cutoff - 86400 + 18000, cutoff + 1, 18000)
+                    if len(merged) < 1400
+                    else (cutoff,)
+                )
+                for end in ends:
+                    data = self._read(
+                        "https://api.coinbase.com/api/v3/brokerage/market/products/"
+                        + product + "/candles?" + urlencode({
+                            "start": end - 18000, "end": end,
+                            "granularity": "ONE_MINUTE", "limit": 300,
+                        })
+                    )
+                    for bar in data.get("candles", []):
+                        stamp = int(bar["start"])
+                        if cutoff - 86400 <= stamp < cutoff:
+                            merged[stamp] = bar
+                histories[asset] = {
+                    "candles": [merged[t] for t in sorted(merged)],
+                    "received_at": utcnow().isoformat(),
+                    "source": f"Coinbase {product} public one-minute candles",
+                }
+            except (KeyError, ValueError, TypeError, httpx.HTTPError):
+                continue
+        return {"markets": candidates, "references": references, "histories": histories}
 
     def resolved(self, ticker):
         data = self._read(KALSHI + "/markets/" + quote(ticker, safe=""))
@@ -554,8 +695,12 @@ class PublicFeed:
                 warnings.append(
                     "Public reference proxy unavailable; official settlement feed not connected."
                 )
+        auxiliary = self.sampled_multi_assets(utcnow())
         return {
             "markets": result,
+            "multi_asset_markets": auxiliary["markets"],
+            "multi_asset_references": auxiliary["references"],
+            "multi_asset_histories": auxiliary["histories"],
             "reference": reference,
             "warnings": warnings,
             "mode": "PUBLIC MARKET DATA",
@@ -847,6 +992,13 @@ class Journal:
                     ticker TEXT NOT NULL,origin TEXT NOT NULL,observed_at TEXT NOT NULL,
                     outcome INTEGER NOT NULL,payload TEXT NOT NULL,
                     PRIMARY KEY(ticker,origin));
+                CREATE TABLE IF NOT EXISTS multi_asset_openings (
+                    mode TEXT NOT NULL,ticker TEXT NOT NULL,asset TEXT NOT NULL,
+                    opens_at TEXT NOT NULL,generated_at TEXT NOT NULL,data_cutoff TEXT NOT NULL,
+                    direction TEXT NOT NULL,probability_up REAL,status TEXT NOT NULL,payload TEXT NOT NULL,
+                    outcome INTEGER,settled_at TEXT,PRIMARY KEY(mode,ticker));
+                CREATE INDEX IF NOT EXISTS multi_asset_asset_open
+                    ON multi_asset_openings(asset,opens_at);
                 """
             )
 
@@ -918,6 +1070,22 @@ class Journal:
         market = state["market"]
         capture_learning = self._learning_sample_due(state)
         with self.connect() as db:
+            for card in state.get("market_strip", []):
+                try:
+                    db.execute(
+                        """INSERT OR IGNORE INTO multi_asset_openings
+                        (mode,ticker,asset,opens_at,generated_at,data_cutoff,direction,
+                         probability_up,status,payload) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (state["mode"], card["ticker"], card["asset"], card["opens_at"],
+                         card["generated_at"], card["data_cutoff"], card["direction"],
+                         card.get("up"), card["status"], json.dumps(card, allow_nan=False)),
+                    )
+                    db.execute(
+                        "INSERT OR IGNORE INTO settlement_queue(mode,ticker,closes_at) VALUES (?,?,?)",
+                        (state["mode"], card["ticker"], card["closes_at"]),
+                    )
+                except (KeyError, ValueError, TypeError):
+                    continue
             if capture_learning:
                 prediction_engine.record(db, state, utcnow())
                 scalp_paper.record(
@@ -1270,6 +1438,11 @@ class Journal:
                 )
             after = rows[-1]["id"]
         if inserted:
+            with self.connect() as db:
+                db.execute(
+                    "UPDATE multi_asset_openings SET outcome=?,settled_at=? WHERE mode=? AND ticker=?",
+                    (int(yes_result == "yes"), seen, mode, ticker),
+                )
             self._record_contract_review(ticker, origin, seen, int(yes_result == "yes"), mode)
         return inserted
 
@@ -1327,9 +1500,21 @@ class Journal:
                 "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
             ).fetchone()[0]
             reviews = db.execute("SELECT payload FROM learning_contract_reviews").fetchall()
+            multi_rows = db.execute(
+                "SELECT asset,probability_up,outcome FROM multi_asset_openings "
+                "WHERE status='EXPERIMENTAL' AND probability_up IS NOT NULL AND outcome IS NOT NULL"
+            ).fetchall()
         opening_mistakes = sum(
             json.loads(row[0]).get("opening", {}).get("correct") is False for row in reviews
         )
+        multi_asset = {}
+        for row in multi_rows:
+            group = multi_asset.setdefault(row[0], {"settled_samples": 0, "brier": 0.0})
+            group["settled_samples"] += 1
+            group["brier"] += (row[1] - row[2]) ** 2
+        for group in multi_asset.values():
+            group["brier"] /= group["settled_samples"]
+            group["status"] = "INSUFFICIENT_FOR_ASSET_MODEL_PROMOTION"
         return {
             "official_contracts": count,
             "official_featured_contracts": None,
@@ -1337,6 +1522,7 @@ class Journal:
             "contract_reviews": len(reviews),
             "opening_mistakes_recorded": opening_mistakes,
             "dense_snapshot_interval_seconds": 1,
+            "multi_asset_opening_learning": multi_asset,
             "reason": f"{count}/170 official outcomes before further feature/chronological eligibility checks. Feature eligibility is checked offline, not by rescanning the full journal each minute. Minimum count is not evidence of skill.",
         }
 

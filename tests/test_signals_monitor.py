@@ -84,8 +84,8 @@ def test_next_contract_rollover():
     assert analyze(data, NOW + timedelta(minutes=10))["market"]["ticker"] == "KXBTC15M-NEXT"
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy):
+@pytest.mark.parametrize("legacy,missing_side", [(False, None), (True, None), (False, "no"), (False, "yes"), (False, "both")])
+def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy, missing_side):
     calls = []
 
     def get(url, **kwargs):
@@ -133,6 +133,11 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy):
             }
             if legacy:
                 payload = {"orderbook": {"yes": [[48, 12]], "no": [[48, 14]]}}
+            elif missing_side == "both":
+                payload["orderbook_fp"]["yes_dollars"] = []
+                payload["orderbook_fp"]["no_dollars"] = []
+            elif missing_side:
+                payload["orderbook_fp"][missing_side + "_dollars"] = []
         elif "/candles?" in url:
             payload = {"candles": []}
         elif url == module.COINBASE:
@@ -145,7 +150,21 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy):
     data = PublicFeed(get).poll()
     assert len(calls) == 9
     assert sum("/candles?" in call for call in calls) == 5
-    assert data["markets"][0]["quotes"]["up"]["ask_size"] == 14
+    market = data["markets"][0]
+    if missing_side == "both":
+        assert market["book_diagnostic"].startswith("NO_LIQUIDITY")
+        assert market["quotes"]["up"]["ask_size"] == 0
+    elif missing_side == "no":
+        assert market["quotes"]["down"]["ask_size"] == 12
+        assert market["quotes"]["up"]["ask_size"] == 0
+        assert market["book_depth_status"].startswith("PARTIAL_NO_BIDS")
+    elif missing_side == "yes":
+        assert market["quotes"]["up"]["ask_size"] == 14
+        assert market["quotes"]["down"]["ask_size"] == 0
+        assert market["book_depth_status"].startswith("PARTIAL_YES_BIDS")
+    else:
+        assert market["quotes"]["up"]["ask_size"] == 14
+        assert market["book_depth_status"] == "COMPLETE"
     assert not data["reference"]["official"]
     assert analyze(data, NOW)["scalp"] == "WAIT"
 
@@ -170,6 +189,24 @@ def test_enriched_cached_rest_payload_advances_processing_clock_for_new_stream_r
     # Source receipts remain unchanged; advancing the analysis clock must not
     # fabricate a fresh REST quote.
     assert enriched["reference"]["observed_at"] == cached["reference"]["observed_at"]
+
+
+def test_incomplete_startup_candle_preload_retries_after_five_seconds():
+    calls = []
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        return httpx.Response(
+            200, json={"candles": []}, request=httpx.Request("GET", url)
+        )
+
+    feed = PublicFeed(get, multi_venue=False)
+    feed.candles(NOW)
+    assert len(calls) == 5
+    feed.candles(NOW + timedelta(seconds=4))
+    assert len(calls) == 5
+    feed.candles(NOW + timedelta(seconds=5))
+    assert len(calls) == 10
 
 
 def test_counterfactual_journal_deduplicates_and_includes_spread_and_fees(tmp_path):

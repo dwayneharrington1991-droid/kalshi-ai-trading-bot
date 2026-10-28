@@ -111,8 +111,6 @@ def calculate(state, *, slippage=0.01, manual_delay=3, account=None, now=None):
         try:
             if not fresh:
                 raise ValueError("Fresh contract, reference and model inputs required")
-            if market.get("book_diagnostic"):
-                raise ValueError(str(market["book_diagnostic"]))
             if market.get("fee_type") not in FEE_TYPES:
                 raise ValueError("Applicable Kalshi fee schedule is unavailable or unsupported")
             bid = number(quote["bid"], 0, 1)

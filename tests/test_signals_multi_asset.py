@@ -111,3 +111,19 @@ def test_metals_stay_unavailable_without_an_independent_reference():
     assert result["status"] == "UNAVAILABLE"
     assert result["up"] is None
     assert "unavailable" in result["reason"]
+
+
+def test_multi_asset_worker_reports_failure_without_blocking_cached_state():
+    from concurrent.futures import Future
+    from src.signals_display.monitor import PublicFeed
+
+    feed = PublicFeed(lambda *_args, **_kwargs: None, multi_venue=False)
+    failed = Future()
+    failed.set_exception(ValueError("provider response rejected"))
+    feed.multi_asset_pool = object()
+    feed.multi_asset_job = failed
+    feed.multi_asset_started = NOW
+    cached = feed.sampled_multi_assets(NOW)
+    assert cached["markets"] == []
+    assert cached["diagnostics"]["status"] == "ERROR"
+    assert cached["diagnostics"]["error_type"] == "ValueError"

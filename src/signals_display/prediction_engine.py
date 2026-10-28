@@ -429,9 +429,8 @@ def view(state, prior=None, opening=None, generated_at=None):
         )
     except (KeyError, ValueError, TypeError, AttributeError):
         active = False
-    ready = (
+    supported_live = (
         active
-        and day.get("status") == "READY"
         and not state.get("stale", True)
         and market.get("averaging_rule_verified")
         and market.get("mapping_verified")
@@ -440,29 +439,56 @@ def view(state, prior=None, opening=None, generated_at=None):
         and math.isfinite(p)
         and 0 <= p <= 1
     )
+    full_history = day.get("status") == "READY"
+    try:
+        joined_in_progress = (
+            supported_live
+            and not (opening and opening.get("up") is not None)
+            and (timestamp(state["now"]) - timestamp(market["opens_at"])).total_seconds() > 6
+        )
+    except (KeyError, ValueError, TypeError, AttributeError):
+        joined_in_progress = False
     result = dict(
-        status="EXPERIMENTAL" if ready else "INSUFFICIENT DATA",
+        status=(
+            "EXPERIMENTAL"
+            if supported_live and full_history
+            else "EXPERIMENTAL_LIMITED_HISTORY"
+            if supported_live
+            else "INSUFFICIENT DATA"
+        ),
         version=VERSION,
         ticker=market.get("ticker"),
         threshold=market.get("strike"),
         closes_at=market.get("closes_at"),
         opens_at=market.get("opens_at"),
         reference=state.get("reference", {}),
-        up=p if ready else None,
-        down=1 - p if ready else None,
+        up=p if supported_live else None,
+        down=1 - p if supported_live else None,
         updated_at=(generated_at.isoformat() if generated_at else state.get("now")),
         data_cutoff=state.get("now"),
         analysis_24h=day,
         regime=day.get("regime", "unavailable"),
-        direction=direction_label(p) if ready else "UNCLEAR",
+        direction=direction_label(p) if supported_live else "UNCLEAR",
+        forecast_type="JOINED_IN_PROGRESS" if joined_in_progress else "LIVE_UPDATE",
+        joined_in_progress=joined_in_progress,
         direction_policy=DIRECTION_POLICY,
-        displayed_probabilities=display_probability_pair(p if ready else None),
+        displayed_probabilities=display_probability_pair(p if supported_live else None),
         confidence={
             "status": "UNCALIBRATED",
-            "reason": "Experimental model probabilities; no validated accuracy or profitable edge",
+            "reason": (
+                "Joined-in-progress experimental estimate using current timestamped inputs; it is not an opening prediction"
+                if joined_in_progress
+                else "Experimental model probabilities; no validated accuracy or profitable edge"
+            ),
         },
         data_quality={
-            "status": "SUPPORTED PROXY INPUTS" if ready else "INSUFFICIENT DATA",
+            "status": (
+                "SUPPORTED PROXY INPUTS"
+                if supported_live and full_history
+                else "LIMITED HISTORY — LIVE INPUTS SUPPORTED"
+                if supported_live
+                else "INSUFFICIENT DATA"
+            ),
             "history_status": day.get("status", "INSUFFICIENT DATA"),
             "reference_source": state.get("reference", {}).get("source"),
             "reference_received_at": state.get("reference", {}).get("observed_at"),
@@ -475,14 +501,19 @@ def view(state, prior=None, opening=None, generated_at=None):
             ),
             "label": model["price_forecast"].get("interval_label"),
         }
-        if ready and model.get("price_forecast", {}).get("settlement_average_mean") is not None
+        if supported_live
+        and model.get("price_forecast", {}).get("settlement_average_mean") is not None
         else None,
         calibration="UNCALIBRATED — experimental model estimate; edge unverified",
-        reason="Independent final-average estimate; proxy/index basis and zero-drift assumptions remain unvalidated"
-        if ready
+        reason=(
+            "JOINED IN PROGRESS: current-time independent final-average estimate; original opening forecast remains unavailable; proxy/index basis and model assumptions remain unvalidated"
+            if joined_in_progress
+            else "Independent final-average estimate; proxy/index basis and zero-drift assumptions remain unvalidated"
+        )
+        if supported_live
         else (state.get("explanation") if day.get("status") == "READY" else day.get("reason"))
         or state.get("explanation")
-        or "Fresh supported contract and full 24h history required",
+        or "Fresh supported contract, reference, volatility and settlement-rule inputs required",
         settlement_condition="UP: final official 60s average >= strike; DOWN: average < strike",
         initial=None,
         previous_up=None,
@@ -495,7 +526,7 @@ def view(state, prior=None, opening=None, generated_at=None):
         "reason": "No frozen opening inputs available",
     }
     result["opening_diagnostics"] = opening_diagnostics(opening, model)
-    if ready:
+    if supported_live:
         previous = prior.get("latest") if prior else None
         result["previous_up"] = previous["up"] if previous else None
         result["change_since_previous"] = p - previous["up"] if previous else 0

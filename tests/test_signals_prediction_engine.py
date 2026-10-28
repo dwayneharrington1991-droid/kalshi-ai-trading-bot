@@ -82,6 +82,26 @@ def test_opening_forecast_uses_only_preopen_received_data_and_reports_delay():
     assert engine.opening_forecast(m, data, points(), NOW + timedelta(seconds=3))["up"] is None
 
 
+def test_past_only_quality_guard_withholds_weak_fallback_without_changing_probability():
+    data = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=2))
+    evidence = {
+        "directional_samples": 26,
+        "correct": 10,
+        "accuracy": 10 / 26,
+        "accuracy_interval": [0.224, 0.575],
+    }
+    unguarded = engine.opening_forecast(market(), data, points(), NOW + timedelta(seconds=3))
+    guarded = engine.opening_forecast(
+        market(), data, points(), NOW + timedelta(seconds=3),
+        audit_context={"opening_forward_accuracy": evidence},
+    )
+    assert guarded["up"] == unguarded["up"]
+    assert guarded["probability_inputs"] == unguarded["probability_inputs"]
+    assert guarded["direction"] == "UNCLEAR"
+    assert guarded["confidence"]["status"] == "INSUFFICIENT PREDICTIVE CONFIDENCE"
+    assert guarded["opening_quality_guard"]["probability_changed"] is False
+
+
 def test_basis_anchor_replay_accepts_one_fresh_preopen_proxy_receipt_without_zero_basis():
     data = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=2))
     contract = market()

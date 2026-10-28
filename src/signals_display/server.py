@@ -100,8 +100,10 @@ class Monitor:
             opening_model_artifact
         )
         self.scalp_criteria = self.journal.scalp_criteria()
-        self.readiness_at = None
-        self.readiness = {}
+        # Small indexed aggregates only. Load before the first contract so a
+        # past-only quality guard cannot be bypassed during startup warm-up.
+        self.readiness = journal.learning_readiness()
+        self.readiness_at = utcnow()
         self.estimator = LiveEstimator(manual_delay=manual_delay, slippage=slippage)
         if isinstance(feed, PublicFeed):
             self.estimator.restore(journal.recent_states())
@@ -518,6 +520,9 @@ class Monitor:
                                 and self.artifact.get("model", {}).get("kind") == "ensemble"
                             ),
                             "opening_candidate_status": self.opening_artifact_status,
+                            "opening_forward_accuracy": self.readiness.get(
+                                "opening_forward_accuracy", {}
+                            ),
                         },
                         frozen_context={
                             **self.intelligence.summarize(

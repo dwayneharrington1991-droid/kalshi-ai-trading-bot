@@ -4,7 +4,7 @@
     {
       "label": "🚀 OPEN MY BOT",
       "type": "shell",
-      "command": "python3 scripts/start_dashboard.py --private-dashboard --open-browser",
+      "command": "python3 scripts/update_dashboard.py",
       "options": {"cwd": "${workspaceFolder}"},
       "problemMatcher": [],
       "runOptions": {"instanceLimit": 1},
@@ -13,7 +13,7 @@
     {
       "label": "🔄 RESTART MY BOT",
       "type": "shell",
-      "command": "python3 scripts/start_dashboard.py --restart --private-dashboard --open-browser",
+      "command": "python3 scripts/update_dashboard.py --restart",
       "options": {"cwd": "${workspaceFolder}"},
       "problemMatcher": [],
       "runOptions": {"instanceLimit": 1},

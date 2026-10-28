@@ -60,9 +60,10 @@ def test_tasks_and_port_configuration_are_private_and_idempotent():
     by_name = {task["label"]: task for task in tasks["tasks"]}
     launch = by_name["🚀 OPEN MY BOT"]
     restart = by_name["🔄 RESTART MY BOT"]
+    assert "update_dashboard.py" in launch["command"]
     assert "--restart" not in launch["command"]
+    assert "update_dashboard.py" in restart["command"]
     assert "--restart" in restart["command"]
-    assert "--open-browser" in launch["command"]
     assert launch["runOptions"]["instanceLimit"] == 1
     config = json.loads((ROOT / ".devcontainer/devcontainer.json").read_text())
     assert 8765 in config["forwardPorts"]

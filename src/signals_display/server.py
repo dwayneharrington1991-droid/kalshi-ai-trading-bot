@@ -920,10 +920,10 @@ class Monitor:
         if state.get("stale") and state.get("prediction_engine"):
             state["prediction_engine"] = {
                 **state["prediction_engine"],
-                "status": "INSUFFICIENT DATA",
-                "up": None,
-                "down": None,
-                "reason": "Fresh unexpired contract/reference data required",
+                "status": "STALE_LAST_KNOWN"
+                if state["prediction_engine"].get("up") is not None
+                else "INSUFFICIENT DATA",
+                "reason": "Last valid forecast retained for display; fresh unexpired contract/reference data required before edge or trade qualification",
             }
         state["trade_decision"] = trade_decision(state)
         state["model_market"] = model_market(

@@ -82,6 +82,28 @@ def test_opening_forecast_uses_only_preopen_received_data_and_reports_delay():
     assert engine.opening_forecast(m, data, points(), NOW + timedelta(seconds=3))["up"] is None
 
 
+def test_basis_anchor_replay_accepts_one_fresh_preopen_proxy_receipt_without_zero_basis():
+    data = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=2))
+    contract = market()
+    receipt = (NOW - timedelta(seconds=1), 99975)
+    opening = engine.opening_forecast(contract, data, [receipt], NOW + timedelta(seconds=2))
+    assert opening["up"] is not None
+    assert opening["basis"]["point"] == pytest.approx(contract["strike"] - receipt[1])
+    assert "single fresh pre-opening proxy receipt" in opening["basis"]["method"]
+    assert opening["data_quality"]["status"] == "REDUCED PROXY INPUTS"
+    assert opening["data_quality"]["basis_coverage"].startswith("REDUCED")
+    assert opening["reference_received_at"] == receipt[0].isoformat()
+
+
+def test_basis_anchor_still_rejects_stale_or_post_open_proxy_receipts():
+    data = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=2))
+    contract = market()
+    stale = [(NOW - timedelta(seconds=6), 99975)]
+    future = [(NOW + timedelta(milliseconds=1), 99975)]
+    assert engine.opening_forecast(contract, data, stale, NOW + timedelta(seconds=2))["up"] is None
+    assert engine.opening_forecast(contract, data, future, NOW + timedelta(seconds=2))["up"] is None
+
+
 def test_opening_is_immutable_and_survives_restart(tmp_path):
     j = Journal(tmp_path / "j.db")
     m = market()

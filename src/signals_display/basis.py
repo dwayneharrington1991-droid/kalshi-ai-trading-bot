@@ -41,6 +41,25 @@ def estimate_basis(payload, market, history, now):
                 "opening_window_end": opened.isoformat(),
                 "future_basis_uncertainty": "Unmeasured: assumes opening proxy/index basis persists; range is sensitivity, not a confidence interval",
             }, None
+    # A restart/reconnect can leave fewer than sixty seconds of receipt-proven
+    # proxy ticks even though a genuinely fresh pre-opening receipt and the
+    # verified official threshold are available. Anchor the observed
+    # proxy-to-official difference at that instant; never assume zero basis and
+    # never describe this as an official-index observation.
+    if points and (opened - points[-1][0]).total_seconds() <= 5:
+        proxy = points[-1][1]
+        strike = number(market["strike"], 0.000001, 1e12)
+        point = strike - proxy
+        return {
+            "method": "single fresh pre-opening proxy receipt anchored to official threshold",
+            "point": point,
+            "low": point,
+            "high": point,
+            "proxy_opening_average": proxy,
+            "opening_window_end": opened.isoformat(),
+            "coverage_status": "REDUCED: full 60-second proxy window unavailable",
+            "future_basis_uncertainty": "Unmeasured and potentially material: the official threshold is known, but one proxy receipt cannot measure the official 60-second path or future basis drift. Low/high are the same point estimate, not uncertainty bounds.",
+        }, None
     data = payload.get("btc_candles", {})
     try:
         if not 0 <= (now - timestamp(data["received_at"])).total_seconds() <= 150:

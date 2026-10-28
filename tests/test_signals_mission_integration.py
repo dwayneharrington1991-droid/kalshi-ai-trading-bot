@@ -148,7 +148,9 @@ def test_fresh_book_cannot_keep_stale_btc_forecast_live(tmp_path):
     result = monitor.snapshot()
     assert result["market_health"]["contract_quotes_fresh"]
     assert not result["market_health"]["reference_fresh"]
-    assert result["stale"] and result["prediction_engine"]["up"] is None
+    assert result["stale"] and result["prediction_engine"]["up"] == 0.8
+    assert result["prediction_engine"]["status"] == "STALE_LAST_KNOWN"
+    assert result["trade_decision"]["action"] == "WAIT"
     assert result["prediction_engine"]["initial"]["up"] == 0.6
 
 

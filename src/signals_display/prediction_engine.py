@@ -1244,6 +1244,54 @@ def opening_forecast(
                 )
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         result["reason"] = str(exc)
+    shadow = [
+        "RSI", "MACD", "VWAP", "EMA", "Bollinger Bands", "volume",
+        "order flow", "order-book imbalance", "CVD", "market microstructure",
+    ]
+    if str(result.get("model", "")).startswith("opening-candidate/"):
+        active = [
+            name for name, value in result.get("frozen_features", {}).get("values", {}).items()
+            if value is not None
+        ]
+        model_role = "chronologically eligible experimental opening-only candidate"
+    else:
+        active = [
+            "latest pre-opening proxy price",
+            "official contract threshold",
+            "proxy-to-threshold opening basis anchor",
+            "24-hour realized volatility",
+            "contract duration and final-60-second averaging rule",
+            "zero expected drift",
+        ] if result.get("up") is not None else []
+        model_role = "experimental zero-drift statistical fallback"
+    result["feature_usage"] = {
+        "model_role": model_role,
+        "active_probability_inputs": active,
+        "available_shadow_features": [
+            name for name, value in result.get("frozen_features", {}).get("values", {}).items()
+            if value is not None
+        ],
+        "inactive_directional_feature_groups": shadow,
+        "inactive_reason": "No opening-only chronological out-of-sample evidence currently validates directional coefficients for these correlated features; they are recorded for shadow evaluation and cannot silently move the live probability.",
+    }
+    movement = (result.get("probability_inputs") or {}).get("projected_mean_minus_threshold")
+    result["forecasted_price_movement_from_threshold"] = movement
+    displayed = display_probability_pair(result.get("up"))
+    if displayed["up"] == 50.0:
+        result["direction"] = "UNCLEAR"
+        result["neutral_reason"] = (
+            "INSUFFICIENT PREDICTIVE CONFIDENCE: the eligible opening-only candidate is tied "
+            "at displayed precision; no directional call is supported"
+            if str(result.get("model", "")).startswith("opening-candidate/")
+            else "INSUFFICIENT PREDICTIVE CONFIDENCE: the active opening model assumes zero drift "
+            "and projects the settlement mean at the official threshold; shadow technical, "
+            "flow and machine-learning features are not validated for live directional weighting"
+        )
+        result["confidence"] = {
+            "status": "INSUFFICIENT PREDICTIVE CONFIDENCE",
+            "reason": result["neutral_reason"],
+        }
+        result["reason"] = result["neutral_reason"]
     return result
 
 

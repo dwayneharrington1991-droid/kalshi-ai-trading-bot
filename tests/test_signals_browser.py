@@ -719,7 +719,7 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             page.route("**/api/scalp-criteria", criteria_route)
             page.route("**/api/scalp-paper-performance", paper_route)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
-            playwright.expect(page.locator("#opening-direction")).to_have_text("NEUTRAL")
+            playwright.expect(page.locator("#opening-direction")).to_have_text("INSUFFICIENT PREDICTIVE CONFIDENCE")
             assert page.locator("#opening-up-prob").inner_text() == "50.0%"
             assert page.locator("#opening-down-prob").inner_text() == "50.0%"
             assert page.locator("#live-direction").inner_text() == "NEUTRAL"
@@ -782,7 +782,7 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             }
             page.evaluate("refresh()")
             playwright.expect(page.locator("#live-direction")).to_have_text("UP")
-            assert page.locator("#opening-direction").inner_text() == "NEUTRAL"
+            assert page.locator("#opening-direction").inner_text() == "INSUFFICIENT PREDICTIVE CONFIDENCE"
             assert state["prediction_engine"]["initial"] == initial
             page.evaluate("expired('Synthetic outage')")
             assert page.locator("#scalp-monitor-data").inner_text() == "STALE"

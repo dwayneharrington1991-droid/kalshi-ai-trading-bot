@@ -62,6 +62,11 @@ class CachedReport:
     def close(self):
         self.pool.shutdown(wait=False, cancel_futures=True)
 
+    def invalidate(self):
+        """Request a fresh background result without interrupting in-flight work."""
+        with self.lock:
+            self.started = None
+
 
 class LatestPayload:
     """A size-one mailbox: slow calculations cannot queue obsolete market frames."""

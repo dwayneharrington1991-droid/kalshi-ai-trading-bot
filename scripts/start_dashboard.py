@@ -55,6 +55,23 @@ def healthy(timeout=2, expected_commit=None):
     return not expected_commit or running == expected_commit.lower()
 
 
+def dashboard_page_ready(timeout=2):
+    """Require the actual HTML page, not just an early-open health socket."""
+    try:
+        with urlopen("http://127.0.0.1:8765/", timeout=timeout) as response:
+            content_type = response.headers.get_content_type()
+            # Read a bounded prefix so a handler that fails during rendering does
+            # not send the Codespaces browser to a page that will immediately 502.
+            prefix = response.read(4096).lower()
+            return (
+                response.status == 200
+                and content_type == "text/html"
+                and b"<html" in prefix
+            )
+    except Exception:
+        return False
+
+
 def forwarded_url(environment=None):
     environment = environment or os.environ
     name = environment.get("CODESPACE_NAME")
@@ -220,14 +237,27 @@ def supervise(command, *, open_browser=False, health=healthy, popen=subprocess.P
             child = popen(command, cwd=ROOT)
             started = time.monotonic()
             unhealthy = 0
+            consecutive_healthy = 0
             while not stopping and child.poll() is None:
-                if health():
+                current_healthy = health()
+                if current_healthy:
                     unhealthy = 0
                     failures = 0
-                    if open_browser and not opened:
+                    consecutive_healthy += 1
+                    # Local bind/health can succeed before the Codespaces port
+                    # forward is ready. Requiring sustained health and the real
+                    # page prevents the common one-click launch into a 502 tab.
+                    if (
+                        open_browser
+                        and not opened
+                        and consecutive_healthy >= 2
+                        and dashboard_page_ready()
+                    ):
                         open_dashboard()
                         opened = True
-                elif time.monotonic() - started > 30:
+                else:
+                    consecutive_healthy = 0
+                if not current_healthy and time.monotonic() - started > 30:
                     unhealthy += 1
                     if unhealthy >= 3:
                         print(

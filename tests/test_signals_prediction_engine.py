@@ -93,6 +93,11 @@ def test_basis_anchor_replay_accepts_one_fresh_preopen_proxy_receipt_without_zer
     assert opening["data_quality"]["status"] == "REDUCED PROXY INPUTS"
     assert opening["data_quality"]["basis_coverage"].startswith("REDUCED")
     assert opening["reference_received_at"] == receipt[0].isoformat()
+    assert opening["confidence"]["status"] == "INSUFFICIENT PREDICTIVE CONFIDENCE"
+    assert opening["direction"] == "UNCLEAR"
+    assert opening["forecasted_price_movement_from_threshold"] == pytest.approx(0)
+    assert "zero expected drift" in opening["feature_usage"]["active_probability_inputs"]
+    assert "RSI" in opening["feature_usage"]["inactive_directional_feature_groups"]
 
 
 def test_basis_anchor_still_rejects_stale_or_post_open_proxy_receipts():

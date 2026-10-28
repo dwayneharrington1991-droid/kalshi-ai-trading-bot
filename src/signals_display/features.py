@@ -6,6 +6,7 @@ from statistics import median
 from .model import number, timestamp
 from .advanced_indicators import FEATURE_NAMES as TECHNICAL_FEATURES
 from .advanced_flow import FEATURE_NAMES as FLOW_FEATURES
+from .momentum_confirmation import FEATURES as ADAPTIVE_MOMENTUM_FEATURES
 
 FEATURES = (
     (
@@ -71,6 +72,7 @@ FEATURES = (
     )
     + TECHNICAL_FEATURES
     + FLOW_FEATURES
+    + ADAPTIVE_MOMENTUM_FEATURES
 )
 
 

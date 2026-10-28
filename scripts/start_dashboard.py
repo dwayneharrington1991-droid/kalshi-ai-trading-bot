@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import json
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +43,14 @@ def health_payload(timeout=2):
                 return None
             value = json.load(response)
             return value if isinstance(value, dict) else None
+    except HTTPError as error:
+        try:
+            if error.headers.get_content_type() == "application/json":
+                value = json.load(error)
+                return value if isinstance(value, dict) else None
+        except Exception:
+            pass
+        return None
     except Exception:
         return None
 
@@ -50,6 +59,15 @@ def healthy(timeout=2, expected_commit=None):
     """Require responsive state and, when supplied, the exact checked-out build."""
     value = health_payload(timeout)
     if not value or value.get("status") != "HEALTHY":
+        return False
+    running = str(value.get("build_commit", "")).lower()
+    return not expected_commit or running == expected_commit.lower()
+
+
+def starting(timeout=2, expected_commit=None):
+    """Recognize a responsive pre-initialization server without calling it healthy."""
+    value = health_payload(timeout)
+    if not value or value.get("status") != "STARTING":
         return False
     running = str(value.get("build_commit", "")).lower()
     return not expected_commit or running == expected_commit.lower()
@@ -221,7 +239,10 @@ def stop_child(child, timeout=15):
         child.wait(timeout=5)
 
 
-def supervise(command, *, open_browser=False, health=healthy, popen=subprocess.Popen):
+def supervise(
+    command, *, open_browser=False, health=healthy, startup=lambda: False,
+    popen=subprocess.Popen,
+):
     """Keep the read-only dashboard alive while this Codespaces task is running."""
     stopping = False
 
@@ -257,7 +278,12 @@ def supervise(command, *, open_browser=False, health=healthy, popen=subprocess.P
                         opened = True
                 else:
                     consecutive_healthy = 0
-                if not current_healthy and time.monotonic() - started > 30:
+                # A responsive STARTING endpoint proves the event loop and socket
+                # are alive while a large preserved journal initializes. Bound the
+                # allowance so a permanently stalled initialization still recovers.
+                startup_responsive = not current_healthy and startup()
+                startup_deadline = 300 if startup_responsive else 30
+                if not current_healthy and time.monotonic() - started > startup_deadline:
                     unhealthy += 1
                     if unhealthy >= 3:
                         print(
@@ -487,6 +513,7 @@ def main():
             command,
             open_browser=args.open_browser,
             health=lambda: healthy(expected_commit=expected_commit),
+            startup=lambda: starting(expected_commit=expected_commit),
         )
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)

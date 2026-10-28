@@ -227,6 +227,7 @@ def test_running_pipeline_processes_streams_between_rest_polls_and_rolls_over(
     import sys
     import threading
     from time import monotonic
+    from urllib.error import HTTPError
     from urllib.request import ProxyHandler, build_opener
     from src.signals_display import server as module
     from tests.test_signals_prediction_engine import history
@@ -347,6 +348,11 @@ def test_running_pipeline_processes_streams_between_rest_polls_and_rolls_over(
                             (state.get("market") or {}).get("ticker"),
                         )
                     )
+            except HTTPError as exc:
+                # The bootstrap handler remains responsive with an explicit 503
+                # while preserved journals/models initialize.
+                if exc.code != 503:
+                    errors.append(type(exc).__name__)
             except Exception as exc:
                 errors.append(type(exc).__name__)
             stop.wait(0.05)

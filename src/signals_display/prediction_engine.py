@@ -1066,6 +1066,7 @@ def opening_forecast(
                     "live_model",
                     "live_ensemble_active",
                     "opening_candidate_status",
+                    "opening_forward_accuracy",
                 }
             },
             "historical_feature_role": "24h volatility is used; directional indicator coefficients are not validated. Correlated trend/momentum/volume features are collected for opening-only shadow evaluation.",
@@ -1174,6 +1175,28 @@ def opening_forecast(
                 history, points, market, day, basis, opened, frozen_context
             ),
         )
+        forward = (audit_context or {}).get("opening_forward_accuracy", {})
+        interval = forward.get("accuracy_interval")
+        weak_fallback = bool(
+            isinstance(forward.get("directional_samples"), int)
+            and forward["directional_samples"] >= 20
+            and isinstance(interval, (list, tuple))
+            and len(interval) == 2
+            and interval[1] < 0.60
+        )
+        result["opening_quality_guard"] = {
+            "status": "INSUFFICIENT_PREDICTIVE_CONFIDENCE" if weak_fallback else "COLLECTING_EVIDENCE",
+            "past_only_evidence": forward,
+            "rule": "After at least 20 past official directional openings, suppress the fallback direction when the 95% Wilson upper accuracy bound is below 60%; probabilities remain recorded unchanged",
+            "probability_changed": False,
+        }
+        if weak_fallback:
+            result["direction"] = "UNCLEAR"
+            result["confidence"] = {
+                "status": "INSUFFICIENT PREDICTIVE CONFIDENCE",
+                "reason": "Past-only official opening results do not support a directional call; the experimental probability is retained for continued evaluation",
+            }
+            result["reason"] += "; opening direction withheld by past-only quality guard"
         result["baseline_probability_up"] = p
         if candidate_artifact is not None:
             from .opening_models import eligible_at_opening, predict as candidate_predict

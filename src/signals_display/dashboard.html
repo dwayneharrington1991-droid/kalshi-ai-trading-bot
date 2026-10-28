@@ -244,9 +244,9 @@ function projectedProbability(v){return v==null?'unavailable':v<=0?'<0.1% (model
 function directionLabel(p){const value=roundedUpPercent(p);return value==null?'UNAVAILABLE':value>50?'UP':value<50?'DOWN':'NEUTRAL'}
 function setForecastDirection(id,label){txt(id,label);$(id).className='forecast-label '+(label.startsWith('UP')?'green':label.startsWith('DOWN')?'red':'amber')}
 function engineView(s){
-  const e=s.prediction_engine||{},i=e.initial&&(!e.initial.ticker||e.initial.ticker===e.ticker)?e.initial:{},h=s.market_health||{},ready=e.status==='EXPERIMENTAL'&&!s.stale,hasLive=Number.isFinite(e.up)&&e.up>=0&&e.up<=1,openingReady=i.up!=null&&Number.isFinite(i.up)&&i.up>=0&&i.up<=1;
+  const e=s.prediction_engine||{},i=e.initial&&(!e.initial.ticker||e.initial.ticker===e.ticker)?e.initial:{},h=s.market_health||{},ready=e.status==='EXPERIMENTAL'&&!s.stale,hasLive=Number.isFinite(e.up)&&e.up>=0&&e.up<=1,openingReady=i.up!=null&&Number.isFinite(i.up)&&i.up>=0&&i.up<=1,openingQualified=openingReady&&i.confidence?.status!=='INSUFFICIENT PREDICTIVE CONFIDENCE';
   const initialUp=openingReady?roundedUpPercent(i.up):null,liveUp=hasLive?roundedUpPercent(e.up):null;
-  setForecastDirection('opening-direction',openingReady&&initialUp===50?'INSUFFICIENT PREDICTIVE CONFIDENCE':openingReady?directionLabel(i.up):'OPENING PREDICTION UNAVAILABLE');
+  setForecastDirection('opening-direction',openingReady&&!openingQualified?'INSUFFICIENT PREDICTIVE CONFIDENCE':openingReady&&initialUp===50?'INSUFFICIENT PREDICTIVE CONFIDENCE':openingReady?directionLabel(i.up):'OPENING PREDICTION UNAVAILABLE');
   txt('opening-ticker',e.ticker||s.market?.ticker||'unavailable');txt('opening-threshold',money(i.threshold??e.threshold??s.market?.strike));txt('opening-countdown',countdown(s.remaining_seconds));
   txt('opening-up-prob',projectedProbability(initialUp));txt('opening-down-prob',projectedProbability(initialUp==null?null:100-initialUp));
   txt('opening-generated',i.generated_at||'unavailable');txt('opening-cutoff',i.data_cutoff||'unavailable');txt('opening-reason',i.reason||'No frozen pre-opening inputs are available. This opening prediction will not be invented or backfilled.');

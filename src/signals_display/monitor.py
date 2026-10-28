@@ -1673,6 +1673,12 @@ class Journal:
                 "SELECT asset,probability_up,outcome FROM multi_asset_openings "
                 "WHERE status='EXPERIMENTAL' AND probability_up IS NOT NULL AND outcome IS NOT NULL"
             ).fetchall()
+            opening_rows = db.execute(
+                """SELECT o.up,f.outcome FROM btc_engine_opening o
+                JOIN forecast_outcomes f ON f.ticker=o.ticker AND f.origin='official'
+                WHERE o.mode='PUBLIC MARKET DATA' AND o.up IS NOT NULL
+                ORDER BY o.generated_at"""
+            ).fetchall()
         opening_mistakes = sum(
             json.loads(row[0]).get("opening", {}).get("correct") is False for row in reviews
         )
@@ -1684,6 +1690,25 @@ class Journal:
         for group in multi_asset.values():
             group["brier"] /= group["settled_samples"]
             group["status"] = "INSUFFICIENT_FOR_ASSET_MODEL_PROMOTION"
+        from .prediction_engine import direction_label
+
+        opening_directional = [
+            row for row in opening_rows if direction_label(row["up"]) in {"UP", "DOWN"}
+        ]
+        opening_correct = sum(
+            (direction_label(row["up"]) == "UP") == bool(row["outcome"])
+            for row in opening_directional
+        )
+        opening_accuracy = {
+            "settled_probability_samples": len(opening_rows),
+            "directional_samples": len(opening_directional),
+            "correct": opening_correct,
+            "accuracy": opening_correct / len(opening_directional)
+            if opening_directional else None,
+            "accuracy_interval": wilson(opening_correct, len(opening_directional))
+            if opening_directional else None,
+            "policy": "Past official outcomes only; current/future outcomes never enter a frozen opening",
+        }
         return {
             "official_contracts": count,
             "official_featured_contracts": None,
@@ -1692,6 +1717,7 @@ class Journal:
             "opening_mistakes_recorded": opening_mistakes,
             "dense_snapshot_interval_seconds": 1,
             "multi_asset_opening_learning": multi_asset,
+            "opening_forward_accuracy": opening_accuracy,
             "reason": f"{count}/170 official outcomes before further feature/chronological eligibility checks. Feature eligibility is checked offline, not by rescanning the full journal each minute. Minimum count is not evidence of skill.",
         }
 

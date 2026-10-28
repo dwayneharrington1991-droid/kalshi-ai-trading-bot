@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,3 +54,43 @@ def test_tasks_and_port_configuration_are_private_and_idempotent():
     assert port["visibility"] == "private"
     assert port["protocol"] == "http"
     assert port["onAutoForward"] == "openBrowser"
+    assert config["postCreateCommand"] == "python3 scripts/start_dashboard.py --prepare-only"
+
+
+def test_environment_works_rejects_broken_python_symlink(tmp_path):
+    python = tmp_path / "python3"
+    python.symlink_to(tmp_path / "base-python-removed-by-rebuild")
+    assert launcher.environment_works(python) is False
+
+
+def test_prepare_environment_recreates_broken_venv_and_installs_dependencies(tmp_path, monkeypatch):
+    venv = tmp_path / ".venv"
+    binary = venv / "bin/python3"
+    binary.parent.mkdir(parents=True)
+    binary.symlink_to(tmp_path / "old-codespaces-python")
+    calls = []
+
+    monkeypatch.setattr(launcher, "environment_works", lambda value: value == binary and len(calls) == 2)
+
+    def fake_run(command, purpose, **kwargs):
+        calls.append((command, purpose))
+        if purpose == "Python environment creation":
+            binary.parent.mkdir(parents=True)
+            binary.write_text("replacement")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(launcher, "_run_checked", fake_run)
+    result = launcher.prepare_environment(venv, Path("/usr/bin/python3"))
+    assert result == binary
+    assert calls[0][0] == ["/usr/bin/python3", "-m", "venv", str(venv)]
+    assert calls[1][0][0:4] == [str(binary), "-m", "pip", "install"]
+    assert calls[1][0][-3:] == list(launcher.RUNTIME_PACKAGES)
+
+
+def test_open_dashboard_uses_codespaces_url(monkeypatch):
+    monkeypatch.setenv("CODESPACE_NAME", "mysterious-haunting")
+    monkeypatch.setenv("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", "app.github.dev")
+    calls = []
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda command, **kwargs: calls.append(command))
+    assert launcher.open_dashboard() is True
+    assert calls == [["code", "--open-url", "https://mysterious-haunting-8765.app.github.dev/"]]

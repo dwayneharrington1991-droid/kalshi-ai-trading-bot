@@ -40,6 +40,8 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
 
             page.route("**/*", route)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
+            assert page.locator("#primary-opening").inner_text() == "NO VERIFIED EDGE"
+            assert page.locator("#primary-scalp").inner_text() == "WAIT"
             playwright.expect(page.locator("#direction")).to_have_text("UP")
             assert page.locator("#scalp").text_content() == "WAIT"
             assert page.locator("#trade-action").inner_text() == "🟡 WAIT"

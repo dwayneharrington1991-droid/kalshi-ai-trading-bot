@@ -2,6 +2,7 @@
 from datetime import timedelta
 from http.server import ThreadingHTTPServer
 import json
+from pathlib import Path
 import threading
 from time import perf_counter
 from urllib.request import urlopen
@@ -167,3 +168,30 @@ def test_raw_feed_is_archived_once_without_bloating_new_prediction_rows(tmp_path
         ).fetchone()[0]
         assert json.loads(recovered) == raw
     assert state["model"]["coverage"]["Mock venue"] == raw  # Live view unchanged.
+
+
+def test_prediction_evidence_is_bounded_even_when_live_diagnostics_are_large(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    state = analyze(frame(), NOW)
+    state["model"] = {
+        "version": "bounded-test",
+        "candidate_features": {"values": {"return_1m": 0.01}},
+        "coverage": {"large": {"status": "LIVE", "debug": "x" * 2_000_000}},
+    }
+    journal.step(state)
+    with journal.read() as db:
+        raw = db.execute("SELECT payload FROM predictions").fetchone()[0]
+    saved = json.loads(raw)
+    assert len(raw) < 65536
+    assert saved["schema"] == "compact-prediction-evidence-v1"
+    assert saved["model"]["candidate_features"]["values"]["return_1m"] == 0.01
+    assert "debug" not in raw
+
+
+def test_storage_health_is_constant_time_and_preserves_database(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    before = Path(journal.path).stat().st_size
+    health = journal.storage_health()
+    assert health["database_bytes"] == before
+    assert health["status"] == "NORMAL"
+    assert Path(journal.path).exists()

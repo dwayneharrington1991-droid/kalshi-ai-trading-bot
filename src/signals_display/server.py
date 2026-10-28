@@ -459,6 +459,12 @@ class Monitor:
                 scanner_qualify(state, scan)
             state["discovered_contracts"] = selection_summary(payload.get("markets", []), now)
             state["streaming"] = payload.get("streaming", {})
+            state["historical_preload"] = (payload.get("btc_candles") or {}).get(
+                "diagnostics", {"status": "UNAVAILABLE"}
+            )
+            state["multi_asset_discovery"] = payload.get(
+                "multi_asset_diagnostics", {"status": "UNAVAILABLE"}
+            )
             state["market_health"] = diagnose_market(state, now)
             prior = (
                 self.journal.engine_prior(state["market"]["ticker"], state["mode"])
@@ -1008,6 +1014,10 @@ class Monitor:
             "opening_reason": state.get("prediction_engine", {}).get("initial", {}).get("reason"),
             "last_processing_completed_at": last_tick.isoformat(),
             "database": "WAL / serialized writes; responsive snapshot completed",
+            "historical_preload": state.get("historical_preload", {}),
+            "multi_asset_discovery": state.get("multi_asset_discovery", {}),
+            "storage": self.journal.storage_health(),
+            "runtime_failures": self.runtime_meter.failures(),
         }
         state["scalping_monitor"] = diagnose_scalp(
             state, self.scalp_criteria, account=state["account"], now=health_clock
@@ -1022,6 +1032,10 @@ class Monitor:
             "market_stale": state.get("stale", True),
             "market_reason": state.get("explanation"),
             "market_health": state["market_health"],
+            "historical_preload": state.get("historical_preload", {}),
+            "multi_asset_discovery": state.get("multi_asset_discovery", {}),
+            "storage": self.journal.storage_health(),
+            "runtime_failures": self.runtime_meter.failures(),
             "last_poll_completed_at": last_tick.isoformat(),
             "fill_reconciliation": state["account"].get("fill_reconciliation", {}),
             "open_positions": sum(

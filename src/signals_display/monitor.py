@@ -43,6 +43,10 @@ class PublicFeed:
         self.transport_diagnostics = []
         self.candle_cache = None
         self.candles_checked = None
+        self.candle_diagnostics = {
+            "status": "WARMING_UP", "last_attempt_at": None,
+            "last_success_at": None, "error_type": None,
+        }
         from concurrent.futures import ThreadPoolExecutor
 
         self.candle_pool = (
@@ -60,6 +64,11 @@ class PublicFeed:
         )
         self.multi_asset_job = None
         self.multi_asset_started = None
+        self.multi_asset_diagnostics = {
+            "status": "WARMING_UP", "last_attempt_at": None,
+            "last_success_at": None, "error_type": None,
+            "markets_scanned": 0, "compatible_markets": 0,
+        }
         self.kalshi_stream = None
         self.streams = None
         self.http_backoff = {}
@@ -163,10 +172,16 @@ class PublicFeed:
                 result = self.candle_job.result()
                 if isinstance(result, dict):
                     self.candle_cache = result
+                    self.candle_diagnostics = dict(result.get("diagnostics", {}))
             except Exception as exc:
+                self.candle_diagnostics.update(
+                    status="ERROR", error_type=type(exc).__name__,
+                    last_attempt_at=now.isoformat(),
+                )
                 self.candle_cache = {
                     **(self.candle_cache or {}),
                     "error": "CANDLE_FETCH_FAILED: " + type(exc).__name__,
+                    "diagnostics": dict(self.candle_diagnostics),
                 }
             self.candle_job = None
         retained = len((self.candle_cache or {}).get("candles", []))
@@ -237,6 +252,7 @@ class PublicFeed:
         )
 
     def candles(self, now):
+        self.candle_diagnostics["last_attempt_at"] = now.isoformat()
         retained = len((self.candle_cache or {}).get("candles", []))
         retry_seconds = 60 if retained >= 1440 and not (self.candle_cache or {}).get("error") else 5
         if (
@@ -260,7 +276,11 @@ class PublicFeed:
                 else:
                     ranges.append([stamp, stamp + 60])
             if not ranges:
-                return self.candle_cache or {}
+                self.candle_diagnostics.update(
+                    status="READY", last_success_at=utcnow().isoformat(), error_type=None,
+                    retained_bars=len(merged), missing_bars=0,
+                )
+                return {**(self.candle_cache or {}), "diagnostics": dict(self.candle_diagnostics)}
             for left, right in ranges[:5]:
                 start = left - 60
                 end = min(int(utcnow().timestamp()), right + 60)
@@ -291,11 +311,24 @@ class PublicFeed:
                     "retained_bars": len(merged),
                     "maximum_requests_per_refresh": 5,
                 },
+                "diagnostics": {
+                    "status": "READY", "last_attempt_at": now.isoformat(),
+                    "last_success_at": received.isoformat(), "error_type": None,
+                    "retained_bars": len(merged),
+                    "missing_bars": max(0, 1440 - len(merged)),
+                },
             }
-        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            self.candle_diagnostics = dict(self.candle_cache["diagnostics"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            retained = len((self.candle_cache or {}).get("candles", []))
+            self.candle_diagnostics.update(
+                status="ERROR", error_type=type(exc).__name__, retained_bars=retained,
+                missing_bars=max(0, 1440 - retained),
+            )
             return {
-                "error": "MISSING_CANDLES: public one-minute candle endpoint unavailable",
                 **(self.candle_cache or {}),
+                "error": "MISSING_CANDLES: public one-minute candle endpoint unavailable",
+                "diagnostics": dict(self.candle_diagnostics),
             }
         return self.candle_cache
 
@@ -306,8 +339,16 @@ class PublicFeed:
         if self.multi_asset_job is not None and self.multi_asset_job.done():
             try:
                 self.multi_asset_cache = self.multi_asset_job.result()
-            except Exception:
-                pass
+                self.multi_asset_diagnostics = dict(
+                    self.multi_asset_cache.get("diagnostics", self.multi_asset_diagnostics)
+                )
+            except Exception as exc:
+                self.multi_asset_diagnostics.update(
+                    status="ERROR", error_type=type(exc).__name__,
+                    last_attempt_at=now.isoformat(),
+                    reason="Public discovery request failed; cached results retained",
+                )
+                self.multi_asset_cache["diagnostics"] = dict(self.multi_asset_diagnostics)
             self.multi_asset_job = None
         if self.multi_asset_job is None and (
             self.multi_asset_started is None
@@ -318,6 +359,7 @@ class PublicFeed:
         return self.multi_asset_cache
 
     def _load_multi_assets(self, now):
+        attempted_at = utcnow().isoformat()
         rows, cursor, seen = [], None, set()
         for _ in range(10):
             params = {
@@ -338,10 +380,15 @@ class PublicFeed:
         else:
             raise ValueError("Multi-asset discovery exceeded the safe pagination limit")
         candidates = []
+        rejections = {
+            "unsupported_asset_or_series": 0, "outside_effective_window": 0,
+            "invalid_metadata": 0, "unverified_rules": 0,
+        }
         for raw in rows:
             series_ticker = str(raw.get("series_ticker", ""))
             asset = asset_of({**raw, "series": series_ticker})
             if not asset or "15M" not in series_ticker.upper():
+                rejections["unsupported_asset_or_series"] += 1
                 continue
             try:
                 close = timestamp(raw["close_time"])
@@ -350,6 +397,7 @@ class PublicFeed:
                 # immutable history/reference snapshot is already warm when
                 # MarketStrip activates the card at the opening boundary.
                 if not opened - timedelta(minutes=5) <= now < close or not 60 <= (close-opened).total_seconds() <= 900:
+                    rejections["outside_effective_window"] += 1
                     continue
                 series = self.multi_series_cache.get(series_ticker)
                 if series is None:
@@ -369,6 +417,8 @@ class PublicFeed:
                         for word in ALIASES[asset]
                     )
                 )
+                if not verified:
+                    rejections["unverified_rules"] += 1
                 candidates.append({
                     "asset": asset, "ticker": raw["ticker"], "series": series_ticker,
                     "title": raw.get("title"), "opens_at": opened.isoformat(),
@@ -379,8 +429,13 @@ class PublicFeed:
                     "status": "open",
                 })
             except (KeyError, ValueError, TypeError, AttributeError):
+                rejections["invalid_metadata"] += 1
                 continue
         references = {}
+        input_failures = {
+            asset: "NO_CONFIGURED_INDEPENDENT_METALS_REFERENCE"
+            for asset in {m["asset"] for m in candidates} & {"GOLD", "SILVER"}
+        }
         histories = dict(self.multi_asset_cache.get("histories", {}))
         for asset in sorted({m["asset"] for m in candidates if m["asset"] not in {"GOLD", "SILVER"}}):
             product = asset + "-USD"
@@ -426,9 +481,29 @@ class PublicFeed:
                     "received_at": utcnow().isoformat(),
                     "source": f"Coinbase {product} public one-minute candles",
                 }
-            except (KeyError, ValueError, TypeError, httpx.HTTPError):
+            except (KeyError, ValueError, TypeError, httpx.HTTPError) as exc:
+                input_failures[asset] = type(exc).__name__
                 continue
-        return {"markets": candidates, "references": references, "histories": histories}
+        reference_ready = sorted(references)
+        history_ready = sorted(
+            asset for asset, item in histories.items() if len(item.get("candles", [])) >= 1440
+        )
+        diagnostics = {
+            "status": "READY" if candidates else "NO_COMPATIBLE_MARKETS",
+            "last_attempt_at": attempted_at, "last_success_at": utcnow().isoformat(),
+            "error_type": None, "markets_scanned": len(rows),
+            "compatible_markets": len(candidates), "rejections": rejections,
+            "reference_ready_assets": reference_ready,
+            "history_ready_assets": history_ready,
+            "input_failures": input_failures,
+            "reason": (
+                "Compatible listings discovered; individual cards still require verified rules and opening inputs"
+                if candidates else
+                "Kalshi returned no supported 15-minute listing in the current/pre-open window"
+            ),
+        }
+        return {"markets": candidates, "references": references, "histories": histories,
+                "diagnostics": diagnostics}
 
     def resolved(self, ticker):
         data = self._read(KALSHI + "/markets/" + quote(ticker, safe=""))
@@ -701,6 +776,7 @@ class PublicFeed:
             "multi_asset_markets": auxiliary["markets"],
             "multi_asset_references": auxiliary["references"],
             "multi_asset_histories": auxiliary["histories"],
+            "multi_asset_diagnostics": auxiliary.get("diagnostics", self.multi_asset_diagnostics),
             "reference": reference,
             "warnings": warnings,
             "mode": "PUBLIC MARKET DATA",
@@ -1045,6 +1121,83 @@ class Journal:
     def read(self):
         return storage_connect(self.path, readonly=True)
 
+    def storage_health(self):
+        """Constant-time storage pressure indicators; never scan journal rows."""
+        path = Path(self.path)
+        sizes = {}
+        for label, candidate in (
+            ("database", path), ("wal", Path(str(path) + "-wal")),
+            ("shared_memory", Path(str(path) + "-shm")),
+        ):
+            try:
+                sizes[label + "_bytes"] = candidate.stat().st_size
+            except OSError:
+                sizes[label + "_bytes"] = 0
+        total = sizes["database_bytes"] + sizes["wal_bytes"]
+        return {
+            **sizes, "total_mib": round(total / 1048576, 2),
+            "status": "HIGH_STORAGE_PRESSURE" if total >= 2 * 1024**3 else "NORMAL",
+            "note": "Existing history is preserved; new prediction evidence uses bounded compact rows",
+        }
+
+    @staticmethod
+    def _compact_prediction(state, persisted):
+        """Keep reproducible learning evidence without copying the live UI state."""
+        market = persisted.get("market") or {}
+        model = persisted.get("model") or {}
+        features = model.get("candidate_features") or {}
+        scanner = model.get("scanner") or {}
+        analysis = model.get("analysis_24h") or {}
+        coverage = {}
+        for source, item in (model.get("coverage") or {}).items():
+            coverage[source] = {
+                key: item.get(key) for key in ("status", "reason", "raw_observation")
+                if item.get(key) is not None
+            }
+        return {
+            "schema": "compact-prediction-evidence-v1",
+            "mode": persisted.get("mode"), "now": persisted.get("now"),
+            "stale": bool(persisted.get("stale", True)),
+            "direction": persisted.get("direction"), "scalp": persisted.get("scalp"),
+            "market": {
+                key: market.get(key) for key in (
+                    "ticker", "opens_at", "closes_at", "strike", "mapping_verified",
+                    "comparison_operator", "averaging_rule_verified", "observed_at", "quotes",
+                ) if market.get(key) is not None
+            },
+            "reference": {
+                key: (persisted.get("reference") or {}).get(key)
+                for key in ("price", "observed_at", "source", "official")
+                if (persisted.get("reference") or {}).get(key) is not None
+            },
+            "estimate": persisted.get("estimate") or {},
+            "plans": persisted.get("plans") or {},
+            "market_comparison": persisted.get("market_comparison") or {},
+            "prediction_engine": {
+                key: (persisted.get("prediction_engine") or {}).get(key)
+                for key in ("updated_at", "version", "up", "down", "status")
+                if (persisted.get("prediction_engine") or {}).get(key) is not None
+            },
+            "model": {
+                "version": model.get("version"),
+                "baseline_probability_up": model.get("baseline_probability_up"),
+                "candidate_features": {
+                    "values": features.get("values") or {},
+                    "cutoff": features.get("cutoff"),
+                },
+                "analysis_24h": {"regime": analysis.get("regime")},
+                "scalp_edges": model.get("scalp_edges") or {},
+                "execution_assumptions": model.get("execution_assumptions") or {},
+                "scanner": {
+                    key: scanner.get(key) for key in (
+                        "high_slippage_risk", "macro_blackout", "edge_reading_core"
+                    ) if scanner.get(key) is not None
+                },
+                "coverage": coverage,
+            },
+            "advanced_intelligence": persisted.get("advanced_intelligence") or {},
+        }
+
     def scalp_criteria(self, values=None):
         from .scalp_monitor import ScalpCriteria
 
@@ -1264,6 +1417,22 @@ class Journal:
                         "validation": advanced.get("validation"),
                     },
                 }
+            persisted = self._compact_prediction(state, persisted)
+            encoded = json.dumps(persisted, allow_nan=False, separators=(",", ":"))
+            if len(encoded) > 65536:
+                # Candidate values are required learning evidence. Optional
+                # diagnostics are bounded first if a provider expands fields.
+                persisted["model"]["coverage"] = {
+                    source: {"status": item.get("status"), "reason": item.get("reason")}
+                    for source, item in persisted["model"]["coverage"].items()
+                }
+                persisted["advanced_intelligence"] = {
+                    "status": persisted["advanced_intelligence"].get("status"),
+                    "generated_at": persisted["advanced_intelligence"].get("generated_at"),
+                }
+                encoded = json.dumps(persisted, allow_nan=False, separators=(",", ":"))
+            if len(encoded) > 65536:
+                raise ValueError("Compact prediction evidence exceeded 64 KiB")
             db.execute(
                 """INSERT OR IGNORE INTO predictions
                 (mode,ticker,timestamp,direction,scalp,probability_up,probability_down,payload)
@@ -1276,7 +1445,7 @@ class Journal:
                     state["scalp"],
                     e["settlement_up"],
                     e["settlement_down"],
-                    json.dumps(persisted, allow_nan=False),
+                    encoded,
                 ),
             )
             prediction = db.execute(

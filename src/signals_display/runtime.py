@@ -8,6 +8,7 @@ from time import process_time
 import logging
 import json
 import resource
+from pathlib import Path
 
 
 class CachedReport:
@@ -93,10 +94,19 @@ class RuntimeMeter:
         self.wall = monotonic()
         self.cpu = process_time()
         self.logged = {}
+        self.recent_errors = {}
 
     def sample(self):
         wall, cpu = monotonic(), process_time()
         elapsed = wall - self.wall
+        current_rss = None
+        try:
+            for line in Path("/proc/self/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    current_rss = round(int(line.split()[1]) / 1024, 2)
+                    break
+        except (OSError, ValueError, IndexError):
+            pass
         result = {
             "process_cpu_percent_one_core": round(100 * (cpu - self.cpu) / elapsed, 2)
             if elapsed > 0
@@ -104,7 +114,8 @@ class RuntimeMeter:
             "peak_resident_mib": round(
                 resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 2
             ),
-            "memory_note": "Linux process high-water RSS, not current usage; CPU is process time / monotonic elapsed time",
+            "current_resident_mib": current_rss,
+            "memory_note": "Current and Linux high-water RSS; CPU is process time / monotonic elapsed time",
         }
         self.wall, self.cpu = wall, cpu
         return result
@@ -116,6 +127,10 @@ class RuntimeMeter:
             return
         if not isinstance(error_type, str) or not error_type.isidentifier():
             error_type = "RedactedError"
+        observed = datetime.now(timezone.utc).isoformat()
+        self.recent_errors[component] = {
+            "error_type": error_type, "observed_at": observed,
+        }
         key, now = (component, error_type), monotonic()
         if now - self.logged.get(key, -1e9) < 30:
             return
@@ -126,7 +141,10 @@ class RuntimeMeter:
                     "event": "read_only_monitor_error",
                     "component": component,
                     "error_type": error_type,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": observed,
                 }
             )
         )
+
+    def failures(self):
+        return dict(self.recent_errors)

@@ -145,6 +145,73 @@ def dashboard_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
     return matches
 
 
+def stop_child(child, timeout=15):
+    """Stop one supervised signals server without touching any unrelated process."""
+    if child.poll() is not None:
+        return
+    child.send_signal(signal.SIGTERM)
+    try:
+        child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=5)
+
+
+def supervise(command, *, open_browser=False, health=healthy, popen=subprocess.Popen):
+    """Keep the read-only dashboard alive while this Codespaces task is running."""
+    stopping = False
+
+    def requested_stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    old_term = signal.signal(signal.SIGTERM, requested_stop)
+    failures = 0
+    opened = False
+    try:
+        while not stopping:
+            child = popen(command, cwd=ROOT)
+            started = time.monotonic()
+            unhealthy = 0
+            while not stopping and child.poll() is None:
+                if health():
+                    unhealthy = 0
+                    failures = 0
+                    if open_browser and not opened:
+                        open_dashboard()
+                        opened = True
+                elif time.monotonic() - started > 30:
+                    unhealthy += 1
+                    if unhealthy >= 6:
+                        print(
+                            "Dashboard health check failed for 30 seconds; restarting safely.",
+                            flush=True,
+                        )
+                        stop_child(child)
+                        break
+                time.sleep(5)
+            if stopping:
+                stop_child(child)
+                return 0
+            failures += 1
+            delay = min(60, 2 ** min(failures, 6))
+            print(
+                f"Dashboard stopped unexpectedly; automatic restart in {delay}s "
+                f"(exit {child.poll()}).",
+                flush=True,
+            )
+            deadline = time.monotonic() + delay
+            while not stopping and time.monotonic() < deadline:
+                time.sleep(0.25)
+        return 0
+    except KeyboardInterrupt:
+        stopping = True
+        stop_child(child)
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -170,7 +237,12 @@ def main():
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        parser.exit(1, "Another dashboard launcher is running.\n")
+        if healthy():
+            print("Dashboard supervisor is already running; reusing it.", flush=True)
+            if args.open_browser:
+                open_dashboard()
+            return 0
+        parser.exit(1, "Dashboard supervisor is already recovering the server; try again shortly.\n")
     try:
         python = prepare_environment()
     except RuntimeError as error:
@@ -283,21 +355,13 @@ def main():
         flush=True,
     )
     print("Open Codespaces Ports > 8765 > Open in Browser. Keep visibility Private.", flush=True)
-    child = subprocess.Popen(command, cwd=ROOT)
-    fcntl.flock(lock, fcntl.LOCK_UN)
-    lock.close()
-    if args.open_browser:
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and child.poll() is None:
-            if healthy():
-                open_dashboard()
-                break
-            time.sleep(0.25)
+    # Hold the launcher lock for the supervisor lifetime. Repeated clicks reuse
+    # this owner and cannot race an automatic restart into a duplicate process.
     try:
-        return child.wait()
-    except KeyboardInterrupt:
-        child.send_signal(signal.SIGINT)
-        return child.wait()
+        return supervise(command, open_browser=args.open_browser)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 if __name__ == "__main__":

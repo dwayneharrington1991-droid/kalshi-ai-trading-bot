@@ -149,13 +149,22 @@ class Monitor:
             self.edge_performance, interval=30, name="edge-performance"
         )
         self.scheduled_learning = None
+        self.scheduled_scalp_learning = None
         if model_registry is not None:
             from .model_registry import scheduled_evaluation
+            from .scalp_learning import scheduled_evaluation as scheduled_scalp_evaluation
 
             self.scheduled_learning = CachedReport(
                 lambda: scheduled_evaluation(self.journal.path, model_registry),
                 interval=3600,
                 name="scheduled-offline-model-comparison",
+            )
+            self.scheduled_scalp_learning = CachedReport(
+                lambda: scheduled_scalp_evaluation(
+                    self.journal.path, Path(model_registry) / "latest-scalp-evaluation.json"
+                ),
+                interval=3600,
+                name="scheduled-scalp-shadow-evaluation",
             )
 
     def prediction_performance(self):
@@ -346,6 +355,15 @@ class Monitor:
                         "last_completed_at": evaluation["generated_at"],
                         "result": evaluation["value"],
                         "active_model_changed": False,
+                    }
+                if self.scheduled_scalp_learning is not None:
+                    scalp_evaluation = self.scheduled_scalp_learning.get()
+                    info["learning_status"]["scheduled_scalp_evaluation"] = {
+                        "status": scalp_evaluation["status"],
+                        "last_completed_at": scalp_evaluation["generated_at"],
+                        "result": scalp_evaluation["value"],
+                        "active_model_changed": False,
+                        "actionable": False,
                     }
                 if self.artifact is not None and result.settlement_up is not None:
                     if timestamp(self.artifact["labels_available_through"]) < now:
@@ -1016,6 +1034,7 @@ def make_handler(monitor):
             parts = urlsplit(self.path)
             route = parts.path
             query = parse_qs(parts.query)
+            status_code = 200
             if route == "/":
                 body = Path(__file__).with_name("dashboard.html").read_bytes()
                 content_type = "text/html; charset=utf-8"
@@ -1139,12 +1158,27 @@ def make_handler(monitor):
                     value = probability_history(db, ticker, limit=limit, now=utcnow())
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
+            elif route == "/healthz":
+                with monitor.lock:
+                    age = max(0, (utcnow() - monitor.last_tick).total_seconds())
+                    version = monitor.state_version
+                healthy = version > 0 and age <= 10
+                status_code = 200 if healthy else 503
+                body = json.dumps(
+                    {
+                        "status": "HEALTHY" if healthy else "UNHEALTHY",
+                        "state_age_seconds": round(age, 3),
+                        "state_version": version,
+                        "signals_only": True,
+                    }
+                ).encode()
+                content_type = "application/json"
             elif route == "/health":
                 body, content_type = b"signals-only dashboard", "text/plain"
             else:
                 self.send_error(404)
                 return
-            self.send_response(200)
+            self.send_response(status_code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
@@ -1468,6 +1502,8 @@ def main():
         monitor.edge_report.close()
         if monitor.scheduled_learning:
             monitor.scheduled_learning.close()
+        if monitor.scheduled_scalp_learning:
+            monitor.scheduled_scalp_learning.close()
         if isinstance(feed, PublicFeed):
             if feed.streams:
                 feed.streams.close()

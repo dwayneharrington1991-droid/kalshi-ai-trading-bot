@@ -15,6 +15,7 @@ from .candles import candle_context
 from .basis import estimate_basis
 from .features import extract, DevelopingCandle
 from .prediction_engine import context24
+from .momentum_confirmation import describe as adaptive_momentum
 
 VERSION = "independent-basis-forecast-v3"
 MIN_SAMPLES = 61
@@ -214,6 +215,10 @@ class LiveEstimator:
         info["analysis_24h"] = context24(payload.get("btc_candles", {}), now)
         info["candidate_features"] = extract(payload, market, now)
         info["candidate_features"]["values"].update(info["analysis_24h"].get("features", {}))
+        info["adaptive_momentum"] = adaptive_momentum(
+            info["candidate_features"]["values"], market
+        )
+        info["candidate_features"]["values"].update(info["adaptive_momentum"]["features"])
         info["developing_candle"] = self.developing.update(payload.get("reference", {}), now)
         info["coverage"] = payload.get("coverage", {})
         info["learning_status"] = {

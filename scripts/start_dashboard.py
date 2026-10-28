@@ -23,7 +23,7 @@ RUNTIME_PACKAGES = (
 def healthy(timeout=2):
     """A responsive state endpoint proves process health, not market freshness."""
     try:
-        with urlopen("http://127.0.0.1:8765/api/state?view=main", timeout=timeout) as response:
+        with urlopen("http://127.0.0.1:8765/healthz", timeout=timeout) as response:
             return response.status == 200 and response.headers.get_content_type() == "application/json"
     except Exception:
         return False
@@ -145,6 +145,26 @@ def dashboard_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
     return matches
 
 
+def launcher_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
+    """Find only this checkout's dashboard supervisor, never another task."""
+    own_pid = os.getpid() if own_pid is None else own_pid
+    matches = []
+    expected = str((root / "scripts/start_dashboard.py").resolve())
+    for proc in proc_root.iterdir():
+        if not proc.name.isdigit() or int(proc.name) == own_pid:
+            continue
+        try:
+            parts = [part for part in (proc / "cmdline").read_bytes().decode().split("\0") if part]
+            if (proc / "cwd").resolve() != root.resolve():
+                continue
+            scripts = [str((root / part).resolve()) if not Path(part).is_absolute() else part for part in parts]
+            if expected in scripts:
+                matches.append(int(proc.name))
+        except (OSError, UnicodeError):
+            continue
+    return matches
+
+
 def stop_child(child, timeout=15):
     """Stop one supervised signals server without touching any unrelated process."""
     if child.poll() is not None:
@@ -182,9 +202,9 @@ def supervise(command, *, open_browser=False, health=healthy, popen=subprocess.P
                         opened = True
                 elif time.monotonic() - started > 30:
                     unhealthy += 1
-                    if unhealthy >= 6:
+                    if unhealthy >= 3:
                         print(
-                            "Dashboard health check failed for 30 seconds; restarting safely.",
+                            "Dashboard health checks failed repeatedly; restarting safely.",
                             flush=True,
                         )
                         stop_child(child)
@@ -237,12 +257,33 @@ def main():
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        if healthy():
+        if args.restart:
+            supervisors = launcher_pids()
+            print(
+                f"Stopping {len(supervisors)} existing dashboard supervisor(s) for an explicit restart.",
+                flush=True,
+            )
+            for pid in supervisors:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        parser.exit(1, "Existing dashboard supervisor did not stop; stop its task terminal and retry.\n")
+                    time.sleep(0.1)
+        elif healthy():
             print("Dashboard supervisor is already running; reusing it.", flush=True)
             if args.open_browser:
                 open_dashboard()
             return 0
-        parser.exit(1, "Dashboard supervisor is already recovering the server; try again shortly.\n")
+        else:
+            parser.exit(1, "Dashboard supervisor is already recovering the server; try again shortly.\n")
     try:
         python = prepare_environment()
     except RuntimeError as error:

@@ -434,6 +434,13 @@ def compare(rows, *, used_test_contracts=None):
             "bollinger_z",
             "volatility_24h",
         },
+        "adaptive_momentum": {
+            "adaptive_momentum_consistency",
+            "adaptive_momentum_strength",
+            "adaptive_threshold_distance",
+            "adaptive_acceleration",
+            "adaptive_reversal",
+        },
         "candles": set(FEATURES[2:13]),
     }.items():
         keep = [i for i, name in enumerate(prep["names"]) if name not in names]

@@ -39,6 +39,22 @@ def test_process_detection_is_checkout_port_and_module_scoped(tmp_path):
     assert launcher.dashboard_pids(ROOT, proc, own_pid=999) == [100]
 
 
+def test_supervisor_detection_is_checkout_and_script_scoped(tmp_path):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+
+    def fake(pid, cwd, args):
+        item = proc / str(pid)
+        item.mkdir()
+        (item / "cmdline").write_bytes("\0".join(args).encode() + b"\0")
+        (item / "cwd").symlink_to(cwd, target_is_directory=True)
+
+    fake(200, ROOT, ["python3", "scripts/start_dashboard.py", "--private-dashboard"])
+    fake(201, tmp_path, ["python3", "scripts/start_dashboard.py"])
+    fake(202, ROOT, ["python3", "scripts/something_else.py"])
+    assert launcher.launcher_pids(ROOT, proc, own_pid=999) == [200]
+
+
 def test_tasks_and_port_configuration_are_private_and_idempotent():
     tasks = json.loads((ROOT / ".vscode/tasks.json").read_text())
     by_name = {task["label"]: task for task in tasks["tasks"]}
@@ -134,3 +150,26 @@ def test_dashboard_uses_bounded_adaptive_polling_instead_of_250ms_full_renders()
     assert "scheduleRefresh(backoff)" in html
     assert "document.hidden?5000:1000" in html
     assert "setInterval(refreshDetails,10000)" in html
+
+
+def test_launcher_health_check_uses_lightweight_engine_watchdog_endpoint(monkeypatch):
+    calls = []
+
+    class Headers:
+        @staticmethod
+        def get_content_type():
+            return "application/json"
+
+    class Response:
+        status = 200
+        headers = Headers()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(launcher, "urlopen", lambda url, timeout: calls.append(url) or Response())
+    assert launcher.healthy() is True
+    assert calls == ["http://127.0.0.1:8765/healthz"]

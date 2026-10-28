@@ -182,3 +182,62 @@ def test_launcher_health_check_uses_lightweight_engine_watchdog_endpoint(monkeyp
     assert launcher.healthy(expected_commit="abc123") is True
     assert launcher.healthy(expected_commit="different") is False
     assert calls == ["http://127.0.0.1:8765/healthz"] * 3
+
+
+def test_dashboard_page_readiness_requires_rendered_html(monkeypatch):
+    class Headers:
+        @staticmethod
+        def get_content_type():
+            return "text/html"
+
+    class Response:
+        status = 200
+        headers = Headers()
+
+        @staticmethod
+        def read(_size):
+            return b"<!doctype html><html><body>signals only</body></html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(launcher, "urlopen", lambda url, timeout: Response())
+    assert launcher.dashboard_page_ready() is True
+
+
+def test_supervisor_waits_for_sustained_health_before_opening_browser(monkeypatch):
+    class Child:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def send_signal(self, _value):
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    sleeps = 0
+
+    def sleep(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps >= 2:
+            raise KeyboardInterrupt
+
+    opened = []
+    monkeypatch.setattr(launcher.time, "sleep", sleep)
+    monkeypatch.setattr(launcher, "dashboard_page_ready", lambda: True)
+    monkeypatch.setattr(launcher, "open_dashboard", lambda: opened.append(True) or True)
+    assert launcher.supervise(
+        ["safe-server"], open_browser=True, health=lambda: True,
+        popen=lambda command, **kwargs: Child(),
+    ) == 0
+    assert opened == [True]

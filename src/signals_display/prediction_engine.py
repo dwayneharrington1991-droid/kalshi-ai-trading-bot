@@ -1150,7 +1150,9 @@ def opening_forecast(
             reference_price=current,
             reference_source=reference_source or "BTC proxy feed (sample source not recorded)",
             data_quality={
-                "status": "SUPPORTED PROXY INPUTS",
+                "status": "REDUCED PROXY INPUTS"
+                if str(basis.get("coverage_status", "")).startswith("REDUCED")
+                else "SUPPORTED PROXY INPUTS",
                 "closed_history_bars": day["closed_bars"],
                 "history_received_at": history["received_at"],
                 "reference_received_at": points[-1][0].isoformat(),
@@ -1158,6 +1160,7 @@ def opening_forecast(
                 or "BTC proxy feed (sample source not recorded)",
                 "reference_age_at_open_seconds": (opened - points[-1][0]).total_seconds(),
                 "limitation": "Proxy exchange prices and an assumed constant opening basis do not measure the official settlement index",
+                "basis_coverage": basis.get("coverage_status", "FULL OPENING PROXY WINDOW"),
             },
             status="DELAYED" if generated_at > opened else "ON_TIME",
             reason="Frozen pre-opening BTC inputs only; official threshold metadata arrival disclosed; experimental constant-basis Gaussian final-60s-average model",

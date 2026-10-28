@@ -36,7 +36,7 @@ def test_process_detection_is_checkout_port_and_module_scoped(tmp_path):
     fake(101, ROOT, ["python", "-m", "src.signals_display.server", "--port", "9999"])
     fake(102, tmp_path, ["python", "-m", "src.signals_display.server", "--port", "8765"])
     fake(103, ROOT, ["python", "some_trading_bot.py", "--port", "8765"])
-    assert launcher.dashboard_pids(ROOT, proc, own_pid=999) == [100]
+    assert launcher.dashboard_pids(ROOT, proc, own_pid=999) == [100, 102]
 
 
 def test_supervisor_detection_is_checkout_and_script_scoped(tmp_path):
@@ -52,7 +52,7 @@ def test_supervisor_detection_is_checkout_and_script_scoped(tmp_path):
     fake(200, ROOT, ["python3", "scripts/start_dashboard.py", "--private-dashboard"])
     fake(201, tmp_path, ["python3", "scripts/start_dashboard.py"])
     fake(202, ROOT, ["python3", "scripts/something_else.py"])
-    assert launcher.launcher_pids(ROOT, proc, own_pid=999) == [200]
+    assert launcher.launcher_pids(ROOT, proc, own_pid=999) == [200, 201]
 
 
 def test_tasks_and_port_configuration_are_private_and_idempotent():
@@ -166,6 +166,10 @@ def test_launcher_health_check_uses_lightweight_engine_watchdog_endpoint(monkeyp
         status = 200
         headers = Headers()
 
+        @staticmethod
+        def read(*_args):
+            return b'{"status":"HEALTHY","build_commit":"abc123"}'
+
         def __enter__(self):
             return self
 
@@ -174,4 +178,6 @@ def test_launcher_health_check_uses_lightweight_engine_watchdog_endpoint(monkeyp
 
     monkeypatch.setattr(launcher, "urlopen", lambda url, timeout: calls.append(url) or Response())
     assert launcher.healthy() is True
-    assert calls == ["http://127.0.0.1:8765/healthz"]
+    assert launcher.healthy(expected_commit="abc123") is True
+    assert launcher.healthy(expected_commit="different") is False
+    assert calls == ["http://127.0.0.1:8765/healthz"] * 3

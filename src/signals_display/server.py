@@ -56,8 +56,10 @@ class Monitor:
         account_store=None,
         model_registry=None,
         opening_model_artifact=None,
+        build_commit="unknown",
     ):
         self.feed, self.journal = feed, journal
+        self.build_commit = build_commit
         self.target, self.stop, self.horizon = target, stop, horizon
         self.account_client = account_client
         self.account_candidate = None
@@ -1033,6 +1035,8 @@ class Monitor:
         }
         state["runtime"] = {
             **state.get("runtime", {}),
+            "build_commit": self.build_commit,
+            "build_short": self.build_commit[:7],
             "response_generated_at": utcnow().isoformat(),
             "state_age_seconds": max(0, (utcnow() - last_tick).total_seconds()),
         }
@@ -1190,6 +1194,7 @@ def make_handler(monitor):
                         "status": "HEALTHY" if healthy else "UNHEALTHY",
                         "state_age_seconds": round(age, 3),
                         "state_version": version,
+                        "build_commit": monitor.build_commit,
                         "signals_only": True,
                     }
                 ).encode()
@@ -1203,6 +1208,7 @@ def make_handler(monitor):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Dashboard-Build", monitor.build_commit)
             self.send_header(
                 "Server-Timing",
                 "dashboard;dur=" + str(round((perf_counter() - request_started) * 1000, 2)),
@@ -1308,6 +1314,7 @@ def main():
     parser.add_argument("--journal", type=Path, default=Path("signals_monitor.db"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--build-commit", default="unknown")
     parser.add_argument("--poll-seconds", type=float, default=1)
     parser.add_argument(
         "--processing-ms",
@@ -1404,6 +1411,7 @@ def main():
         account_client=None,
         account_store=args.account_store,
         opening_model_artifact=args.opening_model_artifact,
+        build_commit=args.build_commit,
         model_registry=args.model_registry
         if args.mode == "public" and not args.disable_model and not args.disable_scheduled_learning
         else None,

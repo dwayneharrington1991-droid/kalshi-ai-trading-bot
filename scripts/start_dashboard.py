@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+import json
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,13 +21,38 @@ RUNTIME_PACKAGES = (
 )
 
 
-def healthy(timeout=2):
-    """A responsive state endpoint proves process health, not market freshness."""
+def current_commit(root=ROOT):
+    """Return the checked-out build identity without reading configuration/secrets."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+            capture_output=True, text=True, timeout=5,
+        )
+        value = result.stdout.strip().lower()
+        return value if len(value) == 40 and all(c in "0123456789abcdef" for c in value) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def health_payload(timeout=2):
+    """Read bounded local health metadata; the endpoint contains no credentials."""
     try:
         with urlopen("http://127.0.0.1:8765/healthz", timeout=timeout) as response:
-            return response.status == 200 and response.headers.get_content_type() == "application/json"
+            if response.headers.get_content_type() != "application/json":
+                return None
+            value = json.load(response)
+            return value if isinstance(value, dict) else None
     except Exception:
+        return None
+
+
+def healthy(timeout=2, expected_commit=None):
+    """Require responsive state and, when supplied, the exact checked-out build."""
+    value = health_payload(timeout)
+    if not value or value.get("status") != "HEALTHY":
         return False
+    running = str(value.get("build_commit", "")).lower()
+    return not expected_commit or running == expected_commit.lower()
 
 
 def forwarded_url(environment=None):
@@ -125,7 +151,12 @@ def prepare_environment(venv=VENV, system_python=None):
 
 
 def dashboard_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
-    """Find only this checkout's signals server on port 8765."""
+    """Find only the signals-only server module on port 8765.
+
+    Do not depend on /proc/<pid>/cwd: Codespaces process namespaces can expose
+    cmdline while denying cwd resolution. Module + exact port remains narrowly
+    scoped and also finds an old checkout that still owns the forwarded port.
+    """
     own_pid = os.getpid() if own_pid is None else own_pid
     matches = []
     for proc in proc_root.iterdir():
@@ -133,8 +164,6 @@ def dashboard_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
             continue
         try:
             parts = (proc / "cmdline").read_bytes().decode().split("\0")
-            if (proc / "cwd").resolve() != root.resolve():
-                continue
             if "-m" not in parts or parts[parts.index("-m") + 1] != "src.signals_display.server":
                 continue
             port = parts[parts.index("--port") + 1] if "--port" in parts else "8765"
@@ -142,11 +171,11 @@ def dashboard_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
                 matches.append(int(proc.name))
         except (OSError, ValueError, IndexError, UnicodeError):
             continue
-    return matches
+    return sorted(matches)
 
 
 def launcher_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
-    """Find only this checkout's dashboard supervisor, never another task."""
+    """Find only dashboard launcher supervisors, never a trading task."""
     own_pid = os.getpid() if own_pid is None else own_pid
     matches = []
     expected = str((root / "scripts/start_dashboard.py").resolve())
@@ -155,14 +184,12 @@ def launcher_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
             continue
         try:
             parts = [part for part in (proc / "cmdline").read_bytes().decode().split("\0") if part]
-            if (proc / "cwd").resolve() != root.resolve():
-                continue
             scripts = [str((root / part).resolve()) if not Path(part).is_absolute() else part for part in parts]
-            if expected in scripts:
+            if expected in scripts or any(part.endswith("/scripts/start_dashboard.py") for part in scripts):
                 matches.append(int(proc.name))
         except (OSError, UnicodeError):
             continue
-    return matches
+    return sorted(matches)
 
 
 def stop_child(child, timeout=15):
@@ -253,6 +280,9 @@ def main():
     )
     args = parser.parse_args()
     os.chdir(ROOT)
+    expected_commit = current_commit()
+    if not expected_commit:
+        parser.exit(1, "Cannot identify the checked-out commit; dashboard startup was withheld.\n")
     lock = open(ROOT / ".dashboard-launch.lock", "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -277,13 +307,35 @@ def main():
                     if time.monotonic() >= deadline:
                         parser.exit(1, "Existing dashboard supervisor did not stop; stop its task terminal and retry.\n")
                     time.sleep(0.1)
-        elif healthy():
+        elif healthy(expected_commit=expected_commit):
             print("Dashboard supervisor is already running; reusing it.", flush=True)
             if args.open_browser:
                 open_dashboard()
             return 0
         else:
-            parser.exit(1, "Dashboard supervisor is already recovering the server; try again shortly.\n")
+            # A prior launcher can remain alive after git pull while supervising
+            # an old in-memory module. Replace that supervisor automatically;
+            # this never targets trading scripts or unrelated processes.
+            supervisors = launcher_pids()
+            print(
+                "Running dashboard does not match the checked-out commit; "
+                f"replacing {len(supervisors)} stale supervisor(s).",
+                flush=True,
+            )
+            for pid in supervisors:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        parser.exit(1, "Stale dashboard supervisor did not stop safely.\n")
+                    time.sleep(0.1)
     try:
         python = prepare_environment()
     except RuntimeError as error:
@@ -292,7 +344,7 @@ def main():
         return 0
     matches = dashboard_pids()
     print(f"Verified dashboard servers on port 8765 in this checkout: {len(matches)}", flush=True)
-    if matches and not args.restart and healthy():
+    if matches and not args.restart and healthy(expected_commit=expected_commit):
         print("Healthy dashboard already running; reusing it without creating another process.", flush=True)
         if args.open_browser:
             open_dashboard()
@@ -376,6 +428,8 @@ def main():
         "250",
         "--stop",
         "0.10",
+        "--build-commit",
+        expected_commit,
     ]
     if account:
         command += [
@@ -399,7 +453,11 @@ def main():
     # Hold the launcher lock for the supervisor lifetime. Repeated clicks reuse
     # this owner and cannot race an automatic restart into a duplicate process.
     try:
-        return supervise(command, open_browser=args.open_browser)
+        return supervise(
+            command,
+            open_browser=args.open_browser,
+            health=lambda: healthy(expected_commit=expected_commit),
+        )
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()

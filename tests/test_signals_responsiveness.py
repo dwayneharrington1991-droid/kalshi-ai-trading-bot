@@ -12,9 +12,36 @@ import pytest
 
 from src.signals_display.monitor import Journal, analyze
 from src.signals_display.runtime import CachedReport, LatestPayload
-from src.signals_display.server import Monitor, make_handler
+from src.signals_display.server import Monitor, make_handler, make_startup_handler
 from tests.test_signals_display import NOW
 from tests.test_signals_monitor import frame
+
+
+def test_startup_health_responds_before_database_or_feed_initialization():
+    """A stalled initializer must not leave the local health socket silent."""
+    from urllib.request import ProxyHandler, build_opener
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_startup_handler("abc123")
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    opener = build_opener(ProxyHandler({}))
+    try:
+        with pytest.raises(HTTPError) as captured:
+            opener.open(
+                f"http://127.0.0.1:{server.server_port}/healthz", timeout=1
+            )
+        assert captured.value.code == 503
+        value = json.load(captured.value)
+        assert value["status"] == "STARTING"
+        assert value["build_commit"] == "abc123"
+        assert value["signals_only"] is True
+        assert value["started_at"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_report_cache_returns_immediately_and_never_queues_duplicates():

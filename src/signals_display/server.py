@@ -1319,6 +1319,46 @@ def make_handler(monitor):
     return Handler
 
 
+def make_startup_handler(build_commit):
+    """Serve bounded health responses before journals and models finish loading."""
+    started = utcnow()
+
+    class StartupHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            route = urlsplit(self.path).path
+            if route == "/healthz":
+                body = json.dumps(
+                    {
+                        "status": "STARTING",
+                        "phase": "INITIALIZING_PRESERVED_STATE",
+                        "started_at": started.isoformat(),
+                        "build_commit": build_commit,
+                        "signals_only": True,
+                    }
+                ).encode()
+                content_type, status = "application/json", 503
+            elif route == "/health":
+                body, content_type, status = b"signals-only dashboard starting", "text/plain", 200
+            else:
+                body = b"Dashboard is starting; preserved journals and models are loading."
+                content_type, status = "text/plain", 503
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Dashboard-Build", build_commit)
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    return StartupHandler
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="KXBTC15M signals-only public/replay monitor with optional GET-only account monitoring"
@@ -1392,7 +1432,9 @@ def main():
         )
     # Reserve port before opening/migrating journals or reading credentials.
     try:
-        server = ThreadingHTTPServer((args.host, args.port), make_handler(None))
+        server = ThreadingHTTPServer(
+            (args.host, args.port), make_startup_handler(args.build_commit)
+        )
     except OSError:
         parser.error("Dashboard port is already in use; use scripts/start_dashboard.py --restart")
     import fcntl
@@ -1407,6 +1449,13 @@ def main():
             server.server_close()
             parser.error("Another dashboard owns this journal; no database changes made")
         guards.append(guard)
+    # Begin serving the lightweight STARTING endpoint before any database,
+    # account, model, or public-feed initialization. This keeps Codespaces and
+    # the supervisor observable even when preserved state takes time to open.
+    server_thread = threading.Thread(
+        target=server.serve_forever, daemon=True, name="dashboard-http"
+    )
+    server_thread.start()
     account_candidate = None
     disabled_reason = None
     if args.account_readonly:
@@ -1531,12 +1580,15 @@ def main():
         flush=True,
     )
     try:
-        server.serve_forever()
+        while server_thread.is_alive():
+            server_thread.join(timeout=1)
     except KeyboardInterrupt:
-        pass
+        server.shutdown()
     finally:
         stop.set()
+        server.shutdown()
         server.server_close()
+        server_thread.join(timeout=5)
         thread.join(timeout=35)
         if collector:
             collector.join(timeout=10)

@@ -208,6 +208,17 @@ def test_dashboard_page_readiness_requires_rendered_html(monkeypatch):
     assert launcher.dashboard_page_ready() is True
 
 
+def test_launcher_distinguishes_responsive_startup_from_healthy(monkeypatch):
+    monkeypatch.setattr(
+        launcher,
+        "health_payload",
+        lambda timeout=2: {"status": "STARTING", "build_commit": "abc123"},
+    )
+    assert launcher.starting(expected_commit="abc123") is True
+    assert launcher.starting(expected_commit="different") is False
+    assert launcher.healthy(expected_commit="abc123") is False
+
+
 def test_supervisor_waits_for_sustained_health_before_opening_browser(monkeypatch):
     class Child:
         returncode = None

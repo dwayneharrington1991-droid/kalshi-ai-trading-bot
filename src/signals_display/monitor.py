@@ -159,8 +159,11 @@ class PublicFeed:
                     "error": "CANDLE_FETCH_FAILED: " + type(exc).__name__,
                 }
             self.candle_job = None
+        retained = len((self.candle_cache or {}).get("candles", []))
+        retry_seconds = 60 if retained >= 1440 and not (self.candle_cache or {}).get("error") else 5
         if self.candle_job is None and (
-            self.candle_started is None or (now - self.candle_started).total_seconds() >= 60
+            self.candle_started is None
+            or (now - self.candle_started).total_seconds() >= retry_seconds
         ):
             self.candle_started = now
             self.candle_job = self.candle_pool.submit(self.candles, now)
@@ -224,7 +227,12 @@ class PublicFeed:
         )
 
     def candles(self, now):
-        if self.candles_checked is not None and (now - self.candles_checked).total_seconds() < 60:
+        retained = len((self.candle_cache or {}).get("candles", []))
+        retry_seconds = 60 if retained >= 1440 and not (self.candle_cache or {}).get("error") else 5
+        if (
+            self.candles_checked is not None
+            and (now - self.candles_checked).total_seconds() < retry_seconds
+        ):
             return self.candle_cache or {}
         self.candles_checked = now
         cutoff = int(now.timestamp()) // 60 * 60
@@ -491,16 +499,27 @@ class PublicFeed:
                     ]
                 yes = [level for level in yes if level[1] > 0]
                 no = [level for level in no if level[1] > 0]
-                if yes and no:
-                    selected["book_diagnostic"] = None
+                if yes or no:
                     selected["observed_at"] = utcnow().isoformat()
-                    y, n = max(yes), max(no)
-                    selected["quotes"] = {
-                        "up": dict(bid=y[0], ask=round(1 - n[0], 6), bid_size=y[1], ask_size=n[1]),
-                        "down": dict(
-                            bid=n[0], ask=round(1 - y[0], 6), bid_size=n[1], ask_size=y[1]
-                        ),
-                    }
+                    quotes = {side: dict(values) for side, values in selected["quotes"].items()}
+                    if yes:
+                        y = max(yes)
+                        quotes["up"].update(bid=y[0], bid_size=y[1])
+                        quotes["down"].update(ask=round(1 - y[0], 6), ask_size=y[1])
+                    if no:
+                        n = max(no)
+                        quotes["down"].update(bid=n[0], bid_size=n[1])
+                        quotes["up"].update(ask=round(1 - n[0], 6), ask_size=n[1])
+                    selected["quotes"] = quotes
+                    selected["book_diagnostic"] = None
+                    selected["book_depth_status"] = (
+                        "COMPLETE" if yes and no else
+                        "PARTIAL_NO_BIDS: YES bid depth provides executable DOWN asks; UP asks/exit depth remain unavailable"
+                        if yes else
+                        "PARTIAL_YES_BIDS: NO bid depth provides executable UP asks; DOWN asks/exit depth remain unavailable"
+                    )
+                else:
+                    selected["book_diagnostic"] = "NO_LIQUIDITY: public orderbook contains no positive YES or NO bid levels"
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 selected["book_diagnostic"] = (

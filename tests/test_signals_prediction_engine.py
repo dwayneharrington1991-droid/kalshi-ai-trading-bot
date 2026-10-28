@@ -415,6 +415,39 @@ def test_live_panel_clears_current_estimate_without_overwriting_frozen_opening()
     assert stale["direction"] == "UNCLEAR" and stale["initial"] == opening
 
 
+def test_mid_contract_start_displays_current_forecast_without_backfilling_opening():
+    m = market()
+    m.update(
+        opens_at=(NOW - timedelta(minutes=7)).isoformat(),
+        closes_at=(NOW + timedelta(minutes=8)).isoformat(),
+    )
+    data = frame()
+    data["markets"] = [m]
+    state = analyze(data, NOW)
+    incomplete = history()
+    incomplete["candles"].pop(500)
+    state.update(
+        stale=False,
+        now=NOW.isoformat(),
+        estimate={"settlement_up": 0.64},
+        model={
+            "analysis_24h": engine.context24(incomplete, NOW),
+            "price_forecast": {
+                "settlement_average_mean": 100010,
+                "settlement_average_conditional_interval": [99900, 100100],
+                "interval_label": "Experimental",
+            },
+        },
+    )
+    live = engine.view(state, None, None, NOW)
+    assert live["status"] == "EXPERIMENTAL_LIMITED_HISTORY"
+    assert live["forecast_type"] == "JOINED_IN_PROGRESS"
+    assert live["joined_in_progress"] is True
+    assert live["up"] == pytest.approx(0.64) and live["down"] == pytest.approx(0.36)
+    assert live["initial"]["up"] is None
+    assert "opening forecast remains unavailable" in live["reason"]
+
+
 def test_contract_summary_is_incremental_idempotent_and_retains_unavailable_openings(tmp_path):
     j = Journal(tmp_path / "j.db")
     m = market()

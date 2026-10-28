@@ -69,7 +69,9 @@ def test_tasks_and_port_configuration_are_private_and_idempotent():
     port = config["portsAttributes"]["8765"]
     assert port["visibility"] == "private"
     assert port["protocol"] == "http"
-    assert port["onAutoForward"] == "openBrowser"
+    # The supervised launcher opens one tab after /healthz succeeds. Opening on
+    # socket reservation races dashboard initialization and creates an error tab.
+    assert port["onAutoForward"] == "silent"
     assert config["postCreateCommand"] == "python3 scripts/start_dashboard.py --prepare-only"
 
 

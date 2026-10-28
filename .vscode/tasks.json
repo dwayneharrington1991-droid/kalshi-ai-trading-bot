@@ -1,11 +1,23 @@
 {
   "version": "2.0.0",
-  "tasks": [{
-    "label": "Start private Kalshi dashboard",
-    "type": "shell",
-    "command": "python3 scripts/start_dashboard.py --restart --private-dashboard",
-    "options": {"cwd": "${workspaceFolder}"},
-    "problemMatcher": [],
-    "presentation": {"reveal": "always", "panel": "dedicated"}
-  }]
+  "tasks": [
+    {
+      "label": "🚀 OPEN MY BOT",
+      "type": "shell",
+      "command": "python3 scripts/start_dashboard.py --private-dashboard --open-browser",
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": [],
+      "runOptions": {"instanceLimit": 1},
+      "presentation": {"reveal": "always", "panel": "dedicated", "clear": true}
+    },
+    {
+      "label": "🔄 RESTART MY BOT",
+      "type": "shell",
+      "command": "python3 scripts/start_dashboard.py --restart --private-dashboard --open-browser",
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": [],
+      "runOptions": {"instanceLimit": 1},
+      "presentation": {"reveal": "always", "panel": "dedicated", "clear": true}
+    }
+  ]
 }

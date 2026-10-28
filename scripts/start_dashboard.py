@@ -9,8 +9,64 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def healthy(timeout=2):
+    """A responsive state endpoint proves process health, not market freshness."""
+    try:
+        with urlopen("http://127.0.0.1:8765/api/state?view=main", timeout=timeout) as response:
+            return response.status == 200 and response.headers.get_content_type() == "application/json"
+    except Exception:
+        return False
+
+
+def forwarded_url(environment=None):
+    environment = environment or os.environ
+    name = environment.get("CODESPACE_NAME")
+    domain = environment.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
+    return f"https://{name}-8765.{domain}/" if name and domain else None
+
+
+def open_dashboard():
+    url = forwarded_url()
+    if not url:
+        print("Open Codespaces Ports > KXBTC15M signals-only dashboard > Open in Browser.", flush=True)
+        return False
+
+
+def dashboard_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
+    """Find only this checkout's signals server on port 8765."""
+    own_pid = os.getpid() if own_pid is None else own_pid
+    matches = []
+    for proc in proc_root.iterdir():
+        if not proc.name.isdigit() or int(proc.name) == own_pid:
+            continue
+        try:
+            parts = (proc / "cmdline").read_bytes().decode().split("\0")
+            if (proc / "cwd").resolve() != root.resolve():
+                continue
+            if "-m" not in parts or parts[parts.index("-m") + 1] != "src.signals_display.server":
+                continue
+            port = parts[parts.index("--port") + 1] if "--port" in parts else "8765"
+            if port == "8765":
+                matches.append(int(proc.name))
+        except (OSError, ValueError, IndexError, UnicodeError):
+            continue
+    return matches
+    try:
+        subprocess.Popen(
+            ["code", "--open-url", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("Opening the private Codespaces dashboard preview.", flush=True)
+        return True
+    except OSError:
+        print("Open Codespaces Ports > KXBTC15M signals-only dashboard > Open in Browser.", flush=True)
+        return False
 
 
 def main():
@@ -26,6 +82,7 @@ def main():
         help="Confirm port 8765 is Private in Codespaces Ports",
     )
     parser.add_argument("--public-only", action="store_true")
+    parser.add_argument("--open-browser", action="store_true")
     args = parser.parse_args()
     os.chdir(ROOT)
     lock = open(ROOT / ".dashboard-launch.lock", "a")
@@ -33,24 +90,17 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         parser.exit(1, "Another dashboard launcher is running.\n")
-    matches = []
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit() or int(proc.name) == os.getpid():
-            continue
-        try:
-            parts = (proc / "cmdline").read_bytes().decode().split("\0")
-            if (proc / "cwd").resolve() != ROOT:
-                continue
-            if "-m" not in parts or parts[parts.index("-m") + 1] != "src.signals_display.server":
-                continue
-            port = parts[parts.index("--port") + 1] if "--port" in parts else "8765"
-            if port == "8765":
-                matches.append(int(proc.name))
-        except (OSError, ValueError, IndexError, UnicodeError):
-            continue
+    matches = dashboard_pids()
     print(f"Verified dashboard servers on port 8765 in this checkout: {len(matches)}", flush=True)
+    if matches and not args.restart and healthy():
+        print("Healthy dashboard already running; reusing it without creating another process.", flush=True)
+        if args.open_browser:
+            open_dashboard()
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+        return 0
     if matches and not args.restart:
-        parser.exit(1, "Dashboard already running. Use --restart or open Ports > 8765.\n")
+        print("Existing dashboard is unresponsive; restarting it safely.", flush=True)
     for pid in matches:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -104,27 +154,27 @@ def main():
         )
     )
     account = configured and not args.public_only
+    private = False
+    if os.environ.get("CODESPACE_NAME"):
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "codespace",
+                    "ports",
+                    "visibility",
+                    "8765:private",
+                    "-c",
+                    os.environ["CODESPACE_NAME"],
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+            )
+            private = result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     if account:
-        private = False
-        if os.environ.get("CODESPACE_NAME"):
-            try:
-                result = subprocess.run(
-                    [
-                        "gh",
-                        "codespace",
-                        "ports",
-                        "visibility",
-                        "8765:private",
-                        "-c",
-                        os.environ["CODESPACE_NAME"],
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=20,
-                )
-                private = result.returncode == 0
-            except (OSError, subprocess.TimeoutExpired):
-                pass
         if not private and not args.private_dashboard:
             parser.exit(
                 1,
@@ -174,6 +224,13 @@ def main():
     child = subprocess.Popen(command, cwd=ROOT)
     fcntl.flock(lock, fcntl.LOCK_UN)
     lock.close()
+    if args.open_browser:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and child.poll() is None:
+            if healthy():
+                open_dashboard()
+                break
+            time.sleep(0.25)
     try:
         return child.wait()
     except KeyboardInterrupt:

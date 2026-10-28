@@ -177,13 +177,26 @@ class Monitor:
 
     def maintain_settlements(self, now):
         self.journal.seed_settlement_queue()
+        learned = False
         for ticker in self.journal.due_settlements(now):
             self.journal.mark_settlement_attempt(ticker, now)
             try:
-                self.journal.settle(ticker, self.feed.resolved(ticker), "PUBLIC MARKET DATA")
+                learned = self.journal.settle(
+                    ticker, self.feed.resolved(ticker), "PUBLIC MARKET DATA"
+                ) or learned
             except Exception:
                 # No stale or fabricated outcome on HTTP failure.
                 self.maintenance_error = "Official settlement result pending or inaccessible"
+        if learned:
+            # Score the new independent outcome immediately. Expensive candidate
+            # fitting remains background/daily and its own due gate still applies.
+            self.engine_report.invalidate()
+            self.research_report.invalidate()
+            self.edge_report.invalidate()
+            if self.scheduled_learning:
+                self.scheduled_learning.invalidate()
+            if self.scheduled_scalp_learning:
+                self.scheduled_scalp_learning.invalidate()
 
     def update_maintenance(self, now):
         if self.maintenance_job is not None and self.maintenance_job.done():

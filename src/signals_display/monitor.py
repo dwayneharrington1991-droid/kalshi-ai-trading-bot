@@ -772,6 +772,7 @@ class Journal:
     def __init__(self, path):
         self.path = str(path)
         self._last_candle_batch = None
+        self._last_learning_sample = {}
         with self.connect() as db:
             db.executescript(
                 """
@@ -842,8 +843,26 @@ class Journal:
                     PRIMARY KEY(mode,ticker));
                 CREATE INDEX IF NOT EXISTS opening_input_snapshots_open
                     ON opening_input_snapshots(mode,opens_at);
+                CREATE TABLE IF NOT EXISTS learning_contract_reviews (
+                    ticker TEXT NOT NULL,origin TEXT NOT NULL,observed_at TEXT NOT NULL,
+                    outcome INTEGER NOT NULL,payload TEXT NOT NULL,
+                    PRIMARY KEY(ticker,origin));
                 """
             )
+
+    def _learning_sample_due(self, state, interval=1.0):
+        """At most one dense learning snapshot/second/contract; rollovers are immediate."""
+        market = state.get("market") or {}
+        ticker = market.get("ticker")
+        if not ticker:
+            return False
+        now = timestamp(state["now"])
+        key = (state.get("mode"), ticker)
+        prior = self._last_learning_sample.get(key)
+        if prior is not None and 0 <= (now - prior).total_seconds() < interval:
+            return False
+        self._last_learning_sample = {key: now}
+        return True
 
     def record_candles(self, data, now):
         if not data or not data.get("source"):
@@ -897,14 +916,16 @@ class Journal:
     def step(self, state):
         now = timestamp(state["now"])
         market = state["market"]
+        capture_learning = self._learning_sample_due(state)
         with self.connect() as db:
-            prediction_engine.record(db, state, utcnow())
-            scalp_paper.record(
-                db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
-            )
-            edge_scanner.record(
-                db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
-            )
+            if capture_learning:
+                prediction_engine.record(db, state, utcnow())
+                scalp_paper.record(
+                    db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+                )
+                edge_scanner.record(
+                    db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+                )
             pending = db.execute(
                 "SELECT * FROM simulations WHERE status IN ('PENDING','AWAITING_ENTRY')"
             ).fetchall()
@@ -1007,6 +1028,8 @@ class Journal:
                 "INSERT OR IGNORE INTO settlement_queue(mode,ticker,closes_at) VALUES (?,?,?)",
                 (state["mode"], market["ticker"], market["closes_at"]),
             )
+            if not capture_learning:
+                return
             e = state["estimate"]
             persisted = state
             coverage = state.get("model", {}).get("coverage", {})
@@ -1213,14 +1236,14 @@ class Journal:
 
     def settle(self, ticker, yes_result, mode, observed_at=None):
         if yes_result not in {"yes", "no"}:
-            return
+            return False
         origin = "official" if mode == "PUBLIC MARKET DATA" else "replay"
         seen = observed_at or utcnow().isoformat()
         with self.connect() as db:
-            db.execute(
+            inserted = db.execute(
                 "INSERT OR IGNORE INTO forecast_outcomes VALUES (?,?,?,?)",
                 (ticker, origin, seen, int(yes_result == "yes")),
-            )
+            ).rowcount == 1
             db.execute(
                 "UPDATE settlement_queue SET resolved=1 WHERE ticker=? AND mode=?", (ticker, mode)
             )
@@ -1246,6 +1269,47 @@ class Journal:
                     updates,
                 )
             after = rows[-1]["id"]
+        if inserted:
+            self._record_contract_review(ticker, origin, seen, int(yes_result == "yes"), mode)
+        return inserted
+
+    def _record_contract_review(self, ticker, origin, observed_at, outcome, mode):
+        """One immutable, compact mistake review per independently settled contract."""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT timestamp,up,version FROM btc_engine_predictions "
+                "WHERE ticker=? AND mode=? ORDER BY timestamp",
+                (ticker, mode),
+            ).fetchall()
+            if not rows:
+                return
+
+            def review(row):
+                probability = float(row["up"])
+                clipped = max(1e-12, min(1 - 1e-12, probability))
+                return {
+                    "timestamp": row["timestamp"],
+                    "probability_up": probability,
+                    "predicted_direction": "UP" if probability > 0.5 else "DOWN" if probability < 0.5 else "UNCLEAR",
+                    "correct": (probability > 0.5) == bool(outcome) if probability != 0.5 else None,
+                    "absolute_error": abs(probability - outcome),
+                    "brier": (probability - outcome) ** 2,
+                    "log_loss": -(outcome * math.log(clipped) + (1 - outcome) * math.log(1 - clipped)),
+                    "model_version": row["version"],
+                }
+
+            payload = {
+                "ticker": ticker,
+                "official_outcome": "UP" if outcome else "DOWN",
+                "opening": review(rows[0]),
+                "latest_before_settlement": review(rows[-1]),
+                "recorded_forecasts": len(rows),
+                "lesson": "Errors are retained for chronological retraining; this review cannot update weights using the same contract or enable a trade signal.",
+            }
+            db.execute(
+                "INSERT OR IGNORE INTO learning_contract_reviews VALUES (?,?,?,?,?)",
+                (ticker, origin, observed_at, outcome, json.dumps(payload, allow_nan=False)),
+            )
 
     def record_feeds(self, coverage):
         with self.connect() as db:
@@ -1262,10 +1326,17 @@ class Journal:
             count = db.execute(
                 "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
             ).fetchone()[0]
+            reviews = db.execute("SELECT payload FROM learning_contract_reviews").fetchall()
+        opening_mistakes = sum(
+            json.loads(row[0]).get("opening", {}).get("correct") is False for row in reviews
+        )
         return {
             "official_contracts": count,
             "official_featured_contracts": None,
             "minimum_contracts": 170,
+            "contract_reviews": len(reviews),
+            "opening_mistakes_recorded": opening_mistakes,
+            "dense_snapshot_interval_seconds": 1,
             "reason": f"{count}/170 official outcomes before further feature/chronological eligibility checks. Feature eligibility is checked offline, not by rescanning the full journal each minute. Minimum count is not evidence of skill.",
         }
 

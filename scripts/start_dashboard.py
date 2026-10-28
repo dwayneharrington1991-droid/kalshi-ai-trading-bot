@@ -2,9 +2,9 @@
 """One-command signals dashboard. Never imports an execution client."""
 import argparse
 import fcntl
-import importlib.util
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -12,6 +12,12 @@ import time
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+VENV = ROOT / ".venv"
+RUNTIME_PACKAGES = (
+    "httpx==0.27.0",
+    "websockets==16.1.1",
+    "cryptography==42.0.0",
+)
 
 
 def healthy(timeout=2):
@@ -35,6 +41,87 @@ def open_dashboard():
     if not url:
         print("Open Codespaces Ports > KXBTC15M signals-only dashboard > Open in Browser.", flush=True)
         return False
+    try:
+        subprocess.Popen(
+            ["code", "--open-url", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("Opening the private Codespaces dashboard preview.", flush=True)
+        return True
+    except OSError:
+        print("Open Codespaces Ports > KXBTC15M signals-only dashboard > Open in Browser.", flush=True)
+        return False
+
+
+def _run_checked(command, purpose, **kwargs):
+    """Run bootstrap work with a short, actionable failure instead of a traceback."""
+    try:
+        return subprocess.run(command, check=True, **kwargs)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{purpose} failed because {command[0]} is unavailable: {error}") from error
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            f"{purpose} failed with exit code {error.returncode}. "
+            "Check the launcher terminal for the package installer error, then click 🔄 RESTART MY BOT."
+        ) from error
+
+
+def environment_works(python):
+    """Validate the interpreter and every dependency used by the signals server."""
+    if not python.is_file() or not os.access(python, os.X_OK):
+        return False
+    check = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import httpx, cryptography; "
+                "from websockets.sync.client import connect; "
+                "from importlib.metadata import version; "
+                "assert int(version('websockets').split('.')[0]) >= 16"
+            ),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return check.returncode == 0
+
+
+def prepare_environment(venv=VENV, system_python=None):
+    """Create or repair a Codespaces venv whose base interpreter may have changed."""
+    system_python = system_python or Path(sys.executable)
+    python = venv / "bin/python3"
+    if environment_works(python):
+        print("Python environment is ready.", flush=True)
+        return python
+
+    # A Codespaces rebuild can preserve .venv while replacing its absolute base-python
+    # symlink. Recreate only this generated environment; journals and configuration live
+    # elsewhere and are never touched here.
+    if venv.exists() or venv.is_symlink():
+        print("Python environment is missing or broken; rebuilding it safely.", flush=True)
+        if venv.is_symlink() or venv.is_file():
+            venv.unlink()
+        else:
+            shutil.rmtree(venv)
+    else:
+        print("Creating the Python environment for this Codespace.", flush=True)
+    _run_checked(
+        [str(system_python), "-m", "venv", str(venv)],
+        "Python environment creation",
+    )
+    if not python.is_file():
+        raise RuntimeError(f"Python environment creation did not produce {python}")
+    print("Installing dashboard dependencies (first launch can take a minute).", flush=True)
+    _run_checked(
+        [str(python), "-m", "pip", "install", "--disable-pip-version-check", *RUNTIME_PACKAGES],
+        "Dashboard dependency installation",
+    )
+    if not environment_works(python):
+        raise RuntimeError("Dashboard dependencies installed but the environment validation failed.")
+    print("Python environment is ready.", flush=True)
+    return python
 
 
 def dashboard_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
@@ -56,17 +143,6 @@ def dashboard_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
         except (OSError, ValueError, IndexError, UnicodeError):
             continue
     return matches
-    try:
-        subprocess.Popen(
-            ["code", "--open-url", url],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        print("Opening the private Codespaces dashboard preview.", flush=True)
-        return True
-    except OSError:
-        print("Open Codespaces Ports > KXBTC15M signals-only dashboard > Open in Browser.", flush=True)
-        return False
 
 
 def main():
@@ -83,6 +159,11 @@ def main():
     )
     parser.add_argument("--public-only", action="store_true")
     parser.add_argument("--open-browser", action="store_true")
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Create/repair the Python environment without starting the dashboard",
+    )
     args = parser.parse_args()
     os.chdir(ROOT)
     lock = open(ROOT / ".dashboard-launch.lock", "a")
@@ -90,6 +171,12 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         parser.exit(1, "Another dashboard launcher is running.\n")
+    try:
+        python = prepare_environment()
+    except RuntimeError as error:
+        parser.exit(1, f"Launcher setup error: {error}\nNo journal or credential was changed.\n")
+    if args.prepare_only:
+        return 0
     matches = dashboard_pids()
     print(f"Verified dashboard servers on port 8765 in this checkout: {len(matches)}", flush=True)
     if matches and not args.restart and healthy():
@@ -121,31 +208,6 @@ def main():
                 "Old dashboard has not stopped. No database was deleted; stop its terminal with Ctrl+C.\n",
             )
         time.sleep(0.1)
-    python = ROOT / ".venv/bin/python3"
-    if not python.exists():
-        subprocess.run([sys.executable, "-m", "venv", str(ROOT / ".venv")], check=True)
-    check = subprocess.run(
-        [
-            str(python),
-            "-c",
-            "import httpx,cryptography; from websockets.sync.client import connect; from importlib.metadata import version; assert int(version('websockets').split('.')[0]) >= 16",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if check.returncode:
-        subprocess.run(
-            [
-                str(python),
-                "-m",
-                "pip",
-                "install",
-                "httpx==0.27.0",
-                "websockets==16.1.1",
-                "cryptography==42.0.0",
-            ],
-            check=True,
-        )
     configured = bool(
         os.environ.get("KALSHI_MONITOR_KEY_ID")
         and (

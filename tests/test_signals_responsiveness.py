@@ -81,6 +81,24 @@ def test_market_mailbox_coalesces_old_frames_without_a_backlog():
     assert box.get(sequence, timeout=0) == (100, None)
 
 
+def test_state_version_wait_wakes_immediately_without_database_or_model_work(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "j.db"))
+    observed = []
+
+    def wait():
+        observed.append(monitor.wait_for_version(0, 2)[0])
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    with monitor.lock:
+        monitor.state_version = 1
+        monitor.last_tick = NOW
+        monitor.lock.notify_all()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert observed == [1]
+
+
 def test_history_pages_are_indexed_bounded_and_do_not_run_research(tmp_path, monkeypatch):
     journal = Journal(tmp_path / "j.db")
     with journal.connect() as db:
@@ -113,6 +131,7 @@ def test_history_pages_are_indexed_bounded_and_do_not_run_research(tmp_path, mon
 def test_fast_main_state_and_pagination_during_blocked_research(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "j.db"))
     monitor.state = analyze(frame(), NOW)
+    monitor.state_version = 1
     monitor.state["model"] = {"version": "test", "coverage": {"raw": "x" * 150000}}
     started, release = threading.Event(), threading.Event()
 
@@ -141,6 +160,9 @@ def test_fast_main_state_and_pagination_during_blocked_research(tmp_path):
         assert len(json.dumps(data)) < 30000
         assert get("/api/history-page?limit=20")["pagination"]["limit"] == 20
         assert len(json.dumps(get("/api/state?view=details"))) > 150000
+        version = get("/api/state-version?after=0&timeout=1")
+        assert version["changed"] is True
+        assert version["state_version"] == monitor.state_version
         for path in ("/api/history-page?limit=101", "/api/history-page?before_id=-1"):
             with pytest.raises(HTTPError) as error:
                 get(path)

@@ -107,7 +107,9 @@ class Monitor:
         self.estimator = LiveEstimator(manual_delay=manual_delay, slippage=slippage)
         if isinstance(feed, PublicFeed):
             self.estimator.restore(journal.recent_states())
-        self.lock = threading.Lock()
+        # Request threads can wait for a new immutable state version without
+        # polling or blocking the market-data worker.
+        self.lock = threading.Condition()
         self.state = dict(
             direction="UNCLEAR",
             scalp="WAIT",
@@ -673,6 +675,13 @@ class Monitor:
             self.state = state
             self.last_tick = published_at
             self.last_cycle_started = tick_started
+            self.lock.notify_all()
+
+    def wait_for_version(self, after, timeout):
+        """Long-poll a small version token; never runs model/database work."""
+        with self.lock:
+            self.lock.wait_for(lambda: self.state_version > after, timeout=timeout)
+            return self.state_version, self.last_tick
 
     def authenticate_candidate(self):
         permissions = self.account_candidate.permissions()
@@ -1082,6 +1091,24 @@ def make_handler(monitor):
             if route == "/":
                 body = Path(__file__).with_name("dashboard.html").read_bytes()
                 content_type = "text/html; charset=utf-8"
+            elif route == "/api/state-version":
+                try:
+                    after = int(query.get("after", ["0"])[0])
+                    timeout = float(query.get("timeout", ["15"])[0])
+                    if after < 0 or after > 10**12 or not 1 <= timeout <= 20:
+                        raise ValueError("Invalid state-version query")
+                except (ValueError, TypeError):
+                    self.send_error(400, "Use after>=0 and timeout 1..20 seconds")
+                    return
+                version, published_at = monitor.wait_for_version(after, timeout)
+                body = json.dumps(
+                    {
+                        "state_version": version,
+                        "changed": version > after,
+                        "published_at": published_at.isoformat(),
+                    }
+                ).encode()
+                content_type = "application/json"
             elif route in {"/api/state", "/api/details"}:
                 value = monitor.snapshot()
                 if route == "/api/state" and query.get("view") == ["main"]:

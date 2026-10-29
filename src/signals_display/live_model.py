@@ -220,6 +220,17 @@ class LiveEstimator:
         )
         info["candidate_features"]["values"].update(info["adaptive_momentum"]["features"])
         info["developing_candle"] = self.developing.update(payload.get("reference", {}), now)
+        info["multi_timeframe_context"] = {
+            "closed_candle_trends": info["analysis_24h"].get("timeframes", {}),
+            "developing_1m": info["developing_candle"],
+            "as_of": now.isoformat(),
+            "probability_role": (
+                "Recorded shadow context. The current statistical fallback uses measured "
+                "volatility and threshold distance; directional candle trends require "
+                "chronological out-of-sample validation before receiving probability weight."
+            ),
+            "source_limitation": "Coinbase BTC-USD is a proxy, not the official settlement index.",
+        }
         info["coverage"] = payload.get("coverage", {})
         info["learning_status"] = {
             "status": "EXPERIMENTAL_FALLBACK",

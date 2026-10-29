@@ -126,7 +126,7 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     )
     closes = [float(b["close"]) for b in bars]
     returns = [math.log(b / a) for a, b in zip(closes, closes[1:])]
-    for minutes in (1, 5, 15):
+    for minutes in (1, 3, 5, 15, 30, 60):
         if len(closes) > minutes:
             values[f"return_{minutes}m"] = math.log(closes[-1] / closes[-minutes - 1])
     latest = bars[-1]
@@ -235,7 +235,7 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
         for name, value in values.items()
     }
     return {
-        "version": "opening-asof-features-v1",
+        "version": "opening-asof-features-v2",
         "status": "FROZEN_AS_OF_OPENING",
         "cutoff": opened.isoformat(),
         "max_input_received_at": max(receipts).isoformat(),
@@ -367,8 +367,16 @@ def context24(data, now):
             volatility_24h=sigma / closes[-1],
         )
         frames = {}
-        for minutes in (1, 5, 15, 60):
+        for minutes in (1, 3, 5, 15, 30, 60):
             grouped = rows if minutes == 1 else aggregate(rows, minutes)
+            recent = rows[-minutes:]
+            prior = rows[-2 * minutes:-minutes]
+            recent_volume = sum(bar["volume"] for bar in recent)
+            prior_volume = sum(bar["volume"] for bar in prior)
+            trailing_return = (
+                closes[-1] / closes[-minutes - 1] - 1
+                if len(closes) > minutes else None
+            )
             frames[str(minutes) + "m"] = {
                 "closed_bars": len(grouped),
                 "latest_close": grouped[-1]["close"] if grouped else None,
@@ -376,7 +384,27 @@ def context24(data, now):
                 if len(grouped) > 1
                 else None,
                 "latest_volume": grouped[-1]["volume"] if grouped else None,
+                "trailing_return": trailing_return,
+                "direction": "UP" if trailing_return is not None and trailing_return > 0
+                else "DOWN" if trailing_return is not None and trailing_return < 0
+                else "FLAT" if trailing_return == 0 else "UNAVAILABLE",
+                "rolling_volume": recent_volume,
+                "prior_rolling_volume": prior_volume if len(prior) == minutes else None,
+                "volume_ratio": recent_volume / prior_volume
+                if len(prior) == minutes and prior_volume > 0 else None,
+                "as_of": cutoff,
+                "input_policy": "Closed one-minute proxy candles only; rolling window ending at the latest verified close",
             }
+        frames["24h"] = {
+            "closed_bars": len(rows),
+            "latest_close": closes[-1],
+            "trailing_return": features["return_24h"],
+            "direction": "UP" if features["return_24h"] > 0 else "DOWN"
+            if features["return_24h"] < 0 else "FLAT",
+            "rolling_volume": volume,
+            "as_of": cutoff,
+            "input_policy": "Exactly 1,440 contiguous closed one-minute proxy candles",
+        }
         result.update(
             status="READY",
             reason="24h closed, contiguous proxy history; indicators are correlated candidates, not independent votes",

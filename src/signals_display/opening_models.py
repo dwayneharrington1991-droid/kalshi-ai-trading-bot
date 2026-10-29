@@ -22,7 +22,7 @@ from .scores import score
 MIN_CONTRACTS = learning.MIN_CONTRACTS
 BOOST_MIN_CONTRACTS = 500
 PROTOCOL = "opening-frozen-linear-ensemble-stumps-shadow-v1"
-FEATURE_VERSION = "opening-asof-features-v1"
+FEATURE_VERSION = "opening-asof-features-v2"
 
 
 def _opening_rows(db, asof):

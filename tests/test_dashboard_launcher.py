@@ -147,6 +147,12 @@ def test_supervisor_stops_child_cleanly_and_never_spawns_duplicate(monkeypatch):
     assert child.signals == [launcher.signal.SIGTERM]
 
 
+def test_frozen_child_recovery_policy_is_bounded_but_startup_remains_patient():
+    assert launcher.UNRESPONSIVE_GRACE_SECONDS <= 15
+    assert launcher.UNRESPONSIVE_CHECKS_BEFORE_RESTART == 2
+    assert launcher.CHILD_STOP_TIMEOUT_SECONDS <= 5
+
+
 def test_dashboard_uses_bounded_adaptive_polling_instead_of_250ms_full_renders():
     html = (ROOT / "src/signals_display/dashboard.html").read_text()
     assert "setInterval(refresh,250)" not in html

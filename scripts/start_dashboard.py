@@ -21,6 +21,9 @@ RUNTIME_PACKAGES = (
     "cryptography==42.0.0",
 )
 SUPERVISOR_LOG = ROOT / "logs/signals-dashboard-supervisor.log"
+UNRESPONSIVE_GRACE_SECONDS = 15
+UNRESPONSIVE_CHECKS_BEFORE_RESTART = 2
+CHILD_STOP_TIMEOUT_SECONDS = 5
 
 
 def supervisor_event(message, path=SUPERVISOR_LOG):
@@ -242,7 +245,7 @@ def launcher_pids(root=ROOT, proc_root=Path("/proc"), own_pid=None):
     return sorted(matches)
 
 
-def stop_child(child, timeout=15):
+def stop_child(child, timeout=CHILD_STOP_TIMEOUT_SECONDS):
     """Stop one supervised signals server without touching any unrelated process."""
     if child.poll() is not None:
         return
@@ -301,10 +304,10 @@ def supervise(
                 # A responsive STARTING endpoint proves the event loop and socket
                 # are alive while a large preserved journal initializes. Bound the
                 # allowance so a permanently stalled initialization still recovers.
-                startup_deadline = 300 if startup_responsive else 30
+                startup_deadline = 300 if startup_responsive else UNRESPONSIVE_GRACE_SECONDS
                 if not current_healthy and time.monotonic() - started > startup_deadline:
                     unhealthy += 1
-                    if unhealthy >= 3:
+                    if unhealthy >= UNRESPONSIVE_CHECKS_BEFORE_RESTART:
                         print(
                             "Dashboard health checks failed repeatedly; restarting safely.",
                             flush=True,

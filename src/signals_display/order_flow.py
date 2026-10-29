@@ -170,6 +170,17 @@ class Book:
         )
         buy = sum(self.bids[p] for p in sorted(self.bids, reverse=True)[:20]) if valid else None
         sell = sum(self.asks[p] for p in sorted(self.asks)[:20]) if valid else None
+        bid_prices = sorted(self.bids, reverse=True)[:3] if valid else []
+        ask_prices = sorted(self.asks)[:3] if valid else []
+        bid_top3 = sum(self.bids[p] for p in bid_prices) if bid_prices else None
+        ask_top3 = sum(self.asks[p] for p in ask_prices) if ask_prices else None
+        top3_total = bid_top3 + ask_top3 if bid_top3 is not None and ask_top3 is not None else None
+        obi_top3 = float((bid_top3 - ask_top3) / top3_total) if top3_total else None
+        micro_price = (
+            float((bid_prices[0] * ask_top3 + ask_prices[0] * bid_top3) / top3_total)
+            if top3_total else None
+        )
+        midpoint = float((bid_prices[0] + ask_prices[0]) / 2) if bid_prices and ask_prices else None
         ratio = float(buy / sell) if valid and sell else None
         return dict(
             status="LIVE" if valid else "UNAVAILABLE",
@@ -177,6 +188,12 @@ class Book:
             top_levels=20,
             quantity_unit="BTC",
             bid_ask_ratio=ratio,
+            bid_size_top3=float(bid_top3) if bid_top3 is not None else None,
+            ask_size_top3=float(ask_top3) if ask_top3 is not None else None,
+            order_book_imbalance_top3=obi_top3,
+            micro_price=micro_price,
+            micro_price_deviation=(micro_price - midpoint) / midpoint
+            if micro_price is not None and midpoint else None,
             dominant_side="UP"
             if ratio and ratio > 2.5
             else "DOWN"

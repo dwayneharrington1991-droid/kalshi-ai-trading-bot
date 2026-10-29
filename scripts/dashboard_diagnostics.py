@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
-from time import perf_counter
+from time import perf_counter, time
 import httpx
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, build_opener
@@ -114,15 +114,20 @@ def market_data_connectivity():
     """Fixed public GET checks only; never sends credentials or proxy values."""
     import httpx
 
+    end = int(time()) // 60 * 60
+    now_epoch = int(time())
     endpoints = {
         "kalshi_public_markets": (
             "https://api.elections.kalshi.com/trade-api/v2/markets?"
-            "series_ticker=KXBTC15M&limit=1"
+            f"series_ticker=KXBTC15M&min_close_ts={now_epoch}&max_close_ts={now_epoch + 1800}&limit=200"
+        ),
+        "kalshi_series_metadata": (
+            "https://api.elections.kalshi.com/trade-api/v2/series/KXBTC15M"
         ),
         "coinbase_btc_spot": "https://api.coinbase.com/v2/prices/BTC-USD/spot",
         "coinbase_btc_candles": (
             "https://api.coinbase.com/api/v3/brokerage/market/products/"
-            "BTC-USD/candles?granularity=ONE_MINUTE&limit=1"
+            f"BTC-USD/candles?start={end - 300}&end={end}&granularity=ONE_MINUTE&limit=5"
         ),
     }
     result = {
@@ -139,18 +144,132 @@ def market_data_connectivity():
                 response = client.get(
                     url, headers={"Accept": "application/json", "Cache-Control": "no-cache"}
                 )
-                result["checks"][name] = {
+                check = {
                     "status": "OK" if response.status_code == 200 else "HTTP_ERROR",
                     "http_status": response.status_code,
                     "content_type": response.headers.get("content-type", "").split(";", 1)[0],
                     "round_trip_ms": round((perf_counter() - started) * 1000, 2),
                 }
+                if response.status_code == 200:
+                    try:
+                        payload = response.json()
+                        if name == "kalshi_public_markets":
+                            rows = payload.get("markets", [])
+                            active = [
+                                row for row in rows
+                                if row.get("status") in {"open", "active"}
+                                and str(row.get("ticker", "")).startswith("KXBTC15M-")
+                            ]
+                            check.update(
+                                parsed=True,
+                                markets_returned=len(rows),
+                                active_or_upcoming_candidates=len(active),
+                                tickers=[str(row.get("ticker", ""))[:120] for row in rows[:3]],
+                            )
+                        elif name == "kalshi_series_metadata":
+                            series = payload.get("series", {})
+                            check.update(
+                                parsed=series.get("ticker") in {None, "KXBTC15M"},
+                                settlement_sources_present=bool(series.get("settlement_sources")),
+                                fee_metadata_present=series.get("fee_type") is not None,
+                            )
+                        elif name == "coinbase_btc_spot":
+                            data = payload.get("data", {})
+                            check.update(
+                                parsed=bool(data.get("amount")),
+                                pair=f"{data.get('base')}-{data.get('currency')}",
+                            )
+                        else:
+                            candles = payload.get("candles", [])
+                            check.update(parsed=isinstance(candles, list), candles_returned=len(candles))
+                    except (ValueError, TypeError, AttributeError):
+                        check.update(parsed=False, parse_error="INVALID_JSON_SCHEMA")
+                result["checks"][name] = check
             except Exception as error:
                 result["checks"][name] = {
                     "status": "FAILED",
                     "error_type": type(error).__name__,
                     "round_trip_ms": round((perf_counter() - started) * 1000, 2),
                 }
+    # Exercise the same public WebSocket used by the dashboard. This sends only
+    # a public BTC-USD subscription and never loads account credentials.
+    started = perf_counter()
+    try:
+        import json as json_module
+        from websockets.sync.client import connect
+
+        with connect(
+            "wss://advanced-trade-ws.coinbase.com",
+            open_timeout=5,
+            close_timeout=1,
+        ) as socket:
+            for channel in ("ticker", "heartbeats"):
+                socket.send(json_module.dumps({
+                    "type": "subscribe", "product_ids": ["BTC-USD"], "channel": channel
+                }))
+            accepted = None
+            deadline = perf_counter() + 8
+            while perf_counter() < deadline:
+                message = json_module.loads(socket.recv(timeout=max(0.1, deadline - perf_counter())))
+                if message.get("channel") in {"ticker", "heartbeats"}:
+                    accepted = message.get("channel")
+                    break
+            result["checks"]["coinbase_public_websocket"] = {
+                "status": "OK" if accepted else "NO_MARKET_MESSAGE",
+                "channel_received": accepted,
+                "round_trip_ms": round((perf_counter() - started) * 1000, 2),
+            }
+    except Exception as error:
+        result["checks"]["coinbase_public_websocket"] = {
+            "status": "FAILED",
+            "error_type": type(error).__name__,
+            "round_trip_ms": round((perf_counter() - started) * 1000, 2),
+        }
+    # Include the running application's own component health, without copying
+    # market/account values or any credential material into this report.
+    try:
+        response = httpx.get(
+            "http://127.0.0.1:8765/api/state?view=main",
+            timeout=3,
+            trust_env=False,
+        )
+        state = response.json()
+        feed = state.get("feed_health", {})
+        market = state.get("market") or {}
+        preload = state.get("historical_preload", {})
+        streaming = state.get("streaming", {})
+        kalshi_socket = streaming.get("kalshi", {})
+        result["running_pipeline"] = {
+            "http_status": response.status_code,
+            "build_commit": state.get("runtime", {}).get("build_commit"),
+            "mode": state.get("mode"),
+            "active_ticker": market.get("ticker"),
+            "contract_closes_at": market.get("closes_at"),
+            "remaining_seconds": state.get("remaining_seconds"),
+            "market_stale": state.get("stale"),
+            "last_btc_update": feed.get("last_successful_btc_price_update"),
+            "last_kalshi_update": feed.get("last_kalshi_market_update"),
+            "rest_status": feed.get("rest_status"),
+            "rest_root_failure": feed.get("rest_root_failure"),
+            "websocket_status": feed.get("coinbase_websocket_status"),
+            "websocket_last_error_type": feed.get("websocket_last_error_type"),
+            "kalshi_websocket": kalshi_socket,
+            "historical_preload_status": preload.get("status"),
+            "historical_candle_count": preload.get("candle_count"),
+            "prediction_engine_status": feed.get("prediction_engine_status"),
+            "prediction_unavailable_reason": feed.get("prediction_unavailable_reason"),
+            "journal_index_maintenance": feed.get("journal_index_maintenance"),
+        }
+    except Exception as error:
+        result["running_pipeline"] = {
+            "status": "UNREACHABLE", "error_type": type(error).__name__
+        }
+    if "running_pipeline" not in result or result["running_pipeline"].get("status") == "UNREACHABLE":
+        result["kalshi_websocket_note"] = (
+            "Kalshi order-book WebSocket is not anonymous. Its live status can only be read from "
+            "a running dashboard after the existing account key passes read-only permission verification; "
+            "this diagnostic does not load or transmit credentials. Public REST was tested separately."
+        )
     result["notice"] = (
         "Public fixed endpoints only; no credentials, account endpoints, orders or transfers. "
         "Proxy values and response bodies are omitted."

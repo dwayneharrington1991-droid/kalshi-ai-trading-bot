@@ -1103,25 +1103,22 @@ class Journal:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS btc_candles (source TEXT,start INTEGER,payload TEXT,first_received_at TEXT,PRIMARY KEY(source,start))"
             )
+            # Keep startup schema-only.  Building a missing index over a large
+            # preserved journal can take minutes and used to prevent the live
+            # feed worker from starting at all.  Existing indexes remain in
+            # use; missing performance indexes are assessed by
+            # ensure_performance_indexes() after live workers start. Large live
+            # journals defer construction rather than blocking ingestion.
             db.executescript(
-                """CREATE INDEX IF NOT EXISTS predictions_ticker_mode ON predictions(ticker,mode);
-                CREATE INDEX IF NOT EXISTS predictions_mode_id ON predictions(mode,id DESC);
-                CREATE INDEX IF NOT EXISTS simulations_pending ON simulations(status);
-                CREATE INDEX IF NOT EXISTS simulations_probe ON simulations(mode,ticker,side,id DESC);
-                CREATE INDEX IF NOT EXISTS simulations_prediction ON simulations(prediction_id,id DESC);
-                CREATE INDEX IF NOT EXISTS btc_candles_start ON btc_candles(start DESC);
-                CREATE TABLE IF NOT EXISTS settlement_queue (
+                """CREATE TABLE IF NOT EXISTS settlement_queue (
                     mode TEXT,ticker TEXT,closes_at TEXT,last_attempt TEXT,resolved INTEGER DEFAULT 0,
                     PRIMARY KEY(mode,ticker));
-                CREATE INDEX IF NOT EXISTS settlement_due ON settlement_queue(mode,resolved,closes_at);
                 CREATE TABLE IF NOT EXISTS dashboard_migrations (name TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE IF NOT EXISTS dashboard_settings (name TEXT PRIMARY KEY,payload TEXT);
                 CREATE TABLE IF NOT EXISTS opening_input_snapshots (
                     mode TEXT NOT NULL,ticker TEXT NOT NULL,opens_at TEXT NOT NULL,
                     captured_at TEXT NOT NULL,finalized INTEGER NOT NULL,payload TEXT NOT NULL,
                     PRIMARY KEY(mode,ticker));
-                CREATE INDEX IF NOT EXISTS opening_input_snapshots_open
-                    ON opening_input_snapshots(mode,opens_at);
                 CREATE TABLE IF NOT EXISTS learning_contract_reviews (
                     ticker TEXT NOT NULL,origin TEXT NOT NULL,observed_at TEXT NOT NULL,
                     outcome INTEGER NOT NULL,payload TEXT NOT NULL,
@@ -1131,10 +1128,59 @@ class Journal:
                     opens_at TEXT NOT NULL,generated_at TEXT NOT NULL,data_cutoff TEXT NOT NULL,
                     direction TEXT NOT NULL,probability_up REAL,status TEXT NOT NULL,payload TEXT NOT NULL,
                     outcome INTEGER,settled_at TEXT,PRIMARY KEY(mode,ticker));
-                CREATE INDEX IF NOT EXISTS multi_asset_asset_open
-                    ON multi_asset_openings(asset,opens_at);
                 """
             )
+
+    def ensure_performance_indexes(self):
+        """Create optional indexes away from startup and live ingestion.
+
+        Each statement commits independently.  A crash or interruption leaves
+        the journal valid and the next run resumes with the remaining index.
+        No historical row is rewritten or deleted.
+        """
+        statements = (
+            "CREATE INDEX IF NOT EXISTS predictions_ticker_mode ON predictions(ticker,mode)",
+            "CREATE INDEX IF NOT EXISTS predictions_mode_id ON predictions(mode,id DESC)",
+            "CREATE INDEX IF NOT EXISTS simulations_pending ON simulations(status)",
+            "CREATE INDEX IF NOT EXISTS simulations_probe ON simulations(mode,ticker,side,id DESC)",
+            "CREATE INDEX IF NOT EXISTS simulations_prediction ON simulations(prediction_id,id DESC)",
+            "CREATE INDEX IF NOT EXISTS btc_candles_start ON btc_candles(start DESC)",
+            "CREATE INDEX IF NOT EXISTS settlement_due ON settlement_queue(mode,resolved,closes_at)",
+            "CREATE INDEX IF NOT EXISTS opening_input_snapshots_open ON opening_input_snapshots(mode,opens_at)",
+            "CREATE INDEX IF NOT EXISTS multi_asset_asset_open ON multi_asset_openings(asset,opens_at)",
+        )
+        with self.read() as db:
+            existing = {
+                row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+        requested = {
+            statement.split(" ON ", 1)[0].rsplit(" ", 1)[-1]: statement
+            for statement in statements
+        }
+        missing = {name: statement for name, statement in requested.items() if name not in existing}
+        # Index construction is an SQLite writer and can delay journal writes
+        # even in WAL mode. Never build over a large live journal. The
+        # credential-safe diagnostic reports missing names for planned offline
+        # maintenance; existing installations normally already have them.
+        size = Path(self.path).stat().st_size if Path(self.path).exists() else 0
+        if missing and size > 512 * 1024 * 1024:
+            return {
+                "status": "DEFERRED_LARGE_LIVE_JOURNAL",
+                "database_bytes": size,
+                "missing": sorted(missing),
+                "created": [],
+            }
+        completed = []
+        for name, statement in missing.items():
+            with self.connect() as db:
+                db.execute(statement)
+            completed.append(name)
+        return {
+            "status": "READY", "database_bytes": size,
+            "missing": [], "created": completed,
+        }
 
     def _learning_sample_due(self, state, interval=1.0):
         """At most one dense learning snapshot/second/contract; rollovers are immediate."""
@@ -1855,9 +1901,12 @@ class Journal:
     def recent_states(self):
         with self.read() as db:
             rows = db.execute(
+                "WITH recent AS MATERIALIZED (SELECT id,mode,timestamp,payload FROM predictions "
+                "ORDER BY id DESC LIMIT 10000) "
                 "SELECT timestamp,json_extract(payload,'$.reference'),json_extract(payload,'$.market'),"
-                "json_extract(payload,'$.model.version'),json_extract(payload,'$.estimate') "
-                "FROM predictions WHERE mode='PUBLIC MARKET DATA' ORDER BY id DESC LIMIT 600"
+                "json_extract(payload,'$.model.version'),json_extract(payload,'$.estimate') FROM ("
+                "SELECT id,mode,timestamp,payload FROM recent"
+                ") WHERE mode='PUBLIC MARKET DATA' ORDER BY id DESC LIMIT 600"
             ).fetchall()
         return [
             dict(

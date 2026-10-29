@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "🚀 OPEN MY BOT",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/start_dashboard.py",
+      "args": ["--private-dashboard", "--open-browser"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "🔄 UPDATE AND RESTART MY BOT",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/update_dashboard.py",
+      "args": ["--restart"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

@@ -4,7 +4,7 @@
     {
       "label": "🚀 OPEN MY BOT",
       "type": "shell",
-      "command": "python3 scripts/update_dashboard.py",
+      "command": "python3 scripts/start_dashboard.py --private-dashboard --open-browser",
       "options": {"cwd": "${workspaceFolder}"},
       "problemMatcher": [],
       "runOptions": {"instanceLimit": 1},

@@ -1193,6 +1193,11 @@ class Journal:
                     opens_at TEXT NOT NULL,generated_at TEXT NOT NULL,data_cutoff TEXT NOT NULL,
                     direction TEXT NOT NULL,probability_up REAL,status TEXT NOT NULL,payload TEXT NOT NULL,
                     outcome INTEGER,settled_at TEXT,PRIMARY KEY(mode,ticker));
+                CREATE TABLE IF NOT EXISTS intelligence_minute_memory (
+                    mode TEXT NOT NULL,ticker TEXT NOT NULL,minute_start TEXT NOT NULL,
+                    first_observed_at TEXT NOT NULL,last_observed_at TEXT NOT NULL,
+                    samples INTEGER NOT NULL,first_payload TEXT NOT NULL,last_payload TEXT NOT NULL,
+                    PRIMARY KEY(mode,ticker,minute_start));
                 """
             )
 
@@ -1283,6 +1288,51 @@ class Journal:
                     continue
 
         self._last_candle_batch = batch
+
+    @staticmethod
+    def _minute_memory_payload(state):
+        """Compact as-of intelligence evidence; no outcome or model mutation."""
+        market = state.get("market") or {}
+        model = state.get("model") or {}
+        engine = state.get("prediction_engine") or {}
+        payload = {
+            "observed_at": state["now"],
+            "data_cutoff": engine.get("data_cutoff", state["now"]),
+            "ticker": market.get("ticker"),
+            "stale": bool(state.get("stale", True)),
+            "threshold": market.get("strike"),
+            "reference": {
+                key: state.get("reference", {}).get(key)
+                for key in ("price", "observed_at", "event_time", "source")
+            },
+            "quotes": {
+                side: {
+                    key: market.get("quotes", {}).get(side, {}).get(key)
+                    for key in ("bid", "ask", "bid_size", "ask_size")
+                }
+                for side in ("up", "down")
+            },
+            "probability_up": engine.get("up"),
+            "model_version": engine.get("version", model.get("version")),
+            "candidate_features": model.get("candidate_features", {}).get("values", {}),
+            "multi_timeframe_context": model.get("multi_timeframe_context", {}),
+            "binary_contract_context": model.get("binary_contract_context", {}),
+            "memory_role": (
+                "Receipt-proven shadow evidence. Outcomes are joined only after official "
+                "settlement; this row cannot update or activate model weights."
+            ),
+        }
+        encoded = json.dumps(payload, allow_nan=False, separators=(",", ":"))
+        if len(encoded) > 32768:
+            payload["multi_timeframe_context"] = {
+                "closed_candle_trends": model.get("multi_timeframe_context", {}).get(
+                    "closed_candle_trends", {}
+                )
+            }
+            encoded = json.dumps(payload, allow_nan=False, separators=(",", ":"))
+        if len(encoded) > 32768:
+            raise ValueError("Compact minute intelligence memory exceeded 32 KiB")
+        return encoded
 
     def connect(self):
         return storage_connect(self.path)
@@ -1520,6 +1570,23 @@ class Journal:
             )
             if not capture_learning:
                 return
+            memory = self._minute_memory_payload(state)
+            minute_start = now.replace(second=0, microsecond=0).isoformat()
+            db.execute(
+                """INSERT INTO intelligence_minute_memory
+                (mode,ticker,minute_start,first_observed_at,last_observed_at,samples,
+                 first_payload,last_payload) VALUES (?,?,?,?,?,1,?,?)
+                ON CONFLICT(mode,ticker,minute_start) DO UPDATE SET
+                  last_observed_at=excluded.last_observed_at,
+                  samples=intelligence_minute_memory.samples+1,
+                  last_payload=excluded.last_payload
+                WHERE julianday(excluded.last_observed_at)>
+                      julianday(intelligence_minute_memory.last_observed_at)""",
+                (
+                    state["mode"], market["ticker"], minute_start, state["now"],
+                    state["now"], memory, memory,
+                ),
+            )
             e = state["estimate"]
             persisted = state
             coverage = state.get("model", {}).get("coverage", {})
@@ -1876,6 +1943,10 @@ class Journal:
                 WHERE o.mode='PUBLIC MARKET DATA' AND o.up IS NOT NULL
                 ORDER BY o.generated_at"""
             ).fetchall()
+            memory_row = db.execute(
+                "SELECT COUNT(*),COALESCE(SUM(samples),0),MAX(last_observed_at) "
+                "FROM intelligence_minute_memory"
+            ).fetchone()
             from .opening_models import dataset_coverage
 
             opening_coverage = dataset_coverage(db)
@@ -1916,6 +1987,15 @@ class Journal:
             "contract_reviews": len(reviews),
             "opening_mistakes_recorded": opening_mistakes,
             "dense_snapshot_interval_seconds": 1,
+            "intelligence_memory": {
+                "minute_records": memory_row[0],
+                "second_level_samples": memory_row[1],
+                "last_observed_at": memory_row[2],
+                "policy": (
+                    "Receipt-proven observations accumulate continuously; model weights "
+                    "change only after official outcomes and chronological validation."
+                ),
+            },
             "multi_asset_opening_learning": multi_asset,
             "opening_forward_accuracy": opening_accuracy,
             "opening_training_coverage": opening_coverage,

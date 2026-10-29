@@ -24,6 +24,39 @@ MAX_GAP = 5
 PATHS = 2000
 
 
+def binary_contract_context(market, remaining, slippage):
+    """Cost and boundary diagnostics; never an independent event forecast."""
+    quotes = market["quotes"]
+    multiplier = number(market["fee_multiplier"], 0, 100)
+    mids = {}
+    result = {}
+    for side in ("up", "down"):
+        bid = number(quotes[side]["bid"], 0, 1)
+        ask = number(quotes[side]["ask"], bid, 1)
+        mid = max(1e-6, min(1 - 1e-6, (bid + ask) / 2))
+        mids[side] = mid
+        result[side] = {
+            "midpoint": mid,
+            "spread": ask - bid,
+            "entry_fee": fee(ask, multiplier),
+            "break_even_probability": min(1, ask + fee(ask, multiplier) + slippage),
+            "logit": math.log(mid / (1 - mid)),
+            "boundary_sensitivity": 1 / (mid * (1 - mid)),
+        }
+    total = mids["up"] + mids["down"]
+    fraction = max(0, min(1, remaining / 900))
+    return {
+        "status": "EXPERIMENTAL_COST_AND_MARKET_CONTEXT",
+        "vig_stripped_up": mids["up"] / total if total else None,
+        "vig_stripped_down": mids["down"] / total if total else None,
+        "time_remaining_fraction": fraction,
+        "theta_decay_linear": fraction,
+        "theta_decay_exponential": math.exp(-3 * (1 - fraction)),
+        "sides": result,
+        "role": "Market-implied/cost context only; excluded from the independent settlement probability features.",
+    }
+
+
 def volatility(points, now, kind):
     points = [(t, p) for t, p in points if 0 <= (now - t).total_seconds() <= 600]
     count = len(points)
@@ -239,6 +272,7 @@ class LiveEstimator:
         up = down = su = sd = None
         overall_reason = scalp_reason = "MISSING_DATA: no unique active contract"
         if market is not None:
+            remaining = None
             try:
                 if not market.get("mapping_verified", False):
                     raise ValueError("UNSUPPORTED_RULES: YES-to-UP mapping not verified")
@@ -254,6 +288,16 @@ class LiveEstimator:
                 )
             except (KeyError, ValueError, TypeError, AttributeError) as exc:
                 overall_reason = scalp_reason = str(exc)
+            if remaining is not None and remaining > 0:
+                try:
+                    info["binary_contract_context"] = binary_contract_context(
+                        market, remaining, self.slippage
+                    )
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    info["binary_contract_context"] = {
+                        "status": "UNAVAILABLE",
+                        "reason": "Fresh compatible executable quotes and fee metadata are required",
+                    }
         info["execution_assumptions"] = {
             "manual_delay_seconds": self.manual_delay,
             "slippage_per_leg": self.slippage,

@@ -23,6 +23,39 @@ def test_dense_learning_records_once_per_second_and_rollover_immediately(tmp_pat
         ).fetchone()[0] == 1
 
 
+def test_compact_minute_memory_preserves_first_and_latest_second(tmp_path):
+    journal = Journal(tmp_path / "journal.db")
+    first = analyze(frame(), NOW)
+    first["prediction_engine"] = {
+        "up": 0.51, "version": "shadow-v1", "data_cutoff": first["now"]
+    }
+    first["model"]["candidate_features"] = {"values": {"momentum_1m": 0.01}}
+    journal.step(first)
+
+    latest = analyze(frame(2), NOW + timedelta(seconds=2))
+    latest["prediction_engine"] = {
+        "up": 0.54, "version": "shadow-v1", "data_cutoff": latest["now"]
+    }
+    latest["model"]["candidate_features"] = {"values": {"momentum_1m": 0.03}}
+    journal.step(latest)
+
+    with journal.read() as db:
+        row = db.execute(
+            "SELECT samples,first_payload,last_payload FROM intelligence_minute_memory"
+        ).fetchone()
+        assert db.execute("SELECT COUNT(*) FROM forecast_outcomes").fetchone()[0] == 0
+    assert row[0] == 2
+    assert json.loads(row[1])["probability_up"] == 0.51
+    assert json.loads(row[1])["candidate_features"]["momentum_1m"] == 0.01
+    assert json.loads(row[2])["probability_up"] == 0.54
+    assert json.loads(row[2])["candidate_features"]["momentum_1m"] == 0.03
+
+    readiness = journal.learning_readiness()["intelligence_memory"]
+    assert readiness["minute_records"] == 1
+    assert readiness["second_level_samples"] == 2
+    assert "official outcomes" in readiness["policy"]
+
+
 def test_official_settlement_writes_one_immutable_mistake_review(tmp_path):
     journal = Journal(tmp_path / "journal.db")
     state = analyze(frame(), NOW)

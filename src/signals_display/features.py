@@ -34,6 +34,13 @@ FEATURES = (
         "spot_cvd_delta_fraction",
         "perpetual_cvd_delta_fraction",
         "spot_book_dominance",
+        "spot_book_imbalance_top3",
+        "spot_micro_price_deviation",
+        "candle_body_range_ratio",
+        "candle_close_range_position",
+        "candle_volume_weighted_move",
+        "candle_atr_zscore_20",
+        "candle_unusual_expansion",
         "spot_absorption_candidate",
         "perpetual_absorption_candidate",
         "spot_delta_efficiency_3m",
@@ -138,11 +145,35 @@ def extract(payload, market, now):
             )
         _, o, h, l, c, v = bars[-1]
         scale = max(h - l, 1e-9)
+        prior_volumes = [bar[5] for bar in bars[-21:-1]]
+        prior_volume_mean = sum(prior_volumes) / len(prior_volumes) if prior_volumes else None
+        true_ranges = [
+            max(current[2] - current[3], abs(current[2] - previous[4]),
+                abs(current[3] - previous[4]))
+            for previous, current in zip(bars, bars[1:])
+        ]
+        prior_ranges = true_ranges[-21:-1]
+        range_mean = sum(prior_ranges) / len(prior_ranges) if len(prior_ranges) == 20 else None
+        range_std = (
+            math.sqrt(sum((item - range_mean) ** 2 for item in prior_ranges) / 20)
+            if range_mean is not None else None
+        )
+        atr_zscore = (
+            (true_ranges[-1] - range_mean) / range_std
+            if true_ranges and range_std and range_std > 0 else None
+        )
         values.update(
             body_fraction=(c - o) / scale,
             upper_wick=(h - max(c, o)) / scale,
             lower_wick=(min(c, o) - l) / scale,
             range_fraction=(h - l) / o,
+            candle_body_range_ratio=abs(c - o) / scale,
+            candle_close_range_position=(c - l) / scale,
+            candle_volume_weighted_move=(c / o - 1) * (v / prior_volume_mean)
+            if prior_volume_mean and prior_volume_mean > 0 else None,
+            candle_atr_zscore_20=atr_zscore,
+            candle_unusual_expansion=int(atr_zscore > 1.5)
+            if atr_zscore is not None else None,
         )
         if len(bars) > 20:
             prior = bars[-21:-1]
@@ -161,6 +192,9 @@ def extract(payload, market, now):
             "return_1m", "return_3m", "return_5m", "return_15m", "return_30m",
             "return_60m", "acceleration", "body_fraction", "upper_wick", "lower_wick",
             "range_fraction", "breakout_distance", "volatility_change", "relative_volume",
+            "candle_body_range_ratio", "candle_close_range_position",
+            "candle_volume_weighted_move", "candle_atr_zscore_20",
+            "candle_unusual_expansion",
         ):
             values[name] = None
     ref = payload.get("reference", {})
@@ -223,6 +257,14 @@ def extract(payload, market, now):
         ):
             ratio = number(item["bid_ask_ratio"], 0, 1e12)
             values["spot_book_dominance"] = (ratio - 1) / (ratio + 1)
+            if item.get("order_book_imbalance_top3") is not None:
+                values["spot_book_imbalance_top3"] = number(
+                    item["order_book_imbalance_top3"], -1, 1
+                )
+            if item.get("micro_price_deviation") is not None:
+                values["spot_micro_price_deviation"] = number(
+                    item["micro_price_deviation"], -1, 1
+                )
     except (KeyError, ValueError, TypeError):
         pass
     return {

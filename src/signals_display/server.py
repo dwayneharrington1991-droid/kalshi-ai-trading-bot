@@ -1346,9 +1346,64 @@ def make_handler(monitor):
     return Handler
 
 
-def make_startup_handler(build_commit):
-    """Serve bounded health responses before journals and models finish loading."""
-    started = utcnow()
+class StartupStatus:
+    """In-memory startup status; never touches journals, feeds or credentials."""
+
+    def __init__(self, build_commit):
+        self.build_commit = build_commit
+        self.started_at = utcnow()
+        self.updated_at = self.started_at
+        self.stage = "WEB_READY"
+        self.message = "Dashboard shell is ready; preserved data is loading"
+        self.lock = threading.Lock()
+
+    def update(self, stage, message):
+        with self.lock:
+            self.stage, self.message, self.updated_at = stage, message, utcnow()
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "status": "STARTING",
+                "stage": self.stage,
+                "message": self.message,
+                "started_at": self.started_at.isoformat(),
+                "updated_at": self.updated_at.isoformat(),
+                "build_commit": self.build_commit,
+                "signals_only": True,
+            }
+
+    def dashboard_state(self):
+        value = self.snapshot()
+        reason = "STARTING / " + value["stage"] + ": " + value["message"]
+        return {
+            "mode": "STARTING", "now": value["updated_at"], "stale": True,
+            "direction": "UNCLEAR", "scalp": "WAIT", "scalp_lean": "WAIT",
+            "remaining_seconds": 0, "market": None, "market_strip": [],
+            "multi_asset_discovery": {"status": "WARMING UP", "reason": reason},
+            "reference": {},
+            "estimate": {"settlement_up": None, "settlement_down": None, "reason": reason},
+            "plans": {}, "warnings": [reason], "explanation": reason,
+            "scalp_explanation": reason,
+            "prediction_engine": {"status": "STARTING", "reason": reason,
+                                  "initial": {"status": "STARTING", "up": None,
+                                              "reason": reason}},
+            "account": {"status": "ACCOUNT_CONNECTING", "reason": reason},
+            "feed_health": {"status": "WARMING UP", "prediction_engine_status": "STARTING",
+                            "prediction_unavailable_reason": reason},
+            "market_health": {"contract_quotes_fresh": False, "reference_fresh": False,
+                              "contract_quote_reasons": [reason],
+                              "reference_reasons": [reason]},
+            "runtime": {"build_commit": value["build_commit"],
+                        "build_short": value["build_commit"][:7], "state_version": 0,
+                        "published_at": value["updated_at"], "startup": value},
+        }
+
+
+def make_startup_handler(startup):
+    """Serve the real dashboard while preserved journals and models load."""
+    if isinstance(startup, str):
+        startup = StartupStatus(startup)
 
     class StartupHandler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -1356,27 +1411,31 @@ def make_startup_handler(build_commit):
 
         def do_GET(self):
             route = urlsplit(self.path).path
-            if route == "/healthz":
-                body = json.dumps(
-                    {
-                        "status": "STARTING",
-                        "phase": "INITIALIZING_PRESERVED_STATE",
-                        "started_at": started.isoformat(),
-                        "build_commit": build_commit,
-                        "signals_only": True,
-                    }
-                ).encode()
+            if route == "/":
+                body = Path(__file__).with_name("dashboard.html").read_bytes()
+                content_type, status = "text/html; charset=utf-8", 200
+            elif route in {"/healthz", "/api/startup"}:
+                body = json.dumps(startup.snapshot()).encode()
                 content_type, status = "application/json", 503
+            elif route in {"/api/state", "/api/details"}:
+                body = json.dumps(startup.dashboard_state()).encode()
+                content_type, status = "application/json", 200
+            elif route == "/api/state-version":
+                current = startup.snapshot()
+                body = json.dumps({"state_version": 0, "changed": False,
+                                   "published_at": current["updated_at"]}).encode()
+                content_type, status = "application/json", 200
             elif route == "/health":
                 body, content_type, status = b"signals-only dashboard starting", "text/plain", 200
             else:
-                body = b"Dashboard is starting; preserved journals and models are loading."
-                content_type, status = "text/plain", 503
+                body = json.dumps({"status": "STARTING",
+                                   "reason": startup.snapshot()["message"]}).encode()
+                content_type, status = "application/json", 503
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Dashboard-Build", build_commit)
+            self.send_header("X-Dashboard-Build", startup.build_commit)
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -1458,9 +1517,10 @@ def main():
             "Account mode requires --mode public --private-dashboard and a Private forwarded port"
         )
     # Reserve port before opening/migrating journals or reading credentials.
+    startup = StartupStatus(args.build_commit)
     try:
         server = ThreadingHTTPServer(
-            (args.host, args.port), make_startup_handler(args.build_commit)
+            (args.host, args.port), make_startup_handler(startup)
         )
     except OSError:
         parser.error("Dashboard port is already in use; use scripts/start_dashboard.py --restart")
@@ -1483,6 +1543,7 @@ def main():
         target=server.serve_forever, daemon=True, name="dashboard-http"
     )
     server_thread.start()
+    startup.update("JOURNAL_LOCK", "Checking exclusive dashboard ownership without deleting data")
     account_candidate = None
     disabled_reason = None
     if args.account_readonly:
@@ -1492,7 +1553,9 @@ def main():
         except AccountReadError as exc:
             disabled_reason = str(exc)
             print(disabled_reason, flush=True)
+    startup.update("MARKET_FEEDS", "Preparing independent public market-data workers")
     feed = PublicFeed() if args.mode == "public" else ReplayFeed(args.replay)
+    startup.update("INTELLIGENCE", "Opening preserved journals and loading model metadata")
     monitor = Monitor(
         feed,
         Journal(args.journal),
@@ -1515,6 +1578,7 @@ def main():
     monitor.account_requested = args.account_readonly
     monitor.account_candidate = account_candidate
     monitor.update_account(utcnow())
+    startup.update("ENGINE_READY", "Intelligence initialized; starting live update workers")
     stop = threading.Event()
     import signal
 

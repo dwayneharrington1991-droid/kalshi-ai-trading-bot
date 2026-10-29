@@ -12,7 +12,7 @@ import pytest
 
 from src.signals_display.monitor import Journal, analyze
 from src.signals_display.runtime import CachedReport, LatestPayload
-from src.signals_display.server import Monitor, make_handler, make_startup_handler
+from src.signals_display.server import Monitor, StartupStatus, make_handler, make_startup_handler
 from tests.test_signals_display import NOW
 from tests.test_signals_monitor import frame
 
@@ -21,9 +21,8 @@ def test_startup_health_responds_before_database_or_feed_initialization():
     """A stalled initializer must not leave the local health socket silent."""
     from urllib.request import ProxyHandler, build_opener
 
-    server = ThreadingHTTPServer(
-        ("127.0.0.1", 0), make_startup_handler("abc123")
-    )
+    startup = StartupStatus("abc123")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_startup_handler(startup))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opener = build_opener(ProxyHandler({}))
@@ -38,6 +37,17 @@ def test_startup_health_responds_before_database_or_feed_initialization():
         assert value["build_commit"] == "abc123"
         assert value["signals_only"] is True
         assert value["started_at"]
+        with opener.open(f"http://127.0.0.1:{server.server_port}/", timeout=1) as response:
+            page = response.read()
+        assert response.status == 200 and b"Your market prediction helper" in page
+        startup.update("INTELLIGENCE", "Opening preserved journals")
+        with opener.open(
+            f"http://127.0.0.1:{server.server_port}/api/state?view=main", timeout=1
+        ) as response:
+            state = json.load(response)
+        assert state["runtime"]["startup"]["stage"] == "INTELLIGENCE"
+        assert state["stale"] is True and state["direction"] == "UNCLEAR"
+        assert state["scalp"] == "WAIT"
     finally:
         server.shutdown()
         server.server_close()

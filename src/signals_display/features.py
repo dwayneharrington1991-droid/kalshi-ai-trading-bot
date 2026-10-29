@@ -13,8 +13,11 @@ FEATURES = (
         "distance_scaled",
         "remaining_fraction",
         "return_1m",
+        "return_3m",
         "return_5m",
         "return_15m",
+        "return_30m",
+        "return_60m",
         "acceleration",
         "body_fraction",
         "upper_wick",
@@ -126,9 +129,9 @@ def extract(payload, market, now):
         if any(b[0] - a[0] != 60 for a, b in zip(bars, bars[1:])):
             raise ValueError("missing candle interval")
         close = [b[4] for b in bars]
-        for n, label in ((1, "return_1m"), (5, "return_5m"), (15, "return_15m")):
+        for n in (1, 3, 5, 15, 30, 60):
             if len(close) > n:
-                values[label] = math.log(close[-1] / close[-n - 1])
+                values[f"return_{n}m"] = math.log(close[-1] / close[-n - 1])
         if len(close) > 2:
             values["acceleration"] = math.log(close[-1] / close[-2]) - math.log(
                 close[-2] / close[-3]
@@ -154,7 +157,11 @@ def extract(payload, market, now):
     except (KeyError, ValueError, TypeError, OverflowError) as exc:
         diagnostics.append("CANDLE_FEATURES_UNAVAILABLE: " + str(exc))
         bars = []
-        for name in FEATURES[2:13]:
+        for name in (
+            "return_1m", "return_3m", "return_5m", "return_15m", "return_30m",
+            "return_60m", "acceleration", "body_fraction", "upper_wick", "lower_wick",
+            "range_fraction", "breakout_distance", "volatility_change", "relative_volume",
+        ):
             values[name] = None
     ref = payload.get("reference", {})
     if market:

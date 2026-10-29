@@ -49,7 +49,7 @@ def points():
     return [(NOW - timedelta(seconds=65 - i), 100000 + 0.5 * math.sin(i * 0.2)) for i in range(65)]
 
 
-def test_24h_context_aligns_four_timeframes_and_ignores_future_bars():
+def test_24h_context_tracks_live_rolling_timeframes_and_ignores_future_bars():
     data = history()
     a = engine.context24(data, NOW)
     assert (
@@ -58,6 +58,16 @@ def test_24h_context_aligns_four_timeframes_and_ignores_future_bars():
         and a["timeframes"]["60m"]["closed_bars"] == 23  # partial boundary hours excluded
     )
     assert 0 <= a["features"]["rsi_14"] <= 100 and a["vwap"] > 0
+    assert set(a["timeframes"]) == {"1m", "3m", "5m", "15m", "30m", "60m", "24h"}
+    closes = [float(bar["close"]) for bar in data["candles"]]
+    for minutes in (1, 3, 5, 15, 30, 60):
+        frame = a["timeframes"][f"{minutes}m"]
+        assert frame["trailing_return"] == pytest.approx(
+            closes[-1] / closes[-minutes - 1] - 1
+        )
+        assert frame["as_of"] == a["last_close"]
+        assert frame["input_policy"].startswith("Closed one-minute")
+    assert a["timeframes"]["24h"]["trailing_return"] == a["features"]["return_24h"]
     data["candles"].append(
         dict(start=int(NOW.timestamp()), open=1, high=1, low=1, close=1, volume=100)
     )

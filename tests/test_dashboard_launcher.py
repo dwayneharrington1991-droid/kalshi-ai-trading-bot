@@ -157,7 +157,8 @@ def test_dashboard_uses_bounded_adaptive_polling_instead_of_250ms_full_renders()
     html = (ROOT / "src/signals_display/dashboard.html").read_text()
     assert "setInterval(refresh,250)" not in html
     assert "scheduleRefresh(backoff)" in html
-    assert "document.hidden?5000:1000" in html
+    assert "document.hidden?15000:3000" in html
+    assert "version<=lastServerVersion" in html
     assert "function watchState()" in html
     assert "/api/state-version?after=" in html
     assert "setInterval(refreshDetails,10000)" in html

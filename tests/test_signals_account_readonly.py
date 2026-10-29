@@ -199,7 +199,7 @@ def test_restart_preserves_selection_but_requires_fresh_account_and_quotes(tmp_p
     q["quotes"]["up"].update(bid=0.60, ask=0.62)
     exit_guidance = account_guidance(h, restored, q, {}, NOW, defaults, True)
     assert exit_guidance["guidance"] == "CONSIDER EXIT"
-    assert exit_guidance["exit_trigger"] == "TARGET"
+    assert exit_guidance["exit_trigger"] == "TARGET_WITHOUT_FORECAST_SUPPORT"
     assert (
         AccountJournal(path).snapshot()["holdings"][0]["status"] == "OPEN"
     )  # Guidance never closes holdings.
@@ -221,6 +221,63 @@ def test_confirmed_account_holding_does_not_inherit_one_minute_scalp_timeout(tmp
     assert result["guidance"] == "HOLD"
     assert result["exit_trigger"] is None
     assert "maximum holding time" not in result["reason"]
+
+
+def _forecast_state(ticker, at, up, bounds):
+    return {
+        "stale": False,
+        "market": {"ticker": ticker},
+        "prediction_engine": {
+            "status": "EXPERIMENTAL",
+            "ticker": ticker,
+            "up": up,
+            "down": 1 - up,
+            "updated_at": at.isoformat(),
+        },
+        "model": {"settlement_probability_sensitivity": bounds},
+    }
+
+
+def test_profit_target_holds_while_conservative_fresh_forecast_supports_side(tmp_path):
+    store = AccountJournal(tmp_path / "supported-hold.db")
+    store.reconcile(snap())
+    account = store.snapshot()
+    holding = account["holdings"][0]
+    quote = deepcopy(frame()["markets"][0])
+    quote["quotes"]["up"].update(bid=0.60, ask=0.62)
+    defaults = {"target": 0.05, "stop": 0.10, "horizon": 60, "slippage": 0.01}
+    state = _forecast_state(holding["ticker"], NOW, 0.72, [0.62, 0.80])
+
+    result = account_guidance(holding, account, quote, state, NOW, defaults, True)
+
+    assert result["guidance"] == "HOLD"
+    assert result["forecast_assessment"] == "ROBUST_SUPPORT"
+    assert result["exit_trigger"] is None
+    assert "still support" in result["reason"]
+
+
+def test_forecast_exit_requires_persistent_adverse_updates(tmp_path):
+    from src.signals_display.monitor import Journal
+    from src.signals_display.server import Monitor
+
+    monitor = Monitor(None, Journal(tmp_path / "signals.db"), account_store=tmp_path / "account.db")
+    monitor.account_client = object()
+    monitor.account_connected = True
+    monitor.account_journal.reconcile(snap())
+    monitor.account_journal.select(1, True)
+    quote = deepcopy(frame()["markets"][0])
+    monitor.manual_quotes["KXBTC15M-MOCK"] = quote
+
+    guidance = []
+    for seconds in (0, 1, 2):
+        at = NOW + timedelta(seconds=seconds)
+        quote["observed_at"] = at.isoformat()
+        state = _forecast_state("KXBTC15M-MOCK", at, 0.30, [0.20, 0.40])
+        guidance.append(monitor.account_view(state, at)["guidance"][0])
+
+    assert [item["guidance"] for item in guidance] == ["HOLD", "HOLD", "CONSIDER EXIT"]
+    assert guidance[-1]["exit_trigger"] == "FORECAST_DETERIORATION"
+    assert guidance[-1]["forecast_confirmation"] is True
 
 
 def test_missing_limits_and_a_losing_position_never_trigger_adding(tmp_path):

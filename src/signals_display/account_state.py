@@ -621,6 +621,9 @@ def account_guidance(holding, account, quote, state, now, defaults, fresh_reconc
         "executable_bid": None,
         "estimated_impact_after_costs": None,
         "exit_trigger": None,
+        "forecast_assessment": "UNAVAILABLE",
+        "forecast_probability": None,
+        "forecast_confirmation": None,
         "add_suggestion": None,
     }
     if not fresh_reconciliation:
@@ -653,24 +656,55 @@ def account_guidance(holding, account, quote, state, now, defaults, fresh_reconc
             estimated_exit_fee=exit_fee,
             quote_timestamp=quote["observed_at"],
         )
+        forecast = position_forecast_assessment(holding, state, now)
+        result.update(
+            forecast_assessment=forecast["assessment"],
+            forecast_probability=forecast["probability"],
+            forecast_confirmation=state.get("account_forecast_confirmation", {}).get(
+                str(holding["id"])
+            ),
+        )
         # A confirmed account holding is not automatically a dashboard scalp.
         # Its broker fill time must never inherit the global 60-second scalp
         # horizon. Only a user-recorded manual scalp has an explicit max_hold.
         # Account guidance therefore reacts to cost-adjusted price thresholds;
         # it does not manufacture a time limit the trader never selected.
         unit_impact = impact / qty
-        if unit_impact >= defaults["target"]:
-            result.update(
-                guidance="CONSIDER EXIT",
-                exit_trigger="TARGET",
-                reason="The executable bid after estimated slippage and fees reached the configured profit target. Guidance is not an order or guaranteed fill.",
-            )
-            return result
+        confirmed_adverse = (
+            forecast["assessment"] == "ROBUST_ADVERSE"
+            and bool(result["forecast_confirmation"])
+        )
         if unit_impact <= -defaults["stop"]:
             result.update(
                 guidance="CONSIDER EXIT",
                 exit_trigger="STOP",
-                reason="The executable bid after estimated slippage and fees reached the configured loss threshold. Guidance is not an order or guaranteed fill.",
+                reason="The executable bid after estimated slippage and fees reached the configured loss threshold. This hard risk warning does not wait for an experimental forecast.",
+            )
+            return result
+        if confirmed_adverse and unit_impact >= 0:
+            result.update(
+                guidance="CONSIDER EXIT",
+                exit_trigger="FORECAST_DETERIORATION",
+                reason="Fresh same-contract estimates repeatedly turned against this side while an executable cost-adjusted gain remains. The estimate is experimental; guidance is not an order or guaranteed fill.",
+            )
+            return result
+        if unit_impact >= defaults["target"]:
+            if forecast["assessment"] == "ROBUST_SUPPORT":
+                result.update(
+                    guidance="HOLD",
+                    reason="The configured profit target is reached, but fresh conservative same-contract estimates still support this side. HOLD is experimental and will be reassessed on each new model update.",
+                )
+                return result
+            if forecast["assessment"] == "ROBUST_ADVERSE" and not confirmed_adverse:
+                result.update(
+                    guidance="HOLD",
+                    reason="The profit target is reached and the forecast has started to weaken, but persistence confirmation is still pending; one noisy update cannot trigger an exit alert.",
+                )
+                return result
+            result.update(
+                guidance="CONSIDER EXIT",
+                exit_trigger="TARGET_WITHOUT_FORECAST_SUPPORT",
+                reason="The executable cost-adjusted profit target is reached and no robust fresh forecast supports extending the hold. Guidance is not an order or guaranteed fill.",
             )
             return result
         result["add_suggestion"] = incremental_add(holding, account, quote, state, defaults, now)
@@ -682,6 +716,50 @@ def account_guidance(holding, account, quote, state, now, defaults, fresh_reconc
     except (KeyError, ValueError, TypeError) as exc:
         result["reason"] = str(exc)
     return result
+
+
+def position_forecast_assessment(holding, state, now):
+    """Conservative held-side interpretation; never turns stale estimates into advice."""
+    unavailable = {"assessment": "UNAVAILABLE", "probability": None, "reason": None}
+    try:
+        market = state.get("market") or {}
+        forecast = state.get("prediction_engine") or {}
+        if (
+            state.get("stale", True)
+            or market.get("ticker") != holding["ticker"]
+            or forecast.get("ticker") != holding["ticker"]
+            or forecast.get("status") != "EXPERIMENTAL"
+            or not 0 <= (now - timestamp(forecast["updated_at"])).total_seconds() <= 5
+        ):
+            return unavailable
+        up = number(forecast["up"], 0, 1)
+        bounds = state.get("model", {}).get("settlement_probability_sensitivity")
+        if not bounds or len(bounds) != 2:
+            return unavailable
+        low, high = number(bounds[0], 0, 1), number(bounds[1], 0, 1)
+        if low > high:
+            return unavailable
+        if holding["side"] == "up":
+            probability, conservative, adverse_upper = up, low, high
+        elif holding["side"] == "down":
+            probability, conservative, adverse_upper = 1 - up, 1 - high, 1 - low
+        else:
+            return unavailable
+        assessment = (
+            "ROBUST_SUPPORT" if conservative >= 0.55
+            else "ROBUST_ADVERSE" if adverse_upper <= 0.45
+            else "UNCERTAIN"
+        )
+        return {
+            "assessment": assessment,
+            "probability": probability,
+            "conservative_probability": conservative,
+            "adverse_upper_probability": adverse_upper,
+            "updated_at": forecast["updated_at"],
+            "reason": "Experimental same-contract estimate with sensitivity bounds",
+        }
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return unavailable
 
 
 def incremental_add(holding, account, quote, state, defaults, now):

@@ -34,8 +34,13 @@ def bot_processes(proc_root=Path("/proc")):
         try:
             args = [p for p in (entry / "cmdline").read_bytes().decode().split("\0") if p]
             kind = None
+            port = None
             if "src.signals_display.server" in args:
                 kind = "dashboard-server"
+                try:
+                    port = int(args[args.index("--port") + 1])
+                except (ValueError, IndexError):
+                    port = 8765
             elif any(p.endswith("scripts/start_dashboard.py") for p in args):
                 kind = "dashboard-supervisor"
             if kind:
@@ -44,7 +49,11 @@ def bot_processes(proc_root=Path("/proc")):
                     (line.split(":", 1)[1].strip() for line in status.splitlines() if line.startswith("VmRSS:")),
                     "unavailable",
                 )
-                values.append({"pid": int(entry.name), "kind": kind, "rss": rss})
+                item = {"pid": int(entry.name), "kind": kind, "rss": rss}
+                if port is not None:
+                    item["port"] = port
+                    item["intended_dashboard_port"] = port == 8765
+                values.append(item)
         except (OSError, UnicodeError):
             continue
     return sorted(values, key=lambda item: item["pid"])

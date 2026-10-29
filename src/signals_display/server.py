@@ -15,7 +15,12 @@ from time import perf_counter, monotonic
 import uuid
 
 from .account_readonly import ReadOnlyKalshi, AccountReadError, credential_status
-from .account_state import AccountJournal, account_guidance, live_trade_cards
+from .account_state import (
+    AccountJournal,
+    account_guidance,
+    live_trade_cards,
+    position_forecast_assessment,
+)
 from .scanner import context as scanner_context, qualify as scanner_qualify
 from .decision import assess as trade_decision
 from .market_health import selection_summary, diagnose as diagnose_market
@@ -78,6 +83,7 @@ class Monitor:
         self.startup_diagnostics = {}
         self.account_job = None
         self.account_started = None
+        self.account_forecast_candidates = {}
         self.account_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="account-read-only"
         )
@@ -846,12 +852,46 @@ class Monitor:
             if fresh
             else "Waiting for fresh startup/reconnect reconciliation"
         )
+        confirmations = {}
+        active_holding_ids = set()
+        for holding in account.get("holdings", []):
+            if (
+                holding.get("status") != "OPEN"
+                or not holding.get("selected")
+                or not str(holding.get("ticker", "")).startswith("KXBTC15M-")
+            ):
+                continue
+            identifier = holding["id"]
+            active_holding_ids.add(identifier)
+            assessment = position_forecast_assessment(holding, state, now)
+            if assessment["assessment"] != "ROBUST_ADVERSE":
+                self.account_forecast_candidates.pop(identifier, None)
+                confirmations[str(identifier)] = False
+                continue
+            update_key = assessment.get("updated_at")
+            candidate = self.account_forecast_candidates.get(identifier)
+            if candidate is None:
+                candidate = {"first_at": now, "last_update": None, "updates": 0}
+                self.account_forecast_candidates[identifier] = candidate
+            if update_key and update_key != candidate["last_update"]:
+                candidate["last_update"] = update_key
+                candidate["updates"] += 1
+            confirmations[str(identifier)] = bool(
+                candidate["updates"] >= 3
+                and (now - candidate["first_at"]).total_seconds() >= 2
+            )
+        for identifier in set(self.account_forecast_candidates) - active_holding_ids:
+            self.account_forecast_candidates.pop(identifier, None)
+        guidance_state = {
+            **state,
+            "account_forecast_confirmation": confirmations,
+        }
         account["guidance"] = [
             account_guidance(
                 h,
                 account,
                 self.manual_quotes.get(h["ticker"]),
-                state,
+                guidance_state,
                 now,
                 self.manual_defaults,
                 bool(fresh),
@@ -862,7 +902,7 @@ class Monitor:
         for guidance in account["guidance"]:
             guidance["alert_id"] = self.account_journal.alert(guidance, now)
         account["live_trade_cards"] = live_trade_cards(
-            account, self.manual_quotes, state, now, self.manual_defaults, bool(fresh)
+            account, self.manual_quotes, guidance_state, now, self.manual_defaults, bool(fresh)
         )
         return account
 

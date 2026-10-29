@@ -57,13 +57,16 @@ class Monitor:
         model_registry=None,
         opening_model_artifact=None,
         build_commit="unknown",
+        startup_update=None,
     ):
+        startup_update = startup_update or (lambda _stage, _message: None)
         self.feed, self.journal = feed, journal
         self.build_commit = build_commit
         self.target, self.stop, self.horizon = target, stop, horizon
         self.account_client = account_client
         self.account_candidate = None
         self.account_requested = account_client is not None
+        startup_update("ACCOUNT_STORE", "Opening preserved read-only account-monitoring history")
         self.account_journal = AccountJournal(account_store or journal.path)
         if account_client is not None:
             self.account_journal.bind(
@@ -78,6 +81,7 @@ class Monitor:
         self.account_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="account-read-only"
         )
+        startup_update("MANUAL_JOURNAL", "Opening preserved manual-trade journal")
         self.manual = ManualJournal(journal.path)
         self.manual_quotes = {}
         self.manual_jobs = {}
@@ -93,12 +97,14 @@ class Monitor:
         self.signal_key = None
         self.signal_id = None
         self.models_enabled = models_enabled
+        startup_update("MODEL_METADATA", "Loading validation-selected model metadata")
         self.artifact, self.artifact_status = load_artifact(model_artifact)
         from .opening_models import load_artifact as load_opening_artifact
 
         self.opening_artifact, self.opening_artifact_status = load_opening_artifact(
             opening_model_artifact
         )
+        startup_update("LEARNING_READINESS", "Reading indexed learning and validation summaries")
         self.scalp_criteria = self.journal.scalp_criteria()
         # Small indexed aggregates only. Load before the first contract so a
         # past-only quality guard cannot be bypassed during startup warm-up.
@@ -106,6 +112,7 @@ class Monitor:
         self.readiness_at = utcnow()
         self.estimator = LiveEstimator(manual_delay=manual_delay, slippage=slippage)
         if isinstance(feed, PublicFeed):
+            startup_update("LIVE_HISTORY_RESTORE", "Restoring bounded recent timestamped observations")
             self.estimator.restore(journal.recent_states())
         # Request threads can wait for a new immutable state version without
         # polling or blocking the market-data worker.
@@ -127,6 +134,7 @@ class Monitor:
         self.last_tick = utcnow()
         self.state_version = 0
         self.last_cycle_started = None
+        startup_update("ANALYTICS", "Preparing advanced indicators and background evaluators")
         self.intelligence = MarketIntelligence()
         self.advanced = AdvancedIntelligence()
         self.monitoring_alerts = MonitoringAlerts()
@@ -174,6 +182,7 @@ class Monitor:
                 interval=3600,
                 name="scheduled-scalp-shadow-evaluation",
             )
+        startup_update("MONITOR_READY", "Intelligence monitor initialized")
 
     def prediction_performance(self):
         with self.journal.read() as db:
@@ -1022,6 +1031,9 @@ class Monitor:
             "websocket_last_heartbeat": stream_public.get("last_heartbeat_received_at"),
             "websocket_last_error_type": stream_public.get("last_error"),
             "rest_status": state.get("streaming", {}).get("rest", {}).get("status"),
+            "rest_root_failure": state.get("streaming", {}).get("rest", {}).get(
+                "root_failure"
+            ),
             "prediction_engine_status": state.get("prediction_engine", {}).get("status"),
             "prediction_unavailable_reason": state.get("prediction_engine", {}).get("reason"),
             "opening_status": state.get("prediction_engine", {}).get("initial", {}).get("status"),
@@ -1555,10 +1567,12 @@ def main():
             print(disabled_reason, flush=True)
     startup.update("MARKET_FEEDS", "Preparing independent public market-data workers")
     feed = PublicFeed() if args.mode == "public" else ReplayFeed(args.replay)
-    startup.update("INTELLIGENCE", "Opening preserved journals and loading model metadata")
+    startup.update("SIGNAL_JOURNAL", "Opening preserved signal and learning journal")
+    journal = Journal(args.journal)
+    startup.update("INTELLIGENCE", "Constructing the signals-only intelligence monitor")
     monitor = Monitor(
         feed,
-        Journal(args.journal),
+        journal,
         target=args.target,
         stop=args.stop,
         horizon=args.horizon,
@@ -1573,6 +1587,7 @@ def main():
         model_registry=args.model_registry
         if args.mode == "public" and not args.disable_model and not args.disable_scheduled_learning
         else None,
+        startup_update=startup.update,
     )
     monitor.account_error = disabled_reason
     monitor.account_requested = args.account_readonly
@@ -1696,16 +1711,7 @@ def main():
         if monitor.scheduled_scalp_learning:
             monitor.scheduled_scalp_learning.close()
         if isinstance(feed, PublicFeed):
-            if feed.streams:
-                feed.streams.close()
-            if feed.kalshi_stream:
-                feed.kalshi_stream.close()
-            if feed.hub:
-                feed.hub.close()
-            if feed.candle_pool:
-                feed.candle_pool.shutdown(wait=False, cancel_futures=True)
-            if feed.multi_asset_pool:
-                feed.multi_asset_pool.shutdown(wait=False, cancel_futures=True)
+            feed.close()
 
 
 if __name__ == "__main__":

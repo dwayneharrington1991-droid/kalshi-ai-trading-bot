@@ -384,3 +384,21 @@ def test_proxy_denial_explains_access_without_requesting_credentials(tmp_path):
     state = monitor.snapshot()
     assert any("403" in message for message in state["warnings"])
     assert state["scalp"] == "WAIT"
+
+
+def test_public_feed_reports_proxy_failure_and_bounded_retry_without_stale_refresh():
+    def blocked(*_args, **_kwargs):
+        raise httpx.ProxyError("redacted proxy failure")
+
+    feed = PublicFeed(blocked, multi_venue=False)
+    with pytest.raises(httpx.ProxyError):
+        feed._read(module.COINBASE)
+    failure = feed.transport_diagnostics[-1]
+    assert failure["error_type"] == "ProxyError"
+    assert failure["failure_reason"] == "PROXY_CONNECT_FAILED"
+    assert 0 < failure["retry_after_seconds"] <= 60
+    assert "redacted proxy failure" not in str(failure)
+    assert feed.failure_summary()["reason"] == "PROXY_CONNECT_FAILED"
+    with pytest.raises(ValueError, match="PUBLIC_HTTP_BACKOFF"):
+        feed._read(module.COINBASE)
+    assert feed.failure_summary()["reason"] == "PROXY_CONNECT_FAILED"

@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
+from time import perf_counter
+import httpx
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, build_opener
 
@@ -107,7 +110,56 @@ def capacity():
     return result
 
 
+def market_data_connectivity():
+    """Fixed public GET checks only; never sends credentials or proxy values."""
+    import httpx
+
+    endpoints = {
+        "kalshi_public_markets": (
+            "https://api.elections.kalshi.com/trade-api/v2/markets?"
+            "series_ticker=KXBTC15M&limit=1"
+        ),
+        "coinbase_btc_spot": "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+        "coinbase_btc_candles": (
+            "https://api.coinbase.com/api/v3/brokerage/market/products/"
+            "BTC-USD/candles?granularity=ONE_MINUTE&limit=1"
+        ),
+    }
+    result = {
+        "proxy_environment_present": any(
+            os.environ.get(name)
+            for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+        ),
+        "checks": {},
+    }
+    with httpx.Client(timeout=httpx.Timeout(8, connect=4), follow_redirects=False) as client:
+        for name, url in endpoints.items():
+            started = perf_counter()
+            try:
+                response = client.get(
+                    url, headers={"Accept": "application/json", "Cache-Control": "no-cache"}
+                )
+                result["checks"][name] = {
+                    "status": "OK" if response.status_code == 200 else "HTTP_ERROR",
+                    "http_status": response.status_code,
+                    "content_type": response.headers.get("content-type", "").split(";", 1)[0],
+                    "round_trip_ms": round((perf_counter() - started) * 1000, 2),
+                }
+            except Exception as error:
+                result["checks"][name] = {
+                    "status": "FAILED",
+                    "error_type": type(error).__name__,
+                    "round_trip_ms": round((perf_counter() - started) * 1000, 2),
+                }
+    result["notice"] = (
+        "Public fixed endpoints only; no credentials, account endpoints, orders or transfers. "
+        "Proxy values and response bodies are omitted."
+    )
+    return result
+
+
 def main():
+    check_market_data = "--market-data" in sys.argv[1:]
     report = {
         "branch": git_value("branch", "--show-current"),
         "commit": git_value("rev-parse", "HEAD"),
@@ -128,6 +180,12 @@ def main():
         ],
         "security": "Diagnostic performs local reads only; no API or trading request is made.",
     }
+    if check_market_data:
+        report["market_data_connectivity"] = market_data_connectivity()
+        report["security"] = (
+            "Diagnostic performs local reads plus fixed unauthenticated public market-data GETs; "
+            "no account or trading request is made."
+        )
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

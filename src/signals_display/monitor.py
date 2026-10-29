@@ -39,7 +39,19 @@ class PublicFeed:
     """Only fixed public market-data GETs; never reads trading credentials."""
 
     def __init__(self, get=None, multi_venue=None):
-        self.get = get or httpx.get
+        # Reuse bounded TLS connections across the one-second metadata loop and
+        # background candle/discovery workers. httpx.Client is thread-safe; a
+        # fresh client per request caused needless handshakes and proxy churn.
+        self.client = (
+            httpx.Client(
+                timeout=httpx.Timeout(10, connect=4),
+                follow_redirects=False,
+                limits=httpx.Limits(max_connections=12, max_keepalive_connections=6),
+            )
+            if get is None
+            else None
+        )
+        self.get = get or self.client.get
         self.transport_diagnostics = []
         self.candle_cache = None
         self.candles_checked = None
@@ -84,6 +96,21 @@ class PublicFeed:
         if self.candle_pool is not None:
             self.sampled_candles(utcnow())
 
+    def close(self):
+        """Release public transports/workers without touching persisted state."""
+        if self.streams:
+            self.streams.close()
+        if self.kalshi_stream:
+            self.kalshi_stream.close()
+        if self.hub:
+            self.hub.close()
+        if self.candle_pool:
+            self.candle_pool.shutdown(wait=False, cancel_futures=True)
+        if self.multi_asset_pool:
+            self.multi_asset_pool.shutdown(wait=False, cancel_futures=True)
+        if self.client:
+            self.client.close()
+
     def _read(self, url):
         started = perf_counter()
         diagnostic = {
@@ -94,6 +121,8 @@ class PublicFeed:
             retry = self.http_backoff.get(diagnostic["endpoint"], {})
             if monotonic() < retry.get("until", 0):
                 diagnostic["retry_after_seconds"] = round(retry["until"] - monotonic(), 2)
+                diagnostic["failure_reason"] = "PUBLIC_HTTP_BACKOFF"
+                diagnostic["root_failure"] = retry.get("root_failure")
                 raise ValueError("PUBLIC_HTTP_BACKOFF: waiting for provider retry interval")
             response = self.get(
                 url,
@@ -146,6 +175,18 @@ class PublicFeed:
         except Exception as exc:
             diagnostic["status"] = "FAILED"
             diagnostic["error_type"] = type(exc).__name__
+            failure_reason = (
+                "PROXY_CONNECT_FAILED"
+                if isinstance(exc, httpx.ProxyError)
+                else "CONNECT_TIMEOUT"
+                if isinstance(exc, httpx.ConnectTimeout)
+                else "READ_TIMEOUT"
+                if isinstance(exc, httpx.ReadTimeout)
+                else "DNS_OR_TCP_CONNECT_FAILED"
+                if isinstance(exc, httpx.ConnectError)
+                else diagnostic.get("failure_reason") or "PUBLIC_RESPONSE_REJECTED"
+            )
+            diagnostic["failure_reason"] = failure_reason
             if isinstance(exc, httpx.TransportError):
                 previous = self.http_backoff.get(diagnostic["endpoint"], {})
                 attempts = previous.get("attempts", 0) + 1
@@ -153,6 +194,7 @@ class PublicFeed:
                 self.http_backoff[diagnostic["endpoint"]] = {
                     "until": monotonic() + delay,
                     "attempts": attempts,
+                    "root_failure": failure_reason,
                 }
                 diagnostic["retry_after_seconds"] = delay
             raise
@@ -163,6 +205,21 @@ class PublicFeed:
             )
             self.transport_diagnostics.append(diagnostic)
             self.transport_diagnostics = self.transport_diagnostics[-20:]
+
+    def failure_summary(self):
+        """Latest root transport failure, excluding intentional retry waits."""
+        for item in reversed(self.transport_diagnostics):
+            if item.get("status") != "FAILED":
+                continue
+            root = item.get("root_failure") or item.get("failure_reason")
+            if root and root != "PUBLIC_HTTP_BACKOFF":
+                return {
+                    "endpoint": item.get("endpoint"),
+                    "reason": root,
+                    "error_type": item.get("error_type"),
+                    "observed_at": item.get("received_at"),
+                }
+        return None
 
     def sampled_candles(self, now):
         if self.candle_pool is None:
@@ -533,6 +590,7 @@ class PublicFeed:
         diagnostics["rest"] = {
             "status": "FAILED" if payload.get("rest_poll_failed") else "CONNECTED",
             "error_type": payload.get("rest_error_type"),
+            "root_failure": self.failure_summary(),
             "note": "REST fallback never advances a cached quote timestamp",
         }
         if self.streams is not None:

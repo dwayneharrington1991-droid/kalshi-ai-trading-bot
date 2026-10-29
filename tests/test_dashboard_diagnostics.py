@@ -19,6 +19,7 @@ def test_report_prints_only_credential_presence(monkeypatch, capsys):
     monkeypatch.setattr(diagnostics, "git_value", lambda *args: "test")
     monkeypatch.setattr(diagnostics, "bot_processes", lambda: [])
     monkeypatch.setattr(diagnostics, "health", lambda: {"reachable": False})
+    monkeypatch.setattr(diagnostics, "port_status", lambda: {"port": 8765, "listening": False})
     monkeypatch.setattr(diagnostics, "capacity", lambda: {})
     monkeypatch.setattr(
         diagnostics, "database_status", lambda path: {"path": path, "exists": False}

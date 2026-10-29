@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from src.signals_display.monitor import Journal, analyze
+from src.signals_display.monitor import Journal, PublicFeed, analyze, utcnow
 from src.signals_display.runtime import CachedReport, LatestPayload
 from src.signals_display.server import Monitor, StartupStatus, make_handler, make_startup_handler
 from tests.test_signals_display import NOW
@@ -126,6 +126,48 @@ def test_market_mailbox_coalesces_old_frames_without_a_backlog():
     sequence, frame = box.get(0)
     assert sequence == 100 and frame == {"tick": 99}
     assert box.get(sequence, timeout=0) == (100, None)
+
+
+def test_dead_public_collector_is_unhealthy_even_when_prediction_state_still_ticks(tmp_path):
+    monitor = Monitor(
+        PublicFeed(lambda *_args, **_kwargs: None, multi_venue=False),
+        Journal(tmp_path / "worker.db"),
+    )
+
+    class Worker:
+        def __init__(self, alive): self.alive = alive
+        def is_alive(self): return self.alive
+
+    collector, prediction = Worker(True), Worker(True)
+    monitor.worker_threads.update(collector=collector, prediction=prediction)
+    monitor.worker_event("collector", "started")
+    monitor.worker_event("collector", "completed")
+    monitor.worker_event("prediction", "started")
+    monitor.worker_event("prediction", "completed")
+    assert monitor.workers_health()["healthy"] is True
+
+    collector.alive = False
+    health = monitor.workers_health()
+    assert health["healthy"] is False
+    assert health["workers"]["prediction"]["thread_alive"] is True
+    assert "collector worker is not alive" in health["reasons"]
+
+    monitor.state_version = 1
+    monitor.last_tick = utcnow()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        with pytest.raises(HTTPError) as captured:
+            urlopen(f"http://127.0.0.1:{server.server_port}/healthz", timeout=2)
+        assert captured.value.code == 503
+        payload = json.load(captured.value)
+        assert payload["status"] == "UNHEALTHY"
+        assert payload["workers"]["healthy"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
 
 
 def test_state_version_wait_wakes_immediately_without_database_or_model_work(tmp_path):

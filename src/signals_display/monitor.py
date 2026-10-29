@@ -81,6 +81,16 @@ class PublicFeed:
             "last_success_at": None, "error_type": None,
             "markets_scanned": 0, "compatible_markets": 0,
         }
+        self.series_cache = None
+        self.series_cached_at = None
+        self.book_cache = {}
+        self.book_job = None
+        self.book_job_ticker = None
+        self.book_started = None
+        self.book_pool = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="public-kalshi-depth")
+            if get is None else None
+        )
         self.kalshi_stream = None
         self.streams = None
         self.http_backoff = {}
@@ -108,6 +118,8 @@ class PublicFeed:
             self.candle_pool.shutdown(wait=False, cancel_futures=True)
         if self.multi_asset_pool:
             self.multi_asset_pool.shutdown(wait=False, cancel_futures=True)
+        if self.book_pool:
+            self.book_pool.shutdown(wait=False, cancel_futures=True)
         if self.client:
             self.client.close()
 
@@ -307,6 +319,75 @@ class PublicFeed:
                 "down": dict(bid=n[0], ask=1 - y[0], bid_size=n[1], ask_size=y[1]),
             },
         )
+
+    def series_metadata(self, now):
+        """Cache static series rules/fees away from the one-second quote loop."""
+        # Series settlement rules and fee metadata are static for the process
+        # lifetime. A restart obtains them again; an hourly synchronous refresh
+        # used to create an avoidable live-update stall when the endpoint slowed.
+        if self.series_cache is not None:
+            return self.series_cache
+        series = self._read(KALSHI + "/series/KXBTC15M")["series"]
+        self.series_cache = series
+        self.series_cached_at = now
+        return series
+
+    def _load_orderbook(self, ticker):
+        book = self._read(
+            KALSHI + "/markets/" + quote(ticker, safe="") + "/orderbook"
+        )
+        if "orderbook_fp" in book:
+            fixed = book["orderbook_fp"]
+            yes = [
+                (number(float(p), 0, 1), number(float(q), 0, 1e12))
+                for p, q in fixed.get("yes_dollars", [])
+            ]
+            no = [
+                (number(float(p), 0, 1), number(float(q), 0, 1e12))
+                for p, q in fixed.get("no_dollars", [])
+            ]
+        else:
+            legacy = book.get("orderbook", {})
+            yes = [
+                (number(p, 0, 100) / 100, number(q, 0, 1e12))
+                for p, q in (legacy.get("yes") or [])
+            ]
+            no = [
+                (number(p, 0, 100) / 100, number(q, 0, 1e12))
+                for p, q in (legacy.get("no") or [])
+            ]
+        return {
+            "ticker": ticker,
+            "observed_at": utcnow().isoformat(),
+            "yes": [level for level in yes if level[1] > 0],
+            "no": [level for level in no if level[1] > 0],
+        }
+
+    def sampled_orderbook(self, ticker, now):
+        """Refresh depth in the background so it cannot block settlement updates."""
+        if self.book_pool is None:
+            return self._load_orderbook(ticker)
+        if self.book_job is not None and self.book_job.done():
+            try:
+                value = self.book_job.result()
+                self.book_cache[value["ticker"]] = value
+            except Exception as exc:
+                self.book_cache[ticker] = {
+                    "ticker": ticker, "observed_at": None, "yes": [], "no": [],
+                    "error_type": type(exc).__name__,
+                }
+            self.book_job = None
+            self.book_job_ticker = None
+        cached = self.book_cache.get(ticker)
+        if self.book_job is None and (
+            self.book_started is None
+            or (now - self.book_started).total_seconds() >= 1
+            or self.book_job_ticker != ticker
+        ):
+            self.book_started = now
+            self.book_job_ticker = ticker
+            self.book_job = self.book_pool.submit(self._load_orderbook, ticker)
+        return cached
 
     def candles(self, now):
         self.candle_diagnostics["last_attempt_at"] = now.isoformat()
@@ -656,7 +737,7 @@ class PublicFeed:
             seen.add(cursor)
         else:
             raise ValueError("Incomplete market discovery; refusing partial selection")
-        series = self._read(KALSHI + "/series/KXBTC15M")["series"]
+        series = self.series_metadata(utcnow())
         self.last_series = series
         now = utcnow()
         result = []
@@ -748,33 +829,11 @@ class PublicFeed:
                 "book_diagnostic"
             ] = "MISSING_DEPTH: public orderbook has an empty side or unsupported schema"
             try:
-                book = self._read(
-                    KALSHI + "/markets/" + quote(selected["ticker"], safe="") + "/orderbook"
-                )
-                if "orderbook_fp" in book:
-                    fixed = book["orderbook_fp"]
-                    yes = [
-                        (number(float(p), 0, 1), number(float(q), 0, 1e12))
-                        for p, q in fixed.get("yes_dollars", [])
-                    ]
-                    no = [
-                        (number(float(p), 0, 1), number(float(q), 0, 1e12))
-                        for p, q in fixed.get("no_dollars", [])
-                    ]
-                else:
-                    legacy = book.get("orderbook", {})
-                    yes = [
-                        (number(p, 0, 100) / 100, number(q, 0, 1e12))
-                        for p, q in (legacy.get("yes") or [])
-                    ]
-                    no = [
-                        (number(p, 0, 100) / 100, number(q, 0, 1e12))
-                        for p, q in (legacy.get("no") or [])
-                    ]
-                yes = [level for level in yes if level[1] > 0]
-                no = [level for level in no if level[1] > 0]
+                book = self.sampled_orderbook(selected["ticker"], now)
+                yes = (book or {}).get("yes", [])
+                no = (book or {}).get("no", [])
                 if yes or no:
-                    selected["observed_at"] = utcnow().isoformat()
+                    selected["depth_observed_at"] = book["observed_at"]
                     quotes = {side: dict(values) for side, values in selected["quotes"].items()}
                     if yes:
                         y = max(yes)
@@ -793,7 +852,13 @@ class PublicFeed:
                         "PARTIAL_YES_BIDS: NO bid depth provides executable UP asks; DOWN asks/exit depth remain unavailable"
                     )
                 else:
-                    selected["book_diagnostic"] = "NO_LIQUIDITY: public orderbook contains no positive YES or NO bid levels"
+                    selected["book_diagnostic"] = (
+                        "DEPTH_WARMING_UP: settlement forecast continues while executable depth loads"
+                        if book is None else
+                        "MISSING_DEPTH: public orderbook refresh failed; settlement forecast continues"
+                        if book.get("error_type") else
+                        "NO_LIQUIDITY: public orderbook contains no positive YES or NO bid levels"
+                    )
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 selected["book_diagnostic"] = (

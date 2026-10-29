@@ -24,6 +24,7 @@ SUPERVISOR_LOG = ROOT / "logs/signals-dashboard-supervisor.log"
 UNRESPONSIVE_GRACE_SECONDS = 15
 UNRESPONSIVE_CHECKS_BEFORE_RESTART = 2
 CHILD_STOP_TIMEOUT_SECONDS = 5
+SUPERVISOR_CHECK_INTERVAL_SECONDS = 2
 
 
 def supervisor_event(message, path=SUPERVISOR_LOG):
@@ -323,7 +324,10 @@ def supervise(
                         supervisor_event("child unresponsive; safe restart requested")
                         stop_child(child)
                         break
-                time.sleep(5)
+                # Local health checks are cheap. A five-second interval made a
+                # healthy one-click launch wait at least five seconds before
+                # opening the browser and slowed stalled-child detection.
+                time.sleep(SUPERVISOR_CHECK_INTERVAL_SECONDS)
             if stopping:
                 stop_child(child)
                 return 0

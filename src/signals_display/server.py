@@ -1237,11 +1237,17 @@ def make_handler(monitor):
                     value["model"] = {
                         k: v
                         for k, v in value.get("model", {}).items()
-                        if k
-                        not in {"coverage", "scanner", "candidate_features", "market_intelligence"}
+                        if k in {"version", "enabled", "validated", "overall_reason", "scalp_reason"}
+                    }
+                    value["scalping_monitor"] = {
+                        k: v for k, v in value.get("scalping_monitor", {}).items()
+                        if k not in {"blockers", "checks"}
                     }
                     value.pop("coverage", None)
                     value.pop("advanced_intelligence", None)
+                    value.pop("connection_diagnostics", None)
+                    value.pop("streaming", None)
+                    value.pop("transport_diagnostics", None)
                 elif route == "/api/details" and value.get("advanced_intelligence"):
                     value["advanced_intelligence"] = attach_reliability(
                         value["advanced_intelligence"], monitor.engine_report.get()

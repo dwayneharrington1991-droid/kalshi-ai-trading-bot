@@ -177,6 +177,49 @@ def test_public_pagination_ambiguity_fails_closed():
         PublicFeed(lambda *a, **k: response).poll()
 
 
+def test_static_series_metadata_is_cached_outside_fast_quote_loop(monkeypatch):
+    calls = []
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        return httpx.Response(
+            200,
+            json={"series": {"fee_type": "quadratic", "fee_multiplier": 1}},
+            request=httpx.Request("GET", url),
+        )
+
+    feed = PublicFeed(get, multi_venue=False)
+    assert feed.series_metadata(NOW) == feed.series_metadata(NOW + timedelta(seconds=30))
+    assert calls == [module.KALSHI + "/series/KXBTC15M"]
+
+
+def test_live_depth_refresh_is_background_and_bounded():
+    from concurrent.futures import ThreadPoolExecutor
+
+    def get(url, **_kwargs):
+        return httpx.Response(
+            200,
+            json={
+                "orderbook_fp": {
+                    "yes_dollars": [["0.48", "12"]],
+                    "no_dollars": [["0.47", "14"]],
+                }
+            },
+            request=httpx.Request("GET", url),
+        )
+
+    feed = PublicFeed(get, multi_venue=False)
+    feed.book_pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        assert feed.sampled_orderbook("KXBTC15M-MOCK", NOW) is None
+        feed.book_job.result(timeout=1)
+        cached = feed.sampled_orderbook("KXBTC15M-MOCK", NOW + timedelta(seconds=1))
+        assert cached["yes"] == [(0.48, 12.0)]
+        assert cached["no"] == [(0.47, 14.0)]
+    finally:
+        feed.close()
+
+
 def test_enriched_cached_rest_payload_advances_processing_clock_for_new_stream_receipts():
     feed = PublicFeed(lambda *_args, **_kwargs: None, multi_venue=False)
     cached = frame()

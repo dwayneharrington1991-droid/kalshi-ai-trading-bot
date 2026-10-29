@@ -246,6 +246,9 @@ def test_fast_main_state_and_pagination_during_blocked_research(tmp_path):
         data = get("/api/state?view=main")
         assert perf_counter() - timer < 1
         assert "coverage" not in data["model"] and data["market"]
+        assert "connection_diagnostics" not in data and "streaming" not in data
+        assert "blockers" not in data["scalping_monitor"]
+        assert "checks" not in data["scalping_monitor"]
         assert len(json.dumps(data)) < 30000
         assert get("/api/history-page?limit=20")["pagination"]["limit"] == 20
         assert len(json.dumps(get("/api/state?view=details"))) > 150000

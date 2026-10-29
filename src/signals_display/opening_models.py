@@ -25,72 +25,125 @@ PROTOCOL = "opening-frozen-linear-ensemble-stumps-shadow-v1"
 FEATURE_VERSION = "opening-asof-features-v1"
 
 
+def _opening_rows(db, asof):
+    return db.execute(
+        """SELECT o.ticker,b.generated_at,b.cutoff,b.closes_at,b.up,b.payload,
+          o.observed_at,o.outcome FROM forecast_outcomes o
+          LEFT JOIN btc_engine_opening b ON b.ticker=o.ticker
+            AND b.mode='PUBLIC MARKET DATA'
+          WHERE o.origin='official' AND julianday(o.observed_at)<=julianday(?)
+          ORDER BY o.observed_at,o.ticker""",
+        (asof.isoformat(),),
+    )
+
+
+def _assess_opening(raw, asof):
+    """Return an eligible row or one explicit, non-overlapping exclusion reason."""
+    if raw[5] is None:
+        return None, "NO_FROZEN_OPENING_RECORD"
+    if raw[4] is None or not isinstance(raw[4], (int, float)) or not 0 <= raw[4] <= 1:
+        return None, "OPENING_PROBABILITY_UNAVAILABLE"
+    try:
+        opening = json.loads(raw[5])
+        frozen = opening["frozen_features"]
+        opened = timestamp(opening["opens_at"])
+        closed = timestamp(raw[3])
+        generated = timestamp(raw[1])
+        cutoff = timestamp(raw[2])
+        observed = timestamp(raw[6])
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, json.JSONDecodeError):
+        return None, "INVALID_OR_INCOMPLETE_FROZEN_PAYLOAD"
+    if frozen.get("version") != FEATURE_VERSION:
+        return None, "INCOMPATIBLE_FEATURE_VERSION"
+    if raw[7] not in (0, 1):
+        return None, "INVALID_OFFICIAL_OUTCOME"
+    if not opened <= generated < closed <= observed <= asof:
+        return None, "INVALID_PREDICTION_LABEL_CHRONOLOGY"
+    try:
+        if cutoff != opened or timestamp(frozen.get("cutoff")) != cutoff:
+            return None, "CUTOFF_DOES_NOT_EQUAL_MARKET_OPEN"
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        return None, "INVALID_OR_INCOMPLETE_FROZEN_PAYLOAD"
+    try:
+        if timestamp(frozen["max_input_received_at"]) > cutoff:
+            return None, "POST_OPENING_INPUT_DETECTED"
+        if timestamp(opening["data_cutoff"]) != cutoff:
+            return None, "PAYLOAD_CUTOFF_MISMATCH"
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return None, "INVALID_OR_INCOMPLETE_FROZEN_PAYLOAD"
+    if (
+        opening.get("up") != raw[4]
+        or opening.get("generated_at") != raw[1]
+        or opening.get("closes_at") != raw[3]
+    ):
+        return None, "DATABASE_PAYLOAD_MISMATCH"
+    if not 60 <= (closed - opened).total_seconds() <= 900:
+        return None, "UNSUPPORTED_CONTRACT_DURATION"
+    if not _source_receipts_valid(frozen.get("sources", {}), cutoff):
+        return None, "SOURCE_RECEIPT_AFTER_OPEN"
+    try:
+        features = {
+            name: float(value)
+            for name, value in frozen["values"].items()
+            if name in FEATURES and type(value) in (int, float) and math.isfinite(value)
+        }
+    except (TypeError, KeyError, AttributeError):
+        return None, "INVALID_OR_INCOMPLETE_FROZEN_PAYLOAD"
+    if features.get("distance_scaled") is None or features.get("return_1m") is None:
+        return None, "REQUIRED_OPENING_FEATURES_MISSING"
+    try:
+        baseline = float(opening.get("baseline_probability_up", raw[4]))
+    except (ValueError, TypeError):
+        return None, "INVALID_BASELINE_PROBABILITY"
+    if not math.isfinite(baseline) or not 0 <= baseline <= 1:
+        return None, "INVALID_BASELINE_PROBABILITY"
+    return dict(
+        ticker=raw[0], timestamp=generated.isoformat(), opens_at=opened.isoformat(),
+        closes_at=closed.isoformat(), label_available_at=observed.isoformat(),
+        features=features, outcome=int(raw[7]), baseline=baseline, market=None,
+        remaining=(closed - opened).total_seconds(),
+        opening_delay_seconds=(generated - opened).total_seconds(),
+        regime=opening.get("regime", "unavailable"),
+    ), "ELIGIBLE"
+
+
+def dataset_coverage(db, asof=None):
+    """Explain every official outcome's opening-training eligibility.
+
+    Historical inputs are never reconstructed. Missing frozen opening evidence
+    is irrecoverable for training because later data would introduce leakage.
+    """
+    asof = asof or datetime.now(timezone.utc)
+    counts = {}
+    eligible = []
+    for raw in _opening_rows(db, asof):
+        row, reason = _assess_opening(raw, asof)
+        counts[reason] = counts.get(reason, 0) + 1
+        if row is not None:
+            eligible.append(row)
+    total = sum(counts.values())
+    return {
+        "official_settled_contracts": total,
+        "eligible_frozen_openings": len(eligible),
+        "excluded_contracts": total - len(eligible),
+        "exclusion_reasons": {k: v for k, v in sorted(counts.items()) if k != "ELIGIBLE"},
+        "eligibility_rate": len(eligible) / total if total else None,
+        "safe_historical_repairs_applied": 0,
+        "repair_policy": "No missing opening features are backfilled from later observations. Only opening-time receipt-proven snapshots may train the opening model.",
+        "minimum_for_first_shadow_evaluation": MIN_CONTRACTS,
+        "remaining_to_first_shadow_evaluation": max(0, MIN_CONTRACTS - len(eligible)),
+        "edge_status": "edge unverified",
+    }
+
+
 def dataset(db, asof=None):
     """Small immutable opening records joined to observed official outcomes only."""
     asof = asof or datetime.now(timezone.utc)
     rows = []
-    query = db.execute(
-        """SELECT b.ticker,b.generated_at,b.cutoff,b.closes_at,b.up,b.payload,
-          o.observed_at,o.outcome FROM btc_engine_opening b
-          JOIN forecast_outcomes o ON o.ticker=b.ticker AND o.origin='official'
-          WHERE b.mode='PUBLIC MARKET DATA' AND b.up BETWEEN 0 AND 1
-            AND julianday(o.observed_at)<=julianday(?)
-          ORDER BY b.generated_at,b.ticker""",
-        (asof.isoformat(),),
-    )
-    for raw in query:
-        try:
-            opening = json.loads(raw[5])
-            frozen = opening["frozen_features"]
-            opened = timestamp(opening["opens_at"])
-            closed = timestamp(raw[3])
-            generated = timestamp(raw[1])
-            cutoff = timestamp(raw[2])
-            observed = timestamp(raw[6])
-            if (
-                frozen.get("version") != FEATURE_VERSION
-                or not opened <= generated < closed <= observed <= asof
-                or cutoff != opened
-                or timestamp(frozen["cutoff"]) != cutoff
-                or timestamp(frozen["max_input_received_at"]) > cutoff
-                or timestamp(opening["data_cutoff"]) != cutoff
-                or opening.get("up") != raw[4]
-                or opening.get("generated_at") != raw[1]
-                or opening.get("closes_at") != raw[3]
-                or raw[7] not in (0, 1)
-                or not 60 <= (closed - opened).total_seconds() <= 900
-            ):
-                continue
-            features = {
-                name: float(value)
-                for name, value in frozen["values"].items()
-                if name in FEATURES and type(value) in (int, float) and math.isfinite(value)
-            }
-            if not _source_receipts_valid(frozen.get("sources", {}), cutoff):
-                continue
-            if features.get("distance_scaled") is None or features.get("return_1m") is None:
-                continue
-            baseline = float(opening.get("baseline_probability_up", raw[4]))
-            if not math.isfinite(baseline) or not 0 <= baseline <= 1:
-                continue
-            rows.append(
-                dict(
-                    ticker=raw[0],
-                    timestamp=generated.isoformat(),
-                    opens_at=opened.isoformat(),
-                    closes_at=closed.isoformat(),
-                    label_available_at=observed.isoformat(),
-                    features=features,
-                    outcome=int(raw[7]),
-                    baseline=baseline,
-                    market=None,
-                    remaining=(closed - opened).total_seconds(),
-                    opening_delay_seconds=(generated - opened).total_seconds(),
-                    regime=opening.get("regime", "unavailable"),
-                )
-            )
-        except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
-            continue
+    for raw in _opening_rows(db, asof):
+        row, _reason = _assess_opening(raw, asof)
+        if row is not None:
+            rows.append(row)
     return rows
 
 

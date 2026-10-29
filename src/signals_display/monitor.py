@@ -1811,6 +1811,9 @@ class Journal:
                 WHERE o.mode='PUBLIC MARKET DATA' AND o.up IS NOT NULL
                 ORDER BY o.generated_at"""
             ).fetchall()
+            from .opening_models import dataset_coverage
+
+            opening_coverage = dataset_coverage(db)
         opening_mistakes = sum(
             json.loads(row[0]).get("opening", {}).get("correct") is False for row in reviews
         )
@@ -1843,14 +1846,21 @@ class Journal:
         }
         return {
             "official_contracts": count,
-            "official_featured_contracts": None,
+            "official_featured_contracts": opening_coverage["eligible_frozen_openings"],
             "minimum_contracts": 170,
             "contract_reviews": len(reviews),
             "opening_mistakes_recorded": opening_mistakes,
             "dense_snapshot_interval_seconds": 1,
             "multi_asset_opening_learning": multi_asset,
             "opening_forward_accuracy": opening_accuracy,
-            "reason": f"{count}/170 official outcomes before further feature/chronological eligibility checks. Feature eligibility is checked offline, not by rescanning the full journal each minute. Minimum count is not evidence of skill.",
+            "opening_training_coverage": opening_coverage,
+            "reason": (
+                f"{count} official outcomes recorded; "
+                f"{opening_coverage['eligible_frozen_openings']}/170 have receipt-proven frozen "
+                "opening features and are eligible for the first shadow evaluation. "
+                "Missing historical features are not reconstructed from later data. "
+                "Minimum count is not evidence of skill."
+            ),
         }
 
     def opening_inputs(self, opened):

@@ -197,6 +197,32 @@ def test_opening_dataset_uses_only_frozen_feature_records_and_official_outcomes(
             )
     with journal.read() as db:
         assert len(opening_models.dataset(db, NOW + timedelta(minutes=17))) == 1
+        coverage = opening_models.dataset_coverage(db, NOW + timedelta(minutes=17))
+    assert coverage["official_settled_contracts"] == 3
+    assert coverage["eligible_frozen_openings"] == 1
+    assert coverage["exclusion_reasons"] == {
+        "INVALID_OR_INCOMPLETE_FROZEN_PAYLOAD": 1,
+        "POST_OPENING_INPUT_DETECTED": 1,
+    }
+    assert coverage["safe_historical_repairs_applied"] == 0
+    assert "backfilled from later observations" in coverage["repair_policy"]
+
+
+def test_opening_coverage_accounts_for_settlement_without_frozen_opening(tmp_path):
+    from src.signals_display import opening_models
+
+    journal = Journal(tmp_path / "j.db")
+    with journal.connect() as db:
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            ("KXBTC15M-MISSED", "official", NOW.isoformat(), 0),
+        )
+    with journal.read() as db:
+        coverage = opening_models.dataset_coverage(db, NOW + timedelta(seconds=1))
+    assert coverage["official_settled_contracts"] == 1
+    assert coverage["eligible_frozen_openings"] == 0
+    assert coverage["exclusion_reasons"] == {"NO_FROZEN_OPENING_RECORD": 1}
+    assert coverage["remaining_to_first_shadow_evaluation"] == 170
 
 
 def synthetic_rows(n=200):

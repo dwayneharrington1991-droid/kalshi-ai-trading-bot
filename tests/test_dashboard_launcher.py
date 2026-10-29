@@ -60,11 +60,21 @@ def test_tasks_and_port_configuration_are_private_and_idempotent():
     by_name = {task["label"]: task for task in tasks["tasks"]}
     launch = by_name["🚀 OPEN MY BOT"]
     restart = by_name["🔄 RESTART MY BOT"]
-    assert "update_dashboard.py" in launch["command"]
+    assert "start_dashboard.py" in launch["command"]
+    assert "--open-browser" in launch["command"]
     assert "--restart" not in launch["command"]
     assert "update_dashboard.py" in restart["command"]
     assert "--restart" in restart["command"]
     assert launch["runOptions"]["instanceLimit"] == 1
+    debug = json.loads((ROOT / ".vscode/launch.json").read_text())
+    debug_by_name = {item["name"]: item for item in debug["configurations"]}
+    assert debug_by_name["🚀 OPEN MY BOT"]["program"].endswith("scripts/start_dashboard.py")
+    assert debug_by_name["🚀 OPEN MY BOT"]["args"] == [
+        "--private-dashboard", "--open-browser"
+    ]
+    assert debug_by_name["🔄 UPDATE AND RESTART MY BOT"]["program"].endswith(
+        "scripts/update_dashboard.py"
+    )
     config = json.loads((ROOT / ".devcontainer/devcontainer.json").read_text())
     assert 8765 in config["forwardPorts"]
     port = config["portsAttributes"]["8765"]
@@ -159,6 +169,7 @@ def test_dashboard_uses_bounded_adaptive_polling_instead_of_250ms_full_renders()
     assert "scheduleRefresh(backoff)" in html
     assert "document.hidden?15000:3000" in html
     assert "version<=lastServerVersion" in html
+    assert "nextLiveRenderAt=performance.now()+250" in html
     assert "function watchState()" in html
     assert "/api/state-version?after=" in html
     assert "setInterval(refreshDetails,10000)" in html

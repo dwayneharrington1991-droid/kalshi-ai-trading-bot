@@ -533,7 +533,7 @@ def main():
         "--journal",
         "signals_monitor.db",
         "--processing-ms",
-        "250",
+        "100",
         "--stop",
         "0.10",
         "--build-commit",

@@ -1,5 +1,6 @@
 """The one-click updater is fast-forward-only and preserves dirty work."""
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 
@@ -38,6 +39,9 @@ def test_updater_preserves_dirty_work_and_fast_forwards(tmp_path, monkeypatch):
     assert saved in git(checkout, "stash", "list").stdout
 
 
-def test_tasks_use_safe_updater():
-    text = (ROOT / ".vscode/tasks.json").read_text()
-    assert text.count("scripts/update_dashboard.py") == 2
+def test_open_task_reuses_healthy_server_and_restart_task_uses_safe_updater():
+    tasks = json.loads((ROOT / ".vscode/tasks.json").read_text())["tasks"]
+    by_name = {task["label"]: task for task in tasks}
+    assert "start_dashboard.py" in by_name["🚀 OPEN MY BOT"]["command"]
+    assert "--open-browser" in by_name["🚀 OPEN MY BOT"]["command"]
+    assert "update_dashboard.py --restart" in by_name["🔄 RESTART MY BOT"]["command"]

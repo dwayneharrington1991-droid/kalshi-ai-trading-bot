@@ -1,0 +1,26 @@
+{
+    admin off
+}
+
+https://{$TAILSCALE_DNS_NAME} {
+    bind {$TAILSCALE_IP}
+    encode zstd gzip
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+    reverse_proxy 127.0.0.1:8765 {
+        health_uri /healthz
+        health_interval 30s
+        health_timeout 3s
+    }
+    log {
+        output file /var/log/caddy/kalshi-signals-access.log {
+            roll_size 10MiB
+            roll_keep 5
+        }
+        format json
+    }
+}

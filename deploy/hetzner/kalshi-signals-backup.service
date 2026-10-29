@@ -1,0 +1,10 @@
+[Unit]
+Description=Verified online backup of Kalshi signals data
+RequiresMountsFor=/srv/kalshi-backups
+After=kalshi-signals.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/kalshi-signals/app/deploy/hetzner/backup.sh
+Nice=10
+IOSchedulingClass=idle

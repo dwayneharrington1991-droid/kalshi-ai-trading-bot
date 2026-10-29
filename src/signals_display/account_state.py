@@ -620,6 +620,7 @@ def account_guidance(holding, account, quote, state, now, defaults, fresh_reconc
         "timestamp": now.isoformat(),
         "executable_bid": None,
         "estimated_impact_after_costs": None,
+        "exit_trigger": None,
         "add_suggestion": None,
     }
     if not fresh_reconciliation:
@@ -652,13 +653,24 @@ def account_guidance(holding, account, quote, state, now, defaults, fresh_reconc
             estimated_exit_fee=exit_fee,
             quote_timestamp=quote["observed_at"],
         )
-        timed = holding.get("entered_at") and now >= timestamp(holding["entered_at"]) + timedelta(
-            seconds=defaults["horizon"]
-        )
-        if impact / qty >= defaults["target"] or impact / qty <= -defaults["stop"] or timed:
+        # A confirmed account holding is not automatically a dashboard scalp.
+        # Its broker fill time must never inherit the global 60-second scalp
+        # horizon. Only a user-recorded manual scalp has an explicit max_hold.
+        # Account guidance therefore reacts to cost-adjusted price thresholds;
+        # it does not manufacture a time limit the trader never selected.
+        unit_impact = impact / qty
+        if unit_impact >= defaults["target"]:
             result.update(
                 guidance="CONSIDER EXIT",
-                reason="Confirmed-fill target, stop or maximum holding time reached. Guidance is not an order or guaranteed fill.",
+                exit_trigger="TARGET",
+                reason="The executable bid after estimated slippage and fees reached the configured profit target. Guidance is not an order or guaranteed fill.",
+            )
+            return result
+        if unit_impact <= -defaults["stop"]:
+            result.update(
+                guidance="CONSIDER EXIT",
+                exit_trigger="STOP",
+                reason="The executable bid after estimated slippage and fees reached the configured loss threshold. Guidance is not an order or guaranteed fill.",
             )
             return result
         result["add_suggestion"] = incremental_add(holding, account, quote, state, defaults, now)

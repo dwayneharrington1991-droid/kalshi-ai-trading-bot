@@ -197,10 +197,30 @@ def test_restart_preserves_selection_but_requires_fresh_account_and_quotes(tmp_p
     result = account_guidance(h, restored, q, {}, NOW, defaults, True)
     assert result["guidance"] == "HOLD" and result["executable_bid"] == 0.48
     q["quotes"]["up"].update(bid=0.60, ask=0.62)
-    assert account_guidance(h, restored, q, {}, NOW, defaults, True)["guidance"] == "CONSIDER EXIT"
+    exit_guidance = account_guidance(h, restored, q, {}, NOW, defaults, True)
+    assert exit_guidance["guidance"] == "CONSIDER EXIT"
+    assert exit_guidance["exit_trigger"] == "TARGET"
     assert (
         AccountJournal(path).snapshot()["holdings"][0]["status"] == "OPEN"
     )  # Guidance never closes holdings.
+
+
+def test_confirmed_account_holding_does_not_inherit_one_minute_scalp_timeout(tmp_path):
+    store = AccountJournal(tmp_path / "account-hold.db")
+    store.reconcile(snap())
+    account = store.snapshot()
+    holding = account["holdings"][0]
+    later = NOW + timedelta(seconds=61)
+    account["observed_at"] = later.isoformat()
+    quote = deepcopy(frame()["markets"][0])
+    quote["observed_at"] = later.isoformat()
+    defaults = {"target": 0.05, "stop": 0.10, "horizon": 60, "slippage": 0.01}
+
+    result = account_guidance(holding, account, quote, {}, later, defaults, True)
+
+    assert result["guidance"] == "HOLD"
+    assert result["exit_trigger"] is None
+    assert "maximum holding time" not in result["reason"]
 
 
 def test_missing_limits_and_a_losing_position_never_trigger_adding(tmp_path):

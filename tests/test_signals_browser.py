@@ -8,9 +8,36 @@ import pytest
 
 playwright = pytest.importorskip("playwright.sync_api")
 from src.signals_display.monitor import Journal, analyze
-from src.signals_display.server import Monitor, make_handler
+from src.signals_display.server import Monitor, StartupStatus, make_handler, make_startup_handler
 from tests.test_signals_monitor import frame
 from tests.test_signals_display import NOW
+
+
+def test_complete_dashboard_remains_accessible_while_intelligence_initializes():
+    startup = StartupStatus("startup123")
+    startup.update("INTELLIGENCE", "Opening preserved journals")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_startup_handler(startup))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            response = page.goto(f"http://127.0.0.1:{server.server_port}/")
+            assert response.status == 200
+            playwright.expect(page.locator("#freshness")).to_have_text("STALE")
+            playwright.expect(page.locator("#running-build")).to_have_text("startup")
+            assert "Opening preserved journals" in page.locator("#market-health-summary").inner_text()
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path):

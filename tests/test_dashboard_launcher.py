@@ -254,3 +254,28 @@ def test_supervisor_waits_for_sustained_health_before_opening_browser(monkeypatc
         popen=lambda command, **kwargs: Child(),
     ) == 0
     assert opened == [True]
+
+
+def test_supervisor_opens_real_dashboard_shell_while_intelligence_loads(monkeypatch):
+    class Child:
+        returncode = None
+        def poll(self): return self.returncode
+        def send_signal(self, _value): self.returncode = 0
+        def wait(self, timeout=None): return self.returncode
+        def kill(self): self.returncode = -9
+
+    sleeps, opened = 0, []
+    def sleep(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(launcher.time, "sleep", sleep)
+    monkeypatch.setattr(launcher, "dashboard_page_ready", lambda: True)
+    monkeypatch.setattr(launcher, "open_dashboard", lambda: opened.append(True) or True)
+    assert launcher.supervise(
+        ["safe-server"], open_browser=True, health=lambda: False,
+        startup=lambda: True, popen=lambda command, **kwargs: Child(),
+    ) == 0
+    assert opened == [True]

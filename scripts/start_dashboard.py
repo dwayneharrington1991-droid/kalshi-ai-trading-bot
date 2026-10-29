@@ -20,6 +20,21 @@ RUNTIME_PACKAGES = (
     "websockets==16.1.1",
     "cryptography==42.0.0",
 )
+SUPERVISOR_LOG = ROOT / "logs/signals-dashboard-supervisor.log"
+
+
+def supervisor_event(message, path=SUPERVISOR_LOG):
+    """Write bounded credential-free lifecycle diagnostics."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 1_000_000:
+            rotated = path.with_suffix(path.suffix + ".1")
+            rotated.unlink(missing_ok=True)
+            path.replace(rotated)
+        with path.open("a") as stream:
+            stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " " + message + "\n")
+    except OSError:
+        pass
 
 
 def current_commit(root=ROOT):
@@ -253,35 +268,39 @@ def supervise(
     old_term = signal.signal(signal.SIGTERM, requested_stop)
     failures = 0
     opened = False
+    recent_failures = []
     try:
         while not stopping:
+            supervisor_event("starting signals-only dashboard child")
             child = popen(command, cwd=ROOT)
             started = time.monotonic()
             unhealthy = 0
-            consecutive_healthy = 0
+            consecutive_responsive = 0
             while not stopping and child.poll() is None:
                 current_healthy = health()
+                startup_responsive = not current_healthy and startup()
+                current_responsive = current_healthy or startup_responsive
                 if current_healthy:
                     unhealthy = 0
                     failures = 0
-                    consecutive_healthy += 1
-                    # Local bind/health can succeed before the Codespaces port
-                    # forward is ready. Requiring sustained health and the real
-                    # page prevents the common one-click launch into a 502 tab.
+                if current_responsive:
+                    consecutive_responsive += 1
+                    # The bootstrap server serves the complete dashboard shell.
+                    # Two responsive checks plus an HTML request avoid forwarding
+                    # races while allowing the UI to show initialization progress.
                     if (
                         open_browser
                         and not opened
-                        and consecutive_healthy >= 2
+                        and consecutive_responsive >= 2
                         and dashboard_page_ready()
                     ):
                         open_dashboard()
                         opened = True
                 else:
-                    consecutive_healthy = 0
+                    consecutive_responsive = 0
                 # A responsive STARTING endpoint proves the event loop and socket
                 # are alive while a large preserved journal initializes. Bound the
                 # allowance so a permanently stalled initialization still recovers.
-                startup_responsive = not current_healthy and startup()
                 startup_deadline = 300 if startup_responsive else 30
                 if not current_healthy and time.monotonic() - started > startup_deadline:
                     unhealthy += 1
@@ -290,6 +309,7 @@ def supervise(
                             "Dashboard health checks failed repeatedly; restarting safely.",
                             flush=True,
                         )
+                        supervisor_event("child unresponsive; safe restart requested")
                         stop_child(child)
                         break
                 time.sleep(5)
@@ -297,12 +317,25 @@ def supervise(
                 stop_child(child)
                 return 0
             failures += 1
+            now = time.monotonic()
+            recent_failures = [seen for seen in recent_failures if now - seen <= 600]
+            recent_failures.append(now)
+            if len(recent_failures) >= 8:
+                message = (
+                    "Dashboard stopped eight times within ten minutes; automatic restart paused. "
+                    "Run python3 scripts/dashboard_diagnostics.py and inspect "
+                    "logs/signals-dashboard-supervisor.log. No data was deleted."
+                )
+                print(message, flush=True)
+                supervisor_event("restart circuit opened after repeated child failures")
+                return 1
             delay = min(60, 2 ** min(failures, 6))
             print(
                 f"Dashboard stopped unexpectedly; automatic restart in {delay}s "
                 f"(exit {child.poll()}).",
                 flush=True,
             )
+            supervisor_event(f"child stopped; restart scheduled after {delay}s")
             deadline = time.monotonic() + delay
             while not stopping and time.monotonic() < deadline:
                 time.sleep(0.25)

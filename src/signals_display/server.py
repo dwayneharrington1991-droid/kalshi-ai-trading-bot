@@ -141,6 +141,7 @@ class Monitor:
         self.market_strip = MarketStrip()
         self.last_proxy_observation = None
         self.runtime_meter = RuntimeMeter()
+        self.index_maintenance = {"status": "PENDING"}
         self.maintenance_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="settlement-results"
         )
@@ -1044,6 +1045,7 @@ class Monitor:
             "multi_asset_discovery": state.get("multi_asset_discovery", {}),
             "storage": self.journal.storage_health(),
             "runtime_failures": self.runtime_meter.failures(),
+            "journal_index_maintenance": self.index_maintenance,
         }
         state["scalping_monitor"] = diagnose_scalp(
             state, self.scalp_criteria, account=state["account"], now=health_clock
@@ -1062,6 +1064,7 @@ class Monitor:
             "multi_asset_discovery": state.get("multi_asset_discovery", {}),
             "storage": self.journal.storage_health(),
             "runtime_failures": self.runtime_meter.failures(),
+            "journal_index_maintenance": self.index_maintenance,
             "last_poll_completed_at": last_tick.isoformat(),
             "fill_reconciliation": state["account"].get("fill_reconciliation", {}),
             "open_positions": sum(
@@ -1373,6 +1376,12 @@ class StartupStatus:
         with self.lock:
             self.stage, self.message, self.updated_at = stage, message, utcnow()
 
+    def fail(self, stage, exc):
+        # Expose only the exception class.  Exception messages can contain
+        # paths, proxy details, or provider responses and do not belong in the
+        # browser or logs used for support.
+        self.update("FAILED_" + stage, "Initialization failed: " + type(exc).__name__)
+
     def snapshot(self):
         with self.lock:
             return {
@@ -1565,30 +1574,46 @@ def main():
         except AccountReadError as exc:
             disabled_reason = str(exc)
             print(disabled_reason, flush=True)
-    startup.update("MARKET_FEEDS", "Preparing independent public market-data workers")
-    feed = PublicFeed() if args.mode == "public" else ReplayFeed(args.replay)
-    startup.update("SIGNAL_JOURNAL", "Opening preserved signal and learning journal")
-    journal = Journal(args.journal)
-    startup.update("INTELLIGENCE", "Constructing the signals-only intelligence monitor")
-    monitor = Monitor(
-        feed,
-        journal,
-        target=args.target,
-        stop=args.stop,
-        horizon=args.horizon,
-        models_enabled=not args.disable_model,
-        manual_delay=args.manual_delay,
-        slippage=args.slippage,
-        model_artifact=args.model_artifact,
-        account_client=None,
-        account_store=args.account_store,
-        opening_model_artifact=args.opening_model_artifact,
-        build_commit=args.build_commit,
-        model_registry=args.model_registry
-        if args.mode == "public" and not args.disable_model and not args.disable_scheduled_learning
-        else None,
-        startup_update=startup.update,
-    )
+    startup_stage = "MARKET_FEEDS"
+    try:
+        startup.update(startup_stage, "Preparing independent public market-data workers")
+        feed = PublicFeed() if args.mode == "public" else ReplayFeed(args.replay)
+        startup_stage = "SIGNAL_JOURNAL"
+        startup.update(startup_stage, "Opening preserved signal and learning journal")
+        journal = Journal(args.journal)
+        startup_stage = "INTELLIGENCE"
+        startup.update(startup_stage, "Constructing the signals-only intelligence monitor")
+        monitor = Monitor(
+            feed,
+            journal,
+            target=args.target,
+            stop=args.stop,
+            horizon=args.horizon,
+            models_enabled=not args.disable_model,
+            manual_delay=args.manual_delay,
+            slippage=args.slippage,
+            model_artifact=args.model_artifact,
+            account_client=None,
+            account_store=args.account_store,
+            opening_model_artifact=args.opening_model_artifact,
+            build_commit=args.build_commit,
+            model_registry=args.model_registry
+            if args.mode == "public"
+            and not args.disable_model
+            and not args.disable_scheduled_learning
+            else None,
+            startup_update=startup.update,
+        )
+    except Exception as exc:
+        startup.fail(startup_stage, exc)
+        print("Dashboard initialization failed at " + startup_stage + ": " + type(exc).__name__, flush=True)
+        # Leave the diagnostic shell reachable briefly so the launcher and the
+        # user can observe the exact failed stage, then exit for supervisor
+        # recovery.  Never spin forever in STARTING.
+        threading.Event().wait(5)
+        server.shutdown()
+        server.server_close()
+        raise
     monitor.account_error = disabled_reason
     monitor.account_requested = args.account_readonly
     monitor.account_candidate = account_candidate
@@ -1673,6 +1698,16 @@ def main():
                 monitor.tick()
                 stop.wait(args.poll_seconds)
 
+    def maintain_indexes():
+        try:
+            result = journal.ensure_performance_indexes()
+            monitor.index_maintenance = result
+        except Exception as exc:
+            monitor.runtime_meter.error("journal_indexes", type(exc).__name__)
+            monitor.index_maintenance = {
+                "status": "ERROR", "error_type": type(exc).__name__
+            }
+
     server.RequestHandlerClass = make_handler(monitor)
     collector = (
         threading.Thread(target=collect, daemon=True) if isinstance(feed, PublicFeed) else None
@@ -1681,6 +1716,9 @@ def main():
         collector.start()
     thread = threading.Thread(target=poll, daemon=True)
     thread.start()
+    # The first live workers are running before any potentially expensive
+    # index build. SQLite WAL keeps reads/live receipts available meanwhile.
+    threading.Thread(target=maintain_indexes, daemon=True, name="journal-index-maintenance").start()
     print(
         f"Signals-only {args.mode} dashboard on port {server.server_port}; journal: {args.journal}",
         flush=True,

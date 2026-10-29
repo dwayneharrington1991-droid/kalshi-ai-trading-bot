@@ -54,6 +54,43 @@ def test_startup_health_responds_before_database_or_feed_initialization():
         thread.join(timeout=2)
 
 
+def test_startup_failure_reports_exact_stage_without_secret_message():
+    startup = StartupStatus("abc123")
+    startup.update("SIGNAL_JOURNAL", "Opening preserved journal")
+    startup.fail("SIGNAL_JOURNAL", RuntimeError("secret-like exception detail"))
+    value = startup.snapshot()
+    assert value["stage"] == "FAILED_SIGNAL_JOURNAL"
+    assert value["message"] == "Initialization failed: RuntimeError"
+    assert "secret-like" not in json.dumps(value)
+
+
+def test_large_journal_never_builds_missing_indexes_during_live_startup(tmp_path, monkeypatch):
+    journal = Journal(tmp_path / "large.db")
+    with journal.connect() as db:
+        db.execute("DROP INDEX IF EXISTS predictions_mode_id")
+
+    real_stat = Path.stat
+
+    def large_stat(path, *args, **kwargs):
+        value = real_stat(path, *args, **kwargs)
+        if Path(path) == Path(journal.path):
+            from types import SimpleNamespace
+            return SimpleNamespace(**{
+                name: getattr(value, name) for name in dir(value)
+                if name.startswith("st_") and name != "st_size"
+            }, st_size=513 * 1024 * 1024)
+        return value
+
+    monkeypatch.setattr(Path, "stat", large_stat)
+    result = journal.ensure_performance_indexes()
+    assert result["status"] == "DEFERRED_LARGE_LIVE_JOURNAL"
+    assert "predictions_mode_id" in result["missing"]
+    with journal.read() as db:
+        assert db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='predictions_mode_id'"
+        ).fetchone() is None
+
+
 def test_report_cache_returns_immediately_and_never_queues_duplicates():
     started, release = threading.Event(), threading.Event()
     calls = []

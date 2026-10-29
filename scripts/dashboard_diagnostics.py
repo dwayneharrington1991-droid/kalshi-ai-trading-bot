@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import socket
 import subprocess
 import sys
 from time import perf_counter, time
@@ -15,6 +16,35 @@ from urllib.request import ProxyHandler, build_opener
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def error_class(error):
+    """Credential-safe transport classification without exception messages."""
+    if isinstance(error, httpx.ProxyError):
+        return "PROXY_CONNECT_FAILED"
+    if isinstance(error, httpx.ConnectTimeout):
+        return "CONNECT_TIMEOUT"
+    if isinstance(error, httpx.ReadTimeout):
+        return "READ_TIMEOUT"
+    if isinstance(error, httpx.ConnectError):
+        return "DNS_TCP_OR_TLS_CONNECT_FAILED"
+    name = type(error).__name__
+    if "Proxy" in name:
+        return "WEBSOCKET_PROXY_REJECTED"
+    if "SSL" in name or "TLS" in name:
+        return "TLS_HANDSHAKE_FAILED"
+    return name
+
+
+def port_status(port=8765):
+    started = perf_counter()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
+        candidate.settimeout(1)
+        connected = candidate.connect_ex(("127.0.0.1", port)) == 0
+    return {
+        "port": port, "listening": connected,
+        "connect_ms": round((perf_counter() - started) * 1000, 2),
+    }
 
 
 def git_value(*args):
@@ -198,6 +228,7 @@ def market_data_connectivity():
                 result["checks"][name] = {
                     "status": "FAILED",
                     "error_type": type(error).__name__,
+                    "failure_class": error_class(error),
                     "round_trip_ms": round((perf_counter() - started) * 1000, 2),
                 }
     # Exercise the same public WebSocket used by the dashboard. This sends only
@@ -217,21 +248,26 @@ def market_data_connectivity():
                     "type": "subscribe", "product_ids": ["BTC-USD"], "channel": channel
                 }))
             accepted = None
+            heartbeat_received = False
             deadline = perf_counter() + 8
             while perf_counter() < deadline:
                 message = json_module.loads(socket.recv(timeout=max(0.1, deadline - perf_counter())))
-                if message.get("channel") in {"ticker", "heartbeats"}:
-                    accepted = message.get("channel")
+                if message.get("channel") == "heartbeats":
+                    heartbeat_received = True
+                if message.get("channel") == "ticker":
+                    accepted = "ticker"
                     break
             result["checks"]["coinbase_public_websocket"] = {
                 "status": "OK" if accepted else "NO_MARKET_MESSAGE",
                 "channel_received": accepted,
+                "heartbeat_received": heartbeat_received,
                 "round_trip_ms": round((perf_counter() - started) * 1000, 2),
             }
     except Exception as error:
         result["checks"]["coinbase_public_websocket"] = {
             "status": "FAILED",
             "error_type": type(error).__name__,
+            "failure_class": error_class(error),
             "round_trip_ms": round((perf_counter() - started) * 1000, 2),
         }
     # Include the running application's own component health, without copying
@@ -264,10 +300,14 @@ def market_data_connectivity():
             "websocket_last_error_type": feed.get("websocket_last_error_type"),
             "kalshi_websocket": kalshi_socket,
             "historical_preload_status": preload.get("status"),
-            "historical_candle_count": preload.get("candle_count"),
+            "historical_candle_count": preload.get("retained_bars"),
+            "historical_missing_candles": preload.get("missing_bars"),
             "prediction_engine_status": feed.get("prediction_engine_status"),
             "prediction_unavailable_reason": feed.get("prediction_unavailable_reason"),
             "journal_index_maintenance": feed.get("journal_index_maintenance"),
+            "market_data_workers": feed.get("workers"),
+            "stale_reason": state.get("explanation"),
+            "market_health": state.get("market_health"),
         }
     except Exception as error:
         result["running_pipeline"] = {
@@ -282,6 +322,27 @@ def market_data_connectivity():
     result["notice"] = (
         "Public fixed endpoints only; no credentials, account endpoints, orders or transfers. "
         "Proxy values and response bodies are omitted."
+    )
+    checks = result["checks"]
+    pipeline = result.get("running_pipeline", {})
+    stages = (
+        ("KALSHI_REST_DISCOVERY", checks.get("kalshi_public_markets", {}).get("status") == "OK", True),
+        ("KALSHI_SERIES_METADATA", checks.get("kalshi_series_metadata", {}).get("status") == "OK", True),
+        ("BTC_REFERENCE_REST", checks.get("coinbase_btc_spot", {}).get("status") == "OK", True),
+        ("BTC_HISTORICAL_CANDLES", checks.get("coinbase_btc_candles", {}).get("status") == "OK", True),
+        # WebSocket has a supported REST fallback, so failure is visible but is
+        # not the first fatal pipeline stage by itself.
+        ("BTC_REFERENCE_WEBSOCKET", checks.get("coinbase_public_websocket", {}).get("status") == "OK", False),
+        ("RUNNING_DASHBOARD_PIPELINE", pipeline.get("http_status") == 200, True),
+        ("ACTIVE_KXBTC15M_SELECTION", bool(pipeline.get("active_ticker")), True),
+        ("FRESH_KALSHI_AND_BTC_INPUTS", pipeline.get("market_stale") is False, True),
+    )
+    result["pipeline_stages"] = [
+        {"stage": name, "status": "PASS" if passed else "FAIL", "required": required}
+        for name, passed, required in stages
+    ]
+    result["first_failing_stage"] = next(
+        (name for name, passed, required in stages if required and not passed), None
     )
     return result
 
@@ -300,6 +361,7 @@ def main():
             ),
         },
         "processes": bot_processes(),
+        "port_8765": port_status(),
         "health": health(),
         "capacity": capacity(),
         "databases": [

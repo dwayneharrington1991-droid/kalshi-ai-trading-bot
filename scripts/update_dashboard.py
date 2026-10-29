@@ -58,6 +58,10 @@ def update_checkout():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument(
+        "--diagnose", action="store_true",
+        help="After launch, print one credential-safe live-pipeline diagnostic",
+    )
     args = parser.parse_args()
     try:
         update_checkout()
@@ -71,6 +75,8 @@ def main():
     values = [sys.executable, str(launcher), "--private-dashboard", "--open-browser"]
     if args.restart:
         values.append("--restart")
+    if args.diagnose:
+        values.append("--diagnose")
     os.execv(sys.executable, values)
 
 

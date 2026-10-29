@@ -147,6 +147,14 @@ class Monitor:
         self.market_strip = MarketStrip()
         self.last_proxy_observation = None
         self.runtime_meter = RuntimeMeter()
+        self.worker_lock = threading.Lock()
+        self.worker_status = {
+            "collector": {"status": "NOT_STARTED", "last_started_at": None,
+                          "last_completed_at": None, "cycles": 0, "last_error_type": None},
+            "prediction": {"status": "NOT_STARTED", "last_started_at": None,
+                           "last_completed_at": None, "cycles": 0, "last_error_type": None},
+        }
+        self.worker_threads = {}
         self.index_maintenance = {"status": "PENDING"}
         self.maintenance_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="settlement-results"
@@ -190,6 +198,51 @@ class Monitor:
                 name="scheduled-scalp-shadow-evaluation",
             )
         startup_update("MONITOR_READY", "Intelligence monitor initialized")
+
+    def worker_event(self, name, event, error=None):
+        with self.worker_lock:
+            item = self.worker_status[name]
+            now = utcnow().isoformat()
+            if event == "started":
+                item.update(status="RUNNING", last_started_at=now)
+            elif event == "completed":
+                item.update(
+                    status="RUNNING", last_completed_at=now,
+                    cycles=item["cycles"] + 1,
+                    last_error_type=type(error).__name__ if error else None,
+                )
+            elif event == "stopped":
+                item.update(status="STOPPED", last_error_type=type(error).__name__ if error else None)
+
+    def workers_health(self, now=None):
+        now = now or utcnow()
+        with self.worker_lock:
+            values = {name: dict(item) for name, item in self.worker_status.items()}
+        healthy = True
+        reasons = []
+        required = (
+            {"collector", "prediction"} if isinstance(self.feed, PublicFeed)
+            else {"prediction"} if isinstance(self.feed, ReplayFeed)
+            else set()
+        )
+        for name, item in values.items():
+            thread = self.worker_threads.get(name)
+            item["thread_alive"] = bool(thread and thread.is_alive())
+            completed = item.get("last_completed_at")
+            item["seconds_since_completion"] = (
+                max(0, (now - timestamp(completed)).total_seconds()) if completed else None
+            )
+            # A public collection pass is bounded by endpoint timeouts. Thirty
+            # seconds allows a slow provider pass without hiding a dead thread.
+            if name not in required:
+                continue
+            if not item["thread_alive"]:
+                healthy = False
+                reasons.append(name + " worker is not alive")
+            elif completed and item["seconds_since_completion"] > 30:
+                healthy = False
+                reasons.append(name + " worker has not completed a cycle in 30 seconds")
+        return {"healthy": healthy, "reasons": reasons, "workers": values}
 
     def prediction_performance(self):
         with self.journal.read() as db:
@@ -1052,6 +1105,10 @@ class Monitor:
         stream_public = state.get("streaming", {}).get("public", {})
         state["feed_health"] = {
             "status": "LIVE" if not state.get("stale") else "STALE",
+            "kalshi_connection": "CONNECTED"
+            if state["market_health"].get("contract_quotes_fresh") else "DISCONNECTED",
+            "btc_connection": "CONNECTED"
+            if state["market_health"].get("reference_fresh") else "DISCONNECTED",
             "last_successful_btc_price_update": reference.get("observed_at"),
             "last_kalshi_market_update": market.get("observed_at"),
             "btc_source": reference.get("source"),
@@ -1086,6 +1143,11 @@ class Monitor:
             "storage": self.journal.storage_health(),
             "runtime_failures": self.runtime_meter.failures(),
             "journal_index_maintenance": self.index_maintenance,
+            "workers": self.workers_health(health_clock),
+            "stale_reasons": (
+                state["market_health"].get("contract_quote_reasons", [])
+                + state["market_health"].get("reference_reasons", [])
+            ),
         }
         state["scalping_monitor"] = diagnose_scalp(
             state, self.scalp_criteria, account=state["account"], now=health_clock
@@ -1288,7 +1350,8 @@ def make_handler(monitor):
                 with monitor.lock:
                     age = max(0, (utcnow() - monitor.last_tick).total_seconds())
                     version = monitor.state_version
-                healthy = version > 0 and age <= 10
+                workers = monitor.workers_health()
+                healthy = version > 0 and age <= 10 and workers["healthy"]
                 status_code = 200 if healthy else 503
                 body = json.dumps(
                     {
@@ -1297,6 +1360,7 @@ def make_handler(monitor):
                         "state_version": version,
                         "build_commit": monitor.build_commit,
                         "signals_only": True,
+                        "workers": workers,
                     }
                 ).encode()
                 content_type = "application/json"
@@ -1674,69 +1738,91 @@ def main():
         # Public IO has its own thread; prediction/research/account work never
         # delays a network refresh. No unbounded queue of obsolete frames.
         last_success = None
-        while not stop.is_set():
-            started = utcnow()
-            timer = perf_counter()
-            try:
-                payload = feed.poll()
-                last_success = payload
-            except Exception as exc:
-                monitor.runtime_meter.error("public_rest", type(exc).__name__)
-                payload = {
-                    **(
-                        last_success
-                        or {
-                            "markets": [],
-                            "reference": {},
-                            "mode": "PUBLIC MARKET DATA",
-                            "coverage": {},
-                        }
-                    ),
-                    "warnings": [
-                        "Public REST refresh failed ("
-                        + type(exc).__name__
-                        + "); cached receipts retain their original timestamps"
-                    ],
-                    "rest_poll_failed": True,
-                    "rest_error_type": type(exc).__name__,
-                    "btc_candles": feed.sampled_candles(utcnow()),
-                }
-            elapsed = perf_counter() - timer
-            mailbox.put((payload, started, utcnow(), elapsed * 1000))
-            stop.wait(max(0, args.poll_seconds - elapsed))
+        try:
+            while not stop.is_set():
+                monitor.worker_event("collector", "started")
+                started = utcnow()
+                timer = perf_counter()
+                failure = None
+                try:
+                    payload = feed.poll()
+                    last_success = payload
+                except Exception as exc:
+                    failure = exc
+                    monitor.runtime_meter.error("public_rest", type(exc).__name__)
+                    payload = {
+                        **(
+                            last_success
+                            or {
+                                "markets": [],
+                                "reference": {},
+                                "mode": "PUBLIC MARKET DATA",
+                                "coverage": {},
+                            }
+                        ),
+                        "warnings": [
+                            "Public REST refresh failed ("
+                            + type(exc).__name__
+                            + "); cached receipts retain their original timestamps"
+                        ],
+                        "rest_poll_failed": True,
+                        "rest_error_type": type(exc).__name__,
+                        "btc_candles": feed.sampled_candles(utcnow()),
+                    }
+                elapsed = perf_counter() - timer
+                mailbox.put((payload, started, utcnow(), elapsed * 1000))
+                monitor.worker_event("collector", "completed", failure)
+                stop.wait(max(0, args.poll_seconds - elapsed))
+        except BaseException as exc:
+            monitor.worker_event("collector", "stopped", exc)
+            raise
+        finally:
+            if stop.is_set():
+                monitor.worker_event("collector", "stopped")
 
     def poll():
         sequence = 0
         previous = None
         source_key = None
         last_processed = -float("inf")
-        while not stop.is_set():
-            if isinstance(feed, PublicFeed):
-                sequence, collected = mailbox.get(sequence, timeout=0.01)
-                if collected is not None:
-                    previous = collected
-                if previous is None:
-                    stop.wait(0.01)
-                    continue
-                stream_sequence = getattr(feed.streams, "sequence", 0)
-                book_sequence = getattr(feed.kalshi_stream, "sequence", 0)
-                key = (sequence, stream_sequence, book_sequence)
-                elapsed = monotonic() - last_processed
-                if elapsed < args.processing_ms / 1000 or (key == source_key and elapsed < 1):
-                    stop.wait(0.01)
-                    continue
-                source_key = key
-                base, started, completed, duration = previous
-                if isinstance(base, Exception):
-                    monitor.tick(previous)
+        try:
+            while not stop.is_set():
+                if isinstance(feed, PublicFeed):
+                    sequence, collected = mailbox.get(sequence, timeout=0.01)
+                    if collected is not None:
+                        previous = collected
+                    if previous is None:
+                        stop.wait(0.01)
+                        continue
+                    stream_sequence = getattr(feed.streams, "sequence", 0)
+                    book_sequence = getattr(feed.kalshi_stream, "sequence", 0)
+                    key = (sequence, stream_sequence, book_sequence)
+                    elapsed = monotonic() - last_processed
+                    if elapsed < args.processing_ms / 1000 or (key == source_key and elapsed < 1):
+                        stop.wait(0.01)
+                        continue
+                    source_key = key
+                    base, started, completed, duration = previous
+                    monitor.worker_event("prediction", "started")
+                    if isinstance(base, Exception):
+                        monitor.tick(previous)
+                    else:
+                        now = utcnow()
+                        enriched = feed.enriched(base, now)
+                        monitor.tick((enriched, started, completed, duration))
+                    monitor.worker_event("prediction", "completed")
+                    last_processed = monotonic()
                 else:
-                    now = utcnow()
-                    enriched = feed.enriched(base, now)
-                    monitor.tick((enriched, started, completed, duration))
-                last_processed = monotonic()
-            else:
-                monitor.tick()
-                stop.wait(args.poll_seconds)
+                    monitor.worker_event("prediction", "started")
+                    monitor.tick()
+                    monitor.worker_event("prediction", "completed")
+                    stop.wait(args.poll_seconds)
+        except BaseException as exc:
+            monitor.worker_event("prediction", "stopped", exc)
+            raise
+        finally:
+            if stop.is_set():
+                monitor.worker_event("prediction", "stopped")
 
     def maintain_indexes():
         try:
@@ -1753,8 +1839,10 @@ def main():
         threading.Thread(target=collect, daemon=True) if isinstance(feed, PublicFeed) else None
     )
     if collector:
+        monitor.worker_threads["collector"] = collector
         collector.start()
     thread = threading.Thread(target=poll, daemon=True)
+    monitor.worker_threads["prediction"] = thread
     thread.start()
     # The first live workers are running before any potentially expensive
     # index build. SQLite WAL keeps reads/live receipts available meanwhile.

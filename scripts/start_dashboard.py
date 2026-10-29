@@ -259,7 +259,7 @@ def stop_child(child, timeout=CHILD_STOP_TIMEOUT_SECONDS):
 
 def supervise(
     command, *, open_browser=False, health=healthy, startup=lambda: False,
-    popen=subprocess.Popen,
+    diagnose=False, popen=subprocess.Popen,
 ):
     """Keep the read-only dashboard alive while this Codespaces task is running."""
     stopping = False
@@ -271,6 +271,7 @@ def supervise(
     old_term = signal.signal(signal.SIGTERM, requested_stop)
     failures = 0
     opened = False
+    diagnostic_started = False
     recent_failures = []
     try:
         while not stopping:
@@ -286,6 +287,13 @@ def supervise(
                 if current_healthy:
                     unhealthy = 0
                     failures = 0
+                    if diagnose and not diagnostic_started:
+                        subprocess.Popen(
+                            [str(VENV / "bin/python3"),
+                             str(ROOT / "scripts/dashboard_diagnostics.py"), "--market-data"],
+                            cwd=ROOT,
+                        )
+                        diagnostic_started = True
                 if current_responsive:
                     consecutive_responsive += 1
                     # The bootstrap server serves the complete dashboard shell.
@@ -365,6 +373,10 @@ def main():
     )
     parser.add_argument("--public-only", action="store_true")
     parser.add_argument("--open-browser", action="store_true")
+    parser.add_argument(
+        "--diagnose", action="store_true",
+        help="Print a credential-safe component diagnostic after the server is healthy",
+    )
     parser.add_argument(
         "--prepare-only",
         action="store_true",
@@ -550,6 +562,7 @@ def main():
             open_browser=args.open_browser,
             health=lambda: healthy(expected_commit=expected_commit),
             startup=lambda: starting(expected_commit=expected_commit),
+            diagnose=args.diagnose,
         )
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)

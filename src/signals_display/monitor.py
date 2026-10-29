@@ -1757,6 +1757,34 @@ class Journal:
                 (ticker, origin, observed_at, outcome, json.dumps(payload, allow_nan=False)),
             )
 
+    def backfill_contract_reviews(self, limit=20):
+        """Record bounded mistake reviews for already-settled timestamped forecasts.
+
+        This never creates features, labels, predictions, fills, or model
+        weights. It only summarizes forecast rows that were genuinely recorded
+        before an existing official outcome.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Review backfill limit must be 1..100")
+        with self.read() as db:
+            rows = db.execute(
+                """SELECT f.ticker,f.observed_at,f.outcome
+                   FROM forecast_outcomes f
+                   WHERE f.origin='official'
+                   AND EXISTS (SELECT 1 FROM btc_engine_predictions p
+                               WHERE p.ticker=f.ticker AND p.mode='PUBLIC MARKET DATA')
+                   AND NOT EXISTS (SELECT 1 FROM learning_contract_reviews r
+                                   WHERE r.ticker=f.ticker AND r.origin='official')
+                   ORDER BY f.observed_at,f.ticker LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        for row in rows:
+            self._record_contract_review(
+                row["ticker"], "official", row["observed_at"], row["outcome"],
+                "PUBLIC MARKET DATA",
+            )
+        return len(rows)
+
     def record_feeds(self, coverage):
         with self.connect() as db:
             for name, feed in coverage.items():

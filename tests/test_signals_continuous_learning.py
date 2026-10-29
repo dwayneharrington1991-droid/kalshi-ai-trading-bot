@@ -50,3 +50,34 @@ def test_official_settlement_writes_one_immutable_mistake_review(tmp_path):
     assert review["opening"]["correct"] is False
     assert review["opening"]["brier"] > 0
     assert review["recorded_forecasts"] == 1
+
+
+def test_bounded_backfill_reviews_old_forecasts_without_creating_training_inputs(tmp_path):
+    journal = Journal(tmp_path / "journal.db")
+    state = analyze(frame(), NOW)
+    state["prediction_engine"] = {
+        "status": "EXPERIMENTAL", "ticker": state["market"]["ticker"],
+        "updated_at": state["now"], "closes_at": state["market"]["closes_at"],
+        "data_cutoff": state["now"], "up": 0.7, "regime": "test",
+        "version": "old-v1", "threshold": state["market"]["strike"], "initial": {},
+    }
+    journal.step(state)
+    ticker = state["market"]["ticker"]
+    with journal.connect() as db:
+        db.execute(
+            "UPDATE btc_engine_predictions SET mode='PUBLIC MARKET DATA' WHERE ticker=?",
+            (ticker,),
+        )
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            (ticker, "official", (NOW + timedelta(minutes=20)).isoformat(), 0),
+        )
+        before_predictions = db.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+        before_openings = db.execute("SELECT COUNT(*) FROM opening_input_snapshots").fetchone()[0]
+
+    assert journal.backfill_contract_reviews(limit=20) == 1
+    assert journal.backfill_contract_reviews(limit=20) == 0
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM learning_contract_reviews").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == before_predictions
+        assert db.execute("SELECT COUNT(*) FROM opening_input_snapshots").fetchone()[0] == before_openings

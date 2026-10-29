@@ -253,6 +253,9 @@ class Monitor:
             return edge_performance(db)
 
     def maintain_settlements(self, now):
+        # Older settled forecasts may predate the compact review table. Process
+        # a bounded batch in maintenance so live collection is never blocked.
+        self.journal.backfill_contract_reviews(limit=20)
         self.journal.seed_settlement_queue()
         learned = False
         for ticker in self.journal.due_settlements(now):

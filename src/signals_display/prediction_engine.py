@@ -580,9 +580,10 @@ def create(db):
         mode TEXT,ticker TEXT,closes_at TEXT,revisions INTEGER NOT NULL DEFAULT 0,
         latest_at TEXT,PRIMARY KEY(mode,ticker))"""
     )
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS btc_engine_contracts_close ON btc_engine_contracts(closes_at DESC,mode,ticker)"
-    )
+    # Indexes are optional maintenance. Journal startup must never build one:
+    # a missing index on a multi-gigabyte live database can consume all free
+    # disk and prevent market workers from starting. Journal maintenance owns
+    # the size-aware/deferred index policy.
     db.execute(
         """CREATE TABLE IF NOT EXISTS btc_engine_horizons (
         mode TEXT,ticker TEXT,horizon TEXT,timestamp TEXT,recorded_at TEXT,closes_at TEXT,

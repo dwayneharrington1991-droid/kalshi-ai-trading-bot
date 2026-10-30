@@ -1218,6 +1218,10 @@ class Journal:
             "CREATE INDEX IF NOT EXISTS settlement_due ON settlement_queue(mode,resolved,closes_at)",
             "CREATE INDEX IF NOT EXISTS opening_input_snapshots_open ON opening_input_snapshots(mode,opens_at)",
             "CREATE INDEX IF NOT EXISTS multi_asset_asset_open ON multi_asset_openings(asset,opens_at)",
+            "CREATE INDEX IF NOT EXISTS btc_engine_contracts_close ON btc_engine_contracts(closes_at DESC,mode,ticker)",
+            "CREATE INDEX IF NOT EXISTS scalp_book_mode_id ON scalp_book_observations(mode,id DESC)",
+            "CREATE INDEX IF NOT EXISTS scalp_book_ticker_time ON scalp_book_observations(mode,ticker,recorded_at)",
+            "CREATE INDEX IF NOT EXISTS edge_observations_close ON edge_observations(mode,closes_at)",
         )
         with self.read() as db:
             existing = {

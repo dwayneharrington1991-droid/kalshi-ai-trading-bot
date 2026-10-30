@@ -80,10 +80,10 @@ def create_schema(db):
         """CREATE TABLE IF NOT EXISTS scalp_book_observations (
         id INTEGER PRIMARY KEY,mode TEXT,ticker TEXT,observed_at TEXT,
         generated_at TEXT,recorded_at TEXT,payload TEXT,
-        UNIQUE(mode,ticker,generated_at,observed_at));
-        CREATE INDEX IF NOT EXISTS scalp_book_mode_id ON scalp_book_observations(mode,id DESC);
-        CREATE INDEX IF NOT EXISTS scalp_book_ticker_time ON scalp_book_observations(mode,ticker,recorded_at);"""
+        UNIQUE(mode,ticker,generated_at,observed_at));"""
     )
+    # Secondary indexes are constructed only by Journal's size-aware offline
+    # maintenance path. Never scan the preserved journal during startup.
 
 
 def _candidate(state):

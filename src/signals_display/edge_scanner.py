@@ -238,8 +238,9 @@ def create_schema(db):
           fee REAL NOT NULL,probability_edge REAL NOT NULL,net_ev REAL NOT NULL,
           volatility_regime TEXT,time_band TEXT,validation_status TEXT NOT NULL,
           PRIMARY KEY(mode,ticker,side,prediction_at));
-        CREATE INDEX IF NOT EXISTS edge_observations_close ON edge_observations(mode,closes_at);
     """)
+    # Secondary indexes are optional maintenance and must not block live
+    # startup on a large journal.
 
 
 def record(db, state, recorded_at):

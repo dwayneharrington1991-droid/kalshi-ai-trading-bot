@@ -29,7 +29,7 @@ def test_complete_dashboard_remains_accessible_while_intelligence_initializes():
             page.on("pageerror", lambda error: errors.append(str(error)))
             response = page.goto(f"http://127.0.0.1:{server.server_port}/")
             assert response.status == 200
-            playwright.expect(page.locator("#freshness")).to_have_text("STALE")
+            playwright.expect(page.locator("#freshness")).to_have_text("WARMING UP")
             playwright.expect(page.locator("#running-build")).to_have_text("startup")
             assert "Opening preserved journals" in page.locator("#market-health-summary").inner_text()
             assert not errors

@@ -2084,23 +2084,22 @@ class Journal:
     def recent_states(self):
         with self.read() as db:
             rows = db.execute(
-                "WITH recent AS MATERIALIZED (SELECT id,mode,timestamp,payload FROM predictions "
-                "ORDER BY id DESC LIMIT 10000) "
-                "SELECT timestamp,json_extract(payload,'$.reference'),json_extract(payload,'$.market'),"
-                "json_extract(payload,'$.model.version'),json_extract(payload,'$.estimate') FROM ("
-                "SELECT id,mode,timestamp,payload FROM recent"
-                ") WHERE mode='PUBLIC MARKET DATA' ORDER BY id DESC LIMIT 600"
+                "SELECT mode,timestamp,json_extract(payload,'$.reference'),"
+                "json_extract(payload,'$.market'),json_extract(payload,'$.model.version'),"
+                "json_extract(payload,'$.estimate') FROM predictions "
+                "ORDER BY id DESC LIMIT 1200"
             ).fetchall()
         return [
             dict(
                 mode="PUBLIC MARKET DATA",
-                now=row[0],
-                reference=json.loads(row[1]) if row[1] else {},
-                market=json.loads(row[2]) if row[2] else None,
-                model={"version": row[3]},
-                estimate=json.loads(row[4]) if row[4] else {},
+                now=row[1],
+                reference=json.loads(row[2]) if row[2] else {},
+                market=json.loads(row[3]) if row[3] else None,
+                model={"version": row[4]},
+                estimate=json.loads(row[5]) if row[5] else {},
             )
             for row in reversed(rows)
+            if row[0] == "PUBLIC MARKET DATA"
         ]
 
     def performance(self):

@@ -208,7 +208,7 @@ def test_browser_actual_account_cards_pending_fills_and_local_selection(tmp_path
             playwright.expect(page.locator("#live-trade-cards")).to_contain_text("$0.82")
             assert page.locator("#live-trade-cards .manual-record").count() == 1
             assert page.locator("#account-balance").inner_text() == "$1000.00"
-            assert "DATA UNAVAILABLE" in page.locator("#live-trade-cards").inner_text()
+            assert "WAIT" in page.locator("#live-trade-cards").inner_text()
             page.locator("#account-pending > summary").click()
             playwright.expect(page.locator("#account-order-rows")).to_contain_text("8")
             page.locator("#live-trade-cards button").click()
@@ -250,7 +250,7 @@ def test_history_failure_does_not_mark_public_or_account_state_disconnected(tmp_
                 "History refresh delayed"
             )
             playwright.expect(page.locator("#account-status")).to_have_text(
-                "PUBLIC MODE · ACCOUNT OFF"
+                "ACCOUNT DISCONNECTED"
             )
             assert page.locator("#freshness").text_content() == "LIVE"
             browser.close()
@@ -278,7 +278,7 @@ def test_blocked_permission_is_visible_instead_of_generic_account_off(tmp_path):
             page = browser.new_page()
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#account-status")).to_have_text(
-                "ACCOUNT BLOCKED — SEE REASON"
+                "ACCOUNT DISCONNECTED — PERMISSION BLOCKED"
             )
             assert "READ_ONLY_SCOPE_NOT_PROVEN" in page.locator("#account-sync").inner_text()
             assert page.locator("#account-balance").inner_text() == "unavailable"

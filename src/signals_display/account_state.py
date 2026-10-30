@@ -429,6 +429,11 @@ class AccountJournal:
                 "SELECT * FROM monitor_account_guidance_events WHERE holding_id=? ORDER BY id DESC LIMIT 1",
                 (guidance["holding_id"],),
             ).fetchone()
+            guidance["previous_guidance"] = row["guidance"] if row else None
+            guidance["guidance_changed_at"] = (
+                now.isoformat() if not row or row["guidance"] != guidance["guidance"]
+                else row["observed_at"]
+            )
             if (
                 row
                 and row["guidance"] == guidance["guidance"]
@@ -944,6 +949,8 @@ def live_trade_cards(account, quotes, state, now, defaults, fresh):
                     guidance=g["guidance"] if g["guidance"] != "CONSIDER ADDING" else "HOLD",
                     reason=g["reason"],
                     alert_id=g.get("alert_id"),
+                    previous_guidance=g.get("previous_guidance"),
+                    guidance_changed_at=g.get("guidance_changed_at"),
                 )
         cards.append(card)
     return cards

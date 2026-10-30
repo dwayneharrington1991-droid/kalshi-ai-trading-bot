@@ -1,0 +1,7 @@
+# Install as /etc/sudoers.d/kalshi-deploy after validating with visudo -cf.
+# Replace opc only if the dedicated deployment account differs.
+Cmnd_Alias KALSHI_SERVICE = /usr/bin/systemctl restart kalshi-signals.service, \
+ /usr/bin/systemctl is-active kalshi-signals.service, \
+ /usr/bin/systemctl is-active --quiet kalshi-signals.service, \
+ /usr/bin/systemctl show kalshi-signals.service *
+opc ALL=(root) NOPASSWD: KALSHI_SERVICE

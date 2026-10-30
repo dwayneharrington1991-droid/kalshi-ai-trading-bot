@@ -6,6 +6,8 @@ import pytest
 from src.signals_display import prediction_engine as engine
 from src.signals_display.market_health import diagnose, selection_summary
 from src.signals_display.monitor import Journal, analyze
+from src.signals_display.monitor import PublicFeed
+from src.signals_display.server import Monitor
 from src.signals_display.model import timestamp
 from tests.test_signals_monitor import frame
 from tests.test_signals_display import NOW
@@ -214,6 +216,64 @@ def test_one_hundred_consecutive_openings_get_distinct_immutable_snapshots(tmp_p
     with journal.read() as db:
         assert db.execute("SELECT count(*) FROM opening_input_snapshots").fetchone()[0] == 100
         assert db.execute("SELECT count(*) FROM btc_engine_opening").fetchone()[0] == 100
+
+
+def test_monitor_preloads_complete_history_before_rollover_and_keeps_opening_immutable(
+    tmp_path, monkeypatch
+):
+    opened = NOW
+    preopen = opened - timedelta(seconds=1)
+    clock = [preopen]
+    monkeypatch.setattr("src.signals_display.server.utcnow", lambda: clock[0])
+    contract = market()
+    candles = history(opened - timedelta(minutes=1), preopen)
+    observations = [
+        {
+            "kind": "quote", "source": "Coinbase BTC/USD proxy",
+            "received_at": (opened - timedelta(seconds=65-index)).isoformat(),
+            "price": 100000 + 0.1 * index,
+        }
+        for index in range(65)
+    ]
+    journal = Journal(tmp_path / "preload.db")
+    monitor = Monitor(
+        PublicFeed(lambda *_args, **_kwargs: None, multi_venue=False), journal
+    )
+
+    before = frame()
+    before.update(
+        mode="PUBLIC MARKET DATA", now=preopen.isoformat(), clock=preopen.isoformat(),
+        markets=[{**contract, "observed_at": preopen.isoformat()}],
+        btc_candles=candles, stream_observations=observations,
+        reference={"price": 100006.4, "source": "Coinbase BTC/USD proxy",
+                   "observed_at": preopen.isoformat(), "official": False},
+    )
+    monitor.tick((before, preopen, preopen, 0))
+    snapshot = journal.opening_snapshot(contract["ticker"], "PUBLIC MARKET DATA")
+    assert snapshot is not None
+    assert timestamp(snapshot["captured_at"]) < opened
+    assert engine.context24(snapshot["history"], opened)["status"] == "READY"
+
+    at_open = deepcopy(before)
+    at_open.update(now=opened.isoformat(), clock=opened.isoformat(), stream_observations=[])
+    at_open["markets"][0]["observed_at"] = opened.isoformat()
+    at_open["reference"] = {**at_open["reference"], "observed_at": opened.isoformat()}
+    clock[0] = opened
+    monitor.tick((at_open, opened, opened, 0))
+    original = journal.opening_record(contract["ticker"], "PUBLIC MARKET DATA")
+    assert original and original["up"] is not None
+    assert timestamp(original["data_cutoff"]) == opened
+    assert timestamp(original["history_received_at"]) <= opened
+
+    later = deepcopy(at_open)
+    later_time = opened + timedelta(minutes=5)
+    clock[0] = later_time
+    later.update(now=later_time.isoformat(), clock=later_time.isoformat())
+    later["reference"] = {**later["reference"], "price": 200000,
+                          "observed_at": later_time.isoformat()}
+    later["markets"][0]["observed_at"] = later_time.isoformat()
+    monitor.tick((later, later_time, later_time, 0))
+    assert journal.opening_record(contract["ticker"], "PUBLIC MARKET DATA") == original
 
 
 def test_recording_revisions_and_official_scoring_do_not_backfill_or_duplicate(tmp_path):

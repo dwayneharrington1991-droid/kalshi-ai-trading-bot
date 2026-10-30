@@ -148,8 +148,9 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy, m
 
     monkeypatch.setattr(module, "utcnow", lambda: NOW)
     data = PublicFeed(get).poll()
-    assert len(calls) == 9
-    assert sum("/candles?" in call for call in calls) == 5
+    assert len(calls) == 10
+    assert any(url.startswith(module.COINBASE_EXCHANGE_CANDLES) for url in calls)
+    assert sum("/candles?" in call for call in calls) == 6
     market = data["markets"][0]
     if missing_side == "both":
         assert market["book_diagnostic"].startswith("NO_LIQUIDITY")
@@ -245,11 +246,12 @@ def test_incomplete_startup_candle_preload_retries_after_five_seconds():
 
     feed = PublicFeed(get, multi_venue=False)
     feed.candles(NOW)
-    assert len(calls) == 5
+    assert len(calls) == 6
+    assert calls[-1].startswith(module.COINBASE_EXCHANGE_CANDLES)
     feed.candles(NOW + timedelta(seconds=4))
-    assert len(calls) == 5
+    assert len(calls) == 6
     feed.candles(NOW + timedelta(seconds=5))
-    assert len(calls) == 10
+    assert len(calls) == 12
 
 
 def test_counterfactual_journal_deduplicates_and_includes_spread_and_fees(tmp_path):

@@ -1,0 +1,102 @@
+name: Deploy Oracle production
+
+on:
+  push:
+    branches: [production]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Read-only preflight, deploy this tested commit, or roll back
+        required: true
+        type: choice
+        default: preflight
+        options: [preflight, deploy, rollback]
+      rollback_commit:
+        description: Exact 40-character release commit for rollback
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install --disable-pip-version-check -e '.[dev]'
+      - run: python -m pytest -q
+      - name: Build immutable release archive
+        run: |
+          git archive --format=tar.gz --output="/tmp/${GITHUB_SHA}.tar.gz" "$GITHUB_SHA"
+          sha256sum "/tmp/${GITHUB_SHA}.tar.gz" > "/tmp/${GITHUB_SHA}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: |
+            /tmp/${{ github.sha }}.tar.gz
+            /tmp/${{ github.sha }}.sha256
+          retention-days: 14
+
+  production:
+    needs: test
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: /tmp/release
+      - name: Configure strict SSH identity and host verification
+        env:
+          SSH_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
+          SSH_HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/oracle
+          chmod 600 ~/.ssh/oracle
+          printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Upload deployment tools and tested archive
+        env:
+          HOST: ${{ secrets.ORACLE_HOST }}
+          USER: ${{ secrets.ORACLE_USER }}
+        run: |
+          ssh -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER@$HOST" 'install -m 700 -d ~/.kalshi-deploy/incoming ~/.kalshi-deploy/tools'
+          scp -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes deploy/oracle/{preflight.sh,remote_deploy.sh,rollback.sh,health_check.py,sqlite_backup.py} "$USER@$HOST:.kalshi-deploy/tools/"
+          scp -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "/tmp/release/${GITHUB_SHA}.tar.gz" "$USER@$HOST:.kalshi-deploy/incoming/"
+      - name: Read-only production preflight
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'preflight'
+        env:
+          HOST: ${{ secrets.ORACLE_HOST }}
+          USER: ${{ secrets.ORACLE_USER }}
+        run: ssh -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER@$HOST" 'bash ~/.kalshi-deploy/tools/preflight.sh'
+      - name: Deploy exact tested commit
+        if: github.event_name == 'push' || inputs.operation == 'deploy'
+        env:
+          HOST: ${{ secrets.ORACLE_HOST }}
+          USER: ${{ secrets.ORACLE_USER }}
+        run: |
+          sha=$(cut -d' ' -f1 "/tmp/release/${GITHUB_SHA}.sha256")
+          ssh -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER@$HOST" "bash ~/.kalshi-deploy/tools/remote_deploy.sh '$GITHUB_SHA' ~/.kalshi-deploy/incoming/'$GITHUB_SHA'.tar.gz '$sha'"
+      - name: Roll back to a known release
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'rollback'
+        env:
+          HOST: ${{ secrets.ORACLE_HOST }}
+          USER: ${{ secrets.ORACLE_USER }}
+          ROLLBACK_COMMIT: ${{ inputs.rollback_commit }}
+        run: |
+          [[ "$ROLLBACK_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          ssh -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER@$HOST" "bash ~/.kalshi-deploy/tools/rollback.sh '$ROLLBACK_COMMIT'"

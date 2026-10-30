@@ -28,6 +28,7 @@ from .prediction_engine import (
     view as engine_view,
     opening_forecast,
     performance as engine_performance,
+    context24,
 )
 from .manual import ManualJournal
 from .live_model import LiveEstimator
@@ -42,6 +43,9 @@ from .scalp_monitor import diagnose as diagnose_scalp, ScalpCriteria
 from .advanced import AdvancedIntelligence, attach_reliability, refresh_status
 from .edge_scanner import calculate as calculate_edge_scanner, performance as edge_performance
 from .multi_asset import MarketStrip
+
+OPENING_PRELOAD_SECONDS = 120
+OPENING_INPUT_GRACE_SECONDS = 120
 
 
 class Monitor:
@@ -345,15 +349,54 @@ class Monitor:
             for discovered in payload.get("markets", []):
                 try:
                     opened = timestamp(discovered["opens_at"])
-                    if not opened <= now <= opened + timedelta(seconds=6):
+                    if not (
+                        opened - timedelta(seconds=OPENING_PRELOAD_SECONDS)
+                        <= now
+                        <= opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
+                    ):
                         continue
                     raw_history = payload.get("btc_candles", {})
                     try:
                         eligible = timestamp(raw_history["received_at"]) <= opened
                     except (KeyError, ValueError, TypeError, AttributeError):
                         eligible = False
-                    frozen_history = raw_history if eligible else self.journal.opening_inputs(opened)
+                    existing = self.journal.opening_snapshot(discovered["ticker"], mode)
+                    candidates = [
+                        item for item in (
+                            raw_history if eligible else None,
+                            (existing or {}).get("history"),
+                        )
+                        if isinstance(item, dict)
+                    ]
+
+                    def eligible_count(item):
+                        try:
+                            received = timestamp(item["received_at"])
+                            return sum(
+                                1 for bar in item.get("candles", [])
+                                if int(bar["start"]) + 60 <= min(
+                                    opened.timestamp(), received.timestamp()
+                                )
+                                and int(bar["start"]) >= opened.timestamp() - 86520
+                            )
+                        except (KeyError, ValueError, TypeError, AttributeError):
+                            return -1
+
+                    # The archive can be very large. Consult it only when the
+                    # in-memory collector and the already-frozen snapshot do
+                    # not contain a complete cutoff-safe window. This keeps
+                    # normal live updates independent of journal size.
+                    best_count = max((eligible_count(item) for item in candidates), default=-1)
+                    if best_count < 1440 and not existing:
+                        archived = self.journal.opening_inputs(opened)
+                        if isinstance(archived, dict):
+                            candidates.append(archived)
+                    frozen_history = max(candidates, key=eligible_count) if candidates else {}
                     frozen_points, frozen_source = self.estimator.opening_points(opened)
+                    history_ready = context24(frozen_history, opened).get("status") == "READY"
+                    finalize = (
+                        now >= opened + timedelta(seconds=5) and history_ready
+                    ) or now >= opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
                     self.journal.freeze_opening_snapshot(
                         discovered,
                         mode,
@@ -361,7 +404,7 @@ class Monitor:
                         frozen_points,
                         frozen_source,
                         now,
-                        finalized=now >= opened + timedelta(seconds=5),
+                        finalized=finalize,
                     )
                 except (KeyError, ValueError, TypeError, AttributeError):
                     continue
@@ -634,14 +677,17 @@ class Monitor:
                     # Keep retrying briefly when asynchronous history/reference
                     # delivery straddles rollover. Inputs remain cut off at the
                     # opening instant; later observations can never be backfilled.
-                    retry_until = opened + timedelta(seconds=5)
+                    retry_until = opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
                     if candidate.get("up") is not None or generated >= retry_until:
                         opening = self.journal.opening_record(
                             m["ticker"], state["mode"], candidate, generated
                         )
                     else:
                         candidate["status"] = "WARMING UP"
-                        candidate["reason"] += "; retrying receipt-proven pre-opening inputs for up to 5 seconds"
+                        candidate["reason"] += (
+                            "; retrying receipt-proven pre-opening inputs while the bounded "
+                            f"{OPENING_INPUT_GRACE_SECONDS}-second rollover window remains open"
+                        )
                         candidate["retry_until"] = retry_until.isoformat()
                         opening = candidate
             state["prediction_engine"] = engine_view(
@@ -1768,7 +1814,7 @@ def main():
                     last_success = payload
                 except Exception as exc:
                     failure = exc
-                    monitor.runtime_meter.error("public_rest", type(exc).__name__)
+                    monitor.runtime_meter.error("public_rest", feed.poll_failure_code(exc))
                     payload = {
                         **(
                             last_success

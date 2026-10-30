@@ -29,6 +29,9 @@ from .multi_asset import asset_of, ALIASES
 UTC = timezone.utc
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 COINBASE = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+COINBASE_EXCHANGE_CANDLES = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+CANDLE_WINDOW = 1440
+CANDLE_SECONDS = 60
 
 
 def utcnow():
@@ -143,6 +146,8 @@ class PublicFeed:
                 headers={"Accept": "application/json", "Cache-Control": "no-cache"},
             )
             diagnostic["http_status"] = response.status_code
+            if response.status_code >= 400:
+                diagnostic["failure_reason"] = "HTTP_STATUS_" + str(response.status_code)
             if response.status_code == 429 or response.status_code >= 500:
                 attempts = retry.get("attempts", 0) + 1
                 delay = min(60, 2 ** min(attempts, 6))
@@ -232,6 +237,22 @@ class PublicFeed:
                     "observed_at": item.get("received_at"),
                 }
         return None
+
+    def poll_failure_code(self, exc):
+        """Stable credential-free cause for a failed public collection pass."""
+        if isinstance(exc, ValueError) and not str(exc).startswith("PUBLIC_HTTP_BACKOFF"):
+            detail = re.sub(r"\W+", "_", str(exc)).strip("_")[:96]
+            if detail:
+                return (
+                    "PUBLIC_" + str(getattr(self, "poll_stage", "UNKNOWN"))
+                    + "_" + detail
+                )
+        root = self.failure_summary() or {}
+        code = root.get("reason") or (
+            "PUBLIC_" + str(getattr(self, "poll_stage", "UNKNOWN"))
+            + "_" + type(exc).__name__
+        )
+        return re.sub(r"\W+", "_", code).strip("_") or type(exc).__name__
 
     def sampled_candles(self, now):
         if self.candle_pool is None:
@@ -399,63 +420,144 @@ class PublicFeed:
         ):
             return self.candle_cache or {}
         self.candles_checked = now
-        cutoff = int(now.timestamp()) // 60 * 60
+        cutoff = int(now.timestamp()) // CANDLE_SECONDS * CANDLE_SECONDS
         try:
-            merged = {
-                int(b["start"]): b
-                for b in (self.candle_cache or {}).get("candles", [])
-                if cutoff - 86400 <= int(b["start"]) and int(b["start"]) + 60 <= cutoff
-            }
-            missing = [t for t in range(cutoff - 86400, cutoff, 60) if t not in merged]
+            merged = {}
+            duplicate_intervals = []
+            source_counts = {}
+
+            def add_rows(rows, source, exchange_format=False):
+                starts = []
+                for raw in rows:
+                    if exchange_format:
+                        if not isinstance(raw, (list, tuple)) or len(raw) < 6:
+                            raise ValueError("Unsupported Coinbase Exchange candle schema")
+                        raw = {
+                            "start": raw[0], "low": raw[1], "high": raw[2],
+                            "open": raw[3], "close": raw[4], "volume": raw[5],
+                        }
+                    start = int(raw["start"])
+                    starts.append(start)
+                    if start % CANDLE_SECONDS:
+                        raise ValueError("Unaligned one-minute candle timestamp")
+                    if not cutoff - 86400 <= start or start + CANDLE_SECONDS > cutoff:
+                        continue
+                    bar = {
+                        key: raw[key] for key in ("start", "open", "high", "low", "close", "volume")
+                    }
+                    bar["start"] = start
+                    bar["source"] = raw.get("source", source)
+                    existing = merged.get(start)
+                    if existing is not None:
+                        duplicate_intervals.append(start)
+                        if any(float(existing[key]) != float(bar[key]) for key in
+                               ("open", "high", "low", "close", "volume")):
+                            raise ValueError("Conflicting duplicate one-minute candle")
+                        continue
+                    merged[start] = bar
+                    source_counts[bar["source"]] = source_counts.get(bar["source"], 0) + 1
+                return (
+                    "ASCENDING" if len(starts) < 2 or starts == sorted(starts)
+                    else "DESCENDING" if starts == sorted(starts, reverse=True)
+                    else "OUT_OF_ORDER"
+                )
+
+            cache_order = add_rows(
+                (self.candle_cache or {}).get("candles", []), "preserved candle cache"
+            )
+            missing = [t for t in range(cutoff - 86400, cutoff, CANDLE_SECONDS)
+                       if t not in merged]
             ranges = []
             for stamp in missing:
-                if ranges and stamp == ranges[-1][1] and ranges[-1][1] - ranges[-1][0] < 288 * 60:
-                    ranges[-1][1] += 60
+                if (ranges and stamp == ranges[-1][1]
+                        and ranges[-1][1] - ranges[-1][0] < 288 * CANDLE_SECONDS):
+                    ranges[-1][1] += CANDLE_SECONDS
                 else:
-                    ranges.append([stamp, stamp + 60])
+                    ranges.append([stamp, stamp + CANDLE_SECONDS])
             if not ranges:
                 self.candle_diagnostics.update(
                     status="READY", last_success_at=utcnow().isoformat(), error_type=None,
-                    retained_bars=len(merged), missing_bars=0,
+                    retained_bars=len(merged), missing_bars=0, missing_intervals=[],
+                    duplicate_intervals=len(set(duplicate_intervals)),
+                    cache_order=cache_order, source_counts=source_counts,
                 )
                 return {**(self.candle_cache or {}), "diagnostics": dict(self.candle_diagnostics)}
+            requests = 0
+            response_orders = []
             for left, right in ranges[:5]:
-                start = left - 60
-                end = min(int(utcnow().timestamp()), right + 60)
+                start = left - CANDLE_SECONDS
+                end = min(int(utcnow().timestamp()), right + CANDLE_SECONDS)
                 url = (
                     "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles?"
                     + urlencode(
                         {"start": start, "end": end, "granularity": "ONE_MINUTE", "limit": 300}
                     )
                 )
-                for bar in self._read(url)["candles"]:
-                    stamp = int(bar["start"])
-                    if not cutoff - 86400 <= stamp or stamp + 60 > cutoff:
-                        continue
-                    if stamp in merged and any(
-                        float(bar[k]) != float(merged[stamp][k])
-                        for k in ("open", "high", "low", "close", "volume")
-                    ):
-                        raise ValueError("Conflicting overlapping history candles")
-                    merged[stamp] = bar
+                response_orders.append(add_rows(
+                    self._read(url)["candles"], "Coinbase Advanced Trade one-minute candles"
+                ))
+                requests += 1
+
+            # The brokerage history endpoint occasionally omits isolated closed
+            # minutes for several seconds. Fill only still-missing intervals
+            # from Coinbase Exchange's independent public candle endpoint. This
+            # is the same BTC-USD venue, never a fabricated interpolation.
+            remaining = [t for t in range(cutoff - 86400, cutoff, CANDLE_SECONDS)
+                         if t not in merged]
+            fallback_ranges = []
+            for stamp in remaining:
+                if (fallback_ranges and stamp == fallback_ranges[-1][1]
+                        and fallback_ranges[-1][1] - fallback_ranges[-1][0] < 250 * CANDLE_SECONDS):
+                    fallback_ranges[-1][1] += CANDLE_SECONDS
+                else:
+                    fallback_ranges.append([stamp, stamp + CANDLE_SECONDS])
+            for left, right in fallback_ranges[:5]:
+                params = urlencode({
+                    "start": datetime.fromtimestamp(left, timezone.utc).isoformat(),
+                    "end": datetime.fromtimestamp(right, timezone.utc).isoformat(),
+                    "granularity": CANDLE_SECONDS,
+                })
+                response_orders.append(add_rows(
+                    self._read(COINBASE_EXCHANGE_CANDLES + "?" + params),
+                    "Coinbase Exchange BTC-USD one-minute gap fill", exchange_format=True,
+                ))
+                requests += 1
             received = utcnow()
+            expected = list(range(cutoff - 86400, cutoff, CANDLE_SECONDS))
+            remaining = [stamp for stamp in expected if stamp not in merged]
+            ordered = [merged[t] for t in expected if t in merged]
+            status = "READY" if not remaining else "INCOMPLETE"
             self.candle_cache = {
-                "candles": [merged[t] for t in sorted(merged) if t + 60 <= received.timestamp()],
-                "source": "Coinbase BTC-USD public 24h one-minute candles (proxy)",
+                "candles": ordered,
+                "source": "Coinbase BTC-USD public one-minute candles; Exchange endpoint fills verified gaps",
                 "received_at": received.isoformat(),
                 "refresh": {
-                    "method": "Initial 24h preload, then missing closed minutes only",
-                    "requests": min(5, len(ranges)),
+                    "method": "Initial 24h preload, then exact missing-interval backfill",
+                    "requests": requests,
                     "retained_bars": len(merged),
-                    "maximum_requests_per_refresh": 5,
+                    "maximum_requests_per_refresh": 10,
                 },
                 "diagnostics": {
-                    "status": "READY", "last_attempt_at": now.isoformat(),
+                    "status": status, "last_attempt_at": now.isoformat(),
                     "last_success_at": received.isoformat(), "error_type": None,
                     "retained_bars": len(merged),
-                    "missing_bars": max(0, 1440 - len(merged)),
+                    "missing_bars": len(remaining),
+                    "missing_intervals": [
+                        datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+                        for stamp in remaining[:20]
+                    ],
+                    "duplicate_intervals": len(set(duplicate_intervals)),
+                    "cache_order": cache_order,
+                    "response_orders": response_orders,
+                    "source_counts": source_counts,
+                    "reason": None if not remaining else
+                    f"Historical providers still missing {len(remaining)}/1440 exact UTC minutes",
                 },
             }
+            if remaining:
+                self.candle_cache["error"] = (
+                    f"MISSING_CANDLES: {len(remaining)}/1440 UTC intervals unavailable after backfill"
+                )
             self.candle_diagnostics = dict(self.candle_cache["diagnostics"])
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
             retained = len((self.candle_cache or {}).get("candles", []))
@@ -712,6 +814,7 @@ class PublicFeed:
         return result
 
     def poll(self):
+        self.poll_stage = "KALSHI_MARKET_DISCOVERY"
         markets, cursor, seen = [], None, set()
         discovery_time = int(utcnow().timestamp())
         for _ in range(20):
@@ -737,12 +840,14 @@ class PublicFeed:
             seen.add(cursor)
         else:
             raise ValueError("Incomplete market discovery; refusing partial selection")
+        self.poll_stage = "KALSHI_SERIES_METADATA"
         series = self.series_metadata(utcnow())
         self.last_series = series
         now = utcnow()
         result = []
         sources = series.get("settlement_sources", [])
         source = "; ".join(str(item.get("name", "")) for item in sources) or "unavailable"
+        self.poll_stage = "KALSHI_MARKET_VALIDATION"
         for raw in markets:
             if raw.get("status", "open") not in {"open", "active"}:
                 continue
@@ -877,6 +982,7 @@ class PublicFeed:
         warnings = [
             "Coinbase is a proxy, not the official settlement index. Model estimates are UNVALIDATED."
         ]
+        self.poll_stage = "BTC_REFERENCE"
         streamed = self.streams.snapshot(utcnow()).get("reference") if self.streams else None
         if streamed:
             reference = streamed
@@ -893,7 +999,9 @@ class PublicFeed:
                 warnings.append(
                     "Public reference proxy unavailable; official settlement feed not connected."
                 )
+        self.poll_stage = "AUXILIARY_MARKETS"
         auxiliary = self.sampled_multi_assets(utcnow())
+        self.poll_stage = "COMPLETE"
         return {
             "markets": result,
             "multi_asset_markets": auxiliary["markets"],

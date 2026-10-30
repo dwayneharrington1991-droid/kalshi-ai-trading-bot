@@ -47,6 +47,71 @@ def test_candle_preload_then_only_missing_minutes_are_requested(monkeypatch):
     assert second["candles"][-1]["start"] != first["candles"][-1]["start"]
 
 
+def test_missing_coinbase_minutes_are_gap_filled_without_interpolation(monkeypatch):
+    from src.signals_display import monitor as module
+
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    missing = {cutoff - 300, cutoff - 120}
+    calls = []
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        query = parse_qs(urlsplit(url).query)
+        if "api.exchange.coinbase.com" in url:
+            left = int(__import__("datetime").datetime.fromisoformat(query["start"][0]).timestamp())
+            right = int(__import__("datetime").datetime.fromisoformat(query["end"][0]).timestamp())
+            rows = [
+                [t, "99999", "100002", "100000", "100001", "1"]
+                for t in range(left, right, 60) if t in missing
+            ]
+            return httpx.Response(200, json=rows, request=httpx.Request("GET", url))
+        left, right = int(query["start"][0]), int(query["end"][0])
+        bars = [
+            dict(start=str(t), open="100000", high="100002", low="99999",
+                 close="100001", volume="1")
+            for t in range(left, right, 60) if t not in missing
+        ]
+        return httpx.Response(200, json={"candles": bars}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    feed = PublicFeed(get)
+    result = feed.candles(NOW)
+    starts = [bar["start"] for bar in result["candles"]]
+    assert len(starts) == 1440 and len(set(starts)) == 1440
+    assert starts == list(range(cutoff - 86400, cutoff, 60))
+    assert result["diagnostics"]["status"] == "READY"
+    assert result["diagnostics"]["missing_bars"] == 0
+    assert result["diagnostics"]["source_counts"][
+        "Coinbase Exchange BTC-USD one-minute gap fill"
+    ] == 2
+    assert any("api.exchange.coinbase.com" in url for url in calls)
+
+
+def test_unrecoverable_candle_gap_is_explicitly_incomplete(monkeypatch):
+    from src.signals_display import monitor as module
+
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    absent = cutoff - 120
+
+    def get(url, **_kwargs):
+        query = parse_qs(urlsplit(url).query)
+        if "api.exchange.coinbase.com" in url:
+            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+        left, right = int(query["start"][0]), int(query["end"][0])
+        bars = [
+            dict(start=str(t), open="100000", high="100002", low="99999",
+                 close="100001", volume="1")
+            for t in range(left, right, 60) if t != absent
+        ]
+        return httpx.Response(200, json={"candles": bars}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    result = PublicFeed(get).candles(NOW)
+    assert result["diagnostics"]["status"] == "INCOMPLETE"
+    assert result["diagnostics"]["missing_bars"] == 1
+    assert result["error"] == "MISSING_CANDLES: 1/1440 UTC intervals unavailable after backfill"
+
+
 def test_provider_retry_after_prevents_extra_requests(monkeypatch):
     from src.signals_display import monitor as module
 
@@ -64,12 +129,24 @@ def test_provider_retry_after_prevents_extra_requests(monkeypatch):
     with pytest.raises(httpx.HTTPStatusError):
         feed._read(url)
     with pytest.raises(ValueError, match="BACKOFF"):
-        feed._read(url)
+        try:
+            feed._read(url)
+        except ValueError as exc:
+            assert feed.poll_failure_code(exc) == "HTTP_STATUS_429"
+            raise
     assert len(calls) == 1
     clock[0] = 20.1
     with pytest.raises(httpx.HTTPStatusError):
         feed._read(url)
     assert len(calls) == 2
+
+
+def test_public_poll_value_error_reports_stage_and_actual_safe_cause():
+    feed = PublicFeed(lambda *_args, **_kwargs: None, multi_venue=False)
+    feed.poll_stage = "KALSHI_MARKET_VALIDATION"
+    assert feed.poll_failure_code(ValueError("Repeated public pagination cursor")) == (
+        "PUBLIC_KALSHI_MARKET_VALIDATION_Repeated_public_pagination_cursor"
+    )
 
 
 def test_stream_merge_preserves_receipts_and_never_refreshes_old_book():

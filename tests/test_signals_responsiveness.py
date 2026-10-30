@@ -67,7 +67,11 @@ def test_startup_failure_reports_exact_stage_without_secret_message():
 def test_large_journal_never_builds_missing_indexes_during_live_startup(tmp_path, monkeypatch):
     journal = Journal(tmp_path / "large.db")
     with journal.connect() as db:
-        db.execute("DROP INDEX IF EXISTS predictions_mode_id")
+        for name in (
+            "predictions_mode_id", "btc_engine_contracts_close",
+            "scalp_book_mode_id", "scalp_book_ticker_time", "edge_observations_close",
+        ):
+            db.execute("DROP INDEX IF EXISTS " + name)
 
     real_stat = Path.stat
 
@@ -85,10 +89,41 @@ def test_large_journal_never_builds_missing_indexes_during_live_startup(tmp_path
     result = journal.ensure_performance_indexes()
     assert result["status"] == "DEFERRED_LARGE_LIVE_JOURNAL"
     assert "predictions_mode_id" in result["missing"]
+    assert "btc_engine_contracts_close" in result["missing"]
+    assert "scalp_book_mode_id" in result["missing"]
+    assert "scalp_book_ticker_time" in result["missing"]
+    assert "edge_observations_close" in result["missing"]
     with journal.read() as db:
-        assert db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='predictions_mode_id'"
-        ).fetchone() is None
+        for name in result["missing"]:
+            assert db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)
+            ).fetchone() is None
+
+
+def test_journal_initialization_never_executes_secondary_index_builds(tmp_path, monkeypatch):
+    journal = Journal(tmp_path / "startup.db")
+    with journal.connect() as db:
+        for name in (
+            "btc_engine_contracts_close", "scalp_book_mode_id",
+            "scalp_book_ticker_time", "edge_observations_close",
+        ):
+            db.execute("DROP INDEX IF EXISTS " + name)
+    statements = []
+    real_connect = journal.connect
+
+    class Traced:
+        def __enter__(self):
+            self.context = real_connect()
+            self.db = self.context.__enter__()
+            self.db.set_trace_callback(statements.append)
+            return self.db
+
+        def __exit__(self, *args):
+            return self.context.__exit__(*args)
+
+    monkeypatch.setattr(Journal, "connect", lambda self: Traced())
+    Journal(tmp_path / "startup.db")
+    assert not any("CREATE INDEX" in statement.upper() for statement in statements)
 
 
 def test_slow_historical_readiness_cannot_delay_live_monitor_startup(tmp_path, monkeypatch):

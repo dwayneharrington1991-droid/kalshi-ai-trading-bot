@@ -24,7 +24,10 @@ SUPERVISOR_LOG = ROOT / "logs/signals-dashboard-supervisor.log"
 UNRESPONSIVE_GRACE_SECONDS = 15
 UNRESPONSIVE_CHECKS_BEFORE_RESTART = 2
 CHILD_STOP_TIMEOUT_SECONDS = 5
-SUPERVISOR_CHECK_INTERVAL_SECONDS = 2
+# The bootstrap HTTP server is intentionally available before journals and
+# feeds finish. Two half-second checks open that safe shell in roughly one
+# second while retaining duplicate-process and build-identity checks.
+SUPERVISOR_CHECK_INTERVAL_SECONDS = 0.5
 
 
 def supervisor_event(message, path=SUPERVISOR_LOG):

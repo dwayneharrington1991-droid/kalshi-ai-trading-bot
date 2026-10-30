@@ -91,6 +91,38 @@ def test_large_journal_never_builds_missing_indexes_during_live_startup(tmp_path
         ).fetchone() is None
 
 
+def test_slow_historical_readiness_cannot_delay_live_monitor_startup(tmp_path, monkeypatch):
+    journal = Journal(tmp_path / "slow-readiness.db")
+
+    def must_not_run_synchronously():
+        raise AssertionError("historical readiness ran on the startup thread")
+
+    monkeypatch.setattr(journal, "learning_readiness", must_not_run_synchronously)
+    started = perf_counter()
+    monitor = Monitor(
+        PublicFeed(lambda *_args, **_kwargs: None, multi_venue=False), journal
+    )
+    assert perf_counter() - started < 1
+    assert monitor.readiness["status"] == "CALCULATING_IN_BACKGROUND"
+    assert monitor.readiness_at is None
+
+
+def test_recent_state_restore_is_bounded_by_primary_key_tail(tmp_path):
+    journal = Journal(tmp_path / "recent-tail.db")
+    with journal.connect() as db:
+        for index in range(1500):
+            mode = "PUBLIC MARKET DATA" if index >= 300 else "REPLAY / SIMULATED"
+            db.execute(
+                "INSERT INTO predictions "
+                "(mode,ticker,timestamp,direction,scalp,payload) VALUES (?,?,?,?,?,?)",
+                (mode, "KXBTC15M-TEST", f"2026-01-01T00:00:{index:04d}+00:00", "UNCLEAR", "WAIT",
+                 json.dumps({"reference": {}, "market": None, "model": {}, "estimate": {}})),
+            )
+    states = journal.recent_states()
+    assert len(states) == 1200
+    assert all(state["mode"] == "PUBLIC MARKET DATA" for state in states)
+
+
 def test_report_cache_returns_immediately_and_never_queues_duplicates():
     started, release = threading.Event(), threading.Event()
     calls = []

@@ -112,10 +112,20 @@ class Monitor:
         )
         startup_update("LEARNING_READINESS", "Reading indexed learning and validation summaries")
         self.scalp_criteria = self.journal.scalp_criteria()
-        # Small indexed aggregates only. Load before the first contract so a
-        # past-only quality guard cannot be bypassed during startup warm-up.
-        self.readiness = journal.learning_readiness()
-        self.readiness_at = utcnow()
+        # Historical readiness can still scan thousands of settled contracts
+        # on a multi-gigabyte journal. It is display/research metadata, not a
+        # prerequisite for live collection. Start fail-closed and calculate it
+        # in the existing background pool after the first fresh market frame.
+        self.readiness = {
+            "status": "CALCULATING_IN_BACKGROUND",
+            "official_contracts": None,
+            "minimum_contracts": 170,
+            "reason": (
+                "Historical learning readiness is loading in the background; "
+                "unvalidated models remain ineligible for actionable signals."
+            ),
+        }
+        self.readiness_at = None
         self.estimator = LiveEstimator(manual_delay=manual_delay, slippage=slippage)
         if isinstance(feed, PublicFeed):
             startup_update("LIVE_HISTORY_RESTORE", "Restoring bounded recent timestamped observations")

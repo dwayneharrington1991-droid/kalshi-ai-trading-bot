@@ -69,9 +69,15 @@ def test_oracle_paths_and_dirty_worktree_are_preserved_by_versioned_deploy():
     assert "DATA_ROOT=/home/opc/kalshi-ai-trading-bot/data" in config
     assert "data/signals_monitor.db" in config
     assert "data/signals_account_monitor.db" in config
+    assert "ALLOW_SAME_DISK_BACKUP=1" in config
     assert "find \"$DATA_ROOT\" -type f -name '*.db'" in deploy
     assert "oracle-worktree.patch" in deploy
     assert "monitor-comparison.diff" in deploy
     assert "git reset" not in deploy
     assert "git clean" not in deploy
     assert "sqlite_backup.py" in deploy
+    assert "SAME_DISK_BACKUP_APPROVED_TEMPORARILY" in deploy
+    assert "BACKUP_DURABILITY_WARNING.txt" in deploy
+    assert "stat -c %d \"$DATA_ROOT\"" in deploy
+    assert "stat -c %d \"$BACKUP_ROOT\"" in deploy
+    assert "required_free=$((bytes + bytes / 4 + 1073741824))" in deploy

@@ -18,6 +18,19 @@ done
 [[ -d "$BACKUP_ROOT" && -w "$BACKUP_ROOT" ]] || {
   echo "backup root must already exist and be writable: $BACKUP_ROOT" >&2; exit 1;
 }
+data_device=$(stat -c %d "$DATA_ROOT")
+backup_device=$(stat -c %d "$BACKUP_ROOT")
+if [[ "$data_device" == "$backup_device" ]]; then
+  [[ ${ALLOW_SAME_DISK_BACKUP:-0} == 1 ]] || {
+    echo "data and backup paths share a disk; explicit ALLOW_SAME_DISK_BACKUP=1 is required" >&2
+    exit 1
+  }
+  echo "WARNING: SAME_DISK_BACKUP_APPROVED_TEMPORARILY"
+  echo "WARNING: /home/opc/kalshi-backups protects deployment rollback only; it does not protect against disk failure."
+  echo "backup_durability=SAME_DISK_TEMPORARY"
+else
+  echo "backup_durability=SEPARATE_FILESYSTEM"
+fi
 echo "repository_commit=$(git -C "$APP_ROOT" rev-parse HEAD 2>/dev/null || echo unavailable)"
 echo "repository_worktree=$(if [[ -n "$(git -C "$APP_ROOT" status --porcelain 2>/dev/null || true)" ]]; then echo DIRTY_PRESERVED; else echo CLEAN; fi)"
 git -C "$APP_ROOT" status --short 2>/dev/null || true

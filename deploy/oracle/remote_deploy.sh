@@ -28,6 +28,17 @@ previous=$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)
 actual_sha=$(sha256sum "$archive" | awk '{print $1}')
 [[ "$actual_sha" == "$expected_sha" ]] || { echo "release checksum mismatch" >&2; exit 1; }
 mkdir -p "$DEPLOY_ROOT/releases" "$DEPLOY_ROOT/incoming" "$BACKUP_ROOT"
+data_device=$(stat -c %d "$DATA_ROOT")
+backup_device=$(stat -c %d "$BACKUP_ROOT")
+same_disk=0
+if [[ "$data_device" == "$backup_device" ]]; then
+  [[ ${ALLOW_SAME_DISK_BACKUP:-0} == 1 ]] || {
+    echo "same-disk backup refused without explicit ALLOW_SAME_DISK_BACKUP=1" >&2; exit 1;
+  }
+  same_disk=1
+  echo "WARNING: SAME_DISK_BACKUP_APPROVED_TEMPORARILY" >&2
+  echo "WARNING: backups protect deployment rollback but not physical disk failure" >&2
+fi
 mapfile -d '' databases < <(find "$DATA_ROOT" -type f -name '*.db' -print0 | sort -z)
 (( ${#databases[@]} > 0 )) || { echo "no databases discovered under DATA_ROOT" >&2; exit 1; }
 for required in "$JOURNAL_PATH" "$ACCOUNT_STORE_PATH"; do
@@ -38,6 +49,14 @@ done
 stamp=$(date -u +%Y%m%dT%H%M%SZ)-$commit
 backup="$BACKUP_ROOT/$stamp"
 mkdir "$backup" "$backup/databases"
+if (( same_disk == 1 )); then
+  cat > "$backup/BACKUP_DURABILITY_WARNING.txt" <<'EOF'
+SAME_DISK_BACKUP_APPROVED_TEMPORARILY
+This backup can support application rollback, but it cannot protect against
+filesystem corruption, volume loss, or physical disk failure. Copy verified
+backup artifacts to independent storage as soon as practical.
+EOF
+fi
 bytes=0
 for db in "${databases[@]}"; do bytes=$((bytes + $(stat -c %s "$db"))); done
 for model in "${MODEL_ROOT:-}" "${MODEL_ARTIFACT:-}" "${OPENING_MODEL_ARTIFACT:-}" "${MODEL_REGISTRY:-}"; do

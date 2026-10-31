@@ -111,6 +111,7 @@ def test_host_configuration_is_derived_and_never_creates_approval_or_restarts():
     assert 'install -o root -g "$deploy_group" -m 0640' in setup
     assert "chmod 0640" in setup
     assert "-m 0600" not in setup
+    assert "opc primary group must be opc" in setup
     sudoers = (DEPLOY / "sudoers.example").read_text()
     assert "KALSHI_CONFIG" in sudoers
     assert "kalshi-deployment.env.candidate" in sudoers

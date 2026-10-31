@@ -104,6 +104,9 @@ if [[ "$mode" == --install ]]; then
   [[ "$deploy_user" == opc ]] || {
     echo "configuration installation must be run by opc" >&2; exit 1;
   }
+  [[ "$deploy_group" == opc ]] || {
+    echo "opc primary group must be opc to match the reviewed sudoers policy" >&2; exit 1;
+  }
   # root owns the configuration; only root and opc's primary group may read it.
   sudo -n install -d -o root -g "$deploy_group" -m 0750 /etc/kalshi-signals
   if sudo -n test -e /etc/kalshi-signals/deployment.env; then

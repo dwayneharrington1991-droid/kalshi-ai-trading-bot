@@ -1,5 +1,5 @@
 [Service]
-WorkingDirectory=/home/opc/kalshi-ai-trading-bot
+WorkingDirectory=/home/opc/kalshi-ai-trading-bot/.deploy/current
 ExecStart=
 ExecStart=/home/opc/kalshi-ai-trading-bot/.deploy/current/deploy/oracle/run_dashboard.sh
 

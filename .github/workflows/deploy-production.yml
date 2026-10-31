@@ -1,8 +1,10 @@
 name: Deploy Oracle production
 
 on:
+  pull_request:
+    branches: [main]
   push:
-    branches: [production]
+    branches: [main]
   workflow_dispatch:
     inputs:
       operation:
@@ -49,8 +51,9 @@ jobs:
 
   production:
     needs: test
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    environment: production
+    environment: oracle-production
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,6 +67,8 @@ jobs:
           SSH_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
           SSH_HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
         run: |
+          test -n "$SSH_KEY"
+          test -n "$SSH_HOST_KEY"
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/oracle
           chmod 600 ~/.ssh/oracle
@@ -71,31 +76,33 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
       - name: Upload deployment tools and tested archive
         env:
-          HOST: ${{ secrets.ORACLE_HOST }}
-          USER: ${{ secrets.ORACLE_USER }}
+          HOST: ${{ vars.ORACLE_HOST }}
+          USER: ${{ vars.ORACLE_USER }}
         run: |
+          test -n "$HOST"
+          test -n "$USER"
           ssh -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER@$HOST" 'install -m 700 -d ~/.kalshi-deploy/incoming ~/.kalshi-deploy/tools'
           scp -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes deploy/oracle/{preflight.sh,remote_deploy.sh,rollback.sh,health_check.py,sqlite_backup.py} "$USER@$HOST:.kalshi-deploy/tools/"
           scp -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "/tmp/release/${GITHUB_SHA}.tar.gz" "$USER@$HOST:.kalshi-deploy/incoming/"
       - name: Read-only production preflight
         if: github.event_name == 'workflow_dispatch' && inputs.operation == 'preflight'
         env:
-          HOST: ${{ secrets.ORACLE_HOST }}
-          USER: ${{ secrets.ORACLE_USER }}
+          HOST: ${{ vars.ORACLE_HOST }}
+          USER: ${{ vars.ORACLE_USER }}
         run: ssh -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER@$HOST" 'bash ~/.kalshi-deploy/tools/preflight.sh'
       - name: Deploy exact tested commit
-        if: github.event_name == 'push' || inputs.operation == 'deploy'
+        if: inputs.operation == 'deploy'
         env:
-          HOST: ${{ secrets.ORACLE_HOST }}
-          USER: ${{ secrets.ORACLE_USER }}
+          HOST: ${{ vars.ORACLE_HOST }}
+          USER: ${{ vars.ORACLE_USER }}
         run: |
           sha=$(cut -d' ' -f1 "/tmp/release/${GITHUB_SHA}.sha256")
           ssh -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER@$HOST" "bash ~/.kalshi-deploy/tools/remote_deploy.sh '$GITHUB_SHA' ~/.kalshi-deploy/incoming/'$GITHUB_SHA'.tar.gz '$sha'"
       - name: Roll back to a known release
         if: github.event_name == 'workflow_dispatch' && inputs.operation == 'rollback'
         env:
-          HOST: ${{ secrets.ORACLE_HOST }}
-          USER: ${{ secrets.ORACLE_USER }}
+          HOST: ${{ vars.ORACLE_HOST }}
+          USER: ${{ vars.ORACLE_USER }}
           ROLLBACK_COMMIT: ${{ inputs.rollback_commit }}
         run: |
           [[ "$ROLLBACK_COMMIT" =~ ^[0-9a-f]{40}$ ]]

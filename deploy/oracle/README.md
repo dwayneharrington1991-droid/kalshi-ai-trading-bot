@@ -7,10 +7,10 @@ its SQLite journals and model artifacts outside versioned release directories.
 
 ## What the workflow guarantees
 
-1. A commit reaches the designated `production` branch.
+1. A pull request to `main` passes tests, and an approved commit reaches `main`.
 2. GitHub Actions checks out that exact commit and runs the complete test suite.
 3. The production job pauses at the protected GitHub Environment named
-   `production`. A required reviewer must approve it.
+   `oracle-production`. The configured required reviewer must approve it.
 4. SSH uses a dedicated private key and a pinned Oracle host key. Strict host
    verification is mandatory.
 5. The server verifies the release checksum, creates a versioned virtual
@@ -32,16 +32,17 @@ Do these steps in an ordinary SSH session before enabling automatic deploys.
 They are intentionally manual because they inspect and preserve the existing
 service.
 
-1. In GitHub, open **Settings → Environments → New environment**, name it
-   `production`, and add yourself under **Required reviewers**.
+1. In GitHub, open **Settings → Environments → oracle-production** and confirm
+   `dwayneharrington1991-droid` is a required reviewer and only `main` may deploy.
 2. Create a dedicated SSH key pair for deployments. Put only the public key in
    `/home/opc/.ssh/authorized_keys` on Oracle. Store the private key in the
-   `production` environment secret `ORACLE_SSH_PRIVATE_KEY`.
+   `oracle-production` environment secret `ORACLE_SSH_PRIVATE_KEY`.
 3. Run `ssh-keyscan -t ed25519 129.146.120.195` from a trusted network and
    compare the fingerprint with `sudo ssh-keygen -lf
    /etc/ssh/ssh_host_ed25519_key.pub` on Oracle. After they match, store the
-   complete `ssh-ed25519 ...` line as `ORACLE_SSH_HOST_KEY`. Add environment
-   secrets `ORACLE_HOST=129.146.120.195` and `ORACLE_USER=opc`.
+   complete `129.146.120.195 ssh-ed25519 ...` line as the environment secret
+   `ORACLE_SSH_HOST_KEY`. Keep `ORACLE_HOST=129.146.120.195` and
+   `ORACLE_USER=opc` as environment variables.
 4. Copy `deployment.env.example` to
    `/etc/kalshi-signals/deployment.env`. Confirm `BACKUP_ROOT` is a separate
    mounted backup volume with enough free space for the journals plus 20%.
@@ -54,9 +55,10 @@ service.
    `kalshi-signals.override.conf.example`. Back up the existing unit and install
    the override only after confirming every journal/model path. Run
    `sudo systemctl daemon-reload`; do not restart yet.
-8. Preserve the current checkout as the first rollback release, or deploy the
-   new version during a maintenance window. After the paths, backup volume,
-   override, and rollback baseline have been reviewed, create the explicit
+8. Reconcile the preserved `monitor.py` diff and create a versioned release of
+   the current working service as the first rollback baseline. Do not point the
+   service at the repair release during this step. After the paths, backup
+   volume, override, and baseline have been reviewed, create the explicit
    gate with `install -m 600 /dev/null
    /home/opc/kalshi-ai-trading-bot/.deploy/production-approved`.
 
@@ -65,31 +67,30 @@ creates it and never changes the service.
 
 ## Branch protection and routine deployment
 
-Create a `production` branch from an approved commit. Protect it so changes
-arrive through pull requests and require the CI check. A merge to `production`
-runs tests and then pauses for the protected-environment approval. Approving
-that job deploys only the tested merge commit.
+Protect `main` so changes arrive through pull requests and require the CI check.
+A merge to `main` runs the same complete test job but does not deploy. Production
+requires a manual workflow run from `main`; that run tests the selected commit
+again and then pauses for `oracle-production` approval. A pull-request or push
+run never receives the production environment or SSH key.
 
 For a deliberate redeploy, choose **Actions → Deploy Oracle production → Run
 workflow**, select `deploy`, verify the displayed commit, and approve the
-production environment. For a read-only inspection choose `preflight`.
+oracle-production environment. For a read-only inspection choose `preflight`.
 
 ## Persistent data and backups
 
 These files remain under `/home/opc/kalshi-ai-trading-bot` and are never put in
 a release archive:
 
-- `signals_monitor.db`
-- `signals_account_monitor.db`
-- `signals_model.json`
-- `signals_opening_model.json`
-- `signals_model_registry/`
+- `data/signals_monitor.db`
+- `data/signals_account_monitor.db`
+- `data/models/`
 - all service environment and credential files
 
 Before every restart, `sqlite_backup.py` uses `Connection.backup()` so a live
 WAL database is copied consistently. Each backup receives `PRAGMA quick_check`,
 a SHA-256 manifest, and the release policy. The deployment stops when backup
-space is less than the current database size plus 20%. Never copy a live `.db`
+space is less than all databases/models plus 25% and 1 GiB. Never copy a live `.db`
 file with `cp`.
 
 ## Rollback

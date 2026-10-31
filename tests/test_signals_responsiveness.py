@@ -403,3 +403,35 @@ def test_storage_health_is_constant_time_and_preserves_database(tmp_path):
     assert health["database_bytes"] == before
     assert health["status"] == "NORMAL"
     assert Path(journal.path).exists()
+
+
+def test_new_official_settlement_invalidates_learning_count_immediately():
+    class JournalStub:
+        def backfill_contract_reviews(self, limit): assert limit == 20
+        def seed_settlement_queue(self): pass
+        def due_settlements(self, _now): return ["KXBTC15M-MOCK"]
+        def mark_settlement_attempt(self, _ticker, _now): pass
+        def settle(self, _ticker, outcome, mode):
+            assert outcome == "yes" and mode == "PUBLIC MARKET DATA"
+            return True
+
+    class FeedStub:
+        def resolved(self, _ticker): return "yes"
+
+    class ReportStub:
+        def __init__(self): self.invalidated = False
+        def invalidate(self): self.invalidated = True
+
+    monitor = Monitor.__new__(Monitor)
+    monitor.journal, monitor.feed = JournalStub(), FeedStub()
+    monitor.engine_report = ReportStub()
+    monitor.research_report = ReportStub()
+    monitor.edge_report = ReportStub()
+    monitor.scheduled_learning = None
+    monitor.scheduled_scalp_learning = None
+    monitor.readiness_at = NOW
+    monitor.maintenance_error = "Official settlement result pending or inaccessible"
+    monitor.maintain_settlements(NOW)
+    assert monitor.readiness_at is None
+    assert monitor.maintenance_error is None
+    assert monitor.engine_report.invalidated

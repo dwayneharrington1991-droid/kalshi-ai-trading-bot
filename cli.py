@@ -9,7 +9,7 @@ Provides a single entry point for all bot operations:
     python cli.py backtest     Run backtests (placeholder)
     python cli.py health       Verify API connections, database, and configuration
 """
-
+#
 import argparse
 import asyncio
 import os
@@ -106,6 +106,12 @@ def _run_safe_compounder(
     """
     from src.clients.kalshi_client import KalshiClient
     from src.strategies.safe_compounder import SafeCompounder
+
+    if live_mode:
+        raise RuntimeError(
+            "Safe Compounder live submission is disabled because this legacy command "
+            "is not connected to the verified execution gateway."
+        )
 
     print("🔒 SAFE COMPOUNDER MODE")
     print("   NO-side only | Edge-based | Near-certain outcomes")
@@ -352,13 +358,24 @@ def cmd_history(args: argparse.Namespace) -> None:
                         f"{t['quantity']:>4} ${t['pnl']:>7.2f}  {cat}"
                     )
 
-            # Blocked trades summary
-            cursor2 = await db.execute("""
-                SELECT COUNT(*) FROM blocked_trades
-            """)
-            r2 = await cursor2.fetchone()
-            if r2 and r2[0]:
-                print(f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
+            # Blocked trades summary — only query it if the optional table exists
+            cursor2 = await db.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='blocked_trades'"
+            )
+            blocked_table_exists = await cursor2.fetchone()
+
+            if blocked_table_exists:
+                cursor2 = await db.execute(
+                    "SELECT COUNT(*) FROM blocked_trades"
+                )
+                r2 = await cursor2.fetchone()
+
+                if r2 and r2[0]:
+                    print(
+                        f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer "
+                        "(use 'python cli.py health' for details)"
+                    )
 
             print("=" * 70)
 
@@ -381,6 +398,12 @@ def cmd_close_all(args: argparse.Namespace) -> None:
 
     auto_yes = getattr(args, "yes", False)
     live_mode = getattr(args, "live", False)
+
+    if live_mode:
+        raise RuntimeError(
+            "Direct close-all submission is disabled. Live exits must use the verified "
+            "execution gateway and authoritative fill reconciliation."
+        )
 
     print("=" * 56)
     print("  CLOSE ALL POSITIONS")

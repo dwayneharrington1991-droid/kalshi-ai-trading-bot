@@ -11,9 +11,9 @@ from tests.test_database import TEST_DB
 # Mark all tests in this file as async
 pytestmark = pytest.mark.asyncio
 
-async def test_execute_position_places_live_order():
+async def test_execute_position_blocks_legacy_live_order_by_default():
     """
-    Test that the execution job correctly places a live order for a non-live position.
+    The central boundary must not use the legacy live path by default.
     """
     # Arrange: Setup a test database with a non-live position
     db_path = TEST_DB
@@ -62,21 +62,14 @@ async def test_execute_position_places_live_order():
             kalshi_client=mock_kalshi_client
         )
 
-        # Assert: Check that the order was placed and the position updated
-        assert result == True, "Execution should have succeeded"
+        assert result is False
         
         updated_position = await db_manager.get_position_by_market_id("LIVE-TEST-1")
 
-        # Check that place_order was called
-        mock_kalshi_client.place_order.assert_called_once()
-        call_args = mock_kalshi_client.place_order.call_args
-        assert call_args.kwargs['ticker'] == "LIVE-TEST-1"
-        assert call_args.kwargs['side'] == "yes"
-        assert call_args.kwargs['count'] == 10
-        assert 'client_order_id' in call_args.kwargs
+        mock_kalshi_client.place_order.assert_not_called()
 
         assert updated_position is not None, "Position should still exist."
-        assert updated_position.live == True, "Position should be marked as live."
+        assert bool(updated_position.live) is False, "Acceptance must not mark a position live."
         assert updated_position.id == position_id
 
     finally:
@@ -243,4 +236,4 @@ async def test_profit_taking_orders():
         # Cleanup
         await kalshi_client.close()
         if os.path.exists(test_db):
-            os.remove(test_db) 
+            os.remove(test_db)

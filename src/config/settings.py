@@ -16,7 +16,10 @@ load_dotenv()
 class APIConfig:
     """API configuration settings."""
     kalshi_api_key: str = field(default_factory=lambda: os.getenv("KALSHI_API_KEY", ""))
-    kalshi_base_url: str = "https://api.elections.kalshi.com"  # Updated to new API endpoint
+    kalshi_base_url: str = "https://external-api.kalshi.com"  # Updated to new API endpoint
+    kalshi_environment: str = field(
+        default_factory=lambda: os.getenv("KALSHI_ENVIRONMENT", "production").lower()
+    )
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     openai_base_url: str = "https://api.openai.com/v1"
@@ -61,6 +64,37 @@ class SentimentConfig:
     relevance_threshold: float = 0.3
 
 
+@dataclass
+class MultiAgentShadowConfig:
+    """Disabled-by-default intelligence that is forbidden from affecting trades."""
+    enabled: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_SHADOW_ENABLED", "false").lower() == "true")
+    can_affect_trading: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_CAN_AFFECT_TRADING", "false").lower() == "true")
+    max_concurrency: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_MAX_CONCURRENCY", "3")))
+    timeout_seconds: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_TIMEOUT_SECONDS", "30")))
+    max_retries: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_MAX_RETRIES", "1")))
+    min_successful_agents: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_MIN_SUCCESSFUL_AGENTS", "3")))
+    require_risk_agent: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_REQUIRE_RISK_AGENT", "true").lower() == "true")
+    require_forecaster: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_REQUIRE_FORECASTER", "true").lower() == "true")
+    abstain_on_weak_evidence: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_ABSTAIN_ON_WEAK_EVIDENCE", "true").lower() == "true")
+    log_raw_responses: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_LOG_RAW_RESPONSES", "false").lower() == "true")
+    store_sanitized_responses: bool = field(default_factory=lambda: os.getenv("MULTI_AGENT_STORE_SANITIZED_RESPONSES", "true").lower() == "true")
+    max_markets_per_cycle: int = field(default_factory=lambda: int(os.getenv("MULTI_AGENT_MAX_MARKETS_PER_CYCLE", "5")))
+    configuration_version: str = field(default_factory=lambda: os.getenv("MULTI_AGENT_CONFIGURATION_VERSION", "phase4-v1"))
+    weight_learning_enabled: bool = field(default_factory=lambda: os.getenv("AGENT_WEIGHT_LEARNING_ENABLED", "false").lower() == "true")
+    weight_auto_apply: bool = field(default_factory=lambda: os.getenv("AGENT_WEIGHT_AUTO_APPLY", "false").lower() == "true")
+    weight_min_samples: int = field(default_factory=lambda: int(os.getenv("AGENT_WEIGHT_MIN_SAMPLES", "100")))
+    weight_max_change: float = field(default_factory=lambda: float(os.getenv("AGENT_WEIGHT_MAX_CHANGE", "0.05")))
+    weight_min: float = field(default_factory=lambda: float(os.getenv("AGENT_WEIGHT_MIN", "0.05")))
+    weight_max: float = field(default_factory=lambda: float(os.getenv("AGENT_WEIGHT_MAX", "0.40")))
+    weight_rolling_days: int = field(default_factory=lambda: int(os.getenv("AGENT_WEIGHT_ROLLING_DAYS", "90")))
+
+    def __post_init__(self) -> None:
+        if self.can_affect_trading:
+            raise RuntimeError("MULTI_AGENT_CAN_AFFECT_TRADING=true is forbidden in shadow phase")
+        if self.max_concurrency < 1 or self.max_markets_per_cycle < 1:
+            raise ValueError("multi-agent bounds must be positive")
+
+
 # Trading strategy configuration — DISCIPLINED DEFAULTS (sane risk management)
 # Beast mode is still available via --beast flag, but NOT the default.
 # Discipline defaults based on live prediction market trading experience.
@@ -77,10 +111,10 @@ class TradingConfig:
     
     # Market filtering criteria — DISCIPLINED
     min_volume: float = 500.0           # SANE: Higher volume requirement (was 200 beast mode)
-    max_time_to_expiry_days: int = 14   # SANE: Shorter timeframes (was 30)
+    max_time_to_expiry_days: int = 90   # SANE: Shorter timeframes (was 30)
     
     # AI decision making — DATA-DRIVEN THRESHOLDS  
-    min_confidence_to_trade: float = 0.45   # LOOSENED: 45% confidence minimum (was 60%, approved 2026-03-29)
+    min_confidence_to_trade: float = 0.55   # LOOSENED: 45% confidence minimum (was 60%, approved 2026-03-29)
                                            # Based on analysis: 65% was too conservative, bot finding 0 eligible markets
                                            # NCAAB NO-side showed 74% WR at +10% ROI, suggesting value at lower thresholds
     
@@ -107,11 +141,140 @@ class TradingConfig:
     # Kelly Criterion settings (PRIMARY position sizing method) — DISCIPLINED
     use_kelly_criterion: bool = True        # Use Kelly Criterion for position sizing (PRIMARY METHOD)
     kelly_fraction: float = 0.25            # SANE: Quarter-Kelly (was 0.75 beast mode — gambling)
-    max_single_position: float = 0.03       # SANE: 3% max position cap (was 0.05 beast mode)
+    max_single_position: float = 0.10       # SANE: 3% max position cap (was 0.05 beast mode)
+    min_position_size: float = 1.0  # Minimum live position size
     
     # Live trading mode control
     live_trading_enabled: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true")
     paper_trading_mode: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() != "true")
+
+    # Exchange reconciliation is disabled and shadow-only by default. Phase 2
+    # never routes order submission or position mutation through this system.
+    order_reconciliation_enabled: bool = field(
+        default_factory=lambda: os.getenv("ORDER_RECONCILIATION_ENABLED", "false").lower() == "true"
+    )
+    reconciliation_shadow_mode: bool = field(
+        default_factory=lambda: os.getenv("RECONCILIATION_SHADOW_MODE", "true").lower() == "true"
+    )
+    reconciliation_startup_required: bool = field(
+        default_factory=lambda: os.getenv("RECONCILIATION_STARTUP_REQUIRED", "true").lower() == "true"
+    )
+    reconciliation_interval_seconds: int = field(
+        default_factory=lambda: int(os.getenv("RECONCILIATION_INTERVAL_SECONDS", "10"))
+    )
+    full_reconciliation_interval_seconds: int = field(
+        default_factory=lambda: int(os.getenv("FULL_RECONCILIATION_INTERVAL_SECONDS", "60"))
+    )
+    order_verification_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("ORDER_VERIFICATION_TIMEOUT_SECONDS", "30"))
+    )
+    reconciliation_max_staleness_seconds: int = field(
+        default_factory=lambda: int(os.getenv("RECONCILIATION_MAX_STALENESS_SECONDS", "30"))
+    )
+    authoritative_live_execution_enabled: bool = field(
+        default_factory=lambda: os.getenv("AUTHORITATIVE_LIVE_EXECUTION_ENABLED", "false").lower() == "true"
+    )
+    live_order_submission_kill_switch: bool = field(
+        default_factory=lambda: os.getenv("LIVE_ORDER_SUBMISSION_KILL_SWITCH", "true").lower() == "true"
+    )
+    production_execution_acknowledgement: str = field(
+        default_factory=lambda: os.getenv("PRODUCTION_EXECUTION_ACKNOWLEDGEMENT", "")
+    )
+    reconciliation_health_max_age_seconds: int = field(
+        default_factory=lambda: int(os.getenv("RECONCILIATION_HEALTH_MAX_AGE_SECONDS", "30"))
+    )
+    allow_risk_reducing_live_exits: bool = field(
+        default_factory=lambda: os.getenv("ALLOW_RISK_REDUCING_LIVE_EXITS", "false").lower() == "true"
+    )
+    allow_live_order_cancellations: bool = field(
+        default_factory=lambda: os.getenv("ALLOW_LIVE_ORDER_CANCELLATIONS", "false").lower() == "true"
+    )
+    overnight_canary_enabled: bool = field(
+        default_factory=lambda: os.getenv("OVERNIGHT_CANARY_ENABLED", "false").lower() == "true"
+    )
+    overnight_canary_max_total_risk: float = field(
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_TOTAL_RISK", "20"))
+    )
+    overnight_canary_max_market_risk: float = field(
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_MARKET_RISK", "5"))
+    )
+    overnight_canary_max_positions: int = field(
+        default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MAX_POSITIONS", "5"))
+    )
+    overnight_canary_max_rejections: int = field(
+        default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MAX_REJECTIONS", "3"))
+    )
+    overnight_canary_max_daily_loss: float = field(
+        default_factory=lambda: float(os.getenv("OVERNIGHT_CANARY_MAX_DAILY_LOSS", "5"))
+    )
+    overnight_canary_market_data_max_age_seconds: int = field(
+        default_factory=lambda: int(os.getenv("OVERNIGHT_CANARY_MARKET_DATA_MAX_AGE_SECONDS", "120"))
+    )
+    min_preferred_probability: float = field(
+        default_factory=lambda: float(os.getenv("MIN_PREFERRED_PROBABILITY", "0.55"))
+    )
+    max_preferred_probability: float = field(
+        default_factory=lambda: float(os.getenv("MAX_PREFERRED_PROBABILITY", "0.90"))
+    )
+    min_directional_edge: float = field(
+        default_factory=lambda: float(os.getenv("MIN_DIRECTIONAL_EDGE", "0.05"))
+    )
+    directional_fee_estimate: float = field(
+        default_factory=lambda: float(os.getenv("DIRECTIONAL_FEE_ESTIMATE", "0.01"))
+    )
+    directional_slippage_estimate: float = field(
+        default_factory=lambda: float(os.getenv("DIRECTIONAL_SLIPPAGE_ESTIMATE", "0.005"))
+    )
+    fast_live_max_remaining_minutes: int = field(
+        default_factory=lambda: int(os.getenv("FAST_LIVE_MAX_REMAINING_MINUTES", "60"))
+    )
+    fast_live_max_model_age_seconds: int = field(
+        default_factory=lambda: int(os.getenv("FAST_LIVE_MAX_MODEL_AGE_SECONDS", "30"))
+    )
+    # Dedicated BTC 15-minute strategy.  Both switches default off; merely
+    # adding this code can never change the existing canary's trading universe.
+    kxbtc15m_only_mode_enabled: bool = field(
+        default_factory=lambda: os.getenv("KXBTC15M_ONLY_MODE_ENABLED", "false").lower() == "true"
+    )
+    kxbtc15m_live_execution_enabled: bool = field(
+        default_factory=lambda: os.getenv("KXBTC15M_LIVE_EXECUTION_ENABLED", "false").lower() == "true"
+    )
+    kxbtc15m_entry_cutoff_seconds: int = field(
+        default_factory=lambda: int(os.getenv("KXBTC15M_ENTRY_CUTOFF_SECONDS", "60"))
+    )
+    kxbtc15m_ws_max_age_seconds: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_WS_MAX_AGE_SECONDS", "5"))
+    )
+    kxbtc15m_reference_max_age_seconds: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_REFERENCE_MAX_AGE_SECONDS", "5"))
+    )
+    kxbtc15m_reference_max_displacement_bps: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_REFERENCE_MAX_DISPLACEMENT_BPS", "25"))
+    )
+    kxbtc15m_min_confidence: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MIN_CONFIDENCE", "0.75"))
+    )
+    kxbtc15m_min_net_edge: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MIN_NET_EDGE", "0.05"))
+    )
+    kxbtc15m_max_spread: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MAX_SPREAD", "0.08"))
+    )
+    kxbtc15m_min_liquidity: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MIN_LIQUIDITY", "1"))
+    )
+    # BTC15M has a distinct, lower production canary envelope.  These values
+    # are caps, never requested order sizes, and must be enforced alongside
+    # the general verified-execution canary controls.
+    kxbtc15m_max_total_risk: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MAX_TOTAL_RISK", "5"))
+    )
+    kxbtc15m_max_market_risk: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MAX_MARKET_RISK", "1"))
+    )
+    kxbtc15m_max_daily_loss: float = field(
+        default_factory=lambda: float(os.getenv("KXBTC15M_MAX_DAILY_LOSS", "2"))
+    )
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)
@@ -135,24 +298,23 @@ class TradingConfig:
     min_confidence_threshold: float = 0.45  # DECREASED: Lower confidence threshold (was 0.55, now 0.45)
 
     # Cost control and market analysis frequency - MORE PERMISSIVE
-    daily_ai_budget: float = 10.0  # INCREASED: Higher daily budget (was 5.0, now 10.0)
-    max_ai_cost_per_decision: float = 0.08  # INCREASED: Higher per-decision cost (was 0.05, now 0.08)
-    analysis_cooldown_hours: int = 3  # DECREASED: Shorter cooldown (was 6, now 3)
-    max_analyses_per_market_per_day: int = 4  # INCREASED: More analyses per day (was 2, now 4)
-    
+    daily_ai_budget: float = 15.0
+    max_ai_cost_per_decision: float = 0.08
+    analysis_cooldown_hours: int = 3
+    max_analyses_per_market_per_day: int = 4
+    skip_news_for_low_volume: bool = True
+    news_search_volume_threshold: float = 1000.0
+
     # Daily AI spending limits - SAFETY CONTROLS
-    # Default is $10/day — conservative limit to prevent runaway API spend.
-    # Raise via DAILY_AI_COST_LIMIT env var or by editing this value directly.
-    # e.g. export DAILY_AI_COST_LIMIT=25  (for more aggressive scanning)
-    daily_ai_cost_limit: float = field(default_factory=lambda: float(os.getenv("DAILY_AI_COST_LIMIT", "10.0")))
-    enable_daily_cost_limiting: bool = True  # Enable daily cost limits
-    sleep_when_limit_reached: bool = True  # Sleep until next day when limit reached
+    daily_ai_cost_limit: float = field(
+        default_factory=lambda: float(os.getenv("DAILY_AI_COST_LIMIT", "10.0"))
+    )
+    enable_daily_cost_limiting: bool = True
+    sleep_when_limit_reached: bool = True
 
     # Enhanced market filtering to reduce analyses - MORE PERMISSIVE
-    min_volume_for_ai_analysis: float = 200.0  # DECREASED: Much lower threshold (was 500, now 200)
-    exclude_low_liquidity_categories: List[str] = field(default_factory=lambda: [
-        # REMOVED weather and entertainment - trade all categories
-    ])
+    min_volume_for_ai_analysis: float = 200.0
+    exclude_low_liquidity_categories: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -163,7 +325,7 @@ class LoggingConfig:
     log_file: str = "logs/trading_system.log"
     enable_file_logging: bool = True
     enable_console_logging: bool = True
-    max_log_file_size: int = 10 * 1024 * 1024  # 10MB
+    max_log_file_size: int = 10 * 1024 * 1024
     backup_count: int = 5
 
 
@@ -176,12 +338,12 @@ market_making_allocation: float = 0.40  # 40% for market making (spread profits)
 directional_allocation: float = 0.50    # 50% for directional trading (AI predictions) 
 arbitrage_allocation: float = 0.10      # 10% for arbitrage opportunities
 
-  # === PORTFOLIO OPTIMIZATION SETTINGS ===
+# === PORTFOLIO OPTIMIZATION SETTINGS ===
 # Kelly Criterion is now the PRIMARY position sizing method (moved to TradingConfig)
 # total_capital: DYNAMICALLY FETCHED from Kalshi balance - never hardcoded!
 use_risk_parity: bool = True            # Equal risk allocation vs equal capital
 rebalance_hours: int = 6                # Rebalance portfolio every 6 hours
-min_position_size: float = 5.0          # Minimum position size ($5 vs $10)
+min_position_size: float = 1.0          # Minimum position size ($5 vs $10)
 max_opportunities_per_batch: int = 50   # Limit opportunities to prevent optimization issues
 
 # === RISK MANAGEMENT LIMITS ===
@@ -259,10 +421,11 @@ class Settings:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
     sentiment: SentimentConfig = field(default_factory=SentimentConfig)
+    multi_agent_shadow: MultiAgentShadowConfig = field(default_factory=MultiAgentShadowConfig)
 
     def validate(self) -> bool:
         """Validate configuration settings."""
-        if not self.api.kalshi_api_key:
+        if self.trading.live_trading_enabled and not self.api.kalshi_api_key:
             raise ValueError("KALSHI_API_KEY environment variable is required")
 
         if self.trading.max_position_size_pct <= 0 or self.trading.max_position_size_pct > 100:

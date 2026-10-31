@@ -21,6 +21,7 @@ Key innovations:
 """
 
 import numpy as np
+import aiosqlite
 from typing import Dict, List
 from scipy.optimize import minimize
 import warnings
@@ -34,6 +35,7 @@ from src.utils.logging_setup import get_trading_logger
 from src.utils.position_sizing import binary_market_payout_odds, kelly_fraction
 
 from src.strategies.portfolio.models import MarketOpportunity, PortfolioAllocation
+from src.strategies.sports_markets import deduplicate_and_cap_event_exposure
 
 
 class AdvancedPortfolioOptimizer:
@@ -96,6 +98,15 @@ class AdvancedPortfolioOptimizer:
         
         if not opportunities:
             return self._empty_allocation()
+
+        # Every derivative is evaluated independently, but aggregate risk for
+        # contracts attached to one game is capped before optimization.
+        existing_event_exposure = await self._existing_event_exposure(opportunities)
+        opportunities = deduplicate_and_cap_event_exposure(
+            opportunities,
+            max_event_risk=float(getattr(settings.trading, "overnight_canary_max_market_risk", 5.0)),
+            existing=existing_event_exposure,
+        )
         
         # Limit opportunities to prevent optimization complexity
         max_opportunities = getattr(settings.trading, 'max_opportunities_per_batch', 50)
@@ -103,7 +114,7 @@ class AdvancedPortfolioOptimizer:
             # Sort by confidence * expected_return and take top N
             opportunities = sorted(
                 opportunities, 
-                key=lambda x: x.confidence * x.expected_return, 
+                key=lambda x: x.ranking_score,
                 reverse=True
             )[:max_opportunities]
             self.logger.info(f"Limited to top {max_opportunities} opportunities for optimization")
@@ -161,6 +172,32 @@ class AdvancedPortfolioOptimizer:
             self.logger.error(f"Error in portfolio optimization: {e}")
             return self._empty_allocation()
 
+    async def _existing_event_exposure(self, opportunities: List[MarketOpportunity]) -> Dict[str, float]:
+        """Aggregate authoritative/open local risk for related event contracts."""
+        groups = {item.correlation_group for item in opportunities if item.correlation_group}
+        if not groups:
+            return {}
+        exposure = {group: 0.0 for group in groups}
+        try:
+            async with aiosqlite.connect(self.db_manager.db_path) as db:
+                rows = await (await db.execute(
+                    """SELECT market_id, COALESCE(open_quantity, quantity), entry_price
+                       FROM positions
+                       WHERE live = 1 AND status IN ('open', 'pending')
+                         AND COALESCE(open_quantity, quantity) > 0"""
+                )).fetchall()
+        except Exception as exc:
+            self.logger.error("Failed to verify correlated event exposure", error=type(exc).__name__)
+            # Fail closed: make every known group fully utilized.
+            cap = float(getattr(settings.trading, "overnight_canary_max_market_risk", 5.0))
+            return {group: cap for group in groups}
+        for market_id, quantity, entry_price in rows:
+            ticker = str(market_id).upper()
+            for group in groups:
+                if ticker == group or ticker.startswith(group + "-"):
+                    exposure[group] += max(0.0, float(quantity)) * max(0.0, float(entry_price))
+        return exposure
+
     async def _enhance_opportunities_with_metrics(
         self, 
         opportunities: List[MarketOpportunity]
@@ -195,7 +232,23 @@ class AdvancedPortfolioOptimizer:
                     risk_adjusted_fraction=0.0,
                     sharpe_ratio=sharpe_ratio,
                     sortino_ratio=sortino_ratio,
-                    max_drawdown_contribution=max_dd_contribution
+                    max_drawdown_contribution=max_dd_contribution,
+                    recommended_side=opp.recommended_side,
+                    side_probability=opp.side_probability,
+                    side_market_probability=opp.side_market_probability,
+                    net_expected_return=opp.net_expected_return,
+                    ranking_score=opp.ranking_score,
+                    category=opp.category,
+                    sports_phase=opp.sports_phase,
+                    event_ticker=opp.event_ticker,
+                    event_title=opp.event_title,
+                    market_type=opp.market_type,
+                    correlation_group=opp.correlation_group,
+                    existing_correlated_exposure=opp.existing_correlated_exposure,
+                    correlation_reason=opp.correlation_reason,
+                    proposed_risk=opp.proposed_risk,
+                    executable_liquidity=opp.executable_liquidity,
+                    proposed_quantity=opp.proposed_quantity,
                 )
                 
                 enhanced.append(enhanced_opp)
@@ -531,7 +584,7 @@ class AdvancedPortfolioOptimizer:
             scores = []
             for opp in opportunities:
                 # Score based on expected return, confidence, and edge
-                score = opp.expected_return * opp.confidence * max(0, abs(opp.edge))
+                score = opp.ranking_score
                 scores.append((opp.market_id, score))
             
             # Sort by score
@@ -586,6 +639,11 @@ class AdvancedPortfolioOptimizer:
                 
                 # Apply minimum position size
                 dollar_allocation = fraction * self.total_capital
+                self.logger.warning(
+                    f"ALLOCATION DEBUG: market={market_id}, fraction={fraction:.6f}, "
+                    f"capital=${self.total_capital:.2f}, dollars=${dollar_allocation:.2f}, "
+                    f"minimum=${self.min_position_size:.2f}, opportunity={opp is not None}"
+                )
                 if dollar_allocation < self.min_position_size:
                     continue
                 

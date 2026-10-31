@@ -1,0 +1,26 @@
+{
+  "request": {
+    "request_id": "fixture-shadow-request-001",
+    "market_id": "FIXTURE-MARKET",
+    "title": "Will the fixture event occur?",
+    "rules": "Resolves YES if the supplied fixture event occurs before expiry.",
+    "category": "fixture",
+    "yes_price": 0.48,
+    "no_price": 0.52,
+    "bid_ask_spread": 0.02,
+    "volume": 1000,
+    "expiration_timestamp": "2026-01-02T00:00:00+00:00",
+    "time_remaining_seconds": 86400,
+    "analysis_timestamp": "2026-01-01T00:00:00+00:00",
+    "configuration_version": "fixture-v1",
+    "single_model_analysis": {"probability_yes": 0.55},
+    "context": [{"source": "fixture", "timestamp": "2026-01-01T00:00:00+00:00"}]
+  },
+  "agent_outputs": {
+    "forecaster": {"probability_yes": 0.56, "confidence": 0.7, "evidence": ["fixture"], "uncertainty": [], "assumptions": [], "evidence_sufficient": true, "recommendation": "HOLD"},
+    "bull_analyst": {"probability_yes": 0.62, "confidence": 0.6, "evidence": ["fixture"], "uncertainty": [], "assumptions": [], "evidence_sufficient": true, "recommendation": "BUY_YES"},
+    "bear_analyst": {"probability_yes": 0.43, "confidence": 0.6, "evidence": ["fixture"], "uncertainty": [], "assumptions": [], "evidence_sufficient": true, "recommendation": "BUY_NO"},
+    "news_analyst": {"confidence": 0.5, "evidence": ["fixture"], "uncertainty": [], "assumptions": [], "evidence_sufficient": true, "recommendation": "HOLD"},
+    "risk_manager": {"probability_yes": 0.52, "confidence": 0.7, "evidence": ["fixture"], "uncertainty": [], "assumptions": [], "evidence_sufficient": true, "risk_level": "LOW", "veto": false, "recommendation": "HOLD"}
+  }
+}

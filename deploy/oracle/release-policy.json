@@ -1,0 +1,6 @@
+{
+  "database_change": "none",
+  "automatic_code_rollback": true,
+  "review_note": "This release adds no incompatible database migration. Existing additive tables and records remain untouched."
+}
+

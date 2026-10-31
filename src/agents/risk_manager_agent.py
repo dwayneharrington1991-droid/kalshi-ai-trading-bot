@@ -32,6 +32,11 @@ class RiskManagerAgent(BaseAgent):
         "   and lower risk = larger position.\n"
         "4. WORST CASE -- What is the maximum loss, and is it acceptable?\n"
         "5. EDGE DURABILITY -- How long will the informational edge last?\n\n"
+        "Also evaluate ambiguous settlement wording, aggregate/collection markets, "
+        "low liquidity, wide spreads, extreme or stale prices, short time to "
+        "settlement, correlated/concentrated exposure, model disagreement, weak "
+        "or stale evidence, unresolved reconciliation alerts, and duplicate "
+        "positions or intents. Return an explicit veto when any critical issue exists.\n\n"
         "Return your analysis as a JSON object (inside a ```json``` code block) "
         "with the following keys:\n"
         '  "risk_score": float (1.0-10.0),\n'

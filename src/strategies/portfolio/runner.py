@@ -26,8 +26,8 @@ async def run_portfolio_optimization(
         
         # Get markets
         markets = await db_manager.get_eligible_markets(
-            volume_min=20000,  # Balanced volume for actual trading opportunities
-            max_days_to_expiry=365  # Accept any timeline with dynamic exits
+            volume_min=0,  # Balanced volume for actual trading opportunities
+            max_days_to_expiry=3  # Accept any timeline with dynamic exits
         )
         if not markets:
             logger.warning("No eligible markets for portfolio optimization")

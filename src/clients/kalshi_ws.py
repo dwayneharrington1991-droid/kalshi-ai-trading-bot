@@ -36,13 +36,19 @@ from src.utils.logging_setup import TradingLoggerMixin
 # ---------------------------------------------------------------------------
 
 WS_PATH = "/trade-api/ws/v2"
+_WS_BASE_URLS = {
+    "production": "wss://external-api-ws.kalshi.com",
+    "demo": "wss://external-api-ws.demo.kalshi.co",
+}
 
 # Channel names accepted by the Kalshi WebSocket API
 CHANNEL_ORDERBOOK_DELTA = "orderbook_delta"
 CHANNEL_TICKER = "ticker"
 CHANNEL_TRADE = "trade"
 CHANNEL_FILL = "fill"
-ALL_CHANNELS = {CHANNEL_ORDERBOOK_DELTA, CHANNEL_TICKER, CHANNEL_TRADE, CHANNEL_FILL}
+CHANNEL_MARKET_LIFECYCLE = "market_lifecycle_v2"
+CHANNEL_USER_ORDER = "user_order"
+ALL_CHANNELS = {CHANNEL_ORDERBOOK_DELTA, CHANNEL_TICKER, CHANNEL_TRADE, CHANNEL_FILL, CHANNEL_MARKET_LIFECYCLE, CHANNEL_USER_ORDER}
 
 # Reconnect parameters
 _INITIAL_BACKOFF_S = 1.0
@@ -51,6 +57,14 @@ _BACKOFF_MULTIPLIER = 2.0
 
 # Keepalive interval
 _PING_INTERVAL_S = 10.0
+
+
+def websocket_url(environment: str) -> str:
+    """Return the official dedicated Kalshi WebSocket endpoint, fail closed."""
+    base_url = _WS_BASE_URLS.get(str(environment).strip().casefold())
+    if base_url is None:
+        raise ValueError(f"Unsupported Kalshi WebSocket environment: {environment!r}")
+    return f"{base_url}{WS_PATH}"
 
 
 class ConnectionState(str, Enum):
@@ -133,6 +147,8 @@ class KalshiWebSocket(TradingLoggerMixin):
             CHANNEL_ORDERBOOK_DELTA: [],
             CHANNEL_TRADE: [],
             CHANNEL_FILL: [],
+            CHANNEL_MARKET_LIFECYCLE: [],
+            CHANNEL_USER_ORDER: [],
         }
 
         # Load RSA private key on init
@@ -215,8 +231,9 @@ class KalshiWebSocket(TradingLoggerMixin):
 
         self._state = ConnectionState.CONNECTING
 
-        base_url = settings.api.kalshi_base_url.replace("https://", "wss://").replace("http://", "ws://")
-        ws_url = f"{base_url}{WS_PATH}"
+        # REST and WebSocket use distinct dedicated hosts. Deriving one from
+        # the other sends upgrades to a REST-only host and returns HTTP 404.
+        ws_url = websocket_url(settings.api.kalshi_environment)
         headers = self._build_auth_headers()
 
         self.logger.info("Connecting to Kalshi WebSocket", url=ws_url)
@@ -272,6 +289,8 @@ class KalshiWebSocket(TradingLoggerMixin):
         self,
         tickers: List[str],
         channels: Optional[List[str]] = None,
+        *,
+        use_yes_price: bool = True,
     ) -> None:
         """
         Subscribe to real-time channels for the given market tickers.
@@ -295,6 +314,9 @@ class KalshiWebSocket(TradingLoggerMixin):
             "params": {
                 "channels": channels,
                 "market_tickers": tickers,
+                # Kalshi recommends the unified YES-price representation for
+                # new book consumers. This prevents side-scale inversion.
+                "use_yes_price": bool(use_yes_price),
             },
         }
         await self._ws.send(json.dumps(msg))
@@ -357,6 +379,14 @@ class KalshiWebSocket(TradingLoggerMixin):
         self._callbacks[CHANNEL_FILL].append(callback)
         return callback
 
+    def on_market_lifecycle(self, callback: MessageCallback) -> MessageCallback:
+        self._callbacks[CHANNEL_MARKET_LIFECYCLE].append(callback)
+        return callback
+
+    def on_user_order(self, callback: MessageCallback) -> MessageCallback:
+        self._callbacks[CHANNEL_USER_ORDER].append(callback)
+        return callback
+
     # ------------------------------------------------------------------
     # Message dispatch
     # ------------------------------------------------------------------
@@ -378,6 +408,8 @@ class KalshiWebSocket(TradingLoggerMixin):
             "orderbook_snapshot": CHANNEL_ORDERBOOK_DELTA,
             "trade": CHANNEL_TRADE,
             "fill": CHANNEL_FILL,
+            "market_lifecycle_v2": CHANNEL_MARKET_LIFECYCLE,
+            "user_order": CHANNEL_USER_ORDER,
         }
 
         event_bus_map: Dict[str, str] = {

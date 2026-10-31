@@ -28,6 +28,22 @@ class MarketOpportunity:
     sharpe_ratio: float
     sortino_ratio: float
     max_drawdown_contribution: float
+    recommended_side: str = "UNKNOWN"
+    side_probability: float = 0.0
+    side_market_probability: float = 0.0
+    net_expected_return: float = 0.0
+    ranking_score: float = 0.0
+    category: str = ""
+    sports_phase: str = "NOT_APPLICABLE"
+    event_ticker: str = ""
+    event_title: str = ""
+    market_type: str = "OTHER"
+    correlation_group: str = ""
+    existing_correlated_exposure: float = 0.0
+    correlation_reason: str = "not evaluated"
+    proposed_risk: float = 5.0
+    executable_liquidity: float = 0.0
+    proposed_quantity: float = 0.0
 
 
 @dataclass

@@ -4,7 +4,7 @@ Database manager for the Kalshi trading system.
 
 import aiosqlite
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 
 from src.utils.logging_setup import TradingLoggerMixin
@@ -44,6 +44,13 @@ class Position:
     take_profit_price: Optional[float] = None
     max_hold_hours: Optional[int] = None  # Maximum hours to hold position
     target_confidence_change: Optional[float] = None  # Exit if confidence drops by this amount
+    filled_quantity: Optional[float] = None
+    average_entry_price: Optional[float] = None
+    average_exit_price: Optional[float] = None
+    open_quantity: Optional[float] = None
+    last_reconciled_at: Optional[str] = None
+    reconciliation_status: Optional[str] = None
+    legacy_unreconciled: bool = False
 
 @dataclass
 class TradeLog:
@@ -85,66 +92,410 @@ class DatabaseManager(TradingLoggerMixin):
         self.logger.info("Initializing database manager", db_path=db_path)
 
     async def initialize(self) -> None:
-        """Initialize database schema and run migrations."""
+        """Initialize the schema and apply each migration atomically."""
         # Ensure the parent directory exists (e.g. data/ on a fresh clone)
         import os
         db_dir = os.path.dirname(os.path.abspath(self.db_path))
         os.makedirs(db_dir, exist_ok=True)
 
         async with aiosqlite.connect(self.db_path) as db:
-            await self._create_tables(db)
-            await self._run_migrations(db)
-            await db.commit()
+            await db.execute("PRAGMA foreign_keys = ON")
+            await db.execute("PRAGMA busy_timeout = 5000")
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                await self._create_tables(db)
+                await self._run_migrations(db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                self.logger.exception("Database initialization failed; transaction rolled back")
+                raise
         self.logger.info("Database initialized successfully")
 
     async def _run_migrations(self, db: aiosqlite.Connection) -> None:
-        """Run database migrations for schema updates."""
-        try:
-            # Migration 1: Add strategy column to positions table
-            cursor = await db.execute("PRAGMA table_info(positions)")
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            if 'strategy' not in column_names:
-                self.logger.info("Adding strategy column to positions table")
-                await db.execute("ALTER TABLE positions ADD COLUMN strategy TEXT")
-            
-            # Migration 2: Add strategy column to trade_logs table
-            cursor = await db.execute("PRAGMA table_info(trade_logs)")
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            if 'strategy' not in column_names:
-                self.logger.info("Adding strategy column to trade_logs table")
-                await db.execute("ALTER TABLE trade_logs ADD COLUMN strategy TEXT")
-            
-            # Migration 3: Add LLM queries table if it doesn't exist
-            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='llm_queries'")
-            table_exists = await cursor.fetchone()
-            
-            if not table_exists:
-                self.logger.info("Creating llm_queries table")
-                await db.execute("""
-                    CREATE TABLE llm_queries (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp TEXT NOT NULL,
-                        strategy TEXT NOT NULL,
-                        query_type TEXT NOT NULL,
-                        market_id TEXT,
-                        prompt TEXT NOT NULL,
-                        response TEXT NOT NULL,
-                        tokens_used INTEGER,
-                        cost_usd REAL,
-                        confidence_extracted REAL,
-                        decision_extracted TEXT
-                    )
-                """)
-                
-                            # Migration 4: Update existing positions with strategy based on rationale
-            await self._migrate_existing_strategy_data(db)
-            
-        except Exception as e:
-            self.logger.error(f"Error running migrations: {e}")
+        """Apply ordered migrations recorded in ``schema_migrations``."""
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )
+        """)
+        cursor = await db.execute("SELECT version FROM schema_migrations")
+        applied = {row[0] for row in await cursor.fetchall()}
+        migrations = (
+            (1, "legacy_schema_compatibility", self._migration_001_legacy_schema),
+            (2, "order_reconciliation_foundation", self._migration_002_order_reconciliation),
+            (3, "authoritative_position_projection", self._migration_003_position_projection),
+            (4, "multi_agent_shadow_learning", self._migration_004_multi_agent_shadow),
+            (5, "external_account_activity", self._migration_005_external_account_activity),
+        )
+        for version, name, migration in migrations:
+            if version in applied:
+                continue
+            self.logger.info("Applying database migration", version=version, name=name)
+            await migration(db)
+            await db.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                (version, name, datetime.now(timezone.utc).isoformat()),
+            )
+
+    async def _column_names(self, db: aiosqlite.Connection, table: str) -> set[str]:
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in await cursor.fetchall()}
+
+    async def _add_column_if_missing(
+        self, db: aiosqlite.Connection, table: str, column: str, definition: str
+    ) -> None:
+        if column not in await self._column_names(db, table):
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    async def _migration_001_legacy_schema(self, db: aiosqlite.Connection) -> None:
+        await self._add_column_if_missing(db, "positions", "strategy", "TEXT")
+        await self._add_column_if_missing(db, "trade_logs", "strategy", "TEXT")
+        await self._add_column_if_missing(db, "positions", "stop_loss_price", "REAL")
+        await self._add_column_if_missing(db, "positions", "take_profit_price", "REAL")
+        await self._add_column_if_missing(db, "positions", "max_hold_hours", "INTEGER")
+        await self._add_column_if_missing(db, "positions", "target_confidence_change", "REAL")
+        await self._migrate_existing_strategy_data(db)
+
+    async def _migration_002_order_reconciliation(self, db: aiosqlite.Connection) -> None:
+        for column, definition in (
+            ("filled_quantity", "REAL"),
+            ("average_entry_price", "REAL"),
+            ("average_exit_price", "REAL"),
+            ("open_quantity", "REAL"),
+            ("last_reconciled_at", "TEXT"),
+            ("reconciliation_status", "TEXT"),
+            ("legacy_unreconciled", "BOOLEAN NOT NULL DEFAULT 0"),
+        ):
+            await self._add_column_if_missing(db, "positions", column, definition)
+
+        statements = """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER REFERENCES positions(id),
+                parent_order_id INTEGER REFERENCES orders(id),
+                client_order_id TEXT NOT NULL UNIQUE,
+                exchange_order_id TEXT UNIQUE,
+                environment TEXT NOT NULL DEFAULT 'paper',
+                strategy TEXT,
+                market_id TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('YES', 'NO')),
+                action TEXT NOT NULL CHECK (action IN ('buy', 'sell')),
+                order_type TEXT NOT NULL CHECK (order_type IN ('market', 'limit')),
+                limit_price REAL,
+                requested_quantity REAL NOT NULL CHECK (requested_quantity > 0),
+                filled_quantity REAL NOT NULL DEFAULT 0 CHECK (filled_quantity >= 0),
+                remaining_quantity REAL NOT NULL CHECK (remaining_quantity >= 0),
+                vwap_fill_price REAL,
+                fees REAL NOT NULL DEFAULT 0,
+                state TEXT NOT NULL CHECK (state IN (
+                    'locally_created', 'submitted', 'accepted', 'resting',
+                    'partially_filled', 'fully_filled', 'canceled', 'rejected',
+                    'expired', 'verification_failed'
+                )),
+                exchange_status TEXT,
+                submission_fingerprint TEXT NOT NULL,
+                submission_attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                submitted_at TEXT,
+                accepted_at TEXT,
+                last_verified_at TEXT,
+                terminal_at TEXT,
+                verification_error TEXT,
+                raw_submit_response TEXT,
+                raw_order_response TEXT
+            );
+            CREATE INDEX idx_orders_state_verified ON orders(state, last_verified_at);
+            CREATE INDEX idx_orders_market_active ON orders(market_id, side, action, state);
+            CREATE INDEX idx_orders_fingerprint ON orders(submission_fingerprint);
+
+            CREATE TABLE order_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+                exchange_fill_id TEXT NOT NULL UNIQUE,
+                exchange_trade_id TEXT,
+                exchange_order_id TEXT NOT NULL,
+                quantity REAL NOT NULL CHECK (quantity > 0),
+                price REAL NOT NULL CHECK (price >= 0 AND price <= 1),
+                fee REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),
+                is_taker BOOLEAN,
+                filled_at TEXT NOT NULL,
+                raw_response TEXT
+            );
+            CREATE INDEX idx_order_fills_order ON order_fills(order_id, filled_at);
+
+            CREATE TABLE order_state_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+                from_state TEXT,
+                to_state TEXT NOT NULL CHECK (to_state IN (
+                    'locally_created', 'submitted', 'accepted', 'resting',
+                    'partially_filled', 'fully_filled', 'canceled', 'rejected',
+                    'expired', 'verification_failed'
+                )),
+                source TEXT NOT NULL,
+                reason TEXT,
+                exchange_status TEXT,
+                created_at TEXT NOT NULL,
+                raw_payload TEXT
+            );
+            CREATE INDEX idx_order_state_events_order ON order_state_events(order_id, created_at);
+
+            CREATE TABLE reconciliation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trigger TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                local_orders_checked INTEGER NOT NULL DEFAULT 0,
+                remote_orders_seen INTEGER NOT NULL DEFAULT 0,
+                fills_seen INTEGER NOT NULL DEFAULT 0,
+                positions_checked INTEGER NOT NULL DEFAULT 0,
+                mismatch_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                checkpoint TEXT,
+                summary TEXT
+            );
+
+            CREATE TABLE reconciliation_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                severity TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                order_id INTEGER REFERENCES orders(id),
+                position_id INTEGER REFERENCES positions(id),
+                market_id TEXT,
+                expected_value TEXT,
+                observed_value TEXT,
+                details TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                resolved_at TEXT
+            );
+            CREATE INDEX idx_reconciliation_alerts_open
+                ON reconciliation_alerts(resolved_at, severity, last_seen_at);
+        """
+        # sqlite3 ``executescript`` commits implicitly, so execute each DDL
+        # statement separately inside initialize()'s migration transaction.
+        for statement in statements.split(";"):
+            if statement.strip():
+                await db.execute(statement)
+
+    async def _migration_003_position_projection(self, db: aiosqlite.Connection) -> None:
+        statements = """
+            CREATE TABLE position_projection_baselines (
+                position_id INTEGER PRIMARY KEY REFERENCES positions(id) ON DELETE RESTRICT,
+                base_quantity REAL NOT NULL CHECK (base_quantity >= 0),
+                base_entry_price REAL CHECK (base_entry_price >= 0 AND base_entry_price <= 1),
+                captured_at TEXT NOT NULL,
+                legacy_unreconciled BOOLEAN NOT NULL DEFAULT 0
+            );
+            CREATE TABLE position_fill_projections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER NOT NULL REFERENCES positions(id) ON DELETE RESTRICT,
+                order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+                exchange_fill_id TEXT NOT NULL UNIQUE REFERENCES order_fills(exchange_fill_id),
+                action TEXT NOT NULL CHECK (action IN ('buy', 'sell')),
+                quantity REAL NOT NULL CHECK (quantity > 0),
+                price REAL NOT NULL CHECK (price >= 0 AND price <= 1),
+                fee REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),
+                applied_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_position_fill_projections_position
+                ON position_fill_projections(position_id, applied_at);
+        """
+        for statement in statements.split(";"):
+            if statement.strip():
+                await db.execute(statement)
+
+    async def _migration_004_multi_agent_shadow(self, db: aiosqlite.Connection) -> None:
+        """Add shadow-analysis and offline evaluation tables without touching trades."""
+        statements = """
+            CREATE TABLE agent_analysis_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                market_id TEXT NOT NULL,
+                cycle_id TEXT,
+                environment TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (mode = 'shadow'),
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT NOT NULL,
+                agent_count INTEGER NOT NULL DEFAULT 0,
+                successful_agent_count INTEGER NOT NULL DEFAULT 0,
+                failed_agent_count INTEGER NOT NULL DEFAULT 0,
+                total_latency REAL NOT NULL DEFAULT 0,
+                total_cost REAL NOT NULL DEFAULT 0,
+                configuration_version TEXT NOT NULL,
+                error_summary TEXT
+            );
+            CREATE INDEX idx_agent_runs_market_time
+                ON agent_analysis_runs(market_id, started_at);
+
+            CREATE TABLE agent_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_run_id INTEGER NOT NULL REFERENCES agent_analysis_runs(id) ON DELETE CASCADE,
+                agent_name TEXT NOT NULL,
+                agent_version TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                probability_yes REAL CHECK (probability_yes BETWEEN 0 AND 1),
+                confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+                evidence_quality REAL CHECK (evidence_quality BETWEEN 0 AND 1),
+                risk_level TEXT,
+                veto BOOLEAN NOT NULL DEFAULT 0,
+                recommendation TEXT NOT NULL,
+                success BOOLEAN NOT NULL,
+                fallback_used BOOLEAN NOT NULL DEFAULT 0,
+                latency REAL NOT NULL DEFAULT 0,
+                token_count INTEGER,
+                estimated_cost REAL,
+                sanitized_output TEXT,
+                error_category TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(analysis_run_id, agent_name)
+            );
+
+            CREATE TABLE consensus_predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_run_id INTEGER NOT NULL UNIQUE REFERENCES agent_analysis_runs(id) ON DELETE CASCADE,
+                market_id TEXT NOT NULL,
+                probability_yes REAL NOT NULL CHECK (probability_yes BETWEEN 0 AND 1),
+                probability_no REAL NOT NULL CHECK (probability_no BETWEEN 0 AND 1),
+                process_confidence REAL NOT NULL CHECK (process_confidence BETWEEN 0 AND 1),
+                disagreement_score REAL NOT NULL CHECK (disagreement_score BETWEEN 0 AND 1),
+                evidence_quality_score REAL NOT NULL CHECK (evidence_quality_score BETWEEN 0 AND 1),
+                uncertainty_score REAL NOT NULL CHECK (uncertainty_score BETWEEN 0 AND 1),
+                recommendation TEXT NOT NULL,
+                expected_edge REAL NOT NULL,
+                risk_veto BOOLEAN NOT NULL DEFAULT 0,
+                explanation TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE single_vs_multi_comparisons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_run_id INTEGER NOT NULL UNIQUE REFERENCES agent_analysis_runs(id) ON DELETE CASCADE,
+                market_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                market_price_probability REAL NOT NULL,
+                single_model_probability REAL,
+                multi_agent_probability REAL NOT NULL,
+                single_model_action TEXT,
+                multi_agent_action TEXT NOT NULL,
+                probability_difference REAL,
+                action_agreement BOOLEAN,
+                realized_outcome INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE prediction_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                analysis_run_id INTEGER NOT NULL UNIQUE REFERENCES agent_analysis_runs(id) ON DELETE CASCADE,
+                prediction_timestamp TEXT NOT NULL,
+                settlement_timestamp TEXT,
+                predicted_probability_yes REAL NOT NULL CHECK (predicted_probability_yes BETWEEN 0 AND 1),
+                market_probability_at_prediction REAL NOT NULL CHECK (market_probability_at_prediction BETWEEN 0 AND 1),
+                actual_outcome INTEGER CHECK (actual_outcome IN (0, 1)),
+                outcome_status TEXT NOT NULL DEFAULT 'unresolved',
+                eligible_at_prediction BOOLEAN NOT NULL DEFAULT 0,
+                category TEXT,
+                time_horizon_seconds INTEGER NOT NULL,
+                model_version TEXT NOT NULL,
+                settled_at TEXT
+            );
+            CREATE INDEX idx_prediction_outcomes_status ON prediction_outcomes(outcome_status, market_id);
+
+            CREATE TABLE agent_performance (
+                agent_name TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                horizon_bucket TEXT NOT NULL,
+                sample_count INTEGER NOT NULL,
+                brier_score REAL,
+                log_loss REAL,
+                calibration_error REAL,
+                accuracy REAL,
+                average_edge REAL,
+                simulated_roi REAL,
+                last_updated TEXT NOT NULL,
+                PRIMARY KEY(agent_name, model_name, category, horizon_bucket)
+            );
+
+            CREATE TABLE calibration_buckets (
+                model_or_agent TEXT NOT NULL,
+                category TEXT NOT NULL,
+                horizon_bucket TEXT NOT NULL,
+                probability_bucket TEXT NOT NULL,
+                prediction_count INTEGER NOT NULL,
+                average_predicted_probability REAL,
+                observed_yes_rate REAL,
+                calibration_gap REAL,
+                status TEXT NOT NULL,
+                last_updated TEXT NOT NULL,
+                PRIMARY KEY(model_or_agent, category, horizon_bucket, probability_bucket)
+            );
+
+            CREATE TABLE backtest_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                configuration_version TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT NOT NULL,
+                data_start TEXT,
+                data_end TEXT,
+                markets_evaluated INTEGER NOT NULL DEFAULT 0,
+                predictions_evaluated INTEGER NOT NULL DEFAULT 0,
+                fees_model TEXT NOT NULL,
+                slippage_model TEXT NOT NULL,
+                spread_model TEXT NOT NULL,
+                latency_model TEXT NOT NULL,
+                summary_json TEXT,
+                error_summary TEXT
+            );
+        """
+        for statement in statements.split(";"):
+            if statement.strip():
+                await db.execute(statement)
+
+    async def _migration_005_external_account_activity(self, db: aiosqlite.Connection) -> None:
+        """Track verified manual account activity separately from bot positions/fills."""
+        statements = """
+            CREATE TABLE external_account_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('YES', 'NO')),
+                quantity REAL NOT NULL CHECK (quantity > 0),
+                source TEXT NOT NULL CHECK (source = 'manual_exchange_activity'),
+                exchange_order_id TEXT,
+                exchange_fill_id TEXT,
+                first_observed_at TEXT NOT NULL,
+                last_verified_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('active', 'administratively_reconciled')),
+                metadata_json TEXT NOT NULL,
+                UNIQUE(market_id, side, status)
+            );
+            CREATE INDEX idx_external_account_positions_active
+                ON external_account_positions(status, market_id, side);
+            CREATE TABLE reconciliation_admin_repair_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id TEXT NOT NULL,
+                repair_type TEXT NOT NULL,
+                alert_id INTEGER NOT NULL,
+                local_record_type TEXT NOT NULL,
+                local_record_id INTEGER,
+                market_id TEXT,
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                UNIQUE(plan_id, repair_type, alert_id)
+            );
+        """
+        for statement in statements.split(";"):
+            if statement.strip():
+                await db.execute(statement)
 
     async def _migrate_existing_strategy_data(self, db: aiosqlite.Connection) -> None:
         """Migrate existing position data to include strategy information."""
@@ -217,6 +568,7 @@ class DatabaseManager(TradingLoggerMixin):
             
         except Exception as e:
             self.logger.error(f"Error migrating existing strategy data: {e}")
+            raise
 
     async def _create_tables(self, db: aiosqlite.Connection) -> None:
         """Create all database tables."""
@@ -329,40 +681,7 @@ class DatabaseManager(TradingLoggerMixin):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_timestamp ON market_analyses(analysis_timestamp)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_cost_date ON daily_cost_tracking(date)")
         
-        # Run migrations to ensure schema is up to date
-        await self._run_migrations(db)
-        
         self.logger.info("Tables created or already exist.")
-
-    async def _run_migrations(self, db: aiosqlite.Connection) -> None:
-        """Run database migrations to ensure schema is up to date."""
-        try:
-            # Check if positions table has the new columns
-            cursor = await db.execute("PRAGMA table_info(positions)")
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            # Add missing columns for enhanced exit strategy
-            if 'stop_loss_price' not in column_names:
-                await db.execute("ALTER TABLE positions ADD COLUMN stop_loss_price REAL")
-                self.logger.info("Added stop_loss_price column to positions table")
-                
-            if 'take_profit_price' not in column_names:
-                await db.execute("ALTER TABLE positions ADD COLUMN take_profit_price REAL")
-                self.logger.info("Added take_profit_price column to positions table")
-                
-            if 'max_hold_hours' not in column_names:
-                await db.execute("ALTER TABLE positions ADD COLUMN max_hold_hours INTEGER")
-                self.logger.info("Added max_hold_hours column to positions table")
-                
-            if 'target_confidence_change' not in column_names:
-                await db.execute("ALTER TABLE positions ADD COLUMN target_confidence_change REAL")
-                self.logger.info("Added target_confidence_change column to positions table")
-                
-            await db.commit()
-            
-        except Exception as e:
-            self.logger.error(f"Error running migrations: {e}")
 
     async def upsert_markets(self, markets: List[Market]):
         """
@@ -431,6 +750,12 @@ class DatabaseManager(TradingLoggerMixin):
                 market_dict['last_updated'] = datetime.fromisoformat(market_dict['last_updated'])
                 markets.append(Market(**market_dict))
             return markets
+
+    async def get_market_count(self) -> int:
+        """Return the total number of locally ingested markets."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM markets")
+            return int((await cursor.fetchone())[0])
 
     async def get_markets_with_positions(self) -> set[str]:
         """
@@ -530,7 +855,9 @@ class DatabaseManager(TradingLoggerMixin):
                 return Position(**position_dict)
             return None
 
-    async def get_position_by_market_and_side(self, market_id: str, side: str) -> Optional[Position]:
+    async def get_position_by_market_and_side(
+        self, market_id: str, side: str, live: Optional[bool] = None,
+    ) -> Optional[Position]:
         """
         Get a position by market ID and side.
         
@@ -543,10 +870,13 @@ class DatabaseManager(TradingLoggerMixin):
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM positions WHERE market_id = ? AND side = ? AND status = 'open'", 
-                (market_id, side)
-            )
+            query = "SELECT * FROM positions WHERE market_id = ? AND side = ? AND status IN ('open', 'pending')"
+            params = [market_id, side]
+            if live is not None:
+                query += " AND live = ?"
+                params.append(int(live))
+            query += " ORDER BY id DESC LIMIT 1"
+            cursor = await db.execute(query, params)
             row = await cursor.fetchone()
             if row:
                 position_dict = dict(row)
@@ -952,11 +1282,62 @@ class DatabaseManager(TradingLoggerMixin):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 UPDATE positions 
-                SET live = 1, entry_price = ?
+                SET live = 1, entry_price = ?, status = 'open'
                 WHERE id = ?
             """, (entry_price, position_id))
             await db.commit()
         self.logger.info(f"Updated position {position_id} to live.")
+
+    async def mark_position_paper(self, position_id: int, entry_price: float) -> None:
+        """Open a simulated position without labeling it exchange-live."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE positions SET live = 0, entry_price = ?, status = 'open' WHERE id = ?",
+                (entry_price, position_id),
+            )
+            await db.commit()
+
+    async def quarantine_position(self, position_id: int, reason: str) -> None:
+        """Prevent a refused/unverified local intent from blocking future entries."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA busy_timeout = 5000")
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                row = await (await db.execute(
+                    "SELECT market_id FROM positions WHERE id = ?", (position_id,)
+                )).fetchone()
+                if row is None:
+                    await db.rollback()
+                    return
+                market_id = row[0]
+                await db.execute(
+                    "UPDATE positions SET status = 'rejected', reconciliation_status = ? WHERE id = ? AND live = 0",
+                    (reason[:200], position_id),
+                )
+                active = await (await db.execute(
+                    "SELECT COUNT(*) FROM positions WHERE market_id = ? AND status IN ('open', 'pending')",
+                    (market_id,),
+                )).fetchone()
+                if int(active[0]) == 0:
+                    await db.execute(
+                        "UPDATE markets SET has_position = 0 WHERE market_id = ?", (market_id,)
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def get_position_by_id(self, position_id: int) -> Optional[Position]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT * FROM positions WHERE id = ?", (position_id,)
+            )).fetchone()
+            if row is None:
+                return None
+            values = dict(row)
+            values["timestamp"] = datetime.fromisoformat(values["timestamp"])
+            return Position(**values)
 
     async def add_position(self, position: Position) -> Optional[int]:
         """
@@ -978,18 +1359,49 @@ class DatabaseManager(TradingLoggerMixin):
             # aiosqlite does not support dataclasses with datetime objects
             position_dict['timestamp'] = position.timestamp.isoformat()
 
-            cursor = await db.execute("""
-                INSERT OR REPLACE INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change)
-                VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change)
-            """, position_dict)
+            try:
+                cursor = await db.execute("""
+                    INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change)
+                    VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change)
+                """, position_dict)
+                position_id = cursor.lastrowid
+            except aiosqlite.IntegrityError:
+                await db.rollback()
+                db.row_factory = aiosqlite.Row
+                prior = await (await db.execute(
+                    "SELECT id, status FROM positions WHERE market_id = ? AND side = ?",
+                    (position.market_id, position.side),
+                )).fetchone()
+                child_count = 0
+                if prior is not None:
+                    child_count = int((await (await db.execute(
+                        "SELECT COUNT(*) FROM orders WHERE position_id = ?", (prior["id"],)
+                    )).fetchone())[0])
+                if prior is None or prior["status"] != "rejected" or child_count:
+                    self.logger.warning(
+                        "Historical position already exists; refusing destructive replacement",
+                        market_id=position.market_id, side=position.side,
+                    )
+                    return None
+                await db.execute("""
+                    UPDATE positions SET entry_price=:entry_price, quantity=:quantity,
+                        timestamp=:timestamp, rationale=:rationale, confidence=:confidence,
+                        live=:live, status=:status, strategy=:strategy,
+                        stop_loss_price=:stop_loss_price, take_profit_price=:take_profit_price,
+                        max_hold_hours=:max_hold_hours,
+                        target_confidence_change=:target_confidence_change,
+                        reconciliation_status=NULL
+                    WHERE id=:prior_id
+                """, {**position_dict, "prior_id": prior["id"]})
+                position_id = prior["id"]
             await db.commit()
             
             # Set has_position to True for the market
             await db.execute("UPDATE markets SET has_position = 1 WHERE market_id = ?", (position.market_id,))
             await db.commit()
 
-            self.logger.info(f"Added position for market {position.market_id}", position_id=cursor.lastrowid)
-            return cursor.lastrowid
+            self.logger.info(f"Added position for market {position.market_id}", position_id=position_id)
+            return position_id
 
     async def get_open_positions(self) -> List[Position]:
         """Get all open positions."""

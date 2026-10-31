@@ -22,7 +22,7 @@ Key innovations:
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 import numpy as np
@@ -32,6 +32,13 @@ from src.clients.xai_client import XAIClient
 from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
+from src.orders.readiness import (
+    CheckStatus, ReadinessCheck, ReadinessContext, ReadinessReport,
+    SubmissionReadinessEvaluator,
+)
+from src.orders.repository import OrderRepository
+from src.orders.decision_log import log_order_decision
+from src.utils.market_prices import get_market_prices
 
 from src.strategies.market_making import (
     AdvancedMarketMaker, 
@@ -44,6 +51,11 @@ from src.strategies.portfolio_optimization import (
     PortfolioAllocation,
     run_portfolio_optimization,
     create_market_opportunities_from_markets
+)
+from src.strategies.directional_policy import (
+    evaluate_directional_candidate,
+    classify_market_phase,
+    log_directional_evaluation,
 )
 @dataclass
 class TradingSystemConfig:
@@ -69,6 +81,13 @@ class TradingSystemConfig:
     rebalance_frequency_hours: int = 6  # Rebalance every 6 hours
     profit_taking_threshold: float = 0.25  # Take profits at 25%
     loss_cutting_threshold: float = 0.10  # Cut losses at 10%
+
+    # Runtime safety.  Market making performs one API/model analysis per
+    # market, so it must never receive the entire persisted market universe.
+    # These controls affect analysis throughput only; they do not change any
+    # execution, sizing, probability, or risk policy.
+    market_making_scan_limit: int = 20
+    market_making_analysis_timeout_seconds: float = 20.0
 
 
 @dataclass
@@ -144,6 +163,7 @@ class UnifiedAdvancedTradingSystem:
 
         self.market_maker = None
         self.portfolio_optimizer = None
+        self.multi_agent_shadow_service = None
         
         # Capital allocation will be set by async_initialize() after getting actual balance
 
@@ -195,6 +215,31 @@ class UnifiedAdvancedTradingSystem:
         self.market_maker = AdvancedMarketMaker(self.db_manager, self.kalshi_client, self.xai_client)
         self.portfolio_optimizer = AdvancedPortfolioOptimizer(self.db_manager, self.kalshi_client, self.xai_client)
 
+        if settings.multi_agent_shadow.enabled:
+            try:
+                from src.agents.orchestrator import MultiAgentOrchestrator
+                from src.agents.repository import AgentRepository
+                from src.agents.shadow_service import MultiAgentShadowService, build_existing_agent_executors
+
+                shadow = settings.multi_agent_shadow
+                MultiAgentOrchestrator.assert_shadow_configuration(shadow.enabled, shadow.can_affect_trading)
+                orchestrator = MultiAgentOrchestrator(
+                    build_existing_agent_executors(self.xai_client.get_completion),
+                    max_concurrency=shadow.max_concurrency,
+                    timeout_seconds=shadow.timeout_seconds,
+                    max_retries=shadow.max_retries,
+                    min_successful_agents=shadow.min_successful_agents,
+                    require_forecaster=shadow.require_forecaster,
+                    require_risk=shadow.require_risk_agent,
+                )
+                self.multi_agent_shadow_service = MultiAgentShadowService(
+                    orchestrator, AgentRepository(self.db_manager.db_path),
+                    settings.api.kalshi_environment,
+                )
+            except Exception:
+                self.multi_agent_shadow_service = None
+                self.logger.exception("Multi-agent shadow initialization failed; trading path unchanged")
+
         self.logger.info(f"🎯 CAPITAL ALLOCATION: Market Making=${self.market_making_capital:.2f}, Directional=${self.directional_capital:.2f}, Arbitrage=${self.arbitrage_capital:.2f}")
 
     async def execute_unified_trading_strategy(self) -> TradingSystemResults:
@@ -210,6 +255,7 @@ class UnifiedAdvancedTradingSystem:
         6. Monitor and rebalance as needed
         """
         self.logger.info("🚀 Executing Unified Advanced Trading Strategy")
+        self._readiness_logged = False
         
         try:
             # Step 0: Check and enforce position limits AND cash reserves
@@ -221,10 +267,12 @@ class UnifiedAdvancedTradingSystem:
             
             # Check position limits
             limits_status = await limits_manager.get_position_limits_status()
+            self._readiness_limits_status = limits_status
             self.logger.info(f"📊 POSITION LIMITS STATUS: {limits_status['status']} ({limits_status['position_utilization']})")
             
             # Check cash reserves
             cash_status = await cash_manager.get_cash_status()
+            self._readiness_cash_status = cash_status
             self.logger.info(f"💰 CASH RESERVES STATUS: {cash_status['status']} ({cash_status['reserve_percentage']:.1f}%)")
             
             # Handle cash emergency first (higher priority)
@@ -233,6 +281,7 @@ class UnifiedAdvancedTradingSystem:
                 emergency_action = await cash_manager.handle_cash_emergency()
                 if emergency_action.action_type == 'halt_trading':
                     self.logger.critical(f"🛑 TRADING HALTED DUE TO CASH EMERGENCY: {emergency_action.reason}")
+                    await self._log_cycle_readiness(None, None, None)
                     return TradingSystemResults()  # Return empty results
                 elif emergency_action.action_type == 'close_positions':
                     self.logger.warning(f"⚠️ Need to close {emergency_action.positions_to_close} positions for cash reserves")
@@ -246,12 +295,14 @@ class UnifiedAdvancedTradingSystem:
             
             # Step 1: Get ALL available markets (no time restrictions) - MORE PERMISSIVE VOLUME
             markets = await self.db_manager.get_eligible_markets(
-            volume_min=200,  # DECREASED: Much lower volume requirement (was 50,000, now 200) for more opportunities
-            max_days_to_expiry=365  # Accept any timeline with dynamic exits
+            volume_min=0,  # DECREASED: Much lower volume requirement (was 50,000, now 200) for more opportunities
+            max_days_to_expiry=3  # Accept any timeline with dynamic exits
         )
             if not markets:
                 self.logger.warning("No markets available for trading")
+                await self._log_cycle_readiness([], None, None)
                 return TradingSystemResults()
+            self._readiness_market_count = len(markets)
             
             self.logger.info(f"Analyzing {len(markets)} markets across all strategies")
             
@@ -288,6 +339,7 @@ class UnifiedAdvancedTradingSystem:
             
         except Exception as e:
             self.logger.error(f"Error in unified trading strategy: {e}")
+            await self._log_cycle_readiness(None, None, None)
             return TradingSystemResults()
 
     async def _execute_market_making_strategy(self, markets: List[Market]) -> Dict:
@@ -295,10 +347,35 @@ class UnifiedAdvancedTradingSystem:
         Execute market making strategy for spread profits.
         """
         try:
-            self.logger.info(f"🎯 Executing Market Making Strategy on {len(markets)} markets")
+            scan_limit = max(1, int(self.config.market_making_scan_limit))
+            bounded_markets = sorted(
+                markets,
+                key=lambda market: float(getattr(market, "volume", 0.0) or 0.0),
+                reverse=True,
+            )[:scan_limit]
+            timeout_seconds = max(
+                0.1, float(self.config.market_making_analysis_timeout_seconds)
+            )
+            self.logger.info(
+                "🎯 Executing Market Making Strategy on %s/%s markets "
+                "(scan_limit=%s, analysis_timeout_seconds=%.1f)",
+                len(bounded_markets), len(markets), scan_limit, timeout_seconds,
+            )
             
-            # Analyze market making opportunities
-            opportunities = await self.market_maker.analyze_market_making_opportunities(markets)
+            # The analysis phase is read-only.  Bound and cancel it before it
+            # can block the unified cycle indefinitely on a slow provider.
+            try:
+                opportunities = await asyncio.wait_for(
+                    self.market_maker.analyze_market_making_opportunities(bounded_markets),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    "Market-making analysis timed out after %.1fs; branch cancelled "
+                    "and returning an empty result",
+                    timeout_seconds,
+                )
+                return {'orders_placed': 0, 'expected_profit': 0.0}
             
             if not opportunities:
                 self.logger.warning("No market making opportunities found")
@@ -337,7 +414,12 @@ class UnifiedAdvancedTradingSystem:
             
             if not opportunities:
                 self.logger.warning("No directional trading opportunities found")
+                await self._log_cycle_readiness(markets, [], self.portfolio_optimizer._empty_allocation())
                 return self.portfolio_optimizer._empty_allocation()
+
+            # Observation-only: results are persisted and logged, but never
+            # returned to or consumed by the optimizer/execution path.
+            await self._run_multi_agent_shadow(markets, opportunities)
             
             # Filter opportunities based on available capital
             # Adjust portfolio optimizer capital
@@ -352,26 +434,160 @@ class UnifiedAdvancedTradingSystem:
             
             # DEBUG: Log allocation details before execution attempt
             self.logger.info(f"Portfolio allocation result: {len(allocation.allocations) if allocation else 0} allocations, ${allocation.total_capital_used if allocation else 0:.0f} capital used")
+            await self._log_cycle_readiness(markets, opportunities, allocation)
             
             # Actually execute the trades from the allocation
             if allocation and allocation.allocations:
                 self.logger.info(f"Attempting to execute {len(allocation.allocations)} allocations: {list(allocation.allocations.keys())}")
                 execution_results = await self._execute_portfolio_allocations(allocation, opportunities)
-                self.logger.info(f"Executed {execution_results['positions_created']} positions from portfolio allocation")
+                self._last_directional_execution_results = execution_results
+                self.logger.info(
+                    "Directional execution summary",
+                    authoritative_positions_created=execution_results['positions_created'],
+                    orders_pending=execution_results['orders_pending'],
+                    failed_executions=execution_results['failed_executions'],
+                )
             else:
+                self._last_directional_execution_results = {
+                    'positions_created': 0, 'orders_pending': 0,
+                    'failed_executions': 0, 'total_capital_used': 0.0,
+                }
                 self.logger.warning(f"No allocations to execute. Allocation exists: {allocation is not None}, Has allocations: {bool(allocation and allocation.allocations)}")
             
+            execution = self._last_directional_execution_results
             self.logger.info(
-                f"✅ Directional Trading: {len(allocation.allocations)} positions, "
-                f"${allocation.total_capital_used:.0f} allocated, "
-                f"Sharpe: {allocation.portfolio_sharpe:.2f}"
+                "Directional trading complete",
+                proposed_allocations=len(allocation.allocations),
+                authoritative_positions_created=execution['positions_created'],
+                orders_pending=execution['orders_pending'],
+                capital_actually_used=execution['total_capital_used'],
+                sharpe=allocation.portfolio_sharpe,
             )
             
             return allocation
             
         except Exception as e:
             self.logger.error(f"Error in directional trading strategy: {e}")
+            await self._log_cycle_readiness(markets, None, None)
             return self.portfolio_optimizer._empty_allocation()
+
+    async def _run_multi_agent_shadow(self, markets, opportunities) -> None:
+        """Run a bounded shadow comparison; failures cannot escape into trading."""
+        service = self.multi_agent_shadow_service
+        if service is None:
+            return
+        analyzed = failed = 0
+        try:
+            from src.agents.models import MarketAnalysisRequest
+
+            market_by_id = {market.market_id: market for market in markets}
+            limit = settings.multi_agent_shadow.max_markets_per_cycle
+            cycle_id = datetime.now(timezone.utc).isoformat()
+            for opportunity in list(opportunities)[:limit]:
+                market = market_by_id.get(opportunity.market_id)
+                if market is None:
+                    continue
+                timestamp = datetime.now(timezone.utc).isoformat()
+                expiry = datetime.fromtimestamp(market.expiration_ts, timezone.utc)
+                request = MarketAnalysisRequest(
+                    request_id=MarketAnalysisRequest.deterministic_id(
+                        market.market_id, timestamp,
+                        settings.multi_agent_shadow.configuration_version,
+                    ),
+                    market_id=market.market_id, title=market.title, rules="",
+                    category=market.category, yes_price=float(market.yes_price),
+                    no_price=float(market.no_price), bid_ask_spread=abs(float(market.no_price) - float(market.yes_price)),
+                    volume=float(market.volume), expiration_timestamp=expiry.isoformat(),
+                    time_remaining_seconds=max(0, int((expiry - datetime.now(timezone.utc)).total_seconds())),
+                    analysis_timestamp=timestamp,
+                    configuration_version=settings.multi_agent_shadow.configuration_version,
+                    single_model_analysis={
+                        "probability_yes": opportunity.predicted_probability,
+                        "confidence": opportunity.confidence,
+                    },
+                )
+                try:
+                    await service.analyze(request, cycle_id=cycle_id)
+                    analyzed += 1
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                        raise
+                    failed += 1
+                    self.logger.error(
+                        "MULTI_AGENT_SHADOW market=%s status=FAILED trading_impact=NONE",
+                        market.market_id,
+                    )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            self.logger.error("Multi-agent shadow cycle unavailable; trading path unchanged")
+        finally:
+            self.logger.info(
+                "MULTI_AGENT_SHADOW cycle analyzed=%s failed=%s trading_impact=NONE",
+                analyzed, failed,
+            )
+
+    async def _log_cycle_readiness(self, markets, opportunities, allocation) -> None:
+        """Emit one human and one structured readiness summary for this cycle."""
+        if getattr(self, "_readiness_logged", False):
+            return
+        self._readiness_logged = True
+        try:
+            await self._evaluate_and_log_cycle_readiness(markets, opportunities, allocation)
+        except Exception:
+            live = settings.trading.live_trading_enabled
+            fallback = ReadinessReport(
+                mode="LIVE" if live else "PAPER",
+                overall="BLOCKED" if live else "PAPER",
+                scope="cycle",
+                checks=[ReadinessCheck(
+                    "Diagnostic snapshot", CheckStatus.BLOCKED,
+                    "cycle readiness data unavailable", required=live,
+                )],
+            )
+            SubmissionReadinessEvaluator.log(fallback, self.logger)
+
+    async def _evaluate_and_log_cycle_readiness(self, markets, opportunities, allocation) -> None:
+        """Build the cycle snapshot; caller prevents diagnostic failures escaping."""
+        limits = getattr(self, "_readiness_limits_status", {})
+        cash = getattr(self, "_readiness_cash_status", {})
+        allocations = allocation.allocations if allocation is not None else None
+        duplicate_count = None
+        if allocations is not None:
+            open_position_keys = {
+                (position.market_id, str(position.side).upper())
+                for position in await self.db_manager.get_open_positions()
+            }
+            intended_keys = set()
+            for market_id in allocations:
+                opportunity = next((item for item in (opportunities or [])
+                                    if item.market_id == market_id), None)
+                intended_keys.add((market_id, opportunity.recommended_side if opportunity else "UNKNOWN"))
+            duplicate_count = len(open_position_keys & intended_keys)
+        evaluator = SubmissionReadinessEvaluator(OrderRepository(self.db_manager.db_path))
+        report = await evaluator.evaluate(ReadinessContext(
+            live_mode=settings.trading.live_trading_enabled,
+            authoritative_execution_enabled=settings.trading.authoritative_live_execution_enabled,
+            reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+            reconciliation_shadow_mode=settings.trading.reconciliation_shadow_mode,
+            kill_switch=settings.trading.live_order_submission_kill_switch,
+            configured_environment=settings.api.kalshi_environment,
+            client_environment=getattr(self.kalshi_client, "environment", None),
+            production_acknowledgement=settings.trading.production_execution_acknowledgement,
+            reconciliation_max_age_seconds=settings.trading.reconciliation_health_max_age_seconds,
+            total_markets=await self.db_manager.get_market_count(),
+            eligible_markets=len(markets) if markets is not None else 0,
+            opportunity_count=len(opportunities) if opportunities is not None else None,
+            allocation_count=len(allocations) if allocations is not None else None,
+            allocated_dollars=(allocation.total_capital_used if allocation is not None else None),
+            cash_reserve_ok=(None if not cash else cash.get("trading_permitted", False)),
+            cash_reserve_pct=cash.get("reserve_percentage"),
+            position_limit_ok=(None if not limits else limits.get("status") == "HEALTHY"),
+            current_positions=limits.get("current_positions"),
+            max_positions=limits.get("max_positions"),
+            existing_position_blocked=(None if duplicate_count is None else duplicate_count > 0),
+        ), scope="cycle")
+        evaluator.log(report, self.logger)
 
     # Quick flip strategy REMOVED — 0% win rate, -$208 across 12 trades.
     # All capital now routed to AI ensemble directional trading.
@@ -386,6 +602,7 @@ class UnifiedAdvancedTradingSystem:
         """
         results = {
             'positions_created': 0,
+            'orders_pending': 0,
             'total_capital_used': 0.0,
             'successful_executions': 0,
             'failed_executions': 0
@@ -395,23 +612,45 @@ class UnifiedAdvancedTradingSystem:
             from src.jobs.execute import execute_position
             
             for market_id, allocation_fraction in allocation.allocations.items():
+                intended_side = "UNKNOWN"
+                price = None
+                quantity = None
                 try:
                     # Find the corresponding opportunity first to determine intended side
                     opportunity = next((opp for opp in opportunities if opp.market_id == market_id), None)
                     if not opportunity:
                         self.logger.warning(f"Could not find opportunity for {market_id}")
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side="UNKNOWN", action="buy", price=None, quantity=None,
+                            outcome="BLOCKED", reason="allocation has no matching opportunity",
+                            risk_limit="SIGNAL_INTEGRITY", api_attempted=False,
+                        )
                         continue
                     
                     # Determine the intended side based on edge direction
-                    intended_side = "YES" if opportunity.edge > 0 else "NO"
+                    intended_side = opportunity.recommended_side
+                    if intended_side not in {"YES", "NO"}:
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side="UNKNOWN", action="buy", price=None, quantity=None,
+                            outcome="BLOCKED", reason="directional side was not verified",
+                            risk_limit="SIGNAL_INTEGRITY", api_attempted=False,
+                        )
+                        continue
                     
                     # 🚨 ONLY SKIP if we already have a position on the EXACT same market_id AND side
                     existing_position = await self.db_manager.get_position_by_market_and_side(market_id, intended_side)
                     
                     if existing_position:
                         self.logger.info(f"⏭️ SKIPPING {market_id} {intended_side} - exact position already exists (likely from immediate trade)")
-                        results['positions_created'] += 1  # Count as created since it exists
-                        results['total_capital_used'] += allocation_fraction * self.directional_capital
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=opportunity.market_probability,
+                            quantity=None, outcome="BLOCKED",
+                            reason="existing local position or pending intent",
+                            risk_limit="DUPLICATE_POSITION", api_attempted=False,
+                        )
                         continue
                     else:
                         # Check if we have the opposite side (just for logging)
@@ -456,10 +695,23 @@ class UnifiedAdvancedTradingSystem:
                             if current_positions >= limits_manager.max_positions:
                                 self.logger.info(f"❌ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
                                 results['failed_executions'] += 1
+                                log_order_decision(
+                                    self.logger, market_id=market_id, strategy="portfolio_optimization",
+                                    side=intended_side, action="buy", price=opportunity.market_probability,
+                                    quantity=None, outcome="BLOCKED", reason=limit_reason,
+                                    risk_limit=f"MAX_POSITIONS={limits_manager.max_positions}",
+                                    api_attempted=False,
+                                )
                                 continue
                             else:
                                 self.logger.info(f"❌ POSITION SIZE LIMIT: Even minimum size ${initial_position_value * 0.1:.2f} exceeds limits")
                                 results['failed_executions'] += 1
+                                log_order_decision(
+                                    self.logger, market_id=market_id, strategy="portfolio_optimization",
+                                    side=intended_side, action="buy", price=opportunity.market_probability,
+                                    quantity=None, outcome="BLOCKED", reason=limit_reason,
+                                    risk_limit="POSITION_EXPOSURE", api_attempted=False,
+                                )
                                 continue
                     
                     position_value = initial_position_value
@@ -475,6 +727,12 @@ class UnifiedAdvancedTradingSystem:
                     if not can_trade_reserves:
                         self.logger.info(f"❌ CASH RESERVES BLOCK ALLOCATION: {market_id} - {reserves_reason}")
                         results['failed_executions'] += 1
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=opportunity.market_probability,
+                            quantity=None, outcome="BLOCKED", reason=reserves_reason,
+                            risk_limit="CASH_RESERVE", api_attempted=False,
+                        )
                         continue
                     
                     self.logger.info(f"✅ CASH RESERVES OK FOR ALLOCATION: {market_id}")
@@ -483,16 +741,57 @@ class UnifiedAdvancedTradingSystem:
                     market_data = await self.kalshi_client.get_market(market_id)
                     if not market_data:
                         self.logger.warning(f"Could not get market data for {market_id}")
+                        results['failed_executions'] += 1
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=None, quantity=None,
+                            outcome="BLOCKED", reason="market data unavailable",
+                            risk_limit="MARKET_DATA", api_attempted=False,
+                        )
                         continue
                     
                     # FIXED: Extract from nested 'market' object
                     market_info = market_data.get('market', {})
                     
                     # Get price for the intended side (already determined above)
-                    if intended_side == "YES":
-                        price = market_info.get('yes_price', 50) / 100
-                    else:
-                        price = market_info.get('no_price', 50) / 100
+                    yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_info)
+                    live_evaluation = evaluate_directional_candidate(
+                        market_id=market_id,
+                        predicted_yes_probability=opportunity.predicted_probability,
+                        yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask,
+                        min_probability=settings.trading.min_preferred_probability,
+                        max_preferred_probability=settings.trading.max_preferred_probability,
+                        min_edge=settings.trading.min_directional_edge,
+                        fee_estimate=settings.trading.directional_fee_estimate,
+                        slippage_estimate=settings.trading.directional_slippage_estimate,
+                        sports_phase=classify_market_phase(
+                            market_info, opportunity.category,
+                            expiration_ts=(datetime.now(timezone.utc).timestamp()
+                                           + opportunity.time_to_expiry * 86400),
+                        ),
+                    )
+                    log_directional_evaluation(self.logger, live_evaluation)
+                    if not live_evaluation.accepted or live_evaluation.side != intended_side:
+                        results['failed_executions'] += 1
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=None, quantity=None,
+                            outcome="BLOCKED",
+                            reason=(live_evaluation.reason if not live_evaluation.accepted
+                                    else "live quote changed the preferred directional side"),
+                            risk_limit="DIRECTIONAL_QUALITY", api_attempted=False,
+                        )
+                        continue
+                    price = yes_ask if intended_side == "YES" else no_ask
+                    if not 0.01 <= price <= 0.99:
+                        results['failed_executions'] += 1
+                        log_order_decision(
+                            self.logger, market_id=market_id, strategy="portfolio_optimization",
+                            side=intended_side, action="buy", price=price, quantity=None,
+                            outcome="BLOCKED", reason="valid executable ask unavailable",
+                            risk_limit="VALID_QUOTE", api_attempted=False,
+                        )
+                        continue
                     
                     # Calculate quantity
                     quantity = max(1, int(position_value / price))
@@ -527,6 +826,7 @@ class UnifiedAdvancedTradingSystem:
                         rationale=f"Portfolio optimization allocation: {allocation_fraction:.1%} of capital. Edge: {opportunity.edge:.3f}, Confidence: {opportunity.confidence:.3f}, Stop: {exit_levels['stop_loss_pct']}%",
                         confidence=opportunity.confidence,
                         live=False,  # Will be set to True after execution
+                        status="pending",
                         strategy="portfolio_optimization",
                         
                         # Enhanced exit strategy using Grok4 recommendations
@@ -544,6 +844,15 @@ class UnifiedAdvancedTradingSystem:
                         continue
                     
                     position.id = position_id
+
+                    # Transient decision context used only for immediate
+                    # fail-closed quote, phase, game-state, and order-book
+                    # revalidation. It is intentionally not fabricated during
+                    # restart recovery.
+                    position.model_probability = opportunity.predicted_probability
+                    position.model_generated_at = datetime.now(timezone.utc).timestamp()
+                    position.market_phase = opportunity.sports_phase
+                    position.market_category = opportunity.category
                     
                     # Execute the position
                     live_mode = getattr(settings.trading, 'live_trading_enabled', False)
@@ -562,11 +871,33 @@ class UnifiedAdvancedTradingSystem:
                         results['total_capital_used'] += position_value
                         self.logger.info(f"✅ Executed position: {market_id} {intended_side} {quantity} at {price:.3f}")
                     else:
-                        results['failed_executions'] += 1
-                        self.logger.error(f"❌ Failed to execute position for {market_id}")
+                        active_orders = await OrderRepository(
+                            self.db_manager.db_path
+                        ).get_active_orders_for_position(position.id)
+                        if active_orders:
+                            results['orders_pending'] += 1
+                            self.logger.info(
+                                "Order accepted or unresolved; position not counted until authoritative fill",
+                                market_id=market_id, position_id=position.id,
+                            )
+                        else:
+                            results['failed_executions'] += 1
+                            await self.db_manager.quarantine_position(
+                                position.id, "entry execution refused before authoritative fill"
+                            )
+                            self.logger.error(
+                                "Failed to execute position", market_id=market_id,
+                                position_id=position.id,
+                            )
                 
                 except Exception as e:
                     self.logger.error(f"Error executing allocation for {market_id}: {e}")
+                    log_order_decision(
+                        self.logger, market_id=market_id, strategy="portfolio_optimization",
+                        side=intended_side, action="buy", price=price, quantity=quantity,
+                        outcome="BLOCKED", reason="allocation execution error",
+                        api_attempted=False, api_error_category=type(e).__name__,
+                    )
                     results['failed_executions'] += 1
                     continue
             
@@ -610,15 +941,18 @@ class UnifiedAdvancedTradingSystem:
         """
         try:
             # Calculate total metrics
+            directional_execution = getattr(self, "_last_directional_execution_results", {})
+            directional_capital_used = float(directional_execution.get('total_capital_used', 0.0))
+            directional_positions_created = int(directional_execution.get('positions_created', 0))
             total_capital_used = (
                 market_making_results.get('total_exposure', 0) +
-                portfolio_allocation.total_capital_used +
+                directional_capital_used +
                 arbitrage_results.get('arbitrage_exposure', 0)
             )
             
             # Weight expected returns by capital allocation
             mm_weight = market_making_results.get('total_exposure', 0) / (total_capital_used + 1e-8)
-            dir_weight = portfolio_allocation.total_capital_used / (total_capital_used + 1e-8)
+            dir_weight = directional_capital_used / (total_capital_used + 1e-8)
             arb_weight = arbitrage_results.get('arbitrage_exposure', 0) / (total_capital_used + 1e-8)
             
             # Portfolio expected return (weighted average)
@@ -637,7 +971,7 @@ class UnifiedAdvancedTradingSystem:
             # Total positions
             total_positions = (
                 market_making_results.get('orders_placed', 0) // 2 +  # 2 orders per position
-                len(portfolio_allocation.allocations) +
+                directional_positions_created +
                 arbitrage_results.get('arbitrage_trades', 0)
             )
             
@@ -648,8 +982,8 @@ class UnifiedAdvancedTradingSystem:
                 market_making_expected_profit=market_making_results.get('expected_profit', 0),
                 
                 # Directional trading
-                directional_positions=len(portfolio_allocation.allocations),
-                directional_exposure=portfolio_allocation.total_capital_used,
+                directional_positions=directional_positions_created,
+                directional_exposure=directional_capital_used,
                 directional_expected_return=portfolio_allocation.expected_portfolio_return,
                 
                 # Portfolio metrics

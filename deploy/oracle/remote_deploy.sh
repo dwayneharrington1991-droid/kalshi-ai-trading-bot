@@ -5,6 +5,7 @@ commit=${1:?commit required}
 archive=${2:?archive required}
 expected_sha=${3:?archive sha required}
 config=${4:-/etc/kalshi-signals/deployment.env}
+first_mode=${5:-}
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid commit" >&2; exit 1; }
 [[ -r "$config" ]] || { echo "missing deployment config" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -20,15 +21,17 @@ done
 [[ -f "$DEPLOY_ROOT/production-approved" ]] || {
   echo "first-deployment approval marker missing; reviewed baseline setup required" >&2; exit 1;
 }
-service_state=$(sudo -n systemctl show "$SERVICE_NAME" --property=WorkingDirectory,ExecStart --no-pager)
-[[ "$service_state" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]] || {
-  echo "versioned systemd launcher is not active; deployment refused" >&2; exit 1;
-}
 previous=$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)
 [[ -n "$previous" && -d "$previous" && -f "$previous/.deployed-commit" \
    && -x "$previous/.venv/bin/python3" ]] || {
   echo "verified versioned rollback baseline missing; deployment refused" >&2; exit 1;
 }
+service_state=$(sudo -n systemctl show "$SERVICE_NAME" --property=WorkingDirectory,ExecStart --no-pager)
+versioned_active=0
+[[ "$service_state" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]] && versioned_active=1
+if (( versioned_active == 0 )) && [[ "$first_mode" != --first ]]; then
+  echo "versioned systemd launcher is not active; use reviewed first-deployment mode" >&2; exit 1
+fi
 account_mode_file="$DEPLOY_ROOT/account-monitoring.flags"
 [[ -r "$account_mode_file" ]] || { echo "baseline-captured account mode missing" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -89,8 +92,10 @@ for db in "${databases[@]}"; do
   relative=${db#"$DATA_ROOT"/}
   destination="$backup/databases/$relative"
   mkdir -p "$(dirname "$destination")"
+  echo "backup_start database=$relative bytes=$(stat -c %s "$db")" >&2
   "$PYTHON_BIN" "$backup_tool" "$db" "$destination"
   (cd "$(dirname "$destination")" && sha256sum -c "$(basename "$destination").sha256")
+  echo "backup_complete database=$relative" >&2
 done
 for required in "$JOURNAL_PATH" "$ACCOUNT_STORE_PATH"; do
   relative=${required#"$DATA_ROOT"/}
@@ -132,10 +137,46 @@ fi
 "$release/.venv/bin/python3" -m pip install --disable-pip-version-check "$release"
 cp "$release/deploy/oracle/release-policy.json" "$backup/"
 
+dropin_dir="/etc/systemd/system/$SERVICE_NAME.d"
+dropin="$dropin_dir/zz-codex-versioned-release.conf"
+legacy_dropin="$dropin_dir/99-codex-versioned-release.conf"
+legacy_disabled="$dropin_dir/99-codex-versioned-release.conf.disabled-by-codex"
+legacy_moved=0
+restore_first_on_error() {
+  code=$?; trap - ERR; set +e
+  ln -s "$previous" "$DEPLOY_ROOT/current.failed-first-rollback"
+  mv -Tf "$DEPLOY_ROOT/current.failed-first-rollback" "$DEPLOY_ROOT/current"
+  sudo rm -f "$dropin"
+  if (( legacy_moved == 1 )); then sudo mv "$legacy_disabled" "$legacy_dropin"; fi
+  sudo systemctl daemon-reload
+  sudo systemctl restart "$SERVICE_NAME"
+  echo "first deployment failed; original systemd configuration restored" >&2
+  exit "$code"
+}
+if (( versioned_active == 0 )); then
+  trap restore_first_on_error ERR
+  sudo test -f "$dropin" && { echo "winning versioned drop-in already exists" >&2; exit 1; }
+  if sudo test -f "$legacy_dropin"; then
+    sudo test -f "$legacy_disabled" && { echo "legacy override preservation conflict" >&2; exit 1; }
+    sudo mv "$legacy_dropin" "$legacy_disabled"
+    legacy_moved=1
+  fi
+  tools=$(cd "$(dirname "$0")" && pwd)
+  sudo install -d -m 0755 "$dropin_dir"
+  sudo install -m 0644 "$tools/kalshi-signals.override.conf.example" "$dropin"
+  sudo systemctl daemon-reload
+  effective=$(sudo systemctl show "$SERVICE_NAME" --property=ExecStart --value)
+  [[ "$effective" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]] || {
+    echo "winning systemd override is ineffective" >&2; exit 1;
+  }
+fi
+
 ln -s "$release" "$DEPLOY_ROOT/current.next"
 mv -Tf "$DEPLOY_ROOT/current.next" "$DEPLOY_ROOT/current"
 if sudo -n systemctl restart "$SERVICE_NAME"; then
-  for _ in $(seq 1 30); do
+  for attempt in $(seq 1 60); do
+    (( attempt == 1 || attempt % 5 == 0 )) && \
+      echo "deployment_health_wait attempt=$attempt max=60 expected_commit=$commit" >&2
     if sudo -n systemctl is-active --quiet "$SERVICE_NAME" && \
        "$release/.venv/bin/python3" "$release/deploy/oracle/health_check.py" \
          --commit "$commit" --data-root "$DATA_ROOT" --require-models "${REQUIRE_MODEL_ARTIFACTS:-0}"; then
@@ -144,6 +185,7 @@ if sudo -n systemctl restart "$SERVICE_NAME"; then
       command=$(tr '\0' ' ' < "/proc/$pid/cmdline")
       [[ "$cwd" == "$release" && "$command" == *"$release/.venv/bin/python3"* ]] || break
       printf '%s\n' "$commit" > "$DEPLOY_ROOT/deployed-commit"
+      trap - ERR
       echo "deployment=HEALTHY commit=$commit backup=$backup"
       exit 0
     fi
@@ -153,6 +195,16 @@ fi
 if [[ "$rollback" == true && "$policy" == none ]]; then
   ln -s "$previous" "$DEPLOY_ROOT/current.rollback"
   mv -Tf "$DEPLOY_ROOT/current.rollback" "$DEPLOY_ROOT/current"
+  if (( versioned_active == 0 )); then
+    trap - ERR
+    sudo rm -f "$dropin"
+    if (( legacy_moved == 1 )); then sudo mv "$legacy_disabled" "$legacy_dropin"; fi
+    sudo systemctl daemon-reload
+    sudo systemctl restart "$SERVICE_NAME"
+    sudo systemctl is-active --quiet "$SERVICE_NAME"
+    echo "deployment=ROLLED_BACK_TO_ORIGINAL_SYSTEMD failed_commit=$commit" >&2
+    exit 1
+  fi
   sudo -n systemctl restart "$SERVICE_NAME"
   previous_commit=$(cat "$previous/.deployed-commit")
   "$previous/.venv/bin/python3" "$previous/deploy/oracle/health_check.py" \

@@ -141,6 +141,16 @@ def test_baseline_activation_backs_up_before_systemd_switch_and_can_rollback():
     assert "99-codex-versioned-release.conf.disabled-by-codex" in sudoers
 
 
+def test_first_repair_deploy_starts_target_directly_and_restores_original_unit_on_failure():
+    deploy = (DEPLOY / "remote_deploy.sh").read_text()
+    assert "first_mode=${5:-}" in deploy
+    assert '[[ "$first_mode" != --first ]]' in deploy
+    assert "restore_first_on_error" in deploy
+    assert "original systemd configuration restored" in deploy
+    assert "ROLLED_BACK_TO_ORIGINAL_SYSTEMD" in deploy
+    assert deploy.index("sqlite_backup.py") < deploy.index('ln -s "$release"')
+
+
 def test_signals_service_import_boundary_excludes_execution_modules():
     signals = ROOT / "src" / "signals_display"
     forbidden = ("src.clients", "src.jobs", "src.orders", "src.strategies")

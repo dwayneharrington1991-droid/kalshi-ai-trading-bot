@@ -12,6 +12,17 @@ config=/etc/kalshi-signals/deployment.env
 [[ -r "$config" ]] || { echo "DEPLOYMENT_BLOCKED: unreadable $config" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$config"
+: "${DEPLOY_ROOT:?}" "${DATA_ROOT:?}" "${PYTHON_BIN:?}"
+[[ -f "$DEPLOY_ROOT/production-approved" ]] || {
+  echo "DEPLOYMENT_BLOCKED: missing reviewed approval marker: $DEPLOY_ROOT/production-approved" >&2; exit 1;
+}
+baseline=$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)
+[[ -n "$baseline" && -f "$baseline/.deployed-commit" && -x "$baseline/.venv/bin/python3" ]] || {
+  echo "DEPLOYMENT_BLOCKED: prepared rollback baseline is missing or incomplete" >&2; exit 1;
+}
+[[ -r "$DEPLOY_ROOT/account-monitoring.flags" ]] || {
+  echo "DEPLOYMENT_BLOCKED: prepared baseline did not capture read-only account mode" >&2; exit 1;
+}
 
 mkdir -p /home/opc/.kalshi-deploy
 exec 8>/home/opc/.kalshi-deploy/learning-repair.lock

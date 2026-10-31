@@ -61,8 +61,9 @@ fi
 service_state=$(sudo -n systemctl show "$SERVICE_NAME" \
   --property=ExecStart,WorkingDirectory,MainPID --no-pager) || \
   blocker "cannot inspect $SERVICE_NAME with the reviewed sudo policy"
+versioned_active=0
 if [[ "$service_state" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]]; then
-  blocker "the versioned launcher is already active but the target is unhealthy; use the normal recovery workflow"
+  versioned_active=1
 fi
 if sudo -n systemctl is-active --quiet "$SERVICE_NAME"; then
   echo "original_service=ACTIVE will_quiesce_for_consistent_backup=true"
@@ -95,7 +96,9 @@ archive_sha=$(sha256sum "$archive" | awk '{print $1}')
 echo "release_packaged commit=$TARGET_COMMIT sha256=$archive_sha"
 echo "first_release_start commit=$TARGET_COMMIT baseline_activated=false"
 
-"$tools/remote_deploy.sh" "$TARGET_COMMIT" "$archive" "$archive_sha" "$CONFIG" --first
+deploy_mode=()
+(( versioned_active == 0 )) && deploy_mode+=(--first)
+"$tools/remote_deploy.sh" "$TARGET_COMMIT" "$archive" "$archive_sha" "$CONFIG" "${deploy_mode[@]}"
 
 current=$(readlink -f "$DEPLOY_ROOT/current")
 [[ -f "$current/.deployed-commit" && $(cat "$current/.deployed-commit") == "$TARGET_COMMIT" ]] || \

@@ -230,8 +230,13 @@ def test_first_repair_deploy_starts_target_directly_and_restores_original_unit_o
     assert "dashboard_quiesce_complete" in deploy
     assert "trap recover_first_on_exit EXIT" in deploy
     assert "first_recovery_needed=0" in deploy
+    assert "versioned_recovery_needed=0" in deploy
+    assert "previous release restarted" in deploy
     assert '$DEPLOY_ROOT/current/.venv/bin/python3' in deploy
     assert 'src.signals_display.server' in deploy
+    launch = (DEPLOY / "launch_first_release.sh").read_text()
+    assert "deploy_mode=()" in launch
+    assert 'deploy_mode+=(--first)' in launch
 
 
 def test_single_first_release_launcher_is_locked_exact_and_fails_before_backup():
@@ -246,7 +251,7 @@ def test_single_first_release_launcher_is_locked_exact_and_fails_before_backup()
     assert launch.index("production-approved") < launch.index('git -C "$APP_ROOT" archive')
     assert launch.index("pgrep -u opc") < launch.index('git -C "$APP_ROOT" archive')
     assert 'git -C "$APP_ROOT" archive "$TARGET_COMMIT" deploy/oracle' in launch
-    assert '"$tools/remote_deploy.sh" "$TARGET_COMMIT" "$archive" "$archive_sha" "$CONFIG" --first' in launch
+    assert '"$tools/remote_deploy.sh" "$TARGET_COMMIT" "$archive" "$archive_sha" "$CONFIG" "${deploy_mode[@]}"' in launch
     assert "baseline_activated=false" in launch
     assert "src.signals_display.server" in launch
     assert "--mode public" in launch

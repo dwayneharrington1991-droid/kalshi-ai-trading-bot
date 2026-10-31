@@ -54,12 +54,24 @@ fi
 sudo -n systemctl cat "$SERVICE_NAME" > "$backup/systemd-before.txt"
 dropin_dir="/etc/systemd/system/$SERVICE_NAME.d"
 dropin="$dropin_dir/zz-codex-versioned-release.conf"
+legacy_dropin="$dropin_dir/99-codex-versioned-release.conf"
+legacy_disabled="$dropin_dir/99-codex-versioned-release.conf.disabled-by-codex"
 if sudo test -f "$dropin"; then
   echo "target baseline drop-in already exists; refusing to overwrite it" >&2; exit 1
+fi
+legacy_moved=0
+if sudo test -f "$legacy_dropin"; then
+  if sudo test -f "$legacy_disabled"; then
+    echo "both legacy and preserved legacy overrides exist; refusing overwrite" >&2; exit 1
+  fi
+  sudo mv "$legacy_dropin" "$legacy_disabled"
+  legacy_moved=1
+  echo "legacy_override_preserved=$legacy_disabled" >&2
 fi
 rollback() {
   code=$?; trap - ERR; set +e
   sudo rm -f "$dropin"
+  if (( legacy_moved == 1 )); then sudo mv "$legacy_disabled" "$legacy_dropin"; fi
   sudo systemctl daemon-reload; sudo systemctl restart "$SERVICE_NAME"
   echo "baseline activation rolled back; databases were not changed" >&2
   exit "$code"
@@ -80,6 +92,9 @@ for attempt in $(seq 1 90); do
      "$current/.venv/bin/python3" "$current/deploy/oracle/health_check.py" \
        --commit "$commit" --data-root "$DATA_ROOT" --require-models "${REQUIRE_MODEL_ARTIFACTS:-0}"; then
     trap - ERR
+    if (( legacy_moved == 1 )); then
+      echo "legacy_override_disabled=$legacy_disabled"
+    fi
     echo "baseline_activation=HEALTHY backup=$backup production_approval_marker_created=false"
     exit 0
   fi

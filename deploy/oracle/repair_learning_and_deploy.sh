@@ -12,7 +12,7 @@ config=/etc/kalshi-signals/deployment.env
 [[ -r "$config" ]] || { echo "DEPLOYMENT_BLOCKED: unreadable $config" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$config"
-: "${DEPLOY_ROOT:?}" "${DATA_ROOT:?}" "${PYTHON_BIN:?}"
+: "${DEPLOY_ROOT:?}" "${DATA_ROOT:?}" "${PYTHON_BIN:?}" "${SERVICE_NAME:?}"
 [[ -f "$DEPLOY_ROOT/production-approved" ]] || {
   echo "DEPLOYMENT_BLOCKED: missing reviewed approval marker: $DEPLOY_ROOT/production-approved" >&2; exit 1;
 }
@@ -94,6 +94,11 @@ git -C "$app" show "$target:deploy/oracle/launch_first_release.sh" > "$temporary
 chmod 0700 "$temporary"
 "$temporary" "$target"
 
+current=$(readlink -f "$DEPLOY_ROOT/current")
+echo "opening_pipeline_validation_start max_seconds=1100"
+"$current/.venv/bin/python3" "$current/deploy/oracle/verify_opening_pipeline.py" \
+  --max-seconds 1100 --interval 2
+
 # Replace the legacy staging refresh with the bounded versioned runner. Never
 # restore a timer that still points at /home/opc/refresh_learning_staging.py.
 learning_dropin_dir=/etc/systemd/system/kalshi-learning.service.d
@@ -128,4 +133,12 @@ sudo -n systemctl start "$timer"
 sudo -n systemctl is-active --quiet "$timer" || {
   echo "DEPLOYMENT_BLOCKED: dashboard is healthy but $timer could not be restored" >&2; exit 1;
 }
-echo "learning_service=VERIFIED learning_timer=ACTIVE dashboard_commit=$target deployment=VERIFIED"
+sudo -n systemctl enable "$SERVICE_NAME"
+sudo -n systemctl enable "$timer"
+dashboard_enabled=$(sudo -n systemctl is-enabled "$SERVICE_NAME")
+timer_enabled=$(sudo -n systemctl is-enabled "$timer")
+[[ "$dashboard_enabled" == enabled && "$timer_enabled" == enabled ]] || {
+  echo "DEPLOYMENT_BLOCKED: boot enablement failed dashboard=$dashboard_enabled timer=$timer_enabled" >&2
+  exit 1
+}
+echo "learning_service=VERIFIED learning_timer=ACTIVE dashboard_commit=$target deployment=VERIFIED auto_start=ENABLED"

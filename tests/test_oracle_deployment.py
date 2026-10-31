@@ -259,6 +259,10 @@ def test_learning_repair_quiesces_exact_job_and_restores_timer_only_after_deploy
     assert repair.index("production-approved") < repair.index('systemctl stop "$timer"')
     assert repair.index('systemctl stop "$timer"') < repair.index(deploy_call)
     assert repair.index(deploy_call) < repair.index(timer_start)
+    assert "verify_opening_pipeline.py" in repair
+    assert repair.index("verify_opening_pipeline.py") < repair.index(timer_start)
+    assert 'systemctl enable "$SERVICE_NAME"' in repair
+    assert 'systemctl enable "$timer"' in repair
     assert "zz-codex-bounded-learning.conf" in repair
     assert repair.index('systemctl start "$learning"') < repair.index(timer_start)
     assert "learning_result" in repair and "ExecMainStatus" in repair
@@ -281,6 +285,35 @@ def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
     for unsafe in ("place_order", "cancel_order", "transfer", "src.jobs", "src.orders"):
         assert unsafe not in runner
         assert unsafe not in override
+
+
+def test_opening_pipeline_deployment_gate_requires_live_immutable_opening():
+    module_path = DEPLOY / "verify_opening_pipeline.py"
+    spec = importlib.util.spec_from_file_location("verify_opening_pipeline", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    state = {
+        "stale": False,
+        "remaining_seconds": 600,
+        "market": {"ticker": "KXBTC15M-TEST"},
+        "prediction_engine": {
+            "ticker": "KXBTC15M-TEST",
+            "up": 0.61,
+            "initial": {
+                "ticker": "KXBTC15M-TEST", "up": 0.58,
+                "opens_at": "2026-10-30T20:00:00+00:00",
+                "data_cutoff": "2026-10-30T20:00:00+00:00",
+                "generated_at": "2026-10-30T20:00:02+00:00",
+                "closes_at": "2026-10-30T20:15:00+00:00",
+                "model": "opening-test",
+            },
+        },
+    }
+    value, reason = module.validate(state)
+    assert reason is None and value["up"] == 0.58
+    state["prediction_engine"]["initial"]["data_cutoff"] = "2026-10-30T20:00:01+00:00"
+    value, reason = module.validate(state)
+    assert value is None and "cutoff" in reason
 
 
 def test_signals_service_import_boundary_excludes_execution_modules():

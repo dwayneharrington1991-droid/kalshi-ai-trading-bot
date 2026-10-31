@@ -26,10 +26,15 @@ def test_sqlite_backup_is_consistent_and_has_a_verified_manifest(tmp_path):
     with sqlite3.connect(source) as db:
         db.execute("CREATE TABLE journal (id INTEGER PRIMARY KEY, value TEXT)")
         db.executemany("INSERT INTO journal(value) VALUES (?)", [("a",), ("b",)])
-    subprocess.run(
+    completed = subprocess.run(
         [sys.executable, str(DEPLOY / "sqlite_backup.py"), str(source), str(destination)],
         check=True,
+        capture_output=True,
+        text=True,
     )
+    assert "backup_progress" in completed.stdout
+    assert "integrity_check_ok" in completed.stdout
+    assert "checksum_ok" in completed.stdout
     with sqlite3.connect(destination) as db:
         assert db.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert db.execute("SELECT value FROM journal ORDER BY id").fetchall() == [("a",), ("b",)]
@@ -125,6 +130,13 @@ def test_baseline_activation_backs_up_before_systemd_switch_and_can_rollback():
     assert "refusing to overwrite it" in activation
     assert "baseline activation rolled back" in activation
     assert "production_approval_marker_created=false" in activation
+    assert "zz-codex-versioned-release.conf" in activation
+    assert "versioned launcher did not win systemd drop-in precedence" in activation
+    assert "health_wait" in activation
+    assert "99-codex-versioned-release.conf" not in activation
+    sudoers = (DEPLOY / "sudoers.example").read_text()
+    assert "zz-codex-versioned-release.conf" in sudoers
+    assert "99-codex-versioned-release.conf" not in sudoers
 
 
 def test_signals_service_import_boundary_excludes_execution_modules():

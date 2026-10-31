@@ -39,8 +39,10 @@ tools=$(cd "$(dirname "$0")" && pwd)
 for db in "${databases[@]}"; do
   relative=${db#"$DATA_ROOT"/}; destination="$backup/databases/$relative"
   mkdir -p "$(dirname "$destination")"
+  echo "backup_start database=$relative bytes=$(stat -c %s "$db")" >&2
   "$PYTHON_BIN" "$tools/sqlite_backup.py" "$db" "$destination"
   (cd "$(dirname "$destination")" && sha256sum -c "$(basename "$destination").sha256")
+  echo "backup_complete database=$relative" >&2
 done
 if [[ -n ${MODEL_ROOT:-} && -e ${MODEL_ROOT:-} ]]; then
   [[ "$MODEL_ROOT" == /home/opc/kalshi-ai-trading-bot/* ]] || { echo "model root outside application" >&2; exit 1; }
@@ -51,7 +53,7 @@ if [[ -n ${MODEL_ROOT:-} && -e ${MODEL_ROOT:-} ]]; then
 fi
 sudo -n systemctl cat "$SERVICE_NAME" > "$backup/systemd-before.txt"
 dropin_dir="/etc/systemd/system/$SERVICE_NAME.d"
-dropin="$dropin_dir/99-codex-versioned-release.conf"
+dropin="$dropin_dir/zz-codex-versioned-release.conf"
 if sudo test -f "$dropin"; then
   echo "target baseline drop-in already exists; refusing to overwrite it" >&2; exit 1
 fi
@@ -66,8 +68,14 @@ trap rollback ERR
 sudo install -d -m 0755 "$dropin_dir"
 sudo install -m 0644 "$tools/kalshi-signals.override.conf.example" "$dropin"
 sudo systemctl daemon-reload
+effective=$(sudo systemctl show "$SERVICE_NAME" --property=ExecStart --value)
+[[ "$effective" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]] || {
+  echo "versioned launcher did not win systemd drop-in precedence" >&2; false
+}
 sudo systemctl restart "$SERVICE_NAME"
-for _ in $(seq 1 30); do
+for attempt in $(seq 1 90); do
+  (( attempt == 1 || attempt % 5 == 0 )) && \
+    echo "health_wait attempt=$attempt max=90 expected_commit=$commit" >&2
   if sudo systemctl is-active --quiet "$SERVICE_NAME" && \
      "$current/.venv/bin/python3" "$current/deploy/oracle/health_check.py" \
        --commit "$commit" --data-root "$DATA_ROOT" --require-models "${REQUIRE_MODEL_ARTIFACTS:-0}"; then

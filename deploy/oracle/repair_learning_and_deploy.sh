@@ -94,10 +94,38 @@ git -C "$app" show "$target:deploy/oracle/launch_first_release.sh" > "$temporary
 chmod 0700 "$temporary"
 "$temporary" "$target"
 
-# Restore scheduling only after the repaired dashboard and exact commit passed
-# the launcher's process and /healthz verification.
+# Replace the legacy staging refresh with the bounded versioned runner. Never
+# restore a timer that still points at /home/opc/refresh_learning_staging.py.
+learning_dropin_dir=/etc/systemd/system/kalshi-learning.service.d
+learning_dropin="$learning_dropin_dir/zz-codex-bounded-learning.conf"
+runner="$DEPLOY_ROOT/current/deploy/oracle/run_learning_refresh.sh"
+override="$DEPLOY_ROOT/current/deploy/oracle/kalshi-learning.override.conf.example"
+[[ -x "$runner" && -r "$override" ]] || {
+  echo "DEPLOYMENT_BLOCKED: repaired release lacks bounded learning service files" >&2; exit 1;
+}
+sudo -n install -d -m 0755 "$learning_dropin_dir"
+sudo -n install -m 0644 "$override" "$learning_dropin"
+sudo -n systemctl daemon-reload
+learning_exec=$(sudo -n systemctl show "$learning" --property=ExecStart --value)
+[[ "$learning_exec" == *"$DEPLOY_ROOT/current/deploy/oracle/run_learning_refresh.sh"* ]] || {
+  echo "DEPLOYMENT_BLOCKED: bounded learning override did not win systemd precedence" >&2; exit 1;
+}
+echo "learning_validation_start runner=$runner"
+if ! timeout --signal=TERM --kill-after=30s 1320 sudo -n systemctl start "$learning"; then
+  echo "DEPLOYMENT_BLOCKED: bounded learning refresh failed or exceeded 22 minutes; timer remains stopped" >&2
+  exit 1
+fi
+learning_result=$(sudo -n systemctl show "$learning" --property=Result --value)
+learning_status=$(sudo -n systemctl show "$learning" --property=ExecMainStatus --value)
+[[ "$learning_result" == success && "$learning_status" == 0 ]] || {
+  echo "DEPLOYMENT_BLOCKED: bounded learning refresh result=$learning_result status=$learning_status; timer remains stopped" >&2
+  exit 1
+}
+
+# Restore scheduling only after both the repaired dashboard and one bounded
+# learning refresh pass validation.
 sudo -n systemctl start "$timer"
 sudo -n systemctl is-active --quiet "$timer" || {
   echo "DEPLOYMENT_BLOCKED: dashboard is healthy but $timer could not be restored" >&2; exit 1;
 }
-echo "learning_timer=ACTIVE dashboard_commit=$target deployment=VERIFIED"
+echo "learning_service=VERIFIED learning_timer=ACTIVE dashboard_commit=$target deployment=VERIFIED"

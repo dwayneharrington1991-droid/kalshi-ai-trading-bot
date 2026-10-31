@@ -49,6 +49,7 @@ legacy_dropin="$dropin_dir/99-codex-versioned-release.conf"
 legacy_disabled="$dropin_dir/99-codex-versioned-release.conf.disabled-by-codex"
 legacy_moved=0
 first_recovery_needed=0
+versioned_recovery_needed=0
 restore_first_on_error() {
   code=${1:-1}; trap - ERR EXIT; set +e
   ln -s "$previous" "$DEPLOY_ROOT/current.failed-first-rollback"
@@ -66,39 +67,53 @@ recover_first_on_exit() {
     restore_first_on_error "$code"
   fi
 }
+recover_versioned_on_exit() {
+  code=$?
+  if (( versioned_recovery_needed == 1 && code != 0 )); then
+    trap - EXIT
+    set +e
+    ln -s "$previous" "$DEPLOY_ROOT/current.failed-update-rollback"
+    mv -Tf "$DEPLOY_ROOT/current.failed-update-rollback" "$DEPLOY_ROOT/current"
+    sudo systemctl restart "$SERVICE_NAME"
+    echo "versioned deployment failed; previous release restarted" >&2
+    exit "$code"
+  fi
+}
 if (( versioned_active == 0 )); then
   first_recovery_needed=1
   trap recover_first_on_exit EXIT
-  # A consistent first-release backup requires quiescing every known writer.
-  # Stop the managed service, then terminate only orphaned copies of this exact
-  # signals server using this journal and port. Unknown holders cause refusal.
-  echo "dashboard_quiesce_start service=$SERVICE_NAME" >&2
-  sudo -n systemctl stop "$SERVICE_NAME"
-  for pid in $(pgrep -u opc -f '[s]rc\.signals_display\.server' || true); do
-    command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-    if [[ "$command" == *"--journal $JOURNAL_PATH"* && "$command" == *"--port 8765"* ]]; then
-      echo "stopping_orphan_dashboard pid=$pid" >&2
-      kill -TERM "$pid"
-    fi
-  done
-  for _ in $(seq 1 15); do
-    pgrep -u opc -f '[s]rc\.signals_display\.server.*--port 8765' >/dev/null || break
-    sleep 1
-  done
-  for pid in $(pgrep -u opc -f '[s]rc\.signals_display\.server.*--port 8765' || true); do
-    command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-    if [[ "$command" == *"--journal $JOURNAL_PATH"* ]]; then
-      echo "forcing_orphan_dashboard_exit pid=$pid" >&2
-      kill -KILL "$pid"
-    fi
-  done
-  holders=$(fuser "$JOURNAL_PATH" 2>/dev/null || true)
-  [[ -z "${holders//[[:space:]]/}" ]] || {
-    echo "database still held after managed writer shutdown; pids=$holders" >&2
-    exit 1
-  }
-  echo "dashboard_quiesce_complete database_writers=0" >&2
+else
+  versioned_recovery_needed=1
+  trap recover_versioned_on_exit EXIT
 fi
+# Every deployment needs a consistent backup. Stop the managed writer, then
+# terminate only orphaned copies of this exact signals server/journal/port.
+echo "dashboard_quiesce_start service=$SERVICE_NAME" >&2
+sudo -n systemctl stop "$SERVICE_NAME"
+for pid in $(pgrep -u opc -f '[s]rc\.signals_display\.server' || true); do
+  command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  if [[ "$command" == *"--journal $JOURNAL_PATH"* && "$command" == *"--port 8765"* ]]; then
+    echo "stopping_orphan_dashboard pid=$pid" >&2
+    kill -TERM "$pid"
+  fi
+done
+for _ in $(seq 1 15); do
+  pgrep -u opc -f '[s]rc\.signals_display\.server.*--port 8765' >/dev/null || break
+  sleep 1
+done
+for pid in $(pgrep -u opc -f '[s]rc\.signals_display\.server.*--port 8765' || true); do
+  command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  if [[ "$command" == *"--journal $JOURNAL_PATH"* ]]; then
+    echo "forcing_orphan_dashboard_exit pid=$pid" >&2
+    kill -KILL "$pid"
+  fi
+done
+holders=$(fuser "$JOURNAL_PATH" 2>/dev/null || true)
+[[ -z "${holders//[[:space:]]/}" ]] || {
+  echo "database still held after managed writer shutdown; pids=$holders" >&2
+  exit 1
+}
+echo "dashboard_quiesce_complete database_writers=0" >&2
 data_device=$(stat -c %d "$DATA_ROOT")
 backup_device=$(stat -c %d "$BACKUP_ROOT")
 same_disk=0
@@ -234,6 +249,7 @@ if sudo -n systemctl restart "$SERVICE_NAME"; then
          && "$command" == *"--mode public"* ]] || break
       printf '%s\n' "$commit" > "$DEPLOY_ROOT/deployed-commit"
       first_recovery_needed=0
+      versioned_recovery_needed=0
       trap - ERR EXIT
       echo "deployment=HEALTHY commit=$commit backup=$backup"
       exit 0
@@ -260,6 +276,8 @@ if [[ "$rollback" == true && "$policy" == none ]]; then
   "$previous/.venv/bin/python3" "$previous/deploy/oracle/health_check.py" \
     --commit "$previous_commit" --data-root "$DATA_ROOT" --require-models "${REQUIRE_MODEL_ARTIFACTS:-0}"
   echo "deployment=ROLLED_BACK failed_commit=$commit restored_commit=$previous_commit" >&2
+  versioned_recovery_needed=0
+  trap - EXIT
   exit 1
 fi
 echo "deployment failed; automatic rollback withheld by release policy" >&2

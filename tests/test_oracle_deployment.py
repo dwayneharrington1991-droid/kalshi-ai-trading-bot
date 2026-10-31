@@ -11,7 +11,7 @@ DEPLOY = ROOT / "deploy" / "oracle"
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "launch_first_release.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -149,6 +149,26 @@ def test_first_repair_deploy_starts_target_directly_and_restores_original_unit_o
     assert "original systemd configuration restored" in deploy
     assert "ROLLED_BACK_TO_ORIGINAL_SYSTEMD" in deploy
     assert deploy.index("sqlite_backup.py") < deploy.index('ln -s "$release"')
+
+
+def test_single_first_release_launcher_is_locked_exact_and_fails_before_backup():
+    launch = (DEPLOY / "launch_first_release.sh").read_text()
+    target = "7fb41dd323a98571b6d93537386be97987013441"
+    assert f'readonly TARGET_COMMIT="{target}"' in launch
+    assert "flock -n" in launch
+    assert "production-approved" in launch
+    assert "prepared rollback baseline is missing" in launch
+    assert "a deployment or database backup is still running" in launch
+    assert launch.index("production-approved") < launch.index('git -C "$APP_ROOT" archive')
+    assert launch.index("pgrep -u opc") < launch.index('git -C "$APP_ROOT" archive')
+    assert 'git -C "$APP_ROOT" archive "$TARGET_COMMIT" deploy/oracle' in launch
+    assert '"$tools/remote_deploy.sh" "$TARGET_COMMIT" "$archive" "$archive_sha" "$CONFIG" --first' in launch
+    assert "baseline_activated=false" in launch
+    assert "src.signals_display.server" in launch
+    assert "--mode public" in launch
+    assert "curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8765/healthz" in launch
+    for unsafe in ("place_order", "cancel_order", "transfer", "git reset", "git clean"):
+        assert unsafe not in launch
 
 
 def test_signals_service_import_boundary_excludes_execution_modules():

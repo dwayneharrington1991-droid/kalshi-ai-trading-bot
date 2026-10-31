@@ -22,7 +22,7 @@ def load_sqlite_backup():
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -311,6 +311,25 @@ def test_account_activation_is_get_only_verified_and_rolls_back_on_failure():
     assert "signals_only" in script
     for unsafe in ("place_order", "cancel_order", "transfer", "POST", "DELETE", "PATCH"):
         assert unsafe not in script
+
+
+def test_credential_transfer_never_puts_secrets_in_arguments_or_output():
+    transfer = (ROOT / "scripts" / "transfer_oracle_readonly_credentials.sh").read_text()
+    install = (DEPLOY / "install_readonly_credentials.sh").read_text()
+    assert "StrictHostKeyChecking=yes" in transfer
+    assert "ssh-keygen -F" in transfer
+    assert "printf '%s' \"$KALSHI_MONITOR_PRIVATE_KEY_PEM\" >" in transfer
+    assert "scp -q" in transfer
+    assert "credentials_printed=false" in transfer
+    assert "EnvironmentFile=/etc/kalshi-signals/account-monitor.env" in install
+    assert "KALSHI_MONITOR_PRIVATE_KEY_PATH=" in install
+    assert "root -g opc -m 0640" in install
+    assert '"$activation"' in install
+    assert 'visudo -cf "$sudoers"' in install
+    for script in (transfer, install):
+        assert "set -x" not in script
+        assert "echo $KALSHI" not in script
+        assert "place_order" not in script and "cancel_order" not in script
 
 
 def test_opening_pipeline_deployment_gate_requires_live_immutable_opening():

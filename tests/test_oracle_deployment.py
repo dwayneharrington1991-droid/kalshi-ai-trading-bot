@@ -22,7 +22,7 @@ def load_sqlite_backup():
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -259,10 +259,28 @@ def test_learning_repair_quiesces_exact_job_and_restores_timer_only_after_deploy
     assert repair.index("production-approved") < repair.index('systemctl stop "$timer"')
     assert repair.index('systemctl stop "$timer"') < repair.index(deploy_call)
     assert repair.index(deploy_call) < repair.index(timer_start)
+    assert "zz-codex-bounded-learning.conf" in repair
+    assert repair.index('systemctl start "$learning"') < repair.index(timer_start)
+    assert "learning_result" in repair and "ExecMainStatus" in repair
     assert "git reset" not in repair and "git clean" not in repair
     sudoers = (DEPLOY / "sudoers.example").read_text()
     assert "KALSHI_LEARNING" in sudoers
     assert "systemctl stop kalshi-learning.timer" in sudoers
+
+
+def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
+    runner = (DEPLOY / "run_learning_refresh.sh").read_text()
+    override = (DEPLOY / "kalshi-learning.override.conf.example").read_text()
+    assert "flock -n" in runner
+    assert runner.count("timeout --signal=TERM") == 2
+    assert "--scheduled" in runner
+    assert "src.signals_display.opening_models" in runner
+    assert "TimeoutStartSec=22min" in override
+    assert "NoNewPrivileges=true" in override
+    assert "run_learning_refresh.sh" in override
+    for unsafe in ("place_order", "cancel_order", "transfer", "src.jobs", "src.orders"):
+        assert unsafe not in runner
+        assert unsafe not in override
 
 
 def test_signals_service_import_boundary_excludes_execution_modules():
@@ -281,6 +299,8 @@ def test_signals_service_import_boundary_excludes_execution_modules():
     override = (DEPLOY / "kalshi-signals.override.conf.example").read_text()
     assert "-m src.signals_display.server" in wrapper
     assert "run_dashboard.sh" in override
+    assert "Restart=on-failure" in override
+    assert "KillMode=control-group" in override
     for unsafe in ("src.jobs.execute", "cli.py", "place_order", "cancel_order"):
         assert unsafe not in wrapper
         assert unsafe not in override

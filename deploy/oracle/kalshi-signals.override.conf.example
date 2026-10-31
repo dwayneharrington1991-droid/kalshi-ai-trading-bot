@@ -2,4 +2,8 @@
 WorkingDirectory=/home/opc/kalshi-ai-trading-bot/.deploy/current
 ExecStart=
 ExecStart=/home/opc/kalshi-ai-trading-bot/.deploy/current/deploy/oracle/run_dashboard.sh
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=3min
+KillMode=control-group
 

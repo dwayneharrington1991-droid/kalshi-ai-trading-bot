@@ -9,9 +9,12 @@ Cmnd_Alias KALSHI_SERVICE = /usr/bin/systemctl restart kalshi-signals.service, \
 Cmnd_Alias KALSHI_LEARNING = /usr/bin/systemctl stop kalshi-learning.timer, \
  /usr/bin/systemctl start kalshi-learning.timer, \
  /usr/bin/systemctl stop kalshi-learning.service, \
+ /usr/bin/systemctl start kalshi-learning.service, \
  /usr/bin/systemctl is-active --quiet kalshi-learning.timer, \
  /usr/bin/systemctl show kalshi-learning.timer *, \
- /usr/bin/systemctl show kalshi-learning.service *
+ /usr/bin/systemctl show kalshi-learning.service *, \
+ /usr/bin/install -d -m 0755 /etc/systemd/system/kalshi-learning.service.d, \
+ /usr/bin/install -m 0644 /home/opc/kalshi-ai-trading-bot/.deploy/current/deploy/oracle/kalshi-learning.override.conf.example /etc/systemd/system/kalshi-learning.service.d/zz-codex-bounded-learning.conf
 Cmnd_Alias KALSHI_CONFIG = /usr/bin/install -d -o root -g opc -m 0750 /etc/kalshi-signals, \
  /usr/bin/install -o root -g opc -m 0640 /home/opc/kalshi-deployment.env.candidate /etc/kalshi-signals/deployment.env, \
  /usr/bin/chown root\:opc /etc/kalshi-signals/deployment.env, \

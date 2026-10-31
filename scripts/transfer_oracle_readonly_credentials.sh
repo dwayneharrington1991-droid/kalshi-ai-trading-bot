@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+host=${ORACLE_HOST:-129.146.120.195}
+user=${ORACLE_USER:-opc}
+remote="$user@$host"
+repo=$(cd "$(dirname "$0")/.." && pwd)
+stage=/home/opc/.kalshi-credential-stage
+[[ -n ${KALSHI_MONITOR_KEY_ID:-} && -n ${KALSHI_MONITOR_PRIVATE_KEY_PEM:-} ]] || {
+  echo "TRANSFER_BLOCKED: Codespaces monitoring secrets are not present in this shell" >&2; exit 1;
+}
+[[ "$KALSHI_MONITOR_KEY_ID" =~ ^[A-Za-z0-9_-]{1,200}$ ]] || {
+  echo "TRANSFER_BLOCKED: monitoring key identifier format is unsupported" >&2; exit 1;
+}
+ssh-keygen -F "$host" >/dev/null || {
+  echo "TRANSFER_BLOCKED: Oracle SSH host identity is not in ~/.ssh/known_hosts; verify it before transfer" >&2
+  exit 1
+}
+local_stage=$(mktemp -d)
+remote_created=0
+cleanup() {
+  rm -f "$local_stage/key-id" "$local_stage/private-key.pem" \
+    "$local_stage/install" "$local_stage/activate" "$local_stage/sudoers"
+  rmdir "$local_stage" 2>/dev/null || true
+  if (( remote_created == 1 )); then
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$remote" \
+      "rm -f '$stage/key-id' '$stage/private-key.pem' '$stage/install' '$stage/enable-readonly-account.sh' '$stage/sudoers'; rmdir '$stage' 2>/dev/null || true" \
+      >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+printf '%s' "$KALSHI_MONITOR_KEY_ID" > "$local_stage/key-id"
+printf '%s' "$KALSHI_MONITOR_PRIVATE_KEY_PEM" > "$local_stage/private-key.pem"
+cp "$repo/deploy/oracle/install_readonly_credentials.sh" "$local_stage/install"
+cp "$repo/deploy/oracle/enable_readonly_account.sh" "$local_stage/activate"
+cp "$repo/deploy/oracle/sudoers.example" "$local_stage/sudoers"
+chmod 0600 "$local_stage"/*
+
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$remote" \
+  "install -d -m 0700 '$stage' && test -z \"\$(find '$stage' -mindepth 1 -maxdepth 1 -print -quit)\""
+remote_created=1
+scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  "$local_stage/key-id" "$remote:$stage/key-id"
+scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  "$local_stage/private-key.pem" "$remote:$stage/private-key.pem"
+scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  "$local_stage/install" "$remote:$stage/install"
+scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  "$local_stage/activate" "$remote:$stage/enable-readonly-account.sh"
+scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  "$local_stage/sudoers" "$remote:$stage/sudoers"
+ssh -tt -o BatchMode=yes -o StrictHostKeyChecking=yes "$remote" \
+  "chmod 0600 '$stage/'* && bash '$stage/install' '$stage'"
+remote_created=0
+echo "transfer=COMPLETE credentials_printed=false trading_enabled=false"

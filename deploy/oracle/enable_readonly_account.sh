@@ -49,17 +49,21 @@ while time.monotonic() < deadline:
         account = state.get("account") or {}
         permissions = account.get("permissions") or {}
         status = account.get("status")
-        if permissions.get("read_only_verified") is True and status == "READ_ONLY_CONNECTED":
+        balance_present = account.get("available_balance_dollars") is not None
+        holdings = [h for h in account.get("holdings", []) if h.get("status") == "OPEN"]
+        kxbtc = [h for h in holdings if str(h.get("ticker", "")).startswith("KXBTC15M-")]
+        if permissions.get("read_only_verified") is True and status == "READ_ONLY_CONNECTED" and balance_present:
             print(json.dumps({
                 "account_monitoring": "READ_ONLY_CONNECTED",
                 "authentication": permissions.get("authentication"),
                 "scope": permissions.get("status"),
                 "account_scope": permissions.get("account_scope"),
-                "balance_present": account.get("available_balance_dollars") is not None,
-                "open_kxbtc15m_positions": sum(
-                    h.get("status") == "OPEN" and str(h.get("ticker", "")).startswith("KXBTC15M-")
-                    for h in account.get("holdings", [])
-                ),
+                "balance_present": balance_present,
+                "open_positions": len(holdings),
+                "open_kxbtc15m_positions": len(kxbtc),
+                "kxbtc15m_entry_prices_available": sum(h.get("entry_price") is not None for h in kxbtc),
+                "live_trade_cards": len(account.get("live_trade_cards", [])),
+                "hold_exit_guidance": len(account.get("guidance", [])),
                 "signals_only": True,
             }, sort_keys=True))
             raise SystemExit(0)

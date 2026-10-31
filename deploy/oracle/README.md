@@ -50,24 +50,39 @@ service.
    application rollback but provide no protection from filesystem, volume, or
    physical disk failure. Move verified backups to independent storage as soon
    as practical.
+   If `/etc/kalshi-signals` is absent, upload the reviewed tools and run
+   `configure_host.sh --inspect`. It derives every application path from the
+   effective service and refuses missing or mismatched values. Review its
+   candidate, then run `configure_host.sh --install`; installation does not
+   restart or modify the service and never creates the production marker.
 5. Copy `sudoers.example` to `/etc/sudoers.d/kalshi-deploy`, set mode 0440, and
    validate it with `sudo visudo -cf /etc/sudoers.d/kalshi-deploy`.
 6. Run the workflow manually with **operation: preflight**. This is read-only:
    it reports the current commit, service definition, working tree state,
    persistent file sizes, owners, modes, and backup capacity. Save its output.
 7. Compare the current `systemctl show` output with
-   `kalshi-signals.override.conf.example`. Back up the existing unit and install
-   the override only after confirming every journal/model path. Run
-   `sudo systemctl daemon-reload`; do not restart yet.
-8. Reconcile the preserved `monitor.py` diff and create a versioned release of
-   the current working service as the first rollback baseline. Do not point the
-   service at the repair release during this step. After the paths, backup
-   volume, override, and baseline have been reviewed, create the explicit
+   `kalshi-signals.override.conf.example`. Do not install the override yet.
+8. Reconcile the preserved `monitor.py` diff, then run
+   `prepare_baseline.sh`. It snapshots the current Oracle application source,
+   including local modifications, into an isolated Python 3.12 release; detects
+   whether the existing service uses `--account-readonly`; records that mode for
+   every later launcher; and runs focused regression tests. It does not change
+   or restart systemd and does not create the approval marker. Review the
+   resulting baseline, then run `activate_baseline.sh` during a maintenance
+   window. Activation makes fresh verified database/model backups, preserves the
+   prior systemd drop-in, switches only to the unchanged baseline, verifies
+   health, and restores the prior service definition on failure.
+   Only after that successful activation should you create the explicit
    gate with `install -m 600 /dev/null
    /home/opc/kalshi-ai-trading-bot/.deploy/production-approved`.
 
 The deploy script refuses to run without that last marker. The preflight never
 creates it and never changes the service.
+
+`ENABLE_ACCOUNT_READONLY` is intentionally absent from `deployment.env`. The
+baseline preparation derives it from the existing effective systemd command and
+writes a non-secret, mode-only file under `.deploy`. Later releases consume that
+captured value, so deployment cannot silently enable or disable account reads.
 
 ## Branch protection and routine deployment
 
@@ -124,3 +139,19 @@ The post-deploy check requires:
 `market_stale` is reported but is not treated as proof of a bad deployment,
 because an upstream exchange outage must not roll back otherwise healthy code.
 The dashboard continues to label stale inputs and withhold signals.
+
+## Historical data inventory and deferred migration
+
+Preflight inventories every SQLite file below `DATA_ROOT` and reports its exact
+path and byte size. Compare that output with an equivalent read-only inventory
+from the old Codespace before concluding that history is missing. Never copy a
+live SQLite file directly and never merge two journals by replacing Oracle's
+database.
+
+If the Codespace contains additional history, prepare a SQLite online backup at
+the source, run `PRAGMA quick_check`, generate a SHA-256 manifest, transfer the
+backup to a new staging path on Oracle, and verify the checksum again. Import or
+merge logic requires a separate reviewed plan with table-level keys,
+deduplication rules, row-count reconciliation, disk-capacity checks, and a tested
+rollback. The normal deployment workflow deliberately does not migrate data, so
+the dashboard remains functional while historical migration is deferred.

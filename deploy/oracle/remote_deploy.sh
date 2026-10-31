@@ -42,6 +42,63 @@ source "$account_mode_file"
 actual_sha=$(sha256sum "$archive" | awk '{print $1}')
 [[ "$actual_sha" == "$expected_sha" ]] || { echo "release checksum mismatch" >&2; exit 1; }
 mkdir -p "$DEPLOY_ROOT/releases" "$DEPLOY_ROOT/incoming" "$BACKUP_ROOT"
+
+dropin_dir="/etc/systemd/system/$SERVICE_NAME.d"
+dropin="$dropin_dir/zz-codex-versioned-release.conf"
+legacy_dropin="$dropin_dir/99-codex-versioned-release.conf"
+legacy_disabled="$dropin_dir/99-codex-versioned-release.conf.disabled-by-codex"
+legacy_moved=0
+first_recovery_needed=0
+restore_first_on_error() {
+  code=${1:-1}; trap - ERR EXIT; set +e
+  ln -s "$previous" "$DEPLOY_ROOT/current.failed-first-rollback"
+  mv -Tf "$DEPLOY_ROOT/current.failed-first-rollback" "$DEPLOY_ROOT/current"
+  sudo rm -f "$dropin"
+  if (( legacy_moved == 1 )); then sudo mv "$legacy_disabled" "$legacy_dropin"; fi
+  sudo systemctl daemon-reload
+  sudo systemctl restart "$SERVICE_NAME"
+  echo "first deployment failed; original systemd configuration restored" >&2
+  exit "$code"
+}
+recover_first_on_exit() {
+  code=$?
+  if (( first_recovery_needed == 1 && code != 0 )); then
+    restore_first_on_error "$code"
+  fi
+}
+if (( versioned_active == 0 )); then
+  first_recovery_needed=1
+  trap recover_first_on_exit EXIT
+  # A consistent first-release backup requires quiescing every known writer.
+  # Stop the managed service, then terminate only orphaned copies of this exact
+  # signals server using this journal and port. Unknown holders cause refusal.
+  echo "dashboard_quiesce_start service=$SERVICE_NAME" >&2
+  sudo -n systemctl stop "$SERVICE_NAME"
+  for pid in $(pgrep -u opc -f '[s]rc\.signals_display\.server' || true); do
+    command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    if [[ "$command" == *"--journal $JOURNAL_PATH"* && "$command" == *"--port 8765"* ]]; then
+      echo "stopping_orphan_dashboard pid=$pid" >&2
+      kill -TERM "$pid"
+    fi
+  done
+  for _ in $(seq 1 15); do
+    pgrep -u opc -f '[s]rc\.signals_display\.server.*--port 8765' >/dev/null || break
+    sleep 1
+  done
+  for pid in $(pgrep -u opc -f '[s]rc\.signals_display\.server.*--port 8765' || true); do
+    command=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    if [[ "$command" == *"--journal $JOURNAL_PATH"* ]]; then
+      echo "forcing_orphan_dashboard_exit pid=$pid" >&2
+      kill -KILL "$pid"
+    fi
+  done
+  holders=$(fuser "$JOURNAL_PATH" 2>/dev/null || true)
+  [[ -z "${holders//[[:space:]]/}" ]] || {
+    echo "database still held after managed writer shutdown; pids=$holders" >&2
+    exit 1
+  }
+  echo "dashboard_quiesce_complete database_writers=0" >&2
+fi
 data_device=$(stat -c %d "$DATA_ROOT")
 backup_device=$(stat -c %d "$BACKUP_ROOT")
 same_disk=0
@@ -141,24 +198,7 @@ fi
 "$release/.venv/bin/python3" -m pip install --disable-pip-version-check "$release"
 cp "$release/deploy/oracle/release-policy.json" "$backup/"
 
-dropin_dir="/etc/systemd/system/$SERVICE_NAME.d"
-dropin="$dropin_dir/zz-codex-versioned-release.conf"
-legacy_dropin="$dropin_dir/99-codex-versioned-release.conf"
-legacy_disabled="$dropin_dir/99-codex-versioned-release.conf.disabled-by-codex"
-legacy_moved=0
-restore_first_on_error() {
-  code=$?; trap - ERR; set +e
-  ln -s "$previous" "$DEPLOY_ROOT/current.failed-first-rollback"
-  mv -Tf "$DEPLOY_ROOT/current.failed-first-rollback" "$DEPLOY_ROOT/current"
-  sudo rm -f "$dropin"
-  if (( legacy_moved == 1 )); then sudo mv "$legacy_disabled" "$legacy_dropin"; fi
-  sudo systemctl daemon-reload
-  sudo systemctl restart "$SERVICE_NAME"
-  echo "first deployment failed; original systemd configuration restored" >&2
-  exit "$code"
-}
 if (( versioned_active == 0 )); then
-  trap restore_first_on_error ERR
   sudo test -f "$dropin" && { echo "winning versioned drop-in already exists" >&2; exit 1; }
   if sudo test -f "$legacy_dropin"; then
     sudo test -f "$legacy_disabled" && { echo "legacy override preservation conflict" >&2; exit 1; }
@@ -189,7 +229,8 @@ if sudo -n systemctl restart "$SERVICE_NAME"; then
       command=$(tr '\0' ' ' < "/proc/$pid/cmdline")
       [[ "$cwd" == "$release" && "$command" == *"$release/.venv/bin/python3"* ]] || break
       printf '%s\n' "$commit" > "$DEPLOY_ROOT/deployed-commit"
-      trap - ERR
+      first_recovery_needed=0
+      trap - ERR EXIT
       echo "deployment=HEALTHY commit=$commit backup=$backup"
       exit 0
     fi
@@ -200,7 +241,8 @@ if [[ "$rollback" == true && "$policy" == none ]]; then
   ln -s "$previous" "$DEPLOY_ROOT/current.rollback"
   mv -Tf "$DEPLOY_ROOT/current.rollback" "$DEPLOY_ROOT/current"
   if (( versioned_active == 0 )); then
-    trap - ERR
+    first_recovery_needed=0
+    trap - ERR EXIT
     sudo rm -f "$dropin"
     if (( legacy_moved == 1 )); then sudo mv "$legacy_disabled" "$legacy_dropin"; fi
     sudo systemctl daemon-reload

@@ -64,8 +64,11 @@ service_state=$(sudo -n systemctl show "$SERVICE_NAME" \
 if [[ "$service_state" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]]; then
   blocker "the versioned launcher is already active but the target is unhealthy; use the normal recovery workflow"
 fi
-sudo -n systemctl is-active --quiet "$SERVICE_NAME" || \
-  blocker "the original service is not active; refusing a first-release switch without a live rollback target"
+if sudo -n systemctl is-active --quiet "$SERVICE_NAME"; then
+  echo "original_service=ACTIVE will_quiesce_for_consistent_backup=true"
+else
+  echo "original_service=INACTIVE prepared_baseline_remains_rollback_material=true"
+fi
 
 git -C "$APP_ROOT" cat-file -e "$TARGET_COMMIT^{commit}" 2>/dev/null || \
   blocker "target commit is unavailable in $APP_ROOT; fetch the repair branch first"

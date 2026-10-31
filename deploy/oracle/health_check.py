@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, build_opener
 
 
@@ -15,6 +15,8 @@ def read_json(path):
         response = opener.open("http://127.0.0.1:8765" + path, timeout=5)
     except HTTPError as exc:
         response = exc
+    except URLError as exc:
+        raise SystemExit("dashboard endpoint is not accepting connections yet") from exc
     with response:
         return response.status, json.load(response)
 

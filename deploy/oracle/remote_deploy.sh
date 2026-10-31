@@ -227,7 +227,11 @@ if sudo -n systemctl restart "$SERVICE_NAME"; then
       pid=$(sudo -n systemctl show "$SERVICE_NAME" --property=MainPID --value)
       cwd=$(readlink -f "/proc/$pid/cwd")
       command=$(tr '\0' ' ' < "/proc/$pid/cmdline")
-      [[ "$cwd" == "$release" && "$command" == *"$release/.venv/bin/python3"* ]] || break
+      [[ "$cwd" == "$release" \
+         && ( "$command" == *"$release/.venv/bin/python3"* \
+              || "$command" == *"$DEPLOY_ROOT/current/.venv/bin/python3"* ) \
+         && "$command" == *"src.signals_display.server"* \
+         && "$command" == *"--mode public"* ]] || break
       printf '%s\n' "$commit" > "$DEPLOY_ROOT/deployed-commit"
       first_recovery_needed=0
       trap - ERR EXIT

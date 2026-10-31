@@ -22,7 +22,7 @@ def load_sqlite_backup():
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -294,6 +294,18 @@ def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
     for unsafe in ("place_order", "cancel_order", "transfer", "src.jobs", "src.orders"):
         assert unsafe not in runner
         assert unsafe not in override
+
+
+def test_account_activation_is_get_only_verified_and_rolls_back_on_failure():
+    script = (DEPLOY / "enable_readonly_account.sh").read_text()
+    assert "ENABLE_ACCOUNT_READONLY=1" in script
+    assert "read_only_verified" in script
+    assert "READ_ONLY_CONNECTED" in script
+    assert "prior mode restored" in script
+    assert "trap restore ERR" in script
+    assert "signals_only" in script
+    for unsafe in ("place_order", "cancel_order", "transfer", "POST", "DELETE", "PATCH"):
+        assert unsafe not in script
 
 
 def test_opening_pipeline_deployment_gate_requires_live_immutable_opening():

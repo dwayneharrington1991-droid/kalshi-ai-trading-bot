@@ -29,16 +29,30 @@ cleanup() {
 }
 trap cleanup EXIT
 if [[ -n ${ORACLE_SSH_PRIVATE_KEY:-} ]]; then
-  printf '%s' "$ORACLE_SSH_PRIVATE_KEY" > "$local_stage/oracle-ssh-key"
+  # Codespaces secrets are often copied from Windows.  OpenSSH rejects an
+  # otherwise valid private key when CRLF bytes survive in the secret or the
+  # final newline is missing.  Normalize only line endings; never print or
+  # otherwise transform the key material.
+  printf '%s' "$ORACLE_SSH_PRIVATE_KEY" | tr -d '\r' > "$local_stage/oracle-ssh-key"
+  printf '\n' >> "$local_stage/oracle-ssh-key"
   chmod 0600 "$local_stage/oracle-ssh-key"
+  ssh-keygen -y -f "$local_stage/oracle-ssh-key" >/dev/null 2>&1 || {
+    echo "TRANSFER_BLOCKED: ORACLE_SSH_PRIVATE_KEY is malformed, encrypted, or incomplete" >&2
+    exit 1
+  }
   ssh_options+=(-i "$local_stage/oracle-ssh-key")
 fi
 if [[ -n ${ORACLE_SSH_HOST_KEY:-} ]]; then
-  [[ "$ORACLE_SSH_HOST_KEY" == "$host "* ]] || {
+  host_key_clean=$(printf '%s' "$ORACLE_SSH_HOST_KEY" | tr -d '\r')
+  [[ "$host_key_clean" == "$host "* ]] || {
     echo "TRANSFER_BLOCKED: ORACLE_SSH_HOST_KEY does not identify the configured host" >&2; exit 1;
   }
-  printf '%s\n' "$ORACLE_SSH_HOST_KEY" > "$local_stage/oracle-known-hosts"
+  printf '%s\n' "$host_key_clean" > "$local_stage/oracle-known-hosts"
   chmod 0600 "$local_stage/oracle-known-hosts"
+  ssh-keygen -F "$host" -f "$local_stage/oracle-known-hosts" >/dev/null || {
+    echo "TRANSFER_BLOCKED: ORACLE_SSH_HOST_KEY is malformed" >&2
+    exit 1
+  }
   ssh_options+=(-o "UserKnownHostsFile=$local_stage/oracle-known-hosts")
 else
   ssh-keygen -F "$host" >/dev/null || {

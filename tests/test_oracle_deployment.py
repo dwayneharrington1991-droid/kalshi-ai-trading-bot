@@ -324,6 +324,11 @@ def test_credential_transfer_never_puts_secrets_in_arguments_or_output():
     assert "UserKnownHostsFile=" in transfer
     assert "ssh-keygen -F" in transfer
     assert "printf '%s' \"$KALSHI_MONITOR_PRIVATE_KEY_PEM\" >" in transfer
+    assert "tr -d '\\r' > \"$local_stage/oracle-ssh-key\"" in transfer
+    assert "ssh-keygen -y -f \"$local_stage/oracle-ssh-key\"" in transfer
+    assert "ORACLE_SSH_PRIVATE_KEY is malformed, encrypted, or incomplete" in transfer
+    assert "host_key_clean=" in transfer
+    assert "ssh-keygen -F \"$host\" -f \"$local_stage/oracle-known-hosts\"" in transfer
     assert "scp -q" in transfer
     assert "credentials_printed=false" in transfer
     assert "ORACLE_DEPLOY_COMMIT" in transfer

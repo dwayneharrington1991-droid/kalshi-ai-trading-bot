@@ -275,9 +275,12 @@ class Monitor:
         for ticker in self.journal.due_settlements(now):
             self.journal.mark_settlement_attempt(ticker, now)
             try:
+                outcome = self.feed.resolved(ticker)
                 learned = self.journal.settle(
-                    ticker, self.feed.resolved(ticker), "PUBLIC MARKET DATA"
+                    ticker, outcome, "PUBLIC MARKET DATA"
                 ) or learned
+                if outcome is not None:
+                    self.maintenance_error = None
             except Exception:
                 # No stale or fabricated outcome on HTTP failure.
                 self.maintenance_error = "Official settlement result pending or inaccessible"
@@ -287,6 +290,9 @@ class Monitor:
             self.engine_report.invalidate()
             self.research_report.invalidate()
             self.edge_report.invalidate()
+            # Force the displayed official-label count to refresh immediately
+            # after a new result instead of retaining the prior 60-second cache.
+            self.readiness_at = None
             if self.scheduled_learning:
                 self.scheduled_learning.invalidate()
             if self.scheduled_scalp_learning:

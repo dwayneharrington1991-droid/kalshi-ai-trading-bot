@@ -35,8 +35,13 @@ echo "repository_commit=$(git -C "$APP_ROOT" rev-parse HEAD 2>/dev/null || echo 
 echo "repository_worktree=$(if [[ -n "$(git -C "$APP_ROOT" status --porcelain 2>/dev/null || true)" ]]; then echo DIRTY_PRESERVED; else echo CLEAN; fi)"
 git -C "$APP_ROOT" status --short 2>/dev/null || true
 echo "service_active=$(sudo -n systemctl is-active "$SERVICE_NAME" || true)"
+service_user=$(sudo -n systemctl show "$SERVICE_NAME" --property=User --value)
+[[ "$service_user" == opc ]] || {
+  echo "service must run as opc to use the reviewed permissions; found: ${service_user:-root/default}" >&2
+  exit 1
+}
 service_state=$(sudo -n systemctl show "$SERVICE_NAME" \
-  --property=FragmentPath,DropInPaths,WorkingDirectory,ExecStart,MainPID,NRestarts --no-pager)
+  --property=User,Group,FragmentPath,DropInPaths,WorkingDirectory,ExecStart,MainPID,NRestarts --no-pager)
 printf '%s\n' "$service_state"
 account_mode_file="$DEPLOY_ROOT/account-monitoring.flags"
 if [[ -r "$account_mode_file" ]]; then

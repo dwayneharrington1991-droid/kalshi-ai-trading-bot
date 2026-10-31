@@ -55,6 +55,10 @@ service.
    effective service and refuses missing or mismatched values. Review its
    candidate, then run `configure_host.sh --install`; installation does not
    restart or modify the service and never creates the production marker.
+   The directory is installed as `root:<opc-primary-group>` mode `0750` and the
+   configuration as mode `0640`. It is readable by the `opc` deployment/service
+   user but never world-readable. Preflight refuses a service running as another
+   user.
 5. Copy `sudoers.example` to `/etc/sudoers.d/kalshi-deploy`, set mode 0440, and
    validate it with `sudo visudo -cf /etc/sudoers.d/kalshi-deploy`.
 6. Run the workflow manually with **operation: preflight**. This is read-only:

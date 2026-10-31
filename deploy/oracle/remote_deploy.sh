@@ -20,10 +20,21 @@ done
 [[ -f "$DEPLOY_ROOT/production-approved" ]] || {
   echo "first-deployment approval marker missing; reviewed baseline setup required" >&2; exit 1;
 }
+service_state=$(sudo -n systemctl show "$SERVICE_NAME" --property=WorkingDirectory,ExecStart --no-pager)
+[[ "$service_state" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]] || {
+  echo "versioned systemd launcher is not active; deployment refused" >&2; exit 1;
+}
 previous=$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)
 [[ -n "$previous" && -d "$previous" && -f "$previous/.deployed-commit" \
    && -x "$previous/.venv/bin/python3" ]] || {
   echo "verified versioned rollback baseline missing; deployment refused" >&2; exit 1;
+}
+account_mode_file="$DEPLOY_ROOT/account-monitoring.flags"
+[[ -r "$account_mode_file" ]] || { echo "baseline-captured account mode missing" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$account_mode_file"
+[[ ${ENABLE_ACCOUNT_READONLY:-} == 0 || ${ENABLE_ACCOUNT_READONLY:-} == 1 ]] || {
+  echo "invalid baseline-captured account mode" >&2; exit 1;
 }
 actual_sha=$(sha256sum "$archive" | awk '{print $1}')
 [[ "$actual_sha" == "$expected_sha" ]] || { echo "release checksum mismatch" >&2; exit 1; }

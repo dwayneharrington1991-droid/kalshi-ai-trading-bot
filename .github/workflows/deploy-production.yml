@@ -82,7 +82,7 @@ jobs:
           test -n "$HOST"
           test -n "$USER"
           ssh -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER@$HOST" 'install -m 700 -d ~/.kalshi-deploy/incoming ~/.kalshi-deploy/tools'
-          scp -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes deploy/oracle/{preflight.sh,remote_deploy.sh,rollback.sh,health_check.py,sqlite_backup.py} "$USER@$HOST:.kalshi-deploy/tools/"
+          scp -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes deploy/oracle/{configure_host.sh,preflight.sh,prepare_baseline.sh,activate_baseline.sh,remote_deploy.sh,rollback.sh,run_dashboard.sh,health_check.py,sqlite_backup.py,release-policy.json,kalshi-signals.override.conf.example} "$USER@$HOST:.kalshi-deploy/tools/"
           scp -i ~/.ssh/oracle -o BatchMode=yes -o StrictHostKeyChecking=yes "/tmp/release/${GITHUB_SHA}.tar.gz" "$USER@$HOST:.kalshi-deploy/incoming/"
       - name: Read-only production preflight
         if: github.event_name == 'workflow_dispatch' && inputs.operation == 'preflight'

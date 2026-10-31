@@ -10,7 +10,7 @@ DEPLOY = ROOT / "deploy" / "oracle"
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("preflight.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -57,7 +57,7 @@ def test_service_wrapper_reports_exact_release_commit_and_is_signals_only():
     assert '.deployed-commit' in wrapper
     assert '--build-commit "$commit"' in wrapper
     assert "--mode public" in wrapper
-    assert "ENABLE_ACCOUNT_READONLY" in wrapper
+    assert "account-monitoring.flags" in wrapper
     assert "--account-readonly --private-dashboard --require-readonly-scope" in wrapper
     forbidden = ("place_order", "cancel_order", "transfer", "--mode trading")
     assert not any(token in wrapper for token in forbidden)
@@ -81,3 +81,37 @@ def test_oracle_paths_and_dirty_worktree_are_preserved_by_versioned_deploy():
     assert "stat -c %d \"$DATA_ROOT\"" in deploy
     assert "stat -c %d \"$BACKUP_ROOT\"" in deploy
     assert "required_free=$((bytes + bytes / 4 + 1073741824))" in deploy
+
+
+def test_baseline_preserves_dirty_source_and_captures_existing_account_mode():
+    baseline = (DEPLOY / "prepare_baseline.sh").read_text()
+    config = (DEPLOY / "deployment.env.example").read_text()
+    assert "MODEL_REGISTRY=/home/opc/kalshi-ai-trading-bot/data/models/registry" in config
+    assert "ENABLE_ACCOUNT_READONLY=" not in config
+    assert "--account-readonly" in baseline
+    assert "account-monitoring.flags" in baseline
+    assert "--exclude='./data'" in baseline
+    assert "--exclude='./.venv'" in baseline
+    assert "--exclude='./.env*'" in baseline
+    assert "--exclude='*.db'" in baseline
+    assert "Python 3.12" in baseline
+    assert "systemctl restart" not in baseline
+    assert "production-approved" not in baseline
+
+
+def test_host_configuration_is_derived_and_never_creates_approval_or_restarts():
+    setup = (DEPLOY / "configure_host.sh").read_text()
+    assert "data/models/registry" in setup
+    assert "refusing to invent" in setup
+    assert "ALLOW_SAME_DISK_BACKUP=1" in setup
+    assert "systemctl restart" not in setup
+    assert "production-approved" not in setup
+
+
+def test_baseline_activation_backs_up_before_systemd_switch_and_can_rollback():
+    activation = (DEPLOY / "activate_baseline.sh").read_text()
+    assert activation.index("sqlite_backup.py") < activation.index("systemctl restart")
+    assert "model-artifacts.tar.gz.sha256" in activation
+    assert "previous-dropin.conf" in activation
+    assert "baseline activation rolled back" in activation
+    assert "production_approval_marker_created=false" in activation

@@ -38,14 +38,34 @@ echo "service_active=$(sudo -n systemctl is-active "$SERVICE_NAME" || true)"
 service_state=$(sudo -n systemctl show "$SERVICE_NAME" \
   --property=FragmentPath,DropInPaths,WorkingDirectory,ExecStart,MainPID,NRestarts --no-pager)
 printf '%s\n' "$service_state"
-if [[ -L "$DEPLOY_ROOT/current" ]]; then
-  [[ "$service_state" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]] || {
-    echo "service does not use the reviewed versioned-release launcher" >&2; exit 1;
+account_mode_file="$DEPLOY_ROOT/account-monitoring.flags"
+if [[ -r "$account_mode_file" ]]; then
+  # shellcheck disable=SC1090
+  source "$account_mode_file"
+  [[ ${ENABLE_ACCOUNT_READONLY:-} == 0 || ${ENABLE_ACCOUNT_READONLY:-} == 1 ]] || {
+    echo "invalid baseline-captured account monitoring mode" >&2; exit 1;
   }
+  if [[ "$service_state" != *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]]; then
+    detected=0
+    [[ "$service_state" == *"--account-readonly"* ]] && detected=1
+    [[ "$detected" == "$ENABLE_ACCOUNT_READONLY" ]] || {
+      echo "captured account mode does not match existing service" >&2; exit 1;
+    }
+  fi
+  echo "account_monitoring_mode=BASELINE_PRESERVED_${ENABLE_ACCOUNT_READONLY}"
+else
+  echo "baseline_required=true reason=account_monitoring_mode_not_captured"
+fi
+if [[ -L "$DEPLOY_ROOT/current" ]]; then
   current=$(readlink -f "$DEPLOY_ROOT/current")
   [[ -f "$current/.deployed-commit" && -x "$current/.venv/bin/python3" ]] || {
     echo "current rollback baseline is incomplete" >&2; exit 1;
   }
+  if [[ "$service_state" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]]; then
+    echo "versioned_service=ACTIVE"
+  else
+    echo "versioned_service=BASELINE_PREPARED_ACTIVATION_REQUIRED"
+  fi
 else
   echo "baseline_required=true reason=no_versioned_current_release"
 fi

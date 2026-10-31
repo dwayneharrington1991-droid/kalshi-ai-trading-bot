@@ -3,5 +3,6 @@
 Cmnd_Alias KALSHI_SERVICE = /usr/bin/systemctl restart kalshi-signals.service, \
  /usr/bin/systemctl is-active kalshi-signals.service, \
  /usr/bin/systemctl is-active --quiet kalshi-signals.service, \
+ /usr/bin/systemctl cat kalshi-signals.service, \
  /usr/bin/systemctl show kalshi-signals.service *
 opc ALL=(root) NOPASSWD: KALSHI_SERVICE

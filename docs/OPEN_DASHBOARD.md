@@ -87,6 +87,11 @@ forwarded address. This chat environment cannot provide its own external preview
   History loads only when you click **Load recent history**, with 20 records per
   page. Full research metrics are an optional background calculation. They do not
   hold up the main forecast cards.
+- **Historical BTC 15-minute markets** loads a separate, keyset-paginated archive
+  from the persistent market summaries. It shows immutable opening forecasts and
+  official outcomes by unique ticker, marks closed-but-unverified records, and
+  reports directional accuracy only for verified prediction/outcome pairs.
+  Neutral predictions are not counted as correct or incorrect.
 
 Any future entry would be a price cap, not a guaranteed fill. Stops and exit alerts
 cannot guarantee a maximum loss. You place every trade and exit manually.

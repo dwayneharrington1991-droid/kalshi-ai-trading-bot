@@ -1264,6 +1264,38 @@ def make_handler(monitor):
                     )
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
+            elif route == "/api/market-history":
+                try:
+                    before_close_value = query.get("before_close", [None])[0]
+                    before_close = (
+                        "" if before_close_value == "null" else before_close_value
+                    )
+                    before_ticker = query.get("before_ticker", [None])[0]
+                    limit = int(query.get("limit", ["20"])[0])
+                    if not 1 <= limit <= 100:
+                        raise ValueError("Invalid page size")
+                    if (before_close is None) != (before_ticker is None):
+                        raise ValueError("Incomplete market history cursor")
+                    if before_ticker is not None and not re.fullmatch(
+                        r"KXBTC15M-[A-Za-z0-9_-]{1,100}", before_ticker
+                    ):
+                        raise ValueError("Invalid market history cursor")
+                    if before_close:
+                        timestamp(before_close)
+                except (ValueError, TypeError):
+                    self.send_error(
+                        400,
+                        "Use limit 1..100 and a matching before_close/before_ticker cursor",
+                    )
+                    return
+                value = monitor.journal.market_history_page(
+                    before_close=before_close,
+                    before_ticker=before_ticker,
+                    limit=limit,
+                    now=utcnow(),
+                )
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
             elif route in {"/api/history-page", "/api/account-history"}:
                 if route == "/api/account-history" and monitor.account_client is None:
                     self.send_error(

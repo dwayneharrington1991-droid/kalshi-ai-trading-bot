@@ -2,6 +2,7 @@
 from datetime import timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+import json
 import threading
 
 import pytest
@@ -1023,6 +1024,94 @@ def test_reliability_diagram_uses_observed_bins_and_clears_unavailable_results(t
             assert page.locator("#reliability-chart").get_attribute("data-opening-points") == "0"
             assert page.locator("#reliability-chart").get_attribute("data-live-points") == "0"
             assert page.locator("#reliability-chart").evaluate("e => e.toDataURL()") != before
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_browser_loads_deduplicated_market_history_and_verified_summary(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "market-history-browser.db"))
+    closes = [
+        NOW - timedelta(hours=3),
+        NOW - timedelta(hours=2),
+        NOW + timedelta(hours=1),
+    ]
+    with monitor.journal.connect() as db:
+        for index, (ticker, close) in enumerate(
+            zip(
+                (
+                    "KXBTC15M-HISTORY-OPENING",
+                    "KXBTC15M-HISTORY-MISSING",
+                    "KXBTC15M-HISTORY-ACTIVE",
+                ),
+                closes,
+            )
+        ):
+            db.execute(
+                "INSERT INTO btc_engine_contracts(mode,ticker,closes_at,revisions,latest_at) "
+                "VALUES ('PUBLIC MARKET DATA',?,?,0,NULL)",
+                (ticker, close.isoformat()),
+            )
+            if index == 0:
+                opened = close - timedelta(minutes=15)
+                payload = {
+                    "ticker": ticker,
+                    "opens_at": opened.isoformat(),
+                    "generated_at": opened.isoformat(),
+                    "closes_at": close.isoformat(),
+                    "up": 0.8,
+                    "model": "opening-test-v1",
+                }
+                db.execute(
+                    "INSERT INTO btc_engine_opening "
+                    "(mode,ticker,generated_at,cutoff,closes_at,up,status,payload) "
+                    "VALUES ('PUBLIC MARKET DATA',?,?,?,?,?,'RECORDED',?)",
+                    (
+                        ticker,
+                        opened.isoformat(),
+                        opened.isoformat(),
+                        close.isoformat(),
+                        0.8,
+                        json.dumps(payload),
+                    ),
+                )
+                db.execute(
+                    "INSERT INTO forecast_outcomes(ticker,origin,observed_at,outcome) "
+                    "VALUES (?,'official',?,1)",
+                    (ticker, (close + timedelta(seconds=1)).isoformat()),
+                )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            page.locator("#load-market-history").click()
+            playwright.expect(page.locator("#market-history-summary")).to_contain_text(
+                "3 observed markets · 2 completed"
+            )
+            playwright.expect(page.locator("#market-history-rows")).to_contain_text(
+                "KXBTC15M-HISTORY-OPENING"
+            )
+            playwright.expect(page.locator("#market-history-rows")).to_contain_text(
+                "UP 80.0% / DOWN 20.0%"
+            )
+            playwright.expect(page.locator("#market-history-rows")).to_contain_text(
+                "opening-test-v1"
+            )
+            playwright.expect(page.locator("#market-history-rows")).to_contain_text(
+                "CLOSED_UNVERIFIED"
+            )
             assert not errors
             browser.close()
     finally:

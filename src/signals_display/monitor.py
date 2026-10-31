@@ -27,6 +27,8 @@ from .reliability import metrics, wilson
 from .multi_asset import asset_of, ALIASES
 
 UTC = timezone.utc
+LIVE_JOURNAL_MAINTENANCE_LIMIT_BYTES = 512 * 1024 * 1024
+CONTRACT_SUMMARY_MIGRATION = "btc_engine_contract_summaries_v1"
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 COINBASE = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
@@ -1117,6 +1119,10 @@ class Journal:
         self.path = str(path)
         self._last_candle_batch = None
         self._last_learning_sample = {}
+        try:
+            existing_size = Path(self.path).stat().st_size
+        except FileNotFoundError:
+            existing_size = 0
         with self.connect() as db:
             db.executescript(
                 """
@@ -1156,7 +1162,23 @@ class Journal:
             }.items():
                 if name not in prediction_columns:
                     db.execute(f"ALTER TABLE predictions ADD COLUMN {name} {spec}")
-            prediction_engine.create(db)
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS dashboard_migrations (name TEXT PRIMARY KEY,value TEXT)"
+            )
+            summary_migration = db.execute(
+                "SELECT value FROM dashboard_migrations WHERE name=?",
+                (CONTRACT_SUMMARY_MIGRATION,),
+            ).fetchone()
+            backfill_summaries = (
+                existing_size <= LIVE_JOURNAL_MAINTENANCE_LIMIT_BYTES
+                and (summary_migration is None or summary_migration[0] != "complete")
+            )
+            prediction_engine.create(db, migrate_contract_summaries=backfill_summaries)
+            if backfill_summaries:
+                db.execute(
+                    "INSERT OR REPLACE INTO dashboard_migrations(name,value) VALUES (?,?)",
+                    (CONTRACT_SUMMARY_MIGRATION, "complete"),
+                )
             scalp_paper.create_schema(db)
             edge_scanner.create_schema(db)
             db.execute(
@@ -1239,12 +1261,23 @@ class Journal:
         # credential-safe diagnostic reports missing names for planned offline
         # maintenance; existing installations normally already have them.
         size = Path(self.path).stat().st_size if Path(self.path).exists() else 0
-        if missing and size > 512 * 1024 * 1024:
+        with self.read() as db:
+            summary_migration = db.execute(
+                "SELECT value FROM dashboard_migrations WHERE name=?",
+                (CONTRACT_SUMMARY_MIGRATION,),
+            ).fetchone()
+        summary_backfill_deferred = (
+            size > LIVE_JOURNAL_MAINTENANCE_LIMIT_BYTES
+            and (summary_migration is None or summary_migration[0] != "complete")
+        )
+        deferred = ["btc_engine_contract_summaries"] if summary_backfill_deferred else []
+        if missing and size > LIVE_JOURNAL_MAINTENANCE_LIMIT_BYTES:
             return {
                 "status": "DEFERRED_LARGE_LIVE_JOURNAL",
                 "database_bytes": size,
                 "missing": sorted(missing),
                 "created": [],
+                "deferred": deferred,
             }
         completed = []
         for name, statement in missing.items():
@@ -1252,8 +1285,13 @@ class Journal:
                 db.execute(statement)
             completed.append(name)
         return {
-            "status": "READY", "database_bytes": size,
-            "missing": [], "created": completed,
+            "status": (
+                "DEFERRED_LARGE_LIVE_JOURNAL" if summary_backfill_deferred else "READY"
+            ),
+            "database_bytes": size,
+            "missing": [],
+            "created": completed,
+            "deferred": deferred,
         }
 
     def _learning_sample_due(self, state, interval=1.0):
@@ -2215,6 +2253,243 @@ class Journal:
                 "next_before_id": predictions[-1]["id"] if len(rows) > limit else None,
             },
             "notice": "COUNTERFACTUAL probes are simulated, never actual fills. History loads only on request.",
+        }
+
+    def market_history_page(
+        self, *, before_close=None, before_ticker=None, limit=20, now=None
+    ):
+        """Page distinct public BTC markets and score only immutable opening forecasts."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Market history page size must be 1..100")
+        if (before_close is None) != (before_ticker is None):
+            raise ValueError("Market history cursor requires both close time and ticker")
+        if before_ticker is not None:
+            if not re.fullmatch(r"KXBTC15M-[A-Za-z0-9_-]{1,100}", before_ticker):
+                raise ValueError("Invalid market history ticker cursor")
+            if before_close:
+                timestamp(before_close)
+
+        now = now or utcnow()
+        market_keys = """
+            WITH market_keys AS (
+                SELECT ticker,MAX(closes_at) AS closes_at
+                FROM (
+                    SELECT ticker,closes_at FROM btc_engine_contracts
+                    WHERE mode='PUBLIC MARKET DATA' AND ticker GLOB 'KXBTC15M-*'
+                    UNION ALL
+                    SELECT ticker,closes_at FROM btc_engine_opening
+                    WHERE mode='PUBLIC MARKET DATA' AND ticker GLOB 'KXBTC15M-*'
+                    UNION ALL
+                    SELECT ticker,NULL FROM forecast_outcomes
+                    WHERE origin='official' AND ticker GLOB 'KXBTC15M-*'
+                )
+                GROUP BY ticker
+            )
+        """
+
+        def load_record(row):
+            closes_at = row["closes_at"]
+            closed = None
+            if closes_at:
+                try:
+                    closed = timestamp(closes_at)
+                except (TypeError, ValueError):
+                    closes_at = None
+
+            outcome = row["outcome"]
+            outcome_verified = type(outcome) is int and outcome in (0, 1)
+            settled_at = row["observed_at"]
+            if outcome_verified:
+                try:
+                    settled = timestamp(settled_at)
+                    outcome_verified = settled <= now and (closed is None or closed <= settled)
+                except (TypeError, ValueError):
+                    outcome_verified = False
+
+            opening = {}
+            try:
+                if row["opening_payload"]:
+                    opening = json.loads(row["opening_payload"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                opening = {}
+            probability = row["up"]
+            opened_at = None
+            try:
+                opened_at = timestamp(opening["opens_at"]).isoformat()
+            except (KeyError, TypeError, ValueError):
+                pass
+            opening_verified = (
+                type(probability) in (int, float)
+                and math.isfinite(probability)
+                and 0 <= probability <= 1
+            )
+            if opening_verified:
+                try:
+                    opened = timestamp(opening["opens_at"])
+                    generated = timestamp(row["generated_at"])
+                    cutoff = timestamp(row["cutoff"])
+                    opening_close = timestamp(row["opening_closes_at"])
+                    if (
+                        opening.get("ticker") != row["ticker"]
+                        or opening.get("up") != probability
+                        or opening.get("generated_at") != row["generated_at"]
+                        or opening.get("closes_at") != row["opening_closes_at"]
+                        or closed is None
+                        or opening_close != closed
+                        or cutoff != opened
+                        or not opened <= generated < closed
+                        or (outcome_verified and closed > timestamp(settled_at))
+                    ):
+                        opening_verified = False
+                except (KeyError, TypeError, ValueError):
+                    opening_verified = False
+
+            direction = (
+                prediction_engine.direction_label(probability)
+                if opening_verified
+                else "UNCLEAR"
+            )
+            final_outcome = (
+                "UP" if outcome == 1 else "DOWN"
+            ) if outcome_verified else None
+            paired = opening_verified and outcome_verified
+            correct = (
+                (direction == final_outcome)
+                if paired and direction in {"UP", "DOWN"}
+                else None
+            )
+            status = (
+                "VERIFIED_RESULT"
+                if outcome_verified
+                else "CLOSED_UNVERIFIED"
+                if closed is not None and closed <= now
+                else "OPEN"
+                if closed is not None
+                else "INCOMPLETE"
+            )
+            selection = opening.get("model_selection")
+            model_version = (
+                opening.get("model_version")
+                or opening.get("model")
+                or (
+                    selection.get("model_id")
+                    if isinstance(selection, dict)
+                    else None
+                )
+            ) if opening_verified else None
+            return {
+                "ticker": row["ticker"],
+                "opening_at": opened_at,
+                "closing_at": closed.isoformat() if closed else None,
+                "opening_probability_up": probability if opening_verified else None,
+                "opening_probability_down": 1 - probability if opening_verified else None,
+                "opening_direction": direction if opening_verified else None,
+                "opening_status": (
+                    "RECORDED" if opening_verified else row["opening_status"] or "MISSING"
+                ),
+                "model_version": model_version,
+                "final_outcome": final_outcome,
+                "settled_at": settled_at if outcome_verified else None,
+                "outcome_status": "VERIFIED_OFFICIAL" if outcome_verified else "UNVERIFIED",
+                "prediction_outcome_pair_verified": paired,
+                "correct": correct,
+                "status": status,
+                "completed": outcome_verified or (closed is not None and closed <= now),
+            }
+
+        record_query = market_keys + """
+            SELECT k.ticker,k.closes_at,b.generated_at,b.cutoff,b.closes_at AS opening_closes_at,
+                b.up,b.status AS opening_status,b.payload AS opening_payload,
+                o.observed_at,o.outcome
+            FROM market_keys k
+            LEFT JOIN btc_engine_opening b
+                ON b.mode='PUBLIC MARKET DATA' AND b.ticker=k.ticker
+            LEFT JOIN forecast_outcomes o
+                ON o.ticker=k.ticker AND o.origin='official'
+        """
+        with self.read() as db:
+            all_rows = db.execute(record_query).fetchall()
+            records = [load_record(row) for row in all_rows]
+            verified_predictions = [
+                row for row in records if row["prediction_outcome_pair_verified"]
+            ]
+            correct = sum(row["correct"] is True for row in verified_predictions)
+            incorrect = sum(row["correct"] is False for row in verified_predictions)
+            directional = correct + incorrect
+            from .opening_models import dataset_coverage
+
+            training_coverage = dataset_coverage(db, asof=now)
+
+            cursor_clause = ""
+            cursor_params = []
+            if before_close is not None:
+                if before_close == "":
+                    cursor_clause = "WHERE k.closes_at IS NULL AND k.ticker<?"
+                    cursor_params.append(before_ticker)
+                else:
+                    cursor_clause = (
+                        "WHERE (k.closes_at IS NULL OR k.closes_at<? "
+                        "OR (k.closes_at=? AND k.ticker<?))"
+                    )
+                    cursor_params.extend((before_close, before_close, before_ticker))
+            page_rows = db.execute(
+                market_keys
+                + """
+                    SELECT k.ticker,k.closes_at,b.generated_at,b.cutoff,
+                        b.closes_at AS opening_closes_at,b.up,b.status AS opening_status,
+                        b.payload AS opening_payload,o.observed_at,o.outcome
+                    FROM market_keys k
+                    LEFT JOIN btc_engine_opening b
+                        ON b.mode='PUBLIC MARKET DATA' AND b.ticker=k.ticker
+                    LEFT JOIN forecast_outcomes o
+                        ON o.ticker=k.ticker AND o.origin='official'
+                    """
+                + cursor_clause
+                + " ORDER BY (k.closes_at IS NULL),k.closes_at DESC,k.ticker DESC LIMIT ?",
+                (*cursor_params, limit + 1),
+            ).fetchall()
+
+        has_more = len(page_rows) > limit
+        page = [load_record(row) for row in page_rows[:limit]]
+        last = page[-1] if page and has_more else None
+        summary = {
+            "observed_markets": len(records),
+            "completed_markets": sum(row["completed"] for row in records),
+            "opening_forecasts": sum(
+                row["opening_status"] == "RECORDED" for row in records
+            ),
+            "verified_outcomes": sum(
+                row["outcome_status"] == "VERIFIED_OFFICIAL" for row in records
+            ),
+            "verified_predictions": len(verified_predictions),
+            "correct_predictions": correct,
+            "incorrect_predictions": incorrect,
+            "neutral_predictions": len(verified_predictions) - directional,
+            "accuracy": correct / directional if directional else None,
+            "accuracy_samples": directional,
+            "opening_model_eligible_pairs": training_coverage[
+                "eligible_frozen_openings"
+            ],
+            "promotion_threshold": training_coverage[
+                "minimum_for_first_shadow_evaluation"
+            ],
+        }
+        return {
+            "markets": page,
+            "summary": summary,
+            "pagination": {
+                "limit": limit,
+                "before_close": before_close,
+                "before_ticker": before_ticker,
+                "has_more": has_more,
+                "next_before_close": last["closing_at"] if last else None,
+                "next_before_ticker": last["ticker"] if last else None,
+            },
+            "notice": (
+                "Historical rows use immutable opening records and official outcomes only. "
+                "Neutral predictions are excluded from directional accuracy; incomplete "
+                "records are not scored."
+            ),
         }
 
     def seed_settlement_queue(self):

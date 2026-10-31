@@ -133,10 +133,12 @@ def test_baseline_activation_backs_up_before_systemd_switch_and_can_rollback():
     assert "zz-codex-versioned-release.conf" in activation
     assert "versioned launcher did not win systemd drop-in precedence" in activation
     assert "health_wait" in activation
-    assert "99-codex-versioned-release.conf" not in activation
+    assert 'dropin="$dropin_dir/zz-codex-versioned-release.conf"' in activation
+    assert "legacy_override_preserved" in activation
+    assert "disabled-by-codex" in activation
     sudoers = (DEPLOY / "sudoers.example").read_text()
     assert "zz-codex-versioned-release.conf" in sudoers
-    assert "99-codex-versioned-release.conf" not in sudoers
+    assert "99-codex-versioned-release.conf.disabled-by-codex" in sudoers
 
 
 def test_signals_service_import_boundary_excludes_execution_modules():

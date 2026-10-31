@@ -70,3 +70,24 @@ ssh -tt "${ssh_options[@]}" "$remote" \
   "chmod 0600 '$stage/'* && bash '$stage/install' '$stage'"
 remote_created=0
 echo "transfer=COMPLETE credentials_printed=false trading_enabled=false"
+
+if [[ -n ${ORACLE_DEPLOY_COMMIT:-} ]]; then
+  [[ "$ORACLE_DEPLOY_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "DEPLOYMENT_BLOCKED: ORACLE_DEPLOY_COMMIT must be a full SHA" >&2; exit 1;
+  }
+  ssh -tt "${ssh_options[@]}" "$remote" bash -s -- "$ORACLE_DEPLOY_COMMIT" <<'REMOTE'
+set -Eeuo pipefail
+target=${1:?target commit required}
+repo=/home/opc/kalshi-ai-trading-bot
+git -C "$repo" fetch --no-tags origin codex/oracle-opening-hold-repair
+[[ $(git -C "$repo" rev-parse FETCH_HEAD) == "$target" ]] || {
+  echo "DEPLOYMENT_BLOCKED: fetched branch head changed during transfer" >&2; exit 1;
+}
+script=$(mktemp)
+trap 'rm -f "$script"' EXIT
+git -C "$repo" show "$target:deploy/oracle/repair_learning_and_deploy.sh" > "$script"
+chmod 0700 "$script"
+"$script" "$target"
+REMOTE
+  echo "oracle_finish=COMPLETE commit=$ORACLE_DEPLOY_COMMIT"
+fi

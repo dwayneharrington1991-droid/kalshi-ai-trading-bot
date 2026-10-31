@@ -326,6 +326,9 @@ def test_credential_transfer_never_puts_secrets_in_arguments_or_output():
     assert "printf '%s' \"$KALSHI_MONITOR_PRIVATE_KEY_PEM\" >" in transfer
     assert "scp -q" in transfer
     assert "credentials_printed=false" in transfer
+    assert "ORACLE_DEPLOY_COMMIT" in transfer
+    assert "repair_learning_and_deploy.sh" in transfer
+    assert "fetched branch head changed during transfer" in transfer
     assert "EnvironmentFile=/etc/kalshi-signals/account-monitor.env" in install
     assert "KALSHI_MONITOR_PRIVATE_KEY_PATH=" in install
     assert "root -g opc -m 0640" in install

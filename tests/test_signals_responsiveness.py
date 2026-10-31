@@ -396,6 +396,32 @@ def test_prediction_evidence_is_bounded_even_when_live_diagnostics_are_large(tmp
     assert "debug" not in raw
 
 
+def test_quick_learning_summary_uses_compact_records(tmp_path):
+    journal = Journal(tmp_path / "signals.db")
+    with journal.connect() as db:
+        db.execute(
+            "INSERT INTO btc_engine_contracts VALUES (?,?,?,?,?)",
+            ("PUBLIC MARKET DATA", "KXBTC15M-FAST", "2026-10-30T20:15:00+00:00", 12,
+             "2026-10-30T20:14:00+00:00"),
+        )
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            ("KXBTC15M-FAST", "official", "2026-10-30T20:16:00+00:00", 1),
+        )
+        db.execute(
+            "INSERT INTO btc_engine_opening VALUES (?,?,?,?,?,?,?,?)",
+            ("PUBLIC MARKET DATA", "KXBTC15M-FAST", "2026-10-30T20:00:01+00:00",
+             "2026-10-30T20:00:00+00:00", "2026-10-30T20:15:00+00:00", .7,
+             "DELAYED", "{}"),
+        )
+    value = journal.quick_learning_summary()
+    assert value["recorded_markets"] == 1
+    assert value["timestamped_prediction_revisions"] == 12
+    assert value["official_settlements"] == 1
+    assert value["correct_directional_openings"] == 1
+    assert value["opening_directional_accuracy"] == 1
+
+
 def test_storage_health_is_constant_time_and_preserves_database(tmp_path):
     journal = Journal(tmp_path / "j.db")
     before = Path(journal.path).stat().st_size

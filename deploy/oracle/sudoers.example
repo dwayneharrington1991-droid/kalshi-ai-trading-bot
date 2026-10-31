@@ -1,6 +1,8 @@
 # Install as /etc/sudoers.d/kalshi-deploy after validating with visudo -cf.
 # Replace opc only if the dedicated deployment account differs.
 Cmnd_Alias KALSHI_SERVICE = /usr/bin/systemctl restart kalshi-signals.service, \
+ /usr/bin/systemctl enable kalshi-signals.service, \
+ /usr/bin/systemctl is-enabled kalshi-signals.service, \
  /usr/bin/systemctl daemon-reload, \
  /usr/bin/systemctl is-active kalshi-signals.service, \
  /usr/bin/systemctl is-active --quiet kalshi-signals.service, \
@@ -8,6 +10,8 @@ Cmnd_Alias KALSHI_SERVICE = /usr/bin/systemctl restart kalshi-signals.service, \
  /usr/bin/systemctl show kalshi-signals.service *
 Cmnd_Alias KALSHI_LEARNING = /usr/bin/systemctl stop kalshi-learning.timer, \
  /usr/bin/systemctl start kalshi-learning.timer, \
+ /usr/bin/systemctl enable kalshi-learning.timer, \
+ /usr/bin/systemctl is-enabled kalshi-learning.timer, \
  /usr/bin/systemctl stop kalshi-learning.service, \
  /usr/bin/systemctl start kalshi-learning.service, \
  /usr/bin/systemctl is-active --quiet kalshi-learning.timer, \

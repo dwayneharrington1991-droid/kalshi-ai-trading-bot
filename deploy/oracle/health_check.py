@@ -19,6 +19,23 @@ def read_json(path):
         return response.status, json.load(response)
 
 
+def validate_live_workers(health):
+    """Use the live health payload, never the prior snapshot embedded in state.
+
+    The state is assembled inside a prediction cycle before the collector's
+    post-cycle counter is incremented. Rechecking that embedded counter can
+    reject a collector that `/healthz` has already proved alive and current.
+    """
+    workers = ((health.get("workers") or {}).get("workers") or {})
+    for name in ("collector", "prediction"):
+        item = workers.get(name) or {}
+        if not item.get("thread_alive"):
+            raise ValueError(name + " worker thread is not alive")
+    if not isinstance(health.get("state_version"), int) or health["state_version"] < 1:
+        raise ValueError("prediction state has not completed")
+    return workers
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--commit", required=True)
@@ -30,12 +47,11 @@ def main():
         raise SystemExit("health endpoint is not HEALTHY")
     if health.get("build_commit") != args.commit:
         raise SystemExit("running commit does not match tested release")
+    try:
+        workers = validate_live_workers(health)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     _, state = read_json("/api/state?view=main")
-    workers = (state.get("feed_health") or {}).get("workers") or {}
-    for name in ("collector", "prediction"):
-        item = workers.get(name) or {}
-        if not item.get("thread_alive") or item.get("cycles", 0) < 1:
-            raise SystemExit(name + " worker is not running")
     listeners = subprocess.run(
         ["ss", "-ltn"], check=True, capture_output=True, text=True, timeout=5
     ).stdout

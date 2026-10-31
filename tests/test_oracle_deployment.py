@@ -323,6 +323,25 @@ def test_opening_pipeline_deployment_gate_requires_live_immutable_opening():
     assert value is None and "cutoff" in reason
 
 
+def test_deployment_health_uses_live_worker_payload_not_embedded_prior_snapshot():
+    module_path = DEPLOY / "health_check.py"
+    spec = importlib.util.spec_from_file_location("oracle_health_check", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    health = {
+        "state_version": 1,
+        "workers": {"workers": {
+            "collector": {"thread_alive": True, "cycles": 0},
+            "prediction": {"thread_alive": True, "cycles": 1},
+        }},
+    }
+    workers = module.validate_live_workers(health)
+    assert workers["collector"]["thread_alive"] is True
+    health["workers"]["workers"]["collector"]["thread_alive"] = False
+    with pytest.raises(ValueError, match="collector worker thread is not alive"):
+        module.validate_live_workers(health)
+
+
 def test_signals_service_import_boundary_excludes_execution_modules():
     signals = ROOT / "src" / "signals_display"
     forbidden = ("src.clients", "src.jobs", "src.orders", "src.strategies")

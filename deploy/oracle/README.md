@@ -44,8 +44,12 @@ service.
    `ORACLE_SSH_HOST_KEY`. Keep `ORACLE_HOST=129.146.120.195` and
    `ORACLE_USER=opc` as environment variables.
 4. Copy `deployment.env.example` to
-   `/etc/kalshi-signals/deployment.env`. Confirm `BACKUP_ROOT` is a separate
-   mounted backup volume with enough free space for the journals plus 20%.
+   `/etc/kalshi-signals/deployment.env`. The temporary configuration permits
+   `/home/opc/kalshi-backups` on the same filesystem only when
+   `ALLOW_SAME_DISK_BACKUP=1` is explicitly set. Same-disk backups support safe
+   application rollback but provide no protection from filesystem, volume, or
+   physical disk failure. Move verified backups to independent storage as soon
+   as practical.
 5. Copy `sudoers.example` to `/etc/sudoers.d/kalshi-deploy`, set mode 0440, and
    validate it with `sudo visudo -cf /etc/sudoers.d/kalshi-deploy`.
 6. Run the workflow manually with **operation: preflight**. This is read-only:
@@ -92,6 +96,11 @@ WAL database is copied consistently. Each backup receives `PRAGMA quick_check`,
 a SHA-256 manifest, and the release policy. The deployment stops when backup
 space is less than all databases/models plus 25% and 1 GiB. Never copy a live `.db`
 file with `cp`.
+
+When data and backup paths share a filesystem, preflight and deployment require
+the explicit temporary flag, print `SAME_DISK_BACKUP_APPROVED_TEMPORARILY`, and
+write `BACKUP_DURABILITY_WARNING.txt` into the backup. All capacity and integrity
+checks still run. Remove the exception after attaching independent backup storage.
 
 ## Rollback
 

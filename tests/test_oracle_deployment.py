@@ -1,17 +1,28 @@
 import hashlib
 import ast
+import importlib.util
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
 DEPLOY = ROOT / "deploy" / "oracle"
 
 
+def load_sqlite_backup():
+    spec = importlib.util.spec_from_file_location("oracle_sqlite_backup", DEPLOY / "sqlite_backup.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "launch_first_release.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -40,6 +51,69 @@ def test_sqlite_backup_is_consistent_and_has_a_verified_manifest(tmp_path):
         assert db.execute("SELECT value FROM journal ORDER BY id").fetchall() == [("a",), ("b",)]
     expected = hashlib.sha256(destination.read_bytes()).hexdigest()
     assert destination.with_suffix(".db.sha256").read_text().split()[0] == expected
+
+
+def test_sqlite_backup_completes_with_concurrent_wal_writes(tmp_path):
+    module = load_sqlite_backup()
+    source = tmp_path / "live.db"
+    destination = tmp_path / "backup.db"
+    with sqlite3.connect(source) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE journal (id INTEGER PRIMARY KEY, value TEXT)")
+        db.executemany("INSERT INTO journal(value) VALUES (?)", [("seed",)] * 2_000)
+    stop = threading.Event()
+
+    def writer():
+        with sqlite3.connect(source, timeout=1) as db:
+            while not stop.is_set():
+                db.execute("INSERT INTO journal(value) VALUES ('live')")
+                db.commit()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        module.backup_database(source, destination, max_seconds=10, stall_seconds=3,
+                               max_restarts=50, busy_timeout_ms=1000, pages=32)
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+    with sqlite3.connect(destination) as db:
+        assert db.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert db.execute("SELECT count(*) FROM journal").fetchone()[0] >= 2_000
+
+
+def test_sqlite_backup_progress_has_bounded_restarts_and_deadline():
+    module = load_sqlite_backup()
+    guard = module.ProgressGuard(database="live.db", max_seconds=30,
+                                 stall_seconds=30, max_restarts=1)
+    guard(0, 90, 100)
+    guard(0, 95, 100)
+    guard(0, 80, 100)
+    with pytest.raises(module.BackupLimitExceeded, match="source changed too often"):
+        guard(0, 90, 100)
+    deadline = module.ProgressGuard(database="live.db", max_seconds=30,
+                                    stall_seconds=30, max_restarts=3)
+    deadline.deadline = 0
+    with pytest.raises(module.BackupLimitExceeded, match="wall-clock deadline"):
+        deadline(0, 1, 100)
+
+
+def test_failed_sqlite_backup_does_not_publish_or_leave_partial(tmp_path, monkeypatch):
+    module = load_sqlite_backup()
+    source = tmp_path / "live.db"
+    destination = tmp_path / "backup.db"
+    with sqlite3.connect(source) as db:
+        db.execute("CREATE TABLE journal (value TEXT)")
+        db.executemany("INSERT INTO journal VALUES (?)", [("x",)] * 1_000)
+
+    def fail(*_args, **_kwargs):
+        raise module.BackupLimitExceeded("test deadline")
+
+    monkeypatch.setattr(module.ProgressGuard, "__call__", fail)
+    with pytest.raises(module.BackupLimitExceeded, match="test deadline"):
+        module.backup_database(source, destination, pages=1)
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".*.partial.*"))
 
 
 def test_workflow_requires_tests_protected_environment_and_strict_ssh():
@@ -154,7 +228,8 @@ def test_first_repair_deploy_starts_target_directly_and_restores_original_unit_o
 def test_single_first_release_launcher_is_locked_exact_and_fails_before_backup():
     launch = (DEPLOY / "launch_first_release.sh").read_text()
     target = "7fb41dd323a98571b6d93537386be97987013441"
-    assert f'readonly TARGET_COMMIT="{target}"' in launch
+    assert f'readonly DEFAULT_TARGET_COMMIT="{target}"' in launch
+    assert 'readonly TARGET_COMMIT="${1:-$DEFAULT_TARGET_COMMIT}"' in launch
     assert "flock -n" in launch
     assert "production-approved" in launch
     assert "prepared rollback baseline is missing" in launch
@@ -169,6 +244,24 @@ def test_single_first_release_launcher_is_locked_exact_and_fails_before_backup()
     assert "curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8765/healthz" in launch
     for unsafe in ("place_order", "cancel_order", "transfer", "git reset", "git clean"):
         assert unsafe not in launch
+
+
+def test_learning_repair_quiesces_exact_job_and_restores_timer_only_after_deploy():
+    repair = (DEPLOY / "repair_learning_and_deploy.sh").read_text()
+    deploy_call = '"$temporary" "$target"'
+    timer_start = 'systemctl start "$timer"'
+    assert "kalshi-learning.timer" in repair
+    assert "kalshi-learning.service" in repair
+    assert "refresh_learning_staging" in repair
+    assert "pgrep -u opc" in repair
+    assert "PRAGMA quick_check" in repair
+    assert "timeout 600" in repair
+    assert repair.index('systemctl stop "$timer"') < repair.index(deploy_call)
+    assert repair.index(deploy_call) < repair.index(timer_start)
+    assert "git reset" not in repair and "git clean" not in repair
+    sudoers = (DEPLOY / "sudoers.example").read_text()
+    assert "KALSHI_LEARNING" in sudoers
+    assert "systemctl stop kalshi-learning.timer" in sudoers
 
 
 def test_signals_service_import_boundary_excludes_execution_modules():

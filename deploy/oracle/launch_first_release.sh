@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 umask 027
 
-readonly TARGET_COMMIT="7fb41dd323a98571b6d93537386be97987013441"
+readonly DEFAULT_TARGET_COMMIT="7fb41dd323a98571b6d93537386be97987013441"
+readonly TARGET_COMMIT="${1:-$DEFAULT_TARGET_COMMIT}"
 readonly CONFIG="/etc/kalshi-signals/deployment.env"
 readonly LOCK_FILE="/home/opc/.kalshi-deploy/first-release.lock"
 
@@ -12,6 +13,7 @@ blocker() {
 }
 
 [[ $(id -un) == opc ]] || blocker "run this script as opc"
+[[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]] || blocker "target commit must be a full lowercase SHA"
 [[ -r "$CONFIG" ]] || blocker "opc cannot read $CONFIG"
 # shellcheck disable=SC1090
 source "$CONFIG"

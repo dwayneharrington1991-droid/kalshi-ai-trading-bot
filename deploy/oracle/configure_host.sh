@@ -99,14 +99,26 @@ PY
 echo "Candidate generated from the effective service; no configuration installed yet."
 cat "$candidate"
 if [[ "$mode" == --install ]]; then
-  sudo -n install -d -m 0755 /etc/kalshi-signals
+  deploy_user=$(id -un)
+  deploy_group=$(id -gn)
+  [[ "$deploy_user" == opc ]] || {
+    echo "configuration installation must be run by opc" >&2; exit 1;
+  }
+  # root owns the configuration; only root and opc's primary group may read it.
+  sudo -n install -d -o root -g "$deploy_group" -m 0750 /etc/kalshi-signals
   if sudo -n test -e /etc/kalshi-signals/deployment.env; then
     sudo -n cmp -s "$candidate" /etc/kalshi-signals/deployment.env || {
       echo "existing deployment.env differs; refusing overwrite" >&2; exit 1;
     }
+    sudo -n chown root:"$deploy_group" /etc/kalshi-signals/deployment.env
+    sudo -n chmod 0640 /etc/kalshi-signals/deployment.env
   else
-    sudo -n install -m 0600 "$candidate" /etc/kalshi-signals/deployment.env
+    sudo -n install -o root -g "$deploy_group" -m 0640 \
+      "$candidate" /etc/kalshi-signals/deployment.env
   fi
+  [[ -r /etc/kalshi-signals/deployment.env ]] || {
+    echo "installed configuration is not readable by opc" >&2; exit 1;
+  }
   mkdir -p /home/opc/kalshi-backups
   echo "configuration_installed=true service_modified=false service_restarted=false"
   echo "WARNING: same-disk backups do not protect against disk failure."

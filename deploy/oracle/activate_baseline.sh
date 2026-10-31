@@ -52,11 +52,12 @@ fi
 sudo -n systemctl cat "$SERVICE_NAME" > "$backup/systemd-before.txt"
 dropin_dir="/etc/systemd/system/$SERVICE_NAME.d"
 dropin="$dropin_dir/99-codex-versioned-release.conf"
-existed=0
-if sudo test -f "$dropin"; then existed=1; sudo cat "$dropin" > "$backup/previous-dropin.conf"; fi
+if sudo test -f "$dropin"; then
+  echo "target baseline drop-in already exists; refusing to overwrite it" >&2; exit 1
+fi
 rollback() {
   code=$?; trap - ERR; set +e
-  if (( existed == 1 )); then sudo install -m 0644 "$backup/previous-dropin.conf" "$dropin"; else sudo rm -f "$dropin"; fi
+  sudo rm -f "$dropin"
   sudo systemctl daemon-reload; sudo systemctl restart "$SERVICE_NAME"
   echo "baseline activation rolled back; databases were not changed" >&2
   exit "$code"

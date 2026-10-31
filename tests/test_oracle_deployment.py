@@ -317,6 +317,11 @@ def test_credential_transfer_never_puts_secrets_in_arguments_or_output():
     transfer = (ROOT / "scripts" / "transfer_oracle_readonly_credentials.sh").read_text()
     install = (DEPLOY / "install_readonly_credentials.sh").read_text()
     assert "StrictHostKeyChecking=yes" in transfer
+    assert "IdentitiesOnly=yes" in transfer
+    assert "ORACLE_SSH_PRIVATE_KEY" in transfer
+    assert "ORACLE_SSH_HOST_KEY" in transfer
+    assert "oracle-ssh-key" in transfer and "chmod 0600" in transfer
+    assert "UserKnownHostsFile=" in transfer
     assert "ssh-keygen -F" in transfer
     assert "printf '%s' \"$KALSHI_MONITOR_PRIVATE_KEY_PEM\" >" in transfer
     assert "scp -q" in transfer

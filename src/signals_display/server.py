@@ -193,6 +193,9 @@ class Monitor:
         self.edge_report = CachedReport(
             self.edge_performance, interval=30, name="edge-performance"
         )
+        self.quick_learning_report = CachedReport(
+            self.journal.quick_learning_summary, interval=30, name="quick-learning-summary"
+        )
         self.scheduled_learning = None
         self.scheduled_scalp_learning = None
         if model_registry is not None:
@@ -1399,6 +1402,18 @@ def make_handler(monitor):
                 }
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
+            elif route == "/api/learning-summary":
+                report = monitor.quick_learning_report.get()
+                body = json.dumps(
+                    {
+                        "status": report["status"],
+                        "summary": report["value"],
+                        "generated_at": report["generated_at"],
+                        "calculation_ms": report["calculation_ms"],
+                    },
+                    allow_nan=False,
+                ).encode()
+                content_type = "application/json"
             elif route == "/api/probability-history":
                 ticker = query.get("ticker", [""])[0]
                 try:
@@ -1943,6 +1958,7 @@ def main():
         monitor.research_report.close()
         monitor.scalp_paper_report.close()
         monitor.edge_report.close()
+        monitor.quick_learning_report.close()
         if monitor.scheduled_learning:
             monitor.scheduled_learning.close()
         if monitor.scheduled_scalp_learning:

@@ -81,6 +81,7 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             page.locator("#details > summary").click()
             playwright.expect(page.locator("#model-scalp")).to_contain_text("DOWN SCALP")
             assert "90% is a goal, not a claim" in page.locator("#accuracy-summary").inner_text()
+            assert page.locator("#learning-summary").count() == 1
             assert "$100000.00" in page.locator("#strike").inner_text()
             assert "hypothetical plan" in page.locator("#plans").inner_text()
             assert "I entered — record manually" in page.get_by_role("button").all_text_contents()

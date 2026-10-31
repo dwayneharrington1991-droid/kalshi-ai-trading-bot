@@ -2120,6 +2120,50 @@ class Journal:
             ),
         }
 
+    def quick_learning_summary(self):
+        """Bounded historical headline metrics from compact indexed tables."""
+        with self.read() as db:
+            cycle = db.execute(
+                """SELECT COUNT(*) contracts,COALESCE(SUM(revisions),0) revisions
+                FROM btc_engine_contracts WHERE mode='PUBLIC MARKET DATA'"""
+            ).fetchone()
+            settled = db.execute(
+                "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
+            ).fetchone()[0]
+            openings = db.execute(
+                """SELECT b.up,o.outcome FROM btc_engine_opening b
+                JOIN forecast_outcomes o ON o.ticker=b.ticker AND o.origin='official'
+                WHERE b.mode='PUBLIC MARKET DATA' AND b.up IS NOT NULL"""
+            ).fetchall()
+            memory = db.execute(
+                "SELECT COUNT(*),COALESCE(SUM(samples),0),MAX(last_observed_at) "
+                "FROM intelligence_minute_memory"
+            ).fetchone()
+        from .prediction_engine import direction_label, wilson_interval
+
+        directional = [row for row in openings if direction_label(row[0]) in {"UP", "DOWN"}]
+        correct = sum(
+            (direction_label(row[0]) == "UP") == bool(row[1]) for row in directional
+        )
+        total = len(directional)
+        return {
+            "recorded_markets": cycle[0],
+            "timestamped_prediction_revisions": cycle[1],
+            "official_settlements": settled,
+            "settled_opening_probability_samples": len(openings),
+            "directional_opening_calls": total,
+            "correct_directional_openings": correct,
+            "incorrect_directional_openings": total - correct,
+            "opening_directional_accuracy": correct / total if total else None,
+            "opening_accuracy_interval": wilson_interval(correct, total),
+            "unclear_openings": len(openings) - total,
+            "minute_memory_records": memory[0],
+            "second_level_samples": memory[1],
+            "last_learning_observation": memory[2],
+            "status": "DESCRIPTIVE_ONLY_EDGE_UNVERIFIED",
+            "note": "Official outcomes and immutable opening records only. Accuracy is descriptive, not a profitability claim.",
+        }
+
     def opening_inputs(self, opened):
         with self.read() as db:
             rows = db.execute(

@@ -93,7 +93,11 @@ for db in "${databases[@]}"; do
   destination="$backup/databases/$relative"
   mkdir -p "$(dirname "$destination")"
   echo "backup_start database=$relative bytes=$(stat -c %s "$db")" >&2
-  "$PYTHON_BIN" "$backup_tool" "$db" "$destination"
+  "$PYTHON_BIN" "$backup_tool" "$db" "$destination" \
+    --max-seconds "${SQLITE_BACKUP_MAX_SECONDS:-900}" \
+    --stall-seconds "${SQLITE_BACKUP_STALL_SECONDS:-120}" \
+    --max-restarts "${SQLITE_BACKUP_MAX_RESTARTS:-3}" \
+    --busy-timeout-ms "${SQLITE_BACKUP_BUSY_TIMEOUT_MS:-30000}"
   (cd "$(dirname "$destination")" && sha256sum -c "$(basename "$destination").sha256")
   echo "backup_complete database=$relative" >&2
 done

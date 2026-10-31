@@ -230,6 +230,8 @@ def test_first_repair_deploy_starts_target_directly_and_restores_original_unit_o
     assert "dashboard_quiesce_complete" in deploy
     assert "trap recover_first_on_exit EXIT" in deploy
     assert "first_recovery_needed=0" in deploy
+    assert '$DEPLOY_ROOT/current/.venv/bin/python3' in deploy
+    assert 'src.signals_display.server' in deploy
 
 
 def test_single_first_release_launcher_is_locked_exact_and_fails_before_backup():

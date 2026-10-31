@@ -104,7 +104,9 @@ pid=$(sudo -n systemctl show "$SERVICE_NAME" --property=MainPID --value)
 [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/cmdline" ]] || blocker "service has no readable live process"
 cwd=$(readlink -f "/proc/$pid/cwd")
 command=$(tr '\0' ' ' < "/proc/$pid/cmdline")
-[[ "$cwd" == "$current" && "$command" == *"$current/.venv/bin/python3"* && \
+[[ "$cwd" == "$current" \
+   && ( "$command" == *"$current/.venv/bin/python3"* \
+        || "$command" == *"$DEPLOY_ROOT/current/.venv/bin/python3"* ) && \
    "$command" == *"src.signals_display.server"* && "$command" == *"--mode public"* ]] || \
   blocker "running process is not the expected signals-only release"
 "$current/.venv/bin/python3" "$current/deploy/oracle/health_check.py" \

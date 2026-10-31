@@ -256,6 +256,7 @@ def test_learning_repair_quiesces_exact_job_and_restores_timer_only_after_deploy
     assert "pgrep -u opc" in repair
     assert "PRAGMA quick_check" in repair
     assert "timeout 600" in repair
+    assert repair.index("production-approved") < repair.index('systemctl stop "$timer"')
     assert repair.index('systemctl stop "$timer"') < repair.index(deploy_call)
     assert repair.index(deploy_call) < repair.index(timer_start)
     assert "git reset" not in repair and "git clean" not in repair

@@ -8,7 +8,7 @@ import threading
 import pytest
 
 playwright = pytest.importorskip("playwright.sync_api")
-from src.signals_display.monitor import Journal, analyze
+from src.signals_display.monitor import Journal, analyze, utcnow
 from src.signals_display.server import Monitor, StartupStatus, make_handler, make_startup_handler
 from tests.test_signals_monitor import frame
 from tests.test_signals_display import NOW
@@ -1035,10 +1035,11 @@ def test_reliability_diagram_uses_observed_bins_and_clears_unavailable_results(t
 
 def test_browser_loads_deduplicated_market_history_and_verified_summary(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "market-history-browser.db"))
+    test_now = utcnow()
     closes = [
-        NOW - timedelta(hours=3),
-        NOW - timedelta(hours=2),
-        NOW + timedelta(hours=1),
+        test_now - timedelta(hours=3),
+        test_now - timedelta(hours=2),
+        test_now + timedelta(hours=1),
     ]
     with monitor.journal.connect() as db:
         for index, (ticker, close) in enumerate(

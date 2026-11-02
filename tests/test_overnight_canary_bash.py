@@ -37,6 +37,7 @@ def test_shell_canary_is_permanently_disabled_before_any_action(tmp_path):
         timeout=10,
         check=False,
     )
+
     assert result.returncode == 2
     assert "permanently disabled" in result.stderr
     assert not marker.exists()

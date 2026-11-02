@@ -20,14 +20,98 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import sys
 import os
+import sqlite3
 from datetime import datetime, timedelta
 import json
+from pathlib import Path
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.utils.database import DatabaseManager
 from src.clients.kalshi_client import KalshiClient
+from src.utils.dashboard_runtime import (
+    dashboard_credential_status,
+    resolve_dashboard_runtime,
+)
+from src.utils.market_prices import get_market_prices
+
+
+def _dashboard_client() -> KalshiClient:
+    """Construct a dashboard client from the canary-compatible environment.
+
+    The dashboard only calls named GET methods below.  Passing explicit values
+    avoids the import-time settings snapshot and makes relative ``.env`` paths
+    resolve from the repository rather than Streamlit's current directory.
+    """
+    runtime = resolve_dashboard_runtime()
+    api_key = os.environ.get("KALSHI_API_KEY", "").strip()
+    credential_status = dashboard_credential_status()
+    if not api_key or not all(credential_status.values()):
+        raise RuntimeError("dashboard credentials are unavailable")
+    return KalshiClient(
+        api_key=api_key,
+        private_key_path=str(runtime.private_key_path),
+        environment=runtime.environment,
+    )
+
+
+def _database_manager() -> DatabaseManager:
+    return DatabaseManager(str(resolve_dashboard_runtime().database_path))
+
+
+def _balance_dollars(response: dict) -> float:
+    """Normalize Kalshi balance fields without accepting malformed values."""
+    if not isinstance(response, dict):
+        raise RuntimeError("dashboard balance response is unavailable")
+    for field in ("balance_dollars", "balance_fp"):
+        value = response.get(field)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                raise RuntimeError("dashboard balance response is malformed") from None
+    value = response.get("balance")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError("dashboard balance response is unavailable")
+    return float(value) / 100.0
+
+
+def _persistent_health() -> dict:
+    """Read the live ledger health without mutating its SQLite database."""
+    path = resolve_dashboard_runtime().database_path
+    default = {
+        "reconciliation_status": "UNAVAILABLE",
+        "critical_alerts": None,
+        "canary_running": False,
+        "canary_pid": None,
+    }
+    try:
+        with sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True) as db:
+            row = db.execute(
+                "SELECT status FROM reconciliation_runs "
+                "WHERE completed_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            critical = db.execute(
+                "SELECT COUNT(*) FROM reconciliation_alerts "
+                "WHERE resolved_at IS NULL AND severity = 'critical'"
+            ).fetchone()
+        default["reconciliation_status"] = row[0] if row else "UNAVAILABLE"
+        default["critical_alerts"] = int(critical[0]) if critical else None
+    except sqlite3.Error:
+        return default
+
+    pid_file = Path(os.environ.get(
+        "KALSHI_CANARY_PID_FILE", "/tmp/kalshi-overnight-canary.pid"
+    ))
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+        os.kill(pid, 0)
+        default["canary_running"] = True
+        default["canary_pid"] = pid
+    except (OSError, ValueError):
+        pass
+    return default
 
 # Configure Streamlit page
 st.set_page_config(
@@ -79,73 +163,75 @@ def load_performance_data():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        db_manager = DatabaseManager()
-        kalshi_client = KalshiClient()
+        db_manager = _database_manager()
+        kalshi_client = _dashboard_client()
         
         async def get_data():
-            await db_manager.initialize()
+            try:
+                # Get performance by strategy - ensure it's serializable
+                performance_raw = await db_manager.get_performance_by_strategy()
             
-            # Get performance by strategy - ensure it's serializable
-            performance_raw = await db_manager.get_performance_by_strategy()
+                # Convert performance data to ensure serializability
+                performance = {}
+                if performance_raw:
+                    for strategy, stats in performance_raw.items():
+                        performance[str(strategy)] = {
+                            str(k): float(v) if isinstance(v, (int, float)) else str(v)
+                            for k, v in stats.items()
+                        }
             
-            # Convert performance data to ensure serializability
-            performance = {}
-            if performance_raw:
-                for strategy, stats in performance_raw.items():
-                    performance[str(strategy)] = {
-                        str(k): float(v) if isinstance(v, (int, float)) else str(v) 
-                        for k, v in stats.items()
-                    }
+                # Get LIVE positions from Kalshi API (not just database)
+                positions_response = await kalshi_client.get_positions()
+                kalshi_positions = positions_response.get('market_positions', [])
             
-            # Get LIVE positions from Kalshi API (not just database)
-            positions_response = await kalshi_client.get_positions()
-            kalshi_positions = positions_response.get('market_positions', [])
-            
-            # Convert Kalshi positions to simple dictionaries for caching
-            positions = []
-            for pos in kalshi_positions:
-                if pos.get('position', 0) != 0:  # Only active positions
-                    ticker = pos.get('ticker')
-                    position_count = pos.get('position', 0)
+                # Convert Kalshi positions to simple dictionaries for caching
+                positions = []
+                for pos in kalshi_positions:
+                    if pos.get('position', 0) != 0:  # Only active positions
+                        ticker = pos.get('ticker')
+                        position_count = pos.get('position', 0)
                     
-                    # Create a simple dictionary with only serializable types
-                    position_dict = {
-                        'market_id': str(ticker),
-                        'side': 'YES' if position_count > 0 else 'NO',
-                        'quantity': int(abs(position_count)),
-                        'entry_price': 0.50,  # Will be updated below
-                        'timestamp': datetime.now().isoformat(),
-                        'strategy': 'live_sync',
-                        'status': 'open',
-                        'stop_loss_price': None,
-                        'take_profit_price': None
-                    }
+                        # Create a simple dictionary with only serializable types.
+                        # Do not truncate fractional exchange positions.
+                        position_dict = {
+                            'market_id': str(ticker),
+                            'side': 'YES' if position_count > 0 else 'NO',
+                            'quantity': float(abs(position_count)),
+                            'entry_price': 0.50,  # Will be updated below
+                            'timestamp': datetime.now().isoformat(),
+                            'strategy': 'live_sync',
+                            'status': 'open',
+                            'stop_loss_price': None,
+                            'take_profit_price': None
+                        }
                     
-                    # Try to get current market price for better accuracy
-                    try:
-                        market_data = await kalshi_client.get_market(ticker)
-                        if market_data and 'market' in market_data:
-                            market_info = market_data['market']
-                            if position_count > 0:  # YES position
-                                position_dict['entry_price'] = float((market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100)
-                            else:  # NO position
-                                position_dict['entry_price'] = float((market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100)
-                    except:
-                        position_dict['entry_price'] = 0.50  # Keep default price as float
+                        # Try to get current market price for better accuracy.
+                        try:
+                            market_data = await kalshi_client.get_market(ticker)
+                            if market_data and 'market' in market_data:
+                                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(
+                                    market_data['market']
+                                )
+                                if position_count > 0:  # YES position
+                                    position_dict['entry_price'] = (yes_bid + yes_ask) / 2
+                                else:  # NO position
+                                    position_dict['entry_price'] = (no_bid + no_ask) / 2
+                        except Exception:
+                            position_dict['entry_price'] = 0.50  # Keep default price as float
                     
-                    positions.append(position_dict)
-            
-            await db_manager.close()
-            
-            return performance, positions
+                        positions.append(position_dict)
+                return performance, positions
+            finally:
+                await kalshi_client.close()
+                await db_manager.close()
         
         performance, positions = loop.run_until_complete(get_data())
         loop.close()
         
         return performance, positions
         
-    except Exception as e:
-        st.error(f"Error loading performance data: {e}")
+    except Exception:
+        st.error("Unable to load portfolio performance data. Check dashboard credentials and connectivity.")
         return {}, []
 
 # @st.cache_data(ttl=30)  # Cache for 30 seconds - temporarily disabled
@@ -155,11 +241,9 @@ def load_llm_data():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        db_manager = DatabaseManager()
+        db_manager = _database_manager()
         
         async def get_data():
-            await db_manager.initialize()
-            
             # Get recent LLM queries
             queries = await db_manager.get_llm_queries(hours_back=24, limit=100)
             
@@ -190,8 +274,8 @@ def load_llm_data():
         
         return queries, stats
         
-    except Exception as e:
-        st.error(f"Error loading LLM data: {e}")
+    except Exception:
+        st.error("Unable to load dashboard history from the persistent ledger.")
         return [], {}
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
@@ -201,69 +285,72 @@ def load_system_health():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        kalshi_client = KalshiClient()
+        kalshi_client = _dashboard_client()
         
         async def get_health():
-            # Get available cash
-            balance_response = await kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100
-            
-            # Get current positions to calculate total portfolio value
-            positions_response = await kalshi_client.get_positions()
-            market_positions = positions_response.get('market_positions', [])
-            
-            total_position_value = 0
-            positions_count = len(market_positions)
-            
-            # Calculate current value of all positions
-            for position in market_positions:
-                try:
-                    ticker = position.get('ticker')
-                    position_count = position.get('position', 0)
-                    
-                    if ticker and position_count != 0:
-                        # Get current market data
-                        market_data = await kalshi_client.get_market(ticker)
-                        if market_data and 'market' in market_data:
-                            market_info = market_data['market']
-                            
-                            # Determine if this is a YES or NO position and get current price
-                            # For Kalshi, positive position = YES, negative = NO
-                            if position_count > 0:  # YES position
-                                current_price = (market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100
-                            else:  # NO position  
-                                current_price = (market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100
-                            
-                            position_value = abs(position_count) * current_price
-                            total_position_value += position_value
-                            
-                except Exception as e:
-                    # If we can't get market data for a position, skip it
-                    print(f"Warning: Could not value position {ticker}: {e}")
-                    continue
-            
-            # Total portfolio value = cash + position values
-            total_portfolio_value = available_cash + total_position_value
-            
-            return available_cash, total_portfolio_value, positions_count, total_position_value
+            try:
+                # Get available cash
+                balance_response = await kalshi_client.get_balance()
+                available_cash = _balance_dollars(balance_response)
+
+                # Get current positions to calculate total portfolio value
+                positions_response = await kalshi_client.get_positions()
+                market_positions = positions_response.get('market_positions', [])
+
+                total_position_value = 0
+                positions_count = len(market_positions)
+
+                # Calculate current value of all positions
+                for position in market_positions:
+                    try:
+                        ticker = position.get('ticker')
+                        position_count = position.get('position', 0)
+
+                        if ticker and position_count != 0:
+                            # Get current market data
+                            market_data = await kalshi_client.get_market(ticker)
+                            if market_data and 'market' in market_data:
+                                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(
+                                    market_data['market']
+                                )
+                                current_price = (
+                                    (yes_bid + yes_ask) / 2 if position_count > 0
+                                    else (no_bid + no_ask) / 2
+                                )
+                                total_position_value += abs(float(position_count)) * current_price
+                    except Exception:
+                        # An individual valuation failure is deliberately not
+                        # treated as zero cash or a failed account connection.
+                        continue
+
+                # Total portfolio value = cash + position values
+                total_portfolio_value = available_cash + total_position_value
+                return available_cash, total_portfolio_value, positions_count, total_position_value
+            finally:
+                await kalshi_client.close()
         
         available_cash, total_portfolio_value, positions_count, position_value = loop.run_until_complete(get_health())
         loop.close()
         
+        health = _persistent_health()
         return {
             'available_cash': available_cash,
             'total_portfolio_value': total_portfolio_value, 
             'positions_count': positions_count,
-            'position_value': position_value
+            'position_value': position_value,
+            'account_authenticated': True,
+            **health,
         }
         
-    except Exception as e:
-        st.error(f"Error loading system health: {e}")
+    except Exception:
+        st.error("Unable to load live account health. No account value is displayed until GET-only authentication succeeds.")
         return {
             'available_cash': 0.0,
             'total_portfolio_value': 0.0,
             'positions_count': 0,
-            'position_value': 0.0
+            'position_value': 0.0,
+            'account_authenticated': False,
+            **_persistent_health(),
         }
 
 def main():
@@ -299,8 +386,8 @@ def main():
         performance_data, positions = load_performance_data()
         llm_queries, llm_stats = load_llm_data()
         system_health_data = load_system_health()
-    except Exception as e:
-        st.error(f"Error loading dashboard data: {e}")
+    except Exception:
+        st.error("Unable to load dashboard data. Check the dashboard connection and refresh.")
         st.info("Please check your system connections and try refreshing.")
         return
     
@@ -310,6 +397,10 @@ def main():
     st.sidebar.metric("Active Positions", len(positions) if positions else 0)
     st.sidebar.metric("LLM Queries (24h)", len(llm_queries) if llm_queries else 0)
     st.sidebar.metric("Portfolio Balance", f"${system_health_data.get('total_portfolio_value', 0):.2f}")
+    st.sidebar.metric(
+        "Live Canary",
+        "RUNNING" if system_health_data.get("canary_running") else "STOPPED",
+    )
     
     # Page routing
     if page == "📈 Overview":
@@ -323,7 +414,7 @@ def main():
     elif page == "⚠️ Risk Management":
         show_risk_management(performance_data, positions, system_health_data['total_portfolio_value'])
     elif page == "🔧 System Health":
-        show_system_health(system_health_data['available_cash'], system_health_data['positions_count'], llm_stats)
+        show_system_health(system_health_data, llm_stats)
 
 def show_overview(performance_data, positions, system_health_data):
     """Show overview dashboard."""
@@ -986,8 +1077,10 @@ def show_risk_management(performance_data, positions, system_balance):
         with col4:
             st.metric("Max Single Position", "Error")
 
-def show_system_health(available_cash, positions_count, llm_stats):
+def show_system_health(system_health_data, llm_stats):
     """Show system health and monitoring."""
+    available_cash = system_health_data['available_cash']
+    positions_count = system_health_data['positions_count']
     
     st.header("🔧 System Health")
     
@@ -997,7 +1090,10 @@ def show_system_health(available_cash, positions_count, llm_stats):
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.success("✅ **Kalshi Connection**: Active")
+        if system_health_data.get("account_authenticated"):
+            st.success("Kalshi Connection: Authenticated (GET-only dashboard reads)")
+        else:
+            st.error("Kalshi Connection: Account read unavailable")
         st.write(f"Available Cash: ${available_cash:.2f}")
         st.write(f"Positions: {positions_count}")
     
@@ -1010,8 +1106,19 @@ def show_system_health(available_cash, positions_count, llm_stats):
             st.warning("⚠️ **LLM Logging**: No data")
     
     with col3:
-        st.success("✅ **Database**: Connected")
-        st.write("All tables operational")
+        status = system_health_data.get("reconciliation_status", "UNAVAILABLE")
+        critical = system_health_data.get("critical_alerts")
+        if status in {"completed", "completed_with_mismatches"} and critical == 0:
+            st.success("Persistent Reconciliation: Healthy")
+        else:
+            st.warning("Persistent Reconciliation: Needs attention")
+        st.write(f"Status: {status}")
+        st.write(f"Critical alerts: {critical if critical is not None else 'unavailable'}")
+        pid = system_health_data.get("canary_pid")
+        st.write(
+            f"Live canary: {'RUNNING' if system_health_data.get('canary_running') else 'STOPPED'}"
+            + (f" (PID {pid})" if pid else "")
+        )
     
     # Recent activity timeline
     st.subheader("📅 System Activity")
@@ -1036,7 +1143,7 @@ def show_system_health(available_cash, positions_count, llm_stats):
     st.subheader("⚙️ Configuration")
     
     config_info = {
-        "Database Path": "trading_system.db",
+        "Database Path": str(resolve_dashboard_runtime().database_path),
         "Dashboard Refresh": "Auto (1 min cache)",
         "LLM Logging": "Enabled" if llm_stats else "Pending first query",
         "Strategy Tracking": "Enabled",
@@ -1068,4 +1175,4 @@ def show_system_health(available_cash, positions_count, llm_stats):
         st.success("✅ System running optimally - no recommendations at this time")
 
 if __name__ == "__main__":
-    main() 
+    main()

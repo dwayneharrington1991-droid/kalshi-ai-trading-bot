@@ -1,0 +1,2 @@
+"""Deterministic, offline shadow backtesting."""
+

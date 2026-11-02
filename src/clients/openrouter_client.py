@@ -617,8 +617,8 @@ News/Context:
 
 Instructions:
 - Estimate the true probability of the event.
-- Only trade if your estimated edge (|your_probability - market_price/100|) exceeds 10%.
-- Confidence must be >60% to recommend a trade.
+- Only trade if your estimated edge (|your_probability - market_price/100|) exceeds 3%
+- Confidence must be >45% to recommend a trade.
 - Return ONLY a JSON object in the following format (no markdown, no extra text):
 
 {{"action": "BUY", "side": "YES", "limit_price": 55, "confidence": 0.72, "reasoning": "brief explanation"}}

@@ -9,7 +9,7 @@ Provides a single entry point for all bot operations:
     python cli.py backtest     Run backtests (placeholder)
     python cli.py health       Verify API connections, database, and configuration
 """
-
+#
 import argparse
 import asyncio
 import os
@@ -24,26 +24,24 @@ from pathlib import Path
 
 def cmd_run(args: argparse.Namespace) -> None:
     """Start the trading bot (disciplined mode by default)."""
+    if getattr(args, "live", False):
+        print(
+            "BLOCKED: live order execution is disabled in this read-only build.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
     from src.utils.logging_setup import setup_logging
 
     log_level = getattr(args, "log_level", "INFO")
     setup_logging(log_level=log_level)
 
-    live = getattr(args, "live", False)
     paper = getattr(args, "paper", False)
     beast = getattr(args, "beast", False)
     disciplined = getattr(args, "disciplined", False)
     safe_compounder = getattr(args, "safe_compounder", False)
 
-    if live and paper:
-        print("Error: --live and --paper are mutually exclusive.")
-        sys.exit(1)
-
-    live_mode = live and not paper
-
-    if live_mode:
-        print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
-        print("   This will use real money and place actual trades.")
+    live_mode = False
 
     # --safe-compounder mode: edge-based NO-side only
     if safe_compounder:
@@ -106,6 +104,12 @@ def _run_safe_compounder(
     """
     from src.clients.kalshi_client import KalshiClient
     from src.strategies.safe_compounder import SafeCompounder
+
+    if live_mode:
+        raise RuntimeError(
+            "Safe Compounder live submission is disabled because this legacy command "
+            "is not connected to the verified execution gateway."
+        )
 
     print("🔒 SAFE COMPOUNDER MODE")
     print("   NO-side only | Edge-based | Near-certain outcomes")
@@ -352,13 +356,24 @@ def cmd_history(args: argparse.Namespace) -> None:
                         f"{t['quantity']:>4} ${t['pnl']:>7.2f}  {cat}"
                     )
 
-            # Blocked trades summary
-            cursor2 = await db.execute("""
-                SELECT COUNT(*) FROM blocked_trades
-            """)
-            r2 = await cursor2.fetchone()
-            if r2 and r2[0]:
-                print(f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
+            # Blocked trades summary — only query it if the optional table exists
+            cursor2 = await db.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='blocked_trades'"
+            )
+            blocked_table_exists = await cursor2.fetchone()
+
+            if blocked_table_exists:
+                cursor2 = await db.execute(
+                    "SELECT COUNT(*) FROM blocked_trades"
+                )
+                r2 = await cursor2.fetchone()
+
+                if r2 and r2[0]:
+                    print(
+                        f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer "
+                        "(use 'python cli.py health' for details)"
+                    )
 
             print("=" * 70)
 
@@ -370,34 +385,17 @@ def cmd_history(args: argparse.Namespace) -> None:
 
 
 def cmd_close_all(args: argparse.Namespace) -> None:
-    """Place sell orders to close every open position on Kalshi.
-
-    Use this AFTER stopping the bot (Ctrl-C). It queries Kalshi directly
-    rather than the local DB, so it works even if local state is stale.
-    Each position gets a limit sell at the current best bid for its side
-    — marketable, but no guaranteed fill if the book is thin.
-    """
-    import uuid
-
-    auto_yes = getattr(args, "yes", False)
+    """Show a read-only estimate for closing positions; never submit orders."""
     live_mode = getattr(args, "live", False)
+    if live_mode:
+        print("BLOCKED: order submission is disabled in this read-only build.", file=sys.stderr)
+        raise SystemExit(2)
 
     print("=" * 56)
-    print("  CLOSE ALL POSITIONS")
+    print("  CLOSE-ALL ESTIMATE (READ-ONLY)")
     print("=" * 56)
-    if not live_mode:
-        print("  DRY RUN — no orders will be sent. Pass --live to actually sell.")
+    print("  No orders will be sent.")
     print()
-    print("  WARNING: this places sell orders at the current best bid.")
-    print("  You may realize a loss on positions trading below entry.")
-    print("  Stop the bot first (Ctrl-C) before running this command.")
-    print()
-
-    if live_mode and not auto_yes:
-        confirm = input("  Type 'CLOSE ALL' to proceed: ").strip()
-        if confirm != "CLOSE ALL":
-            print("  Aborted.")
-            return
 
     async def _close() -> None:
         from src.clients.kalshi_client import KalshiClient
@@ -416,8 +414,6 @@ def cmd_close_all(args: argparse.Namespace) -> None:
             print(f"  Found {len(market_positions)} open position(s).")
             print()
 
-            placed = 0
-            failed = 0
             for pos in market_positions:
                 ticker = pos["ticker"]
                 contracts = pos["position"]            # signed: + YES, - NO
@@ -429,58 +425,19 @@ def cmd_close_all(args: argparse.Namespace) -> None:
                     book = book_resp.get("orderbook", {})
                     side_bids = book.get(side, [])
                     if not side_bids:
-                        print(f"  ⚠️  {ticker}: no {side.upper()} bids in book — skipping")
-                        failed += 1
+                        print(f"  {ticker}: no {side.upper()} bids in book — estimate unavailable")
                         continue
                     # Kalshi orderbook bid entries are [price_cents, count].
                     # Best bid is the highest price.
                     best_bid_cents = max(int(level[0]) for level in side_bids)
                 except Exception as exc:
-                    print(f"  ❌ {ticker}: orderbook fetch failed — {exc}")
-                    failed += 1
+                    print(f"  {ticker}: orderbook read failed — {exc}")
                     continue
 
-                if not live_mode:
-                    print(
-                        f"  [DRY] would sell {quantity} {side.upper()} of {ticker} "
-                        f"at {best_bid_cents}¢ (~${best_bid_cents * quantity / 100:.2f})"
-                    )
-                    placed += 1
-                    continue
-
-                order_params = {
-                    "ticker": ticker,
-                    "client_order_id": str(uuid.uuid4()),
-                    "side": side,
-                    "action": "sell",
-                    "count": quantity,
-                    "type_": "limit",
-                }
-                if side == "yes":
-                    order_params["yes_price"] = best_bid_cents
-                else:
-                    order_params["no_price"] = best_bid_cents
-
-                try:
-                    resp = await client.place_order(**order_params)
-                    if resp and "order" in resp:
-                        print(
-                            f"  ✅ {ticker}: sell {quantity} {side.upper()} "
-                            f"@ {best_bid_cents}¢ — order_id={resp['order'].get('order_id', '?')}"
-                        )
-                        placed += 1
-                    else:
-                        print(f"  ❌ {ticker}: unexpected response {resp}")
-                        failed += 1
-                except Exception as exc:
-                    print(f"  ❌ {ticker}: order failed — {exc}")
-                    failed += 1
-
-            print()
-            print(f"  Placed: {placed} | Failed: {failed}")
-            print()
-            print("  Sell orders are limit-priced — they may rest unfilled if the book")
-            print("  moves. Check Kalshi or `python cli.py status` after a minute.")
+                print(
+                    f"  {ticker}: estimate only — {quantity} {side.upper()} at "
+                    f"{best_bid_cents}¢ (~${best_bid_cents * quantity / 100:.2f})"
+                )
         finally:
             await client.close()
 
@@ -629,9 +586,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  python cli.py run                      Start AI Ensemble mode (default, paper)\n"
-            "  python cli.py run --live               AI Ensemble with real capital\n"
+            "  python cli.py run --live               BLOCKED: live execution is disabled\n"
             "  python cli.py run --safe-compounder    Safe Compounder: conservative, math-only\n"
-            "  python cli.py run --safe-compounder --live  Safe Compounder live\n"
             "  python cli.py run --beast              Beast mode (aggressive, not recommended)\n"
             "  python cli.py scores                   Show category scores\n"
             "  python cli.py history                  Show trade history + category breakdown\n"
@@ -651,15 +607,15 @@ def build_parser() -> argparse.ArgumentParser:
             "(fallback chain on error), with category scoring and portfolio "
             "guardrails layered on top. Use --safe-compounder for the "
             "conservative math-only NO-side strategy. Use --beast to run "
-            "without guardrails (not recommended). All three are starting "
-            "points — fork them, tune them, replace them."
+            "without guardrails (not recommended). Live order execution is "
+            "disabled in this read-only build."
         ),
     )
     live_group = p_run.add_mutually_exclusive_group()
     live_group.add_argument(
         "--live",
         action="store_true",
-        help="Enable live trading with real capital (default: paper trading)",
+        help="Rejected: live order execution is disabled in this read-only build",
     )
     live_group.add_argument(
         "--paper",
@@ -761,22 +717,21 @@ def build_parser() -> argparse.ArgumentParser:
     # --- close-all ---
     p_close = subparsers.add_parser(
         "close-all",
-        help="Place limit sell orders to close every open position on Kalshi",
+        help="Show a read-only estimate for closing open positions",
         description=(
-            "Best-effort liquidation: query Kalshi for open positions and place "
-            "a limit sell at the current best bid for each. Run this AFTER stopping "
-            "the bot. Defaults to dry-run; pass --live to actually send orders."
+            "Query Kalshi positions and order books to display estimates only. "
+            "This command never places or cancels orders."
         ),
     )
     p_close.add_argument(
         "--live",
         action="store_true",
-        help="Actually place sell orders (default is a dry-run preview)",
+        help="Rejected: order submission is disabled in this read-only build",
     )
     p_close.add_argument(
         "--yes",
         action="store_true",
-        help="Skip the interactive 'CLOSE ALL' confirmation (dangerous)",
+        help=argparse.SUPPRESS,
     )
     p_close.set_defaults(func=cmd_close_all)
 

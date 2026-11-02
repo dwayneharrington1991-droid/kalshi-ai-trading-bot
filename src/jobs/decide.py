@@ -299,7 +299,12 @@ async def make_decision_for_market(
             # Calculate market probabilities and AI confidence
             market_prob = market.yes_price if decision.side == "YES" else market.no_price
             ai_prob = decision.confidence
-            
+            logger.info(
+                f"EDGE DEBUG: ai_prob={ai_prob:.3f}, "
+                f"market_prob={market_prob:.3f}, "
+                f"confidence={decision.confidence:.3f}, "
+                f"side={decision.side}"
+            )  
             # Check edge filter
             should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(
                 ai_probability=ai_prob,

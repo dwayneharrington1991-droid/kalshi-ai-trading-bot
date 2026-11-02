@@ -7,6 +7,8 @@
 kalshi_private_key
 secrets.json
 config.json
+# Backup archives can bundle credentials and databases; keep them out of Git.
+backups/*.tar.gz
 
 # Database files
 *.db
@@ -209,3 +211,18 @@ secrets.yaml
 *.pem
 *.key
 .env*
+
+# Private monitor key directory and local fitted artifacts
+/.private/
+/signals_model*.json
+/signals_model_registry/
+/signals_opening_model*.json
+/opening_shadow*.json
+/opening_shadow_registry/
+/signals_scalp_paper*.json
+
+# SQLite live sidecars and dashboard process guards
+*.db-wal
+*.db-shm
+*.dashboard.lock
+.dashboard-launch.lock

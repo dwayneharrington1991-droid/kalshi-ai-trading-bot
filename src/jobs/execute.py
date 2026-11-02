@@ -13,6 +13,126 @@ from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
 from src.clients.kalshi_client import KalshiClient, KalshiAPIError
 from src.utils.market_prices import get_market_prices, is_tradeable_market
+from src.orders.execution_service import (
+    ExecutionSafetyConfig, ExecutionSafetyError, OrderIntent, VerifiedExecutionService,
+)
+from src.orders.reconciler import OrderReconciler
+from src.orders.repository import OrderRepository
+from src.orders.readiness import ReadinessContext, SubmissionReadinessEvaluator
+from src.orders.decision_log import log_order_decision
+
+
+def _verified_service(db_manager, kalshi_client, live_mode=True):
+    repository = OrderRepository(db_manager.db_path)
+    safety = ExecutionSafetyConfig(
+        live_mode=live_mode,
+        authoritative_execution_enabled=settings.trading.authoritative_live_execution_enabled,
+        reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+        kill_switch=settings.trading.live_order_submission_kill_switch,
+        production_acknowledgement=settings.trading.production_execution_acknowledgement,
+        reconciliation_max_age_seconds=settings.trading.reconciliation_health_max_age_seconds,
+        allow_risk_reducing_exits=settings.trading.allow_risk_reducing_live_exits,
+        overnight_canary_enabled=settings.trading.overnight_canary_enabled,
+        canary_max_total_risk=settings.trading.overnight_canary_max_total_risk,
+        canary_max_market_risk=settings.trading.overnight_canary_max_market_risk,
+        canary_max_positions=settings.trading.overnight_canary_max_positions,
+        canary_max_rejections=settings.trading.overnight_canary_max_rejections,
+        canary_max_daily_loss=settings.trading.overnight_canary_max_daily_loss,
+        canary_market_data_max_age_seconds=settings.trading.overnight_canary_market_data_max_age_seconds,
+    )
+    reconciler = OrderReconciler(
+        repository, kalshi_client, shadow_mode=True, paper_mode=False,
+        max_staleness_seconds=settings.trading.reconciliation_max_staleness_seconds,
+        verification_timeout_seconds=settings.trading.order_verification_timeout_seconds,
+    )
+    return VerifiedExecutionService(repository, kalshi_client, reconciler, safety)
+
+
+async def _execute_verified_buy(position, db_manager, kalshi_client):
+    logger = get_trading_logger("trade_execution")
+    if not settings.trading.authoritative_live_execution_enabled:
+        try:
+            evaluator = SubmissionReadinessEvaluator(OrderRepository(db_manager.db_path))
+            report = await evaluator.evaluate(ReadinessContext(
+                live_mode=True,
+                authoritative_execution_enabled=settings.trading.authoritative_live_execution_enabled,
+                reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+                reconciliation_shadow_mode=settings.trading.reconciliation_shadow_mode,
+                kill_switch=settings.trading.live_order_submission_kill_switch,
+                configured_environment=settings.api.kalshi_environment,
+                client_environment=getattr(kalshi_client, "environment", None),
+                production_acknowledgement=settings.trading.production_execution_acknowledgement,
+                reconciliation_max_age_seconds=settings.trading.reconciliation_health_max_age_seconds,
+                market_id=position.market_id,
+            ), scope="pre_submission")
+            evaluator.log(report, logger)
+        except Exception:
+            logger.error("Submission readiness diagnostic unavailable")
+        logger.error("Legacy live buy path is disabled; authoritative execution is not enabled")
+        log_order_decision(
+            logger, market_id=position.market_id, strategy=position.strategy,
+            side=position.side, action="buy", price=position.entry_price,
+            quantity=position.quantity, outcome="BLOCKED",
+            reason="authoritative execution is disabled",
+            risk_limit="AUTHORITATIVE_LIVE_EXECUTION_ENABLED", api_attempted=False,
+        )
+        return False
+    try:
+        market = (await kalshi_client.get_market(position.market_id)).get("market", {})
+        if not is_tradeable_market(market):
+            log_order_decision(
+                logger, market_id=position.market_id, strategy=position.strategy,
+                side=position.side, action="buy", price=position.entry_price,
+                quantity=position.quantity, outcome="BLOCKED",
+                reason="market is aggregate or not directly tradeable",
+                risk_limit="TRADEABLE_MARKET", api_attempted=False,
+            )
+            return False
+        _, yes_ask, _, no_ask = get_market_prices(market)
+        price = yes_ask if position.side.upper() == "YES" else no_ask
+        if not 0.01 <= price <= 0.99:
+            log_order_decision(
+                logger, market_id=position.market_id, strategy=position.strategy,
+                side=position.side, action="buy", price=price,
+                quantity=position.quantity, outcome="BLOCKED",
+                reason="valid executable ask unavailable", risk_limit="VALID_QUOTE",
+                api_attempted=False,
+            )
+            return False
+        result = await _verified_service(db_manager, kalshi_client).execute(OrderIntent(
+            market_id=position.market_id, side=position.side, action="buy",
+            quantity=position.quantity, price=price, order_type="market",
+            position_id=position.id, environment=kalshi_client.environment,
+            strategy=position.strategy,
+            estimated_probability=getattr(position, "model_probability", None),
+            model_generated_at=getattr(position, "model_generated_at", None),
+            market_phase=getattr(position, "market_phase", "NOT_APPLICABLE"),
+            market_category=getattr(position, "market_category", ""),
+        ))
+        projected = await db_manager.get_position_by_id(position.id)
+        created = bool(
+            projected and projected.live and projected.status == "open"
+            and (projected.open_quantity or projected.quantity) > 0
+        )
+        log_order_decision(
+            logger, market_id=position.market_id, strategy=position.strategy,
+            side=position.side, action="buy", price=price, quantity=position.quantity,
+            outcome="FILLED" if created else "PENDING" if result.submitted else "BLOCKED",
+            reason="authoritative fill projected" if created else f"authoritative order state is {result.state}",
+            api_attempted=result.submitted,
+            order_id=str(result.order_id) if result.order_id is not None else None,
+        )
+        return created
+    except Exception as exc:
+        logger.error("Verified live buy refused", error=str(exc), market_id=position.market_id)
+        log_order_decision(
+            logger, market_id=position.market_id, strategy=position.strategy,
+            side=position.side, action="buy", price=position.entry_price,
+            quantity=position.quantity, outcome="BLOCKED",
+            reason="verified execution refused", api_attempted=False,
+            api_error_category=type(exc).__name__,
+        )
+        return False
 
 async def execute_position(
     position: Position, 
@@ -37,6 +157,8 @@ async def execute_position(
     logger.info(f"🎛️ Live mode: {live_mode}")
     
     if live_mode:
+        return await _execute_verified_buy(position, db_manager, kalshi_client)
+        # Disabled legacy acceptance-as-fill path retained for compatibility.
         logger.warning(f"💰 PLACING LIVE ORDER - Real money will be used for {position.market_id}")
         try:
             # Get current market prices to determine the appropriate price field
@@ -150,9 +272,15 @@ async def execute_position(
             return False
     else:
         # Simulate the trade
-        await db_manager.update_position_to_live(position.id, position.entry_price)
+        await db_manager.mark_position_paper(position.id, position.entry_price)
         logger.info(f"📝 PAPER TRADE SIMULATED for {position.market_id} - No real money used")
         logger.info(f"📊 Would have used: ${position.quantity * position.entry_price:.2f}")
+        log_order_decision(
+            logger, market_id=position.market_id, strategy=position.strategy,
+            side=position.side, action="buy", price=position.entry_price,
+            quantity=position.quantity, outcome="SIMULATED", reason="paper mode",
+            api_attempted=False,
+        )
         return True
 
 
@@ -175,6 +303,22 @@ async def place_sell_limit_order(
         True if order placed successfully, False otherwise
     """
     logger = get_trading_logger("sell_limit_order")
+    if not settings.trading.authoritative_live_execution_enabled:
+        logger.error("Legacy live sell path is disabled; authoritative execution is not enabled")
+        return False
+    try:
+        result = await _verified_service(db_manager, kalshi_client).execute(OrderIntent(
+            market_id=position.market_id, side=position.side, action="sell",
+            quantity=position.quantity, price=limit_price, order_type="limit",
+            position_id=position.id, environment=kalshi_client.environment,
+            strategy=position.strategy,
+        ))
+        return result.state in {"resting", "partially_filled", "fully_filled", "canceled"}
+    except Exception as exc:
+        logger.error("Verified live sell refused", error=str(exc), market_id=position.market_id)
+        return False
+
+    # Disabled legacy sell path retained temporarily for source compatibility.
     
     try:
         import uuid
@@ -270,11 +414,8 @@ async def place_profit_taking_orders(
                     logger.warning(f"Could not get market data for {position.market_id}")
                     continue
                 
-                # Get current price based on position side
-                if position.side == "YES":
-                    current_price = market_data.get('yes_price', 0) / 100  # Convert cents to dollars
-                else:
-                    current_price = market_data.get('no_price', 0) / 100
+                yes_bid, _, no_bid, _ = get_market_prices(market_data)
+                current_price = yes_bid if position.side == "YES" else no_bid
                 
                 # Calculate current profit
                 if current_price > 0:
@@ -358,11 +499,8 @@ async def place_stop_loss_orders(
                     logger.warning(f"Could not get market data for {position.market_id}")
                     continue
                 
-                # Get current price based on position side
-                if position.side == "YES":
-                    current_price = market_data.get('yes_price', 0) / 100
-                else:
-                    current_price = market_data.get('no_price', 0) / 100
+                yes_bid, _, no_bid, _ = get_market_prices(market_data)
+                current_price = yes_bid if position.side == "YES" else no_bid
                 
                 # Calculate current loss
                 if current_price > 0:

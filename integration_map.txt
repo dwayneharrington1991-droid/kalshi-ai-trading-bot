@@ -1,0 +1,2574 @@
+
+================================================================================
+FILE: src/strategies/portfolio/immediate.py
+================================================================================
+
+--- Lines 1-16 ---
+0001: """Immediate-trade evaluation.
+0002: 
+0003: Converts raw markets into scored MarketOpportunity objects (with fast AI
+0004: predictions) and decides single-market immediate trades. Split out of the
+0005: former 1,300-line portfolio_optimization.py.
+0006: """
+0007: 
+0008: import logging
+0009: import numpy as np
+0010: from datetime import datetime
+0011: from typing import List, Optional, Tuple
+0012: 
+0013: from src.utils.database import DatabaseManager, Market
+0014: from src.clients.kalshi_client import KalshiClient
+0015: from src.clients.xai_client import XAIClient
+0016: from src.config.settings import settings
+
+--- Lines 11-31 ---
+0011: from typing import List, Optional, Tuple
+0012: 
+0013: from src.utils.database import DatabaseManager, Market
+0014: from src.clients.kalshi_client import KalshiClient
+0015: from src.clients.xai_client import XAIClient
+0016: from src.config.settings import settings
+0017: from src.utils.logging_setup import get_trading_logger
+0018: from src.utils.market_prices import get_market_prices
+0019: from src.utils.position_sizing import binary_market_payout_odds, kelly_fraction
+0020: 
+0021: from src.strategies.portfolio.models import MarketOpportunity
+0022: 
+0023: 
+0024: async def create_market_opportunities_from_markets(
+0025:     markets: List[Market],
+0026:     xai_client: XAIClient,
+0027:     kalshi_client: KalshiClient,
+0028:     db_manager: DatabaseManager = None,
+0029:     total_capital: float = 10000
+0030: ) -> List[MarketOpportunity]:
+0031:     """
+
+--- Lines 52-72 ---
+0052:             market_info = market_data.get('market', {})
+0053:             market_prob = market_info.get('yes_price', 50) / 100
+0054:             
+0055:             # Skip markets with extreme prices (too risky for portfolio)
+0056:             if market_prob < 0.05 or market_prob > 0.95:
+0057:                 continue
+0058:             
+0059:             # Get REAL AI prediction using fast analysis
+0060:             predicted_prob, confidence = await _get_fast_ai_prediction(
+0061:                 market, xai_client, market_prob
+0062:             )
+0063:             
+0064:             # If AI analysis failed, skip this market
+0065:             if predicted_prob is None or confidence is None:
+0066:                 logger.warning(f"AI analysis failed for {market.market_id}, skipping")
+0067:                 continue
+0068:             
+0069:             # Calculate metrics
+0070:             edge = predicted_prob - market_prob
+0071:             expected_return = abs(edge) * confidence
+0072:             volatility = np.sqrt(market_prob * (1 - market_prob))
+
+--- Lines 57-77 ---
+0057:                 continue
+0058:             
+0059:             # Get REAL AI prediction using fast analysis
+0060:             predicted_prob, confidence = await _get_fast_ai_prediction(
+0061:                 market, xai_client, market_prob
+0062:             )
+0063:             
+0064:             # If AI analysis failed, skip this market
+0065:             if predicted_prob is None or confidence is None:
+0066:                 logger.warning(f"AI analysis failed for {market.market_id}, skipping")
+0067:                 continue
+0068:             
+0069:             # Calculate metrics
+0070:             edge = predicted_prob - market_prob
+0071:             expected_return = abs(edge) * confidence
+0072:             volatility = np.sqrt(market_prob * (1 - market_prob))
+0073:             max_loss = market_prob if edge > 0 else (1 - market_prob)
+0074:             
+0075:             # Time to expiry
+0076:             time_to_expiry = 30.0  # Default 30 days
+0077:             if hasattr(market, 'expiration_ts') and market.expiration_ts:
+
+--- Lines 63-83 ---
+0063:             
+0064:             # If AI analysis failed, skip this market
+0065:             if predicted_prob is None or confidence is None:
+0066:                 logger.warning(f"AI analysis failed for {market.market_id}, skipping")
+0067:                 continue
+0068:             
+0069:             # Calculate metrics
+0070:             edge = predicted_prob - market_prob
+0071:             expected_return = abs(edge) * confidence
+0072:             volatility = np.sqrt(market_prob * (1 - market_prob))
+0073:             max_loss = market_prob if edge > 0 else (1 - market_prob)
+0074:             
+0075:             # Time to expiry
+0076:             time_to_expiry = 30.0  # Default 30 days
+0077:             if hasattr(market, 'expiration_ts') and market.expiration_ts:
+0078:                 import time
+0079:                 time_to_expiry = (market.expiration_ts - time.time()) / 86400
+0080:                 time_to_expiry = max(0.1, time_to_expiry)
+0081:             
+0082:             # Apply Grok4 edge filtering - 10% minimum edge requirement
+0083:             from src.utils.edge_filter import EdgeFilter
+
+--- Lines 76-96 ---
+0076:             time_to_expiry = 30.0  # Default 30 days
+0077:             if hasattr(market, 'expiration_ts') and market.expiration_ts:
+0078:                 import time
+0079:                 time_to_expiry = (market.expiration_ts - time.time()) / 86400
+0080:                 time_to_expiry = max(0.1, time_to_expiry)
+0081:             
+0082:             # Apply Grok4 edge filtering - 10% minimum edge requirement
+0083:             from src.utils.edge_filter import EdgeFilter
+0084:             edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
+0085:             
+0086:             if edge_result.passes_filter:  # Must pass 10% edge filter
+0087:                 opportunity = MarketOpportunity(
+0088:                     market_id=market.market_id,
+0089:                     market_title=market.title,
+0090:                     predicted_probability=predicted_prob,
+0091:                     market_probability=market_prob,
+0092:                     confidence=confidence,
+0093:                     edge=edge,
+0094:                     volatility=volatility,
+0095:                     expected_return=expected_return,
+0096:                     max_loss=max_loss,
+
+--- Lines 84-104 ---
+0084:             edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
+0085:             
+0086:             if edge_result.passes_filter:  # Must pass 10% edge filter
+0087:                 opportunity = MarketOpportunity(
+0088:                     market_id=market.market_id,
+0089:                     market_title=market.title,
+0090:                     predicted_probability=predicted_prob,
+0091:                     market_probability=market_prob,
+0092:                     confidence=confidence,
+0093:                     edge=edge,
+0094:                     volatility=volatility,
+0095:                     expected_return=expected_return,
+0096:                     max_loss=max_loss,
+0097:                     time_to_expiry=time_to_expiry,
+0098:                     correlation_score=0.0,
+0099:                     kelly_fraction=0.0,
+0100:                     fractional_kelly=0.0,
+0101:                     risk_adjusted_fraction=0.0,
+0102:                     sharpe_ratio=0.0,
+0103:                     sortino_ratio=0.0,
+0104:                     max_drawdown_contribution=0.0
+
+--- Lines 91-111 ---
+0091:                     market_probability=market_prob,
+0092:                     confidence=confidence,
+0093:                     edge=edge,
+0094:                     volatility=volatility,
+0095:                     expected_return=expected_return,
+0096:                     max_loss=max_loss,
+0097:                     time_to_expiry=time_to_expiry,
+0098:                     correlation_score=0.0,
+0099:                     kelly_fraction=0.0,
+0100:                     fractional_kelly=0.0,
+0101:                     risk_adjusted_fraction=0.0,
+0102:                     sharpe_ratio=0.0,
+0103:                     sortino_ratio=0.0,
+0104:                     max_drawdown_contribution=0.0
+0105:                 )
+0106:                 
+0107:                 # Add edge filter results to opportunity
+0108:                 opportunity.edge = edge_result.edge_magnitude  # Use filtered edge
+0109:                 opportunity.edge_percentage = edge_result.edge_percentage
+0110:                 opportunity.recommended_side = edge_result.side
+0111:                 
+
+--- Lines 92-112 ---
+0092:                     confidence=confidence,
+0093:                     edge=edge,
+0094:                     volatility=volatility,
+0095:                     expected_return=expected_return,
+0096:                     max_loss=max_loss,
+0097:                     time_to_expiry=time_to_expiry,
+0098:                     correlation_score=0.0,
+0099:                     kelly_fraction=0.0,
+0100:                     fractional_kelly=0.0,
+0101:                     risk_adjusted_fraction=0.0,
+0102:                     sharpe_ratio=0.0,
+0103:                     sortino_ratio=0.0,
+0104:                     max_drawdown_contribution=0.0
+0105:                 )
+0106:                 
+0107:                 # Add edge filter results to opportunity
+0108:                 opportunity.edge = edge_result.edge_magnitude  # Use filtered edge
+0109:                 opportunity.edge_percentage = edge_result.edge_percentage
+0110:                 opportunity.recommended_side = edge_result.side
+0111:                 
+0112:                 opportunities.append(opportunity)
+
+--- Lines 105-125 ---
+0105:                 )
+0106:                 
+0107:                 # Add edge filter results to opportunity
+0108:                 opportunity.edge = edge_result.edge_magnitude  # Use filtered edge
+0109:                 opportunity.edge_percentage = edge_result.edge_percentage
+0110:                 opportunity.recommended_side = edge_result.side
+0111:                 
+0112:                 opportunities.append(opportunity)
+0113:                 logger.info(f"✅ EDGE APPROVED: {market.market_id} - Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), Confidence: {confidence:.1%}, Reason: {edge_result.reason}")
+0114:                 
+0115:                 # 🚀 IMMEDIATE TRADING: Place trade for strong opportunities
+0116:                 if db_manager:
+0117:                     await _evaluate_immediate_trade(opportunity, db_manager, kalshi_client, total_capital)
+0118:             else:
+0119:                 logger.info(f"❌ EDGE FILTERED: {market.market_id} - {edge_result.reason}")
+0120:             
+0121:         except Exception as e:
+0122:             logger.error(f"Error creating opportunity from {market.market_id}: {e}")
+0123:             continue
+0124:     
+0125:     logger.info(f"Created {len(opportunities)} opportunities from {len(markets)} markets")
+
+--- Lines 140-160 ---
+0140:     try:
+0141:         # Use enhanced edge filtering for immediate trading decisions
+0142:         from src.utils.edge_filter import EdgeFilter
+0143:         
+0144:         # Check if opportunity meets immediate trading criteria using edge filter
+0145:         should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(
+0146:             ai_probability=opportunity.predicted_probability,
+0147:             market_probability=opportunity.market_probability,
+0148:             confidence=opportunity.confidence,
+0149:             additional_filters={
+0150:                 'volume': getattr(opportunity, 'volume', 1000),
+0151:                 'min_volume': 1000,
+0152:                 'time_to_expiry_days': opportunity.time_to_expiry,
+0153:                 'max_time_to_expiry': 365
+0154:             }
+0155:         )
+0156:         
+0157:         # Additional criteria for immediate execution - MORE AGGRESSIVE
+0158:         strong_opportunity = (
+0159:             should_trade and
+0160:             edge_result.edge_percentage >= 0.10 and  # DECREASED: 10% edge for immediate execution (was 18%)
+
+--- Lines 153-173 ---
+0153:                 'max_time_to_expiry': 365
+0154:             }
+0155:         )
+0156:         
+0157:         # Additional criteria for immediate execution - MORE AGGRESSIVE
+0158:         strong_opportunity = (
+0159:             should_trade and
+0160:             edge_result.edge_percentage >= 0.10 and  # DECREASED: 10% edge for immediate execution (was 18%)
+0161:             opportunity.confidence >= 0.60 and       # DECREASED: 60% confidence (was 75%)
+0162:             opportunity.expected_return >= 0.05      # DECREASED: 5% expected return (was 8%)
+0163:         )
+0164:         
+0165:         if not strong_opportunity:
+0166:             return  # Not strong enough for immediate action
+0167:         
+0168:         # Check position limits and get maximum allowed position size
+0169:         from src.utils.position_limits import check_can_add_position
+0170:         
+0171:         # Get portfolio value for position sizing
+0172:         try:
+0173:             balance_response = await kalshi_client.get_balance()
+
+--- Lines 191-211 ---
+0191:             total_portfolio_value = available_cash + total_position_value
+0192:             logger.info(f"💰 Portfolio value: Cash=${available_cash:.2f} + Positions=${total_position_value:.2f} = Total=${total_portfolio_value:.2f}")
+0193:             
+0194:         except Exception as e:
+0195:             logger.warning(f"Could not get portfolio value, using available cash: {e}")
+0196:             total_portfolio_value = total_capital
+0197:             available_cash = total_capital
+0198:         
+0199:         # Calculate Kelly-optimal position size
+0200:         kelly_fraction = _calculate_simple_kelly(opportunity)
+0201:         kelly_multiplier = settings.trading.kelly_fraction  # Use configured Kelly fraction (0.75)
+0202:         kelly_position_size = kelly_fraction * kelly_multiplier * total_portfolio_value
+0203:         
+0204:         # Safety cap: never exceed configured max per position
+0205:         max_single_position_pct = settings.trading.max_single_position  # Safety cap from config
+0206:         safety_cap = total_portfolio_value * max_single_position_pct
+0207:         
+0208:         # Cash availability constraint
+0209:         cash_limit = available_cash * 0.8  # Don't use more than 80% of available cash
+0210:         
+0211:         # Initial position size: Kelly-optimal, but capped for safety and cash availability
+
+--- Lines 192-212 ---
+0192:             logger.info(f"💰 Portfolio value: Cash=${available_cash:.2f} + Positions=${total_position_value:.2f} = Total=${total_portfolio_value:.2f}")
+0193:             
+0194:         except Exception as e:
+0195:             logger.warning(f"Could not get portfolio value, using available cash: {e}")
+0196:             total_portfolio_value = total_capital
+0197:             available_cash = total_capital
+0198:         
+0199:         # Calculate Kelly-optimal position size
+0200:         kelly_fraction = _calculate_simple_kelly(opportunity)
+0201:         kelly_multiplier = settings.trading.kelly_fraction  # Use configured Kelly fraction (0.75)
+0202:         kelly_position_size = kelly_fraction * kelly_multiplier * total_portfolio_value
+0203:         
+0204:         # Safety cap: never exceed configured max per position
+0205:         max_single_position_pct = settings.trading.max_single_position  # Safety cap from config
+0206:         safety_cap = total_portfolio_value * max_single_position_pct
+0207:         
+0208:         # Cash availability constraint
+0209:         cash_limit = available_cash * 0.8  # Don't use more than 80% of available cash
+0210:         
+0211:         # Initial position size: Kelly-optimal, but capped for safety and cash availability
+0212:         initial_position_size = min(
+
+--- Lines 193-213 ---
+0193:             
+0194:         except Exception as e:
+0195:             logger.warning(f"Could not get portfolio value, using available cash: {e}")
+0196:             total_portfolio_value = total_capital
+0197:             available_cash = total_capital
+0198:         
+0199:         # Calculate Kelly-optimal position size
+0200:         kelly_fraction = _calculate_simple_kelly(opportunity)
+0201:         kelly_multiplier = settings.trading.kelly_fraction  # Use configured Kelly fraction (0.75)
+0202:         kelly_position_size = kelly_fraction * kelly_multiplier * total_portfolio_value
+0203:         
+0204:         # Safety cap: never exceed configured max per position
+0205:         max_single_position_pct = settings.trading.max_single_position  # Safety cap from config
+0206:         safety_cap = total_portfolio_value * max_single_position_pct
+0207:         
+0208:         # Cash availability constraint
+0209:         cash_limit = available_cash * 0.8  # Don't use more than 80% of available cash
+0210:         
+0211:         # Initial position size: Kelly-optimal, but capped for safety and cash availability
+0212:         initial_position_size = min(
+0213:             kelly_position_size,  # Kelly-optimal size
+
+--- Lines 194-214 ---
+0194:         except Exception as e:
+0195:             logger.warning(f"Could not get portfolio value, using available cash: {e}")
+0196:             total_portfolio_value = total_capital
+0197:             available_cash = total_capital
+0198:         
+0199:         # Calculate Kelly-optimal position size
+0200:         kelly_fraction = _calculate_simple_kelly(opportunity)
+0201:         kelly_multiplier = settings.trading.kelly_fraction  # Use configured Kelly fraction (0.75)
+0202:         kelly_position_size = kelly_fraction * kelly_multiplier * total_portfolio_value
+0203:         
+0204:         # Safety cap: never exceed configured max per position
+0205:         max_single_position_pct = settings.trading.max_single_position  # Safety cap from config
+0206:         safety_cap = total_portfolio_value * max_single_position_pct
+0207:         
+0208:         # Cash availability constraint
+0209:         cash_limit = available_cash * 0.8  # Don't use more than 80% of available cash
+0210:         
+0211:         # Initial position size: Kelly-optimal, but capped for safety and cash availability
+0212:         initial_position_size = min(
+0213:             kelly_position_size,  # Kelly-optimal size
+0214:             safety_cap,          # Safety cap (5% max)
+
+--- Lines 203-223 ---
+0203:         
+0204:         # Safety cap: never exceed configured max per position
+0205:         max_single_position_pct = settings.trading.max_single_position  # Safety cap from config
+0206:         safety_cap = total_portfolio_value * max_single_position_pct
+0207:         
+0208:         # Cash availability constraint
+0209:         cash_limit = available_cash * 0.8  # Don't use more than 80% of available cash
+0210:         
+0211:         # Initial position size: Kelly-optimal, but capped for safety and cash availability
+0212:         initial_position_size = min(
+0213:             kelly_position_size,  # Kelly-optimal size
+0214:             safety_cap,          # Safety cap (5% max)
+0215:             cash_limit           # Available cash constraint
+0216:         )
+0217:         
+0218:         # Check position limits with actual calculated size
+0219:         can_add_position, limit_reason = await check_can_add_position(
+0220:             initial_position_size, db_manager, kalshi_client
+0221:         )
+0222:         
+0223:         if not can_add_position:
+
+--- Lines 204-224 ---
+0204:         # Safety cap: never exceed configured max per position
+0205:         max_single_position_pct = settings.trading.max_single_position  # Safety cap from config
+0206:         safety_cap = total_portfolio_value * max_single_position_pct
+0207:         
+0208:         # Cash availability constraint
+0209:         cash_limit = available_cash * 0.8  # Don't use more than 80% of available cash
+0210:         
+0211:         # Initial position size: Kelly-optimal, but capped for safety and cash availability
+0212:         initial_position_size = min(
+0213:             kelly_position_size,  # Kelly-optimal size
+0214:             safety_cap,          # Safety cap (5% max)
+0215:             cash_limit           # Available cash constraint
+0216:         )
+0217:         
+0218:         # Check position limits with actual calculated size
+0219:         can_add_position, limit_reason = await check_can_add_position(
+0220:             initial_position_size, db_manager, kalshi_client
+0221:         )
+0222:         
+0223:         if not can_add_position:
+0224:             # Instead of blocking, try to find a smaller position size that fits
+
+--- Lines 205-225 ---
+0205:         max_single_position_pct = settings.trading.max_single_position  # Safety cap from config
+0206:         safety_cap = total_portfolio_value * max_single_position_pct
+0207:         
+0208:         # Cash availability constraint
+0209:         cash_limit = available_cash * 0.8  # Don't use more than 80% of available cash
+0210:         
+0211:         # Initial position size: Kelly-optimal, but capped for safety and cash availability
+0212:         initial_position_size = min(
+0213:             kelly_position_size,  # Kelly-optimal size
+0214:             safety_cap,          # Safety cap (5% max)
+0215:             cash_limit           # Available cash constraint
+0216:         )
+0217:         
+0218:         # Check position limits with actual calculated size
+0219:         can_add_position, limit_reason = await check_can_add_position(
+0220:             initial_position_size, db_manager, kalshi_client
+0221:         )
+0222:         
+0223:         if not can_add_position:
+0224:             # Instead of blocking, try to find a smaller position size that fits
+0225:             logger.info(f"⚠️ Position size ${initial_position_size:.2f} exceeds limits, attempting to reduce...")
+
+--- Lines 212-232 ---
+0212:         initial_position_size = min(
+0213:             kelly_position_size,  # Kelly-optimal size
+0214:             safety_cap,          # Safety cap (5% max)
+0215:             cash_limit           # Available cash constraint
+0216:         )
+0217:         
+0218:         # Check position limits with actual calculated size
+0219:         can_add_position, limit_reason = await check_can_add_position(
+0220:             initial_position_size, db_manager, kalshi_client
+0221:         )
+0222:         
+0223:         if not can_add_position:
+0224:             # Instead of blocking, try to find a smaller position size that fits
+0225:             logger.info(f"⚠️ Position size ${initial_position_size:.2f} exceeds limits, attempting to reduce...")
+0226:             
+0227:             # Try progressively smaller position sizes
+0228:             for reduction_factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
+0229:                 reduced_position_size = initial_position_size * reduction_factor
+0230:                 can_add_reduced, reduced_reason = await check_can_add_position(
+0231:                     reduced_position_size, db_manager, kalshi_client
+0232:                 )
+
+--- Lines 217-237 ---
+0217:         
+0218:         # Check position limits with actual calculated size
+0219:         can_add_position, limit_reason = await check_can_add_position(
+0220:             initial_position_size, db_manager, kalshi_client
+0221:         )
+0222:         
+0223:         if not can_add_position:
+0224:             # Instead of blocking, try to find a smaller position size that fits
+0225:             logger.info(f"⚠️ Position size ${initial_position_size:.2f} exceeds limits, attempting to reduce...")
+0226:             
+0227:             # Try progressively smaller position sizes
+0228:             for reduction_factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
+0229:                 reduced_position_size = initial_position_size * reduction_factor
+0230:                 can_add_reduced, reduced_reason = await check_can_add_position(
+0231:                     reduced_position_size, db_manager, kalshi_client
+0232:                 )
+0233:                 
+0234:                 if can_add_reduced:
+0235:                     initial_position_size = reduced_position_size
+0236:                     logger.info(f"✅ Position size reduced to ${initial_position_size:.2f} to fit limits")
+0237:                     break
+
+--- Lines 221-241 ---
+0221:         )
+0222:         
+0223:         if not can_add_position:
+0224:             # Instead of blocking, try to find a smaller position size that fits
+0225:             logger.info(f"⚠️ Position size ${initial_position_size:.2f} exceeds limits, attempting to reduce...")
+0226:             
+0227:             # Try progressively smaller position sizes
+0228:             for reduction_factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
+0229:                 reduced_position_size = initial_position_size * reduction_factor
+0230:                 can_add_reduced, reduced_reason = await check_can_add_position(
+0231:                     reduced_position_size, db_manager, kalshi_client
+0232:                 )
+0233:                 
+0234:                 if can_add_reduced:
+0235:                     initial_position_size = reduced_position_size
+0236:                     logger.info(f"✅ Position size reduced to ${initial_position_size:.2f} to fit limits")
+0237:                     break
+0238:             else:
+0239:                 # If even the smallest size doesn't fit, check if it's due to position count
+0240:                 from src.utils.position_limits import PositionLimitsManager
+0241:                 limits_manager = PositionLimitsManager(db_manager, kalshi_client)
+
+--- Lines 223-243 ---
+0223:         if not can_add_position:
+0224:             # Instead of blocking, try to find a smaller position size that fits
+0225:             logger.info(f"⚠️ Position size ${initial_position_size:.2f} exceeds limits, attempting to reduce...")
+0226:             
+0227:             # Try progressively smaller position sizes
+0228:             for reduction_factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
+0229:                 reduced_position_size = initial_position_size * reduction_factor
+0230:                 can_add_reduced, reduced_reason = await check_can_add_position(
+0231:                     reduced_position_size, db_manager, kalshi_client
+0232:                 )
+0233:                 
+0234:                 if can_add_reduced:
+0235:                     initial_position_size = reduced_position_size
+0236:                     logger.info(f"✅ Position size reduced to ${initial_position_size:.2f} to fit limits")
+0237:                     break
+0238:             else:
+0239:                 # If even the smallest size doesn't fit, check if it's due to position count
+0240:                 from src.utils.position_limits import PositionLimitsManager
+0241:                 limits_manager = PositionLimitsManager(db_manager, kalshi_client)
+0242:                 current_positions = await limits_manager._get_position_count()
+0243:                 
+
+--- Lines 227-247 ---
+0227:             # Try progressively smaller position sizes
+0228:             for reduction_factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
+0229:                 reduced_position_size = initial_position_size * reduction_factor
+0230:                 can_add_reduced, reduced_reason = await check_can_add_position(
+0231:                     reduced_position_size, db_manager, kalshi_client
+0232:                 )
+0233:                 
+0234:                 if can_add_reduced:
+0235:                     initial_position_size = reduced_position_size
+0236:                     logger.info(f"✅ Position size reduced to ${initial_position_size:.2f} to fit limits")
+0237:                     break
+0238:             else:
+0239:                 # If even the smallest size doesn't fit, check if it's due to position count
+0240:                 from src.utils.position_limits import PositionLimitsManager
+0241:                 limits_manager = PositionLimitsManager(db_manager, kalshi_client)
+0242:                 current_positions = await limits_manager._get_position_count()
+0243:                 
+0244:                 if current_positions >= limits_manager.max_positions:
+0245:                     logger.info(f"❌ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
+0246:                     return
+0247:                 else:
+
+--- Lines 228-248 ---
+0228:             for reduction_factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
+0229:                 reduced_position_size = initial_position_size * reduction_factor
+0230:                 can_add_reduced, reduced_reason = await check_can_add_position(
+0231:                     reduced_position_size, db_manager, kalshi_client
+0232:                 )
+0233:                 
+0234:                 if can_add_reduced:
+0235:                     initial_position_size = reduced_position_size
+0236:                     logger.info(f"✅ Position size reduced to ${initial_position_size:.2f} to fit limits")
+0237:                     break
+0238:             else:
+0239:                 # If even the smallest size doesn't fit, check if it's due to position count
+0240:                 from src.utils.position_limits import PositionLimitsManager
+0241:                 limits_manager = PositionLimitsManager(db_manager, kalshi_client)
+0242:                 current_positions = await limits_manager._get_position_count()
+0243:                 
+0244:                 if current_positions >= limits_manager.max_positions:
+0245:                     logger.info(f"❌ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
+0246:                     return
+0247:                 else:
+0248:                     logger.info(f"❌ POSITION SIZE LIMIT: Even minimum size ${initial_position_size * 0.1:.2f} exceeds limits")
+
+--- Lines 240-260 ---
+0240:                 from src.utils.position_limits import PositionLimitsManager
+0241:                 limits_manager = PositionLimitsManager(db_manager, kalshi_client)
+0242:                 current_positions = await limits_manager._get_position_count()
+0243:                 
+0244:                 if current_positions >= limits_manager.max_positions:
+0245:                     logger.info(f"❌ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
+0246:                     return
+0247:                 else:
+0248:                     logger.info(f"❌ POSITION SIZE LIMIT: Even minimum size ${initial_position_size * 0.1:.2f} exceeds limits")
+0249:                     return
+0250:         
+0251:         logger.info(f"✅ POSITION LIMITS OK FOR IMMEDIATE TRADE: ${initial_position_size:.2f}")
+0252:         
+0253:         # Check if we already have a position in this market
+0254:         import aiosqlite
+0255:         async with aiosqlite.connect(db_manager.db_path) as db:
+0256:             cursor = await db.execute(
+0257:                 "SELECT COUNT(*) FROM positions WHERE market_id = ? AND status = 'open'",
+0258:                 (opportunity.market_id,)
+0259:             )
+0260:             result = await cursor.fetchone()
+
+--- Lines 243-263 ---
+0243:                 
+0244:                 if current_positions >= limits_manager.max_positions:
+0245:                     logger.info(f"❌ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
+0246:                     return
+0247:                 else:
+0248:                     logger.info(f"❌ POSITION SIZE LIMIT: Even minimum size ${initial_position_size * 0.1:.2f} exceeds limits")
+0249:                     return
+0250:         
+0251:         logger.info(f"✅ POSITION LIMITS OK FOR IMMEDIATE TRADE: ${initial_position_size:.2f}")
+0252:         
+0253:         # Check if we already have a position in this market
+0254:         import aiosqlite
+0255:         async with aiosqlite.connect(db_manager.db_path) as db:
+0256:             cursor = await db.execute(
+0257:                 "SELECT COUNT(*) FROM positions WHERE market_id = ? AND status = 'open'",
+0258:                 (opportunity.market_id,)
+0259:             )
+0260:             result = await cursor.fetchone()
+0261:             position_count = result[0] if result else 0
+0262:         
+0263:         if position_count > 0:
+
+--- Lines 256-276 ---
+0256:             cursor = await db.execute(
+0257:                 "SELECT COUNT(*) FROM positions WHERE market_id = ? AND status = 'open'",
+0258:                 (opportunity.market_id,)
+0259:             )
+0260:             result = await cursor.fetchone()
+0261:             position_count = result[0] if result else 0
+0262:         
+0263:         if position_count > 0:
+0264:             logger.info(f"⏭️ Skipping immediate trade for {opportunity.market_id} - position already exists")
+0265:             return
+0266:         
+0267:         # 🚀 STRONG OPPORTUNITY - TRADE IMMEDIATELY!
+0268:         logger.info(f"🚀 IMMEDIATE TRADE: {opportunity.market_id} - Edge: {opportunity.edge:.1%}, Confidence: {opportunity.confidence:.1%}")
+0269:         
+0270:         # Use the position size that was already calculated and validated above
+0271:         position_size = initial_position_size
+0272:         
+0273:         logger.info(f"💰 Using validated position size: ${position_size:.2f}")
+0274:         
+0275:         # Final cash reserves check with actual calculated size
+0276:         from src.utils.cash_reserves import check_can_trade_with_cash_reserves
+
+--- Lines 260-280 ---
+0260:             result = await cursor.fetchone()
+0261:             position_count = result[0] if result else 0
+0262:         
+0263:         if position_count > 0:
+0264:             logger.info(f"⏭️ Skipping immediate trade for {opportunity.market_id} - position already exists")
+0265:             return
+0266:         
+0267:         # 🚀 STRONG OPPORTUNITY - TRADE IMMEDIATELY!
+0268:         logger.info(f"🚀 IMMEDIATE TRADE: {opportunity.market_id} - Edge: {opportunity.edge:.1%}, Confidence: {opportunity.confidence:.1%}")
+0269:         
+0270:         # Use the position size that was already calculated and validated above
+0271:         position_size = initial_position_size
+0272:         
+0273:         logger.info(f"💰 Using validated position size: ${position_size:.2f}")
+0274:         
+0275:         # Final cash reserves check with actual calculated size
+0276:         from src.utils.cash_reserves import check_can_trade_with_cash_reserves
+0277:         
+0278:         can_trade_reserves, reserves_reason = await check_can_trade_with_cash_reserves(
+0279:             position_size, db_manager, kalshi_client
+0280:         )
+
+--- Lines 263-283 ---
+0263:         if position_count > 0:
+0264:             logger.info(f"⏭️ Skipping immediate trade for {opportunity.market_id} - position already exists")
+0265:             return
+0266:         
+0267:         # 🚀 STRONG OPPORTUNITY - TRADE IMMEDIATELY!
+0268:         logger.info(f"🚀 IMMEDIATE TRADE: {opportunity.market_id} - Edge: {opportunity.edge:.1%}, Confidence: {opportunity.confidence:.1%}")
+0269:         
+0270:         # Use the position size that was already calculated and validated above
+0271:         position_size = initial_position_size
+0272:         
+0273:         logger.info(f"💰 Using validated position size: ${position_size:.2f}")
+0274:         
+0275:         # Final cash reserves check with actual calculated size
+0276:         from src.utils.cash_reserves import check_can_trade_with_cash_reserves
+0277:         
+0278:         can_trade_reserves, reserves_reason = await check_can_trade_with_cash_reserves(
+0279:             position_size, db_manager, kalshi_client
+0280:         )
+0281:         
+0282:         if not can_trade_reserves:
+0283:             logger.info(f"❌ CASH RESERVES CHECK FAILED: {opportunity.market_id} - {reserves_reason}")
+
+--- Lines 265-285 ---
+0265:             return
+0266:         
+0267:         # 🚀 STRONG OPPORTUNITY - TRADE IMMEDIATELY!
+0268:         logger.info(f"🚀 IMMEDIATE TRADE: {opportunity.market_id} - Edge: {opportunity.edge:.1%}, Confidence: {opportunity.confidence:.1%}")
+0269:         
+0270:         # Use the position size that was already calculated and validated above
+0271:         position_size = initial_position_size
+0272:         
+0273:         logger.info(f"💰 Using validated position size: ${position_size:.2f}")
+0274:         
+0275:         # Final cash reserves check with actual calculated size
+0276:         from src.utils.cash_reserves import check_can_trade_with_cash_reserves
+0277:         
+0278:         can_trade_reserves, reserves_reason = await check_can_trade_with_cash_reserves(
+0279:             position_size, db_manager, kalshi_client
+0280:         )
+0281:         
+0282:         if not can_trade_reserves:
+0283:             logger.info(f"❌ CASH RESERVES CHECK FAILED: {opportunity.market_id} - {reserves_reason}")
+0284:             return
+0285:         
+
+--- Lines 271-291 ---
+0271:         position_size = initial_position_size
+0272:         
+0273:         logger.info(f"💰 Using validated position size: ${position_size:.2f}")
+0274:         
+0275:         # Final cash reserves check with actual calculated size
+0276:         from src.utils.cash_reserves import check_can_trade_with_cash_reserves
+0277:         
+0278:         can_trade_reserves, reserves_reason = await check_can_trade_with_cash_reserves(
+0279:             position_size, db_manager, kalshi_client
+0280:         )
+0281:         
+0282:         if not can_trade_reserves:
+0283:             logger.info(f"❌ CASH RESERVES CHECK FAILED: {opportunity.market_id} - {reserves_reason}")
+0284:             return
+0285:         
+0286:         logger.info(f"✅ CASH RESERVES APPROVED: ${position_size:.2f} - {reserves_reason}")
+0287:         
+0288:         # NO DOLLAR MINIMUM - we'll ensure at least 1 contract below
+0289:         
+0290:         # Determine side based on edge direction
+0291:         side = "NO" if opportunity.edge < 0 else "YES"  # Negative edge = market overpriced = bet NO
+
+--- Lines 278-298 ---
+0278:         can_trade_reserves, reserves_reason = await check_can_trade_with_cash_reserves(
+0279:             position_size, db_manager, kalshi_client
+0280:         )
+0281:         
+0282:         if not can_trade_reserves:
+0283:             logger.info(f"❌ CASH RESERVES CHECK FAILED: {opportunity.market_id} - {reserves_reason}")
+0284:             return
+0285:         
+0286:         logger.info(f"✅ CASH RESERVES APPROVED: ${position_size:.2f} - {reserves_reason}")
+0287:         
+0288:         # NO DOLLAR MINIMUM - we'll ensure at least 1 contract below
+0289:         
+0290:         # Determine side based on edge direction
+0291:         side = "NO" if opportunity.edge < 0 else "YES"  # Negative edge = market overpriced = bet NO
+0292:         
+0293:         # Calculate proper entry price (what we expect to pay)
+0294:         if side == "YES":
+0295:             entry_price = opportunity.market_probability  # Price for YES shares
+0296:             shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
+0297:         else:
+0298:             entry_price = 1 - opportunity.market_probability  # Price for NO shares  
+
+--- Lines 288-308 ---
+0288:         # NO DOLLAR MINIMUM - we'll ensure at least 1 contract below
+0289:         
+0290:         # Determine side based on edge direction
+0291:         side = "NO" if opportunity.edge < 0 else "YES"  # Negative edge = market overpriced = bet NO
+0292:         
+0293:         # Calculate proper entry price (what we expect to pay)
+0294:         if side == "YES":
+0295:             entry_price = opportunity.market_probability  # Price for YES shares
+0296:             shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
+0297:         else:
+0298:             entry_price = 1 - opportunity.market_probability  # Price for NO shares  
+0299:             shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
+0300:         
+0301:         # Verify we can afford at least 1 contract
+0302:         min_cost = shares * entry_price
+0303:         if min_cost > available_cash:
+0304:             logger.info(f"⏭️ Cannot afford minimum 1 contract: ${min_cost:.2f} > ${available_cash:.2f}")
+0305:             return
+0306:             
+0307:         logger.info(f"📊 Trade details: {shares} {side} shares @ ${entry_price:.2f} = ${min_cost:.2f}")
+0308:         
+
+--- Lines 291-311 ---
+0291:         side = "NO" if opportunity.edge < 0 else "YES"  # Negative edge = market overpriced = bet NO
+0292:         
+0293:         # Calculate proper entry price (what we expect to pay)
+0294:         if side == "YES":
+0295:             entry_price = opportunity.market_probability  # Price for YES shares
+0296:             shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
+0297:         else:
+0298:             entry_price = 1 - opportunity.market_probability  # Price for NO shares  
+0299:             shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
+0300:         
+0301:         # Verify we can afford at least 1 contract
+0302:         min_cost = shares * entry_price
+0303:         if min_cost > available_cash:
+0304:             logger.info(f"⏭️ Cannot afford minimum 1 contract: ${min_cost:.2f} > ${available_cash:.2f}")
+0305:             return
+0306:             
+0307:         logger.info(f"📊 Trade details: {shares} {side} shares @ ${entry_price:.2f} = ${min_cost:.2f}")
+0308:         
+0309:         # Calculate proper stop-loss levels using Grok4 recommendations
+0310:         from src.utils.stop_loss_calculator import StopLossCalculator
+0311:         
+
+--- Lines 307-327 ---
+0307:         logger.info(f"📊 Trade details: {shares} {side} shares @ ${entry_price:.2f} = ${min_cost:.2f}")
+0308:         
+0309:         # Calculate proper stop-loss levels using Grok4 recommendations
+0310:         from src.utils.stop_loss_calculator import StopLossCalculator
+0311:         
+0312:         exit_levels = StopLossCalculator.calculate_stop_loss_levels(
+0313:             entry_price=entry_price,
+0314:             side=side,
+0315:             confidence=opportunity.confidence,
+0316:             market_volatility=opportunity.volatility,
+0317:             time_to_expiry_days=opportunity.time_to_expiry
+0318:         )
+0319:         
+0320:         # Create position directly
+0321:         from src.utils.database import Position
+0322:         from src.jobs.execute import execute_position
+0323:         
+0324:         position = Position(
+0325:             market_id=opportunity.market_id,
+0326:             side=side,
+0327:             quantity=shares,
+
+--- Lines 314-334 ---
+0314:             side=side,
+0315:             confidence=opportunity.confidence,
+0316:             market_volatility=opportunity.volatility,
+0317:             time_to_expiry_days=opportunity.time_to_expiry
+0318:         )
+0319:         
+0320:         # Create position directly
+0321:         from src.utils.database import Position
+0322:         from src.jobs.execute import execute_position
+0323:         
+0324:         position = Position(
+0325:             market_id=opportunity.market_id,
+0326:             side=side,
+0327:             quantity=shares,
+0328:             entry_price=entry_price,
+0329:             live=False,  # Will be set to True ONLY after successful execution
+0330:             timestamp=datetime.now(),
+0331:             rationale=f"IMMEDIATE TRADE: Edge={opportunity.edge_percentage:.1%} ({opportunity.recommended_side}), Conf={opportunity.confidence:.1%}, Kelly={kelly_fraction:.1%}, Stop={exit_levels['stop_loss_pct']}%",
+0332:             strategy="immediate_portfolio_optimization",
+0333:             
+0334:             # Enhanced exit strategy using Grok4 recommendations
+
+--- Lines 323-343 ---
+0323:         
+0324:         position = Position(
+0325:             market_id=opportunity.market_id,
+0326:             side=side,
+0327:             quantity=shares,
+0328:             entry_price=entry_price,
+0329:             live=False,  # Will be set to True ONLY after successful execution
+0330:             timestamp=datetime.now(),
+0331:             rationale=f"IMMEDIATE TRADE: Edge={opportunity.edge_percentage:.1%} ({opportunity.recommended_side}), Conf={opportunity.confidence:.1%}, Kelly={kelly_fraction:.1%}, Stop={exit_levels['stop_loss_pct']}%",
+0332:             strategy="immediate_portfolio_optimization",
+0333:             
+0334:             # Enhanced exit strategy using Grok4 recommendations
+0335:             stop_loss_price=exit_levels['stop_loss_price'],
+0336:             take_profit_price=exit_levels['take_profit_price'],
+0337:             max_hold_hours=exit_levels['max_hold_hours'],
+0338:             target_confidence_change=exit_levels['target_confidence_change']
+0339:         )
+0340:         
+0341:         # 🚨 VALIDATE MARKET IS STILL TRADEABLE before executing
+0342:         try:
+0343:             market_data = await kalshi_client.get_market(opportunity.market_id)
+
+--- Lines 330-350 ---
+0330:             timestamp=datetime.now(),
+0331:             rationale=f"IMMEDIATE TRADE: Edge={opportunity.edge_percentage:.1%} ({opportunity.recommended_side}), Conf={opportunity.confidence:.1%}, Kelly={kelly_fraction:.1%}, Stop={exit_levels['stop_loss_pct']}%",
+0332:             strategy="immediate_portfolio_optimization",
+0333:             
+0334:             # Enhanced exit strategy using Grok4 recommendations
+0335:             stop_loss_price=exit_levels['stop_loss_price'],
+0336:             take_profit_price=exit_levels['take_profit_price'],
+0337:             max_hold_hours=exit_levels['max_hold_hours'],
+0338:             target_confidence_change=exit_levels['target_confidence_change']
+0339:         )
+0340:         
+0341:         # 🚨 VALIDATE MARKET IS STILL TRADEABLE before executing
+0342:         try:
+0343:             market_data = await kalshi_client.get_market(opportunity.market_id)
+0344:             
+0345:             # FIXED: Extract from nested 'market' object in API response
+0346:             market_info = market_data.get('market', {})
+0347:             market_status = market_info.get('status')
+0348:             _yes_bid, yes_ask, _no_bid, no_ask = get_market_prices(market_info)
+0349:             
+0350:             logger.info(f"🔍 Market validation for {opportunity.market_id}: status={market_status}, YES={yes_ask:.4f}, NO={no_ask:.4f}")
+
+--- Lines 370-390 ---
+0370:             logger.error(f"⏭️ Skipping {opportunity.market_id} - Market validation failed: {e}")
+0371:             import traceback
+0372:             logger.error(f"Full error: {traceback.format_exc()}")
+0373:             return
+0374:         
+0375:         # Execute immediately
+0376:         position_id = await db_manager.add_position(position)
+0377:         if position_id:
+0378:             # Set the position ID so execute_position can update the database
+0379:             position.id = position_id
+0380:             
+0381:             # Execute the trade - respect the global trading mode setting
+0382:             live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+0383:             success = await execute_position(position, live_mode, db_manager, kalshi_client)
+0384:             if success:
+0385:                 logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
+0386:             else:
+0387:                 logger.error(f"❌ IMMEDIATE TRADE FAILED: {opportunity.market_id}")
+0388:         
+0389:     except Exception as e:
+0390:         logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
+
+--- Lines 375-395 ---
+0375:         # Execute immediately
+0376:         position_id = await db_manager.add_position(position)
+0377:         if position_id:
+0378:             # Set the position ID so execute_position can update the database
+0379:             position.id = position_id
+0380:             
+0381:             # Execute the trade - respect the global trading mode setting
+0382:             live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+0383:             success = await execute_position(position, live_mode, db_manager, kalshi_client)
+0384:             if success:
+0385:                 logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
+0386:             else:
+0387:                 logger.error(f"❌ IMMEDIATE TRADE FAILED: {opportunity.market_id}")
+0388:         
+0389:     except Exception as e:
+0390:         logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
+0391: 
+0392: def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
+0393:     """Calculate simple Kelly fraction for immediate trading.
+0394: 
+0395:     Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
+
+--- Lines 377-397 ---
+0377:         if position_id:
+0378:             # Set the position ID so execute_position can update the database
+0379:             position.id = position_id
+0380:             
+0381:             # Execute the trade - respect the global trading mode setting
+0382:             live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+0383:             success = await execute_position(position, live_mode, db_manager, kalshi_client)
+0384:             if success:
+0385:                 logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
+0386:             else:
+0387:                 logger.error(f"❌ IMMEDIATE TRADE FAILED: {opportunity.market_id}")
+0388:         
+0389:     except Exception as e:
+0390:         logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
+0391: 
+0392: def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
+0393:     """Calculate simple Kelly fraction for immediate trading.
+0394: 
+0395:     Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
+0396:     the side selection (YES on positive edge, NO otherwise), the 20% cap, and
+0397:     the legacy 5% fallback for degenerate market prices.
+
+--- Lines 379-399 ---
+0379:             position.id = position_id
+0380:             
+0381:             # Execute the trade - respect the global trading mode setting
+0382:             live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+0383:             success = await execute_position(position, live_mode, db_manager, kalshi_client)
+0384:             if success:
+0385:                 logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
+0386:             else:
+0387:                 logger.error(f"❌ IMMEDIATE TRADE FAILED: {opportunity.market_id}")
+0388:         
+0389:     except Exception as e:
+0390:         logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
+0391: 
+0392: def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
+0393:     """Calculate simple Kelly fraction for immediate trading.
+0394: 
+0395:     Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
+0396:     the side selection (YES on positive edge, NO otherwise), the 20% cap, and
+0397:     the legacy 5% fallback for degenerate market prices.
+0398:     """
+0399:     try:
+
+--- Lines 382-402 ---
+0382:             live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+0383:             success = await execute_position(position, live_mode, db_manager, kalshi_client)
+0384:             if success:
+0385:                 logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
+0386:             else:
+0387:                 logger.error(f"❌ IMMEDIATE TRADE FAILED: {opportunity.market_id}")
+0388:         
+0389:     except Exception as e:
+0390:         logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
+0391: 
+0392: def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
+0393:     """Calculate simple Kelly fraction for immediate trading.
+0394: 
+0395:     Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
+0396:     the side selection (YES on positive edge, NO otherwise), the 20% cap, and
+0397:     the legacy 5% fallback for degenerate market prices.
+0398:     """
+0399:     try:
+0400:         if opportunity.edge > 0:  # Betting YES
+0401:             p = opportunity.predicted_probability
+0402:             b = binary_market_payout_odds(opportunity.market_probability, bet_yes=True)
+
+--- Lines 384-404 ---
+0384:             if success:
+0385:                 logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
+0386:             else:
+0387:                 logger.error(f"❌ IMMEDIATE TRADE FAILED: {opportunity.market_id}")
+0388:         
+0389:     except Exception as e:
+0390:         logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
+0391: 
+0392: def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
+0393:     """Calculate simple Kelly fraction for immediate trading.
+0394: 
+0395:     Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
+0396:     the side selection (YES on positive edge, NO otherwise), the 20% cap, and
+0397:     the legacy 5% fallback for degenerate market prices.
+0398:     """
+0399:     try:
+0400:         if opportunity.edge > 0:  # Betting YES
+0401:             p = opportunity.predicted_probability
+0402:             b = binary_market_payout_odds(opportunity.market_probability, bet_yes=True)
+0403:         else:  # Betting NO
+0404:             p = 1 - opportunity.predicted_probability
+
+--- Lines 385-405 ---
+0385:                 logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
+0386:             else:
+0387:                 logger.error(f"❌ IMMEDIATE TRADE FAILED: {opportunity.market_id}")
+0388:         
+0389:     except Exception as e:
+0390:         logger.error(f"Error in immediate trade evaluation for {opportunity.market_id}: {e}")
+0391: 
+0392: def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
+0393:     """Calculate simple Kelly fraction for immediate trading.
+0394: 
+0395:     Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
+0396:     the side selection (YES on positive edge, NO otherwise), the 20% cap, and
+0397:     the legacy 5% fallback for degenerate market prices.
+0398:     """
+0399:     try:
+0400:         if opportunity.edge > 0:  # Betting YES
+0401:             p = opportunity.predicted_probability
+0402:             b = binary_market_payout_odds(opportunity.market_probability, bet_yes=True)
+0403:         else:  # Betting NO
+0404:             p = 1 - opportunity.predicted_probability
+0405:             b = binary_market_payout_odds(opportunity.market_probability, bet_yes=False)
+
+--- Lines 402-422 ---
+0402:             b = binary_market_payout_odds(opportunity.market_probability, bet_yes=True)
+0403:         else:  # Betting NO
+0404:             p = 1 - opportunity.predicted_probability
+0405:             b = binary_market_payout_odds(opportunity.market_probability, bet_yes=False)
+0406: 
+0407:         if b <= 0:
+0408:             return 0.05  # degenerate price (e.g. NO at P=0): keep legacy fallback
+0409: 
+0410:         return min(kelly_fraction(p, b), 0.2)  # Cap at 20%
+0411: 
+0412:     except Exception:
+0413:         return 0.05  # Default 5% allocation (includes division by zero on P=0/P=1)
+0414: 
+0415: 
+0416: async def _get_fast_ai_prediction(
+0417:     market: Market,
+0418:     xai_client: XAIClient,
+0419:     market_price: float
+0420: ) -> Tuple[Optional[float], Optional[float]]:
+0421:     """
+0422:     Get a fast AI prediction for a market without expensive analysis.
+
+--- Lines 415-435 ---
+0415: 
+0416: async def _get_fast_ai_prediction(
+0417:     market: Market,
+0418:     xai_client: XAIClient,
+0419:     market_price: float
+0420: ) -> Tuple[Optional[float], Optional[float]]:
+0421:     """
+0422:     Get a fast AI prediction for a market without expensive analysis.
+0423:     Returns (predicted_probability, confidence) or (None, None) if failed.
+0424:     """
+0425:     try:
+0426:         # Create a simplified prompt for faster analysis
+0427:         prompt = f"""
+0428:         QUICK PREDICTION REQUEST
+0429:         
+0430:         Market: {market.title}
+0431:         Current YES price: {market_price:.2f}
+0432:         
+0433:         Provide a FAST prediction in JSON format:
+0434:         {{
+0435:             "probability": [0.0-1.0],
+
+--- Lines 428-448 ---
+0428:         QUICK PREDICTION REQUEST
+0429:         
+0430:         Market: {market.title}
+0431:         Current YES price: {market_price:.2f}
+0432:         
+0433:         Provide a FAST prediction in JSON format:
+0434:         {{
+0435:             "probability": [0.0-1.0],
+0436:             "confidence": [0.0-1.0],
+0437:             "reasoning": "brief 1-2 sentence explanation"
+0438:         }}
+0439:         
+0440:         Focus on: probability estimate and your confidence level.
+0441:         """
+0442:         
+0443:         # Use AI analysis for portfolio optimization - higher tokens for reasoning models  
+0444:         response_text = await xai_client.get_completion(
+0445:             prompt,
+0446:             max_tokens=3000,  # Higher for reasoning models like grok-4
+0447:             temperature=0.1   # Low temperature for consistency
+0448:         )
+
+--- Lines 432-452 ---
+0432:         
+0433:         Provide a FAST prediction in JSON format:
+0434:         {{
+0435:             "probability": [0.0-1.0],
+0436:             "confidence": [0.0-1.0],
+0437:             "reasoning": "brief 1-2 sentence explanation"
+0438:         }}
+0439:         
+0440:         Focus on: probability estimate and your confidence level.
+0441:         """
+0442:         
+0443:         # Use AI analysis for portfolio optimization - higher tokens for reasoning models  
+0444:         response_text = await xai_client.get_completion(
+0445:             prompt,
+0446:             max_tokens=3000,  # Higher for reasoning models like grok-4
+0447:             temperature=0.1   # Low temperature for consistency
+0448:         )
+0449:         
+0450:         # Check if AI response is None (API exhausted or failed)
+0451:         if response_text is None:
+0452:             logging.getLogger("portfolio_opportunities").info(f"AI analysis unavailable for {market.market_id} due to API limits")
+
+--- Lines 463-483 ---
+0463:                 json_str = json_match.group(0)
+0464:                 response = json.loads(json_str)
+0465:             else:
+0466:                 # If no JSON found, try to parse the entire response
+0467:                 response = json.loads(response_text)
+0468:             
+0469:             if response and isinstance(response, dict):
+0470:                 probability = response.get('probability')
+0471:                 confidence = response.get('confidence')
+0472:                 
+0473:                 # Validate values
+0474:                 if (isinstance(probability, (int, float)) and 0 <= probability <= 1 and
+0475:                     isinstance(confidence, (int, float)) and 0 <= confidence <= 1):
+0476:                     return float(probability), float(confidence)
+0477:             
+0478:         except (json.JSONDecodeError, ValueError) as json_error:
+0479:             logging.getLogger("portfolio_opportunities").warning(f"Failed to parse JSON from AI response for {market.market_id}: {json_error}")
+0480:             logging.getLogger("portfolio_opportunities").debug(f"Raw response: {response_text}")
+0481:         
+0482:         return None, None
+0483:         
+
+--- Lines 467-487 ---
+0467:                 response = json.loads(response_text)
+0468:             
+0469:             if response and isinstance(response, dict):
+0470:                 probability = response.get('probability')
+0471:                 confidence = response.get('confidence')
+0472:                 
+0473:                 # Validate values
+0474:                 if (isinstance(probability, (int, float)) and 0 <= probability <= 1 and
+0475:                     isinstance(confidence, (int, float)) and 0 <= confidence <= 1):
+0476:                     return float(probability), float(confidence)
+0477:             
+0478:         except (json.JSONDecodeError, ValueError) as json_error:
+0479:             logging.getLogger("portfolio_opportunities").warning(f"Failed to parse JSON from AI response for {market.market_id}: {json_error}")
+0480:             logging.getLogger("portfolio_opportunities").debug(f"Raw response: {response_text}")
+0481:         
+0482:         return None, None
+0483:         
+0484:     except Exception as e:
+0485:         logging.getLogger("portfolio_opportunities").error(f"Error in fast AI prediction for {market.market_id}: {e}")
+0486:         return None, None
+0487: 
+
+--- Lines 468-487 ---
+0468:             
+0469:             if response and isinstance(response, dict):
+0470:                 probability = response.get('probability')
+0471:                 confidence = response.get('confidence')
+0472:                 
+0473:                 # Validate values
+0474:                 if (isinstance(probability, (int, float)) and 0 <= probability <= 1 and
+0475:                     isinstance(confidence, (int, float)) and 0 <= confidence <= 1):
+0476:                     return float(probability), float(confidence)
+0477:             
+0478:         except (json.JSONDecodeError, ValueError) as json_error:
+0479:             logging.getLogger("portfolio_opportunities").warning(f"Failed to parse JSON from AI response for {market.market_id}: {json_error}")
+0480:             logging.getLogger("portfolio_opportunities").debug(f"Raw response: {response_text}")
+0481:         
+0482:         return None, None
+0483:         
+0484:     except Exception as e:
+0485:         logging.getLogger("portfolio_opportunities").error(f"Error in fast AI prediction for {market.market_id}: {e}")
+0486:         return None, None
+0487: 
+
+================================================================================
+FILE: src/strategies/unified_trading_system.py
+================================================================================
+
+--- Lines 1-18 ---
+0001: """
+0002: Unified Advanced Trading System - The Beast Mode 🚀
+0003: 
+0004: This system orchestrates all cutting-edge strategies:
+0005: 1. Market Making Strategy (limit orders for spreads)
+0006: 2. Advanced Portfolio Optimization (Kelly Criterion Extension)
+0007: 3. Risk Parity Allocation (equal risk, not equal capital)
+0008: 4. Dynamic Exit Strategies (time-based, confidence-based, volatility-based)
+0009: 5. Cross-Market Arbitrage Detection
+0010: 6. Multi-Model AI Ensemble
+0011: 
+0012: The goal: Use ALL available capital optimally across the BEST opportunities
+0013: with sophisticated risk management and dynamic rebalancing.
+0014: 
+0015: Key innovations:
+0016: - No time restrictions (trade any deadline with smart exits)
+0017: - Market making for spread profits without directional risk
+0018: - Portfolio optimization using latest Kelly Criterion research
+
+--- Lines 1-20 ---
+0001: """
+0002: Unified Advanced Trading System - The Beast Mode 🚀
+0003: 
+0004: This system orchestrates all cutting-edge strategies:
+0005: 1. Market Making Strategy (limit orders for spreads)
+0006: 2. Advanced Portfolio Optimization (Kelly Criterion Extension)
+0007: 3. Risk Parity Allocation (equal risk, not equal capital)
+0008: 4. Dynamic Exit Strategies (time-based, confidence-based, volatility-based)
+0009: 5. Cross-Market Arbitrage Detection
+0010: 6. Multi-Model AI Ensemble
+0011: 
+0012: The goal: Use ALL available capital optimally across the BEST opportunities
+0013: with sophisticated risk management and dynamic rebalancing.
+0014: 
+0015: Key innovations:
+0016: - No time restrictions (trade any deadline with smart exits)
+0017: - Market making for spread profits without directional risk
+0018: - Portfolio optimization using latest Kelly Criterion research
+0019: - Real-time rebalancing based on market conditions
+0020: - Maximum capital utilization through diverse strategies
+
+--- Lines 10-30 ---
+0010: 6. Multi-Model AI Ensemble
+0011: 
+0012: The goal: Use ALL available capital optimally across the BEST opportunities
+0013: with sophisticated risk management and dynamic rebalancing.
+0014: 
+0015: Key innovations:
+0016: - No time restrictions (trade any deadline with smart exits)
+0017: - Market making for spread profits without directional risk
+0018: - Portfolio optimization using latest Kelly Criterion research
+0019: - Real-time rebalancing based on market conditions
+0020: - Maximum capital utilization through diverse strategies
+0021: """
+0022: 
+0023: import asyncio
+0024: import logging
+0025: from datetime import datetime, timedelta
+0026: from typing import Dict, List, Optional, Tuple
+0027: from dataclasses import dataclass, asdict
+0028: import numpy as np
+0029: 
+0030: from src.clients.kalshi_client import KalshiClient
+
+--- Lines 110-130 ---
+0110:     
+0111:     Strategy allocation:
+0112:     1. Market Making (40%): Profit from spreads without directional risk
+0113:     2. Directional Trading (50%): Take positions based on AI edge
+0114:     3. Arbitrage (10%): Cross-market and temporal arbitrage
+0115:     
+0116:     Features:
+0117:     - No time restrictions (trade any deadline)
+0118:     - Dynamic position sizing (Kelly Criterion Extension)
+0119:     - Risk parity allocation (equal risk contribution)
+0120:     - Real-time rebalancing
+0121:     - Multi-strategy diversification
+0122:     """
+0123:     
+0124:     def __init__(
+0125:         self,
+0126:         db_manager: DatabaseManager,
+0127:         kalshi_client: KalshiClient,
+0128:         xai_client: XAIClient,
+0129:         config: Optional[TradingSystemConfig] = None
+0130:     ):
+
+--- Lines 200-220 ---
+0200:     async def execute_unified_trading_strategy(self) -> TradingSystemResults:
+0201:         """
+0202:         Execute the unified trading strategy across all approaches.
+0203:         
+0204:         Process:
+0205:         1. Analyze all available markets (no time restrictions!)
+0206:         2. Identify market making opportunities
+0207:         3. Identify directional trading opportunities  
+0208:         4. Optimize portfolio allocation using advanced Kelly Criterion
+0209:         5. Execute trades across all strategies
+0210:         6. Monitor and rebalance as needed
+0211:         """
+0212:         self.logger.info("🚀 Executing Unified Advanced Trading Strategy")
+0213:         
+0214:         try:
+0215:             # Step 0: Check and enforce position limits AND cash reserves
+0216:             from src.utils.position_limits import PositionLimitsManager
+0217:             from src.utils.cash_reserves import CashReservesManager, is_cash_emergency
+0218:             
+0219:             limits_manager = PositionLimitsManager(self.db_manager, self.kalshi_client)
+0220:             cash_manager = CashReservesManager(self.db_manager, self.kalshi_client)
+
+--- Lines 387-407 ---
+0387:         results = {
+0388:             'positions_created': 0,
+0389:             'total_capital_used': 0.0,
+0390:             'successful_executions': 0,
+0391:             'failed_executions': 0
+0392:         }
+0393:         
+0394:         try:
+0395:             from src.jobs.execute import execute_position
+0396:             
+0397:             for market_id, allocation_fraction in allocation.allocations.items():
+0398:                 try:
+0399:                     # Find the corresponding opportunity first to determine intended side
+0400:                     opportunity = next((opp for opp in opportunities if opp.market_id == market_id), None)
+0401:                     if not opportunity:
+0402:                         self.logger.warning(f"Could not find opportunity for {market_id}")
+0403:                         continue
+0404:                     
+0405:                     # Determine the intended side based on edge direction
+0406:                     intended_side = "YES" if opportunity.edge > 0 else "NO"
+0407:                     
+
+--- Lines 404-424 ---
+0404:                     
+0405:                     # Determine the intended side based on edge direction
+0406:                     intended_side = "YES" if opportunity.edge > 0 else "NO"
+0407:                     
+0408:                     # 🚨 ONLY SKIP if we already have a position on the EXACT same market_id AND side
+0409:                     existing_position = await self.db_manager.get_position_by_market_and_side(market_id, intended_side)
+0410:                     
+0411:                     if existing_position:
+0412:                         self.logger.info(f"⏭️ SKIPPING {market_id} {intended_side} - exact position already exists (likely from immediate trade)")
+0413:                         results['positions_created'] += 1  # Count as created since it exists
+0414:                         results['total_capital_used'] += allocation_fraction * self.directional_capital
+0415:                         continue
+0416:                     else:
+0417:                         # Check if we have the opposite side (just for logging)
+0418:                         opposite_side = "NO" if intended_side == "YES" else "YES"
+0419:                         opposite_position = await self.db_manager.get_position_by_market_and_side(market_id, opposite_side)
+0420:                         if opposite_position:
+0421:                             self.logger.info(f"📊 {market_id} - Adding {intended_side} position (already have {opposite_side})")
+0422:                         else:
+0423:                             self.logger.info(f"📊 {market_id} - New {intended_side} position")
+0424:                     
+
+--- Lines 507-527 ---
+0507:                         if market_obj:
+0508:                             time_to_expiry_days = getattr(market_obj, 'time_to_expiry', 30)
+0509:                     except Exception:
+0510:                         pass  # keep 30-day default
+0511:                     
+0512:                     exit_levels = StopLossCalculator.calculate_stop_loss_levels(
+0513:                         entry_price=price,
+0514:                         side=intended_side,
+0515:                         confidence=opportunity.confidence,
+0516:                         market_volatility=0.2,  # Default volatility estimate
+0517:                         time_to_expiry_days=time_to_expiry_days
+0518:                     )
+0519:                     
+0520:                     # Create Position object
+0521:                     position = Position(
+0522:                         market_id=market_id,
+0523:                         side=intended_side,
+0524:                         entry_price=price,
+0525:                         quantity=quantity,
+0526:                         timestamp=datetime.now(),
+0527:                         rationale=f"Portfolio optimization allocation: {allocation_fraction:.1%} of capital. Edge: {opportunity.edge:.3f}, Confidence: {opportunity.confidence:.3f}, Stop: {exit_levels['stop_loss_pct']}%",
+
+--- Lines 519-539 ---
+0519:                     
+0520:                     # Create Position object
+0521:                     position = Position(
+0522:                         market_id=market_id,
+0523:                         side=intended_side,
+0524:                         entry_price=price,
+0525:                         quantity=quantity,
+0526:                         timestamp=datetime.now(),
+0527:                         rationale=f"Portfolio optimization allocation: {allocation_fraction:.1%} of capital. Edge: {opportunity.edge:.3f}, Confidence: {opportunity.confidence:.3f}, Stop: {exit_levels['stop_loss_pct']}%",
+0528:                         confidence=opportunity.confidence,
+0529:                         live=False,  # Will be set to True after execution
+0530:                         strategy="portfolio_optimization",
+0531:                         
+0532:                         # Enhanced exit strategy using Grok4 recommendations
+0533:                         stop_loss_price=exit_levels['stop_loss_price'],
+0534:                         take_profit_price=exit_levels['take_profit_price'],
+0535:                         max_hold_hours=exit_levels['max_hold_hours'],
+0536:                         target_confidence_change=exit_levels['target_confidence_change']
+0537:                     )
+0538:                     
+0539:                     # Add position to database
+
+--- Lines 520-540 ---
+0520:                     # Create Position object
+0521:                     position = Position(
+0522:                         market_id=market_id,
+0523:                         side=intended_side,
+0524:                         entry_price=price,
+0525:                         quantity=quantity,
+0526:                         timestamp=datetime.now(),
+0527:                         rationale=f"Portfolio optimization allocation: {allocation_fraction:.1%} of capital. Edge: {opportunity.edge:.3f}, Confidence: {opportunity.confidence:.3f}, Stop: {exit_levels['stop_loss_pct']}%",
+0528:                         confidence=opportunity.confidence,
+0529:                         live=False,  # Will be set to True after execution
+0530:                         strategy="portfolio_optimization",
+0531:                         
+0532:                         # Enhanced exit strategy using Grok4 recommendations
+0533:                         stop_loss_price=exit_levels['stop_loss_price'],
+0534:                         take_profit_price=exit_levels['take_profit_price'],
+0535:                         max_hold_hours=exit_levels['max_hold_hours'],
+0536:                         target_confidence_change=exit_levels['target_confidence_change']
+0537:                     )
+0538:                     
+0539:                     # Add position to database
+0540:                     position_id = await self.db_manager.add_position(position)
+
+--- Lines 528-548 ---
+0528:                         confidence=opportunity.confidence,
+0529:                         live=False,  # Will be set to True after execution
+0530:                         strategy="portfolio_optimization",
+0531:                         
+0532:                         # Enhanced exit strategy using Grok4 recommendations
+0533:                         stop_loss_price=exit_levels['stop_loss_price'],
+0534:                         take_profit_price=exit_levels['take_profit_price'],
+0535:                         max_hold_hours=exit_levels['max_hold_hours'],
+0536:                         target_confidence_change=exit_levels['target_confidence_change']
+0537:                     )
+0538:                     
+0539:                     # Add position to database
+0540:                     position_id = await self.db_manager.add_position(position)
+0541:                     if position_id is None:
+0542:                         # This shouldn't happen now that we check above, but safety net
+0543:                         self.logger.warning(f"Position already exists for {market_id}, skipping execution")
+0544:                         continue
+0545:                     
+0546:                     position.id = position_id
+0547:                     
+0548:                     # Execute the position
+
+--- Lines 544-564 ---
+0544:                         continue
+0545:                     
+0546:                     position.id = position_id
+0547:                     
+0548:                     # Execute the position
+0549:                     live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+0550:                     self.logger.info(f"🎛️ Trading mode check: live_mode={live_mode} for market {opportunity.market_id}")
+0551:                     
+0552:                     success = await execute_position(
+0553:                         position=position,
+0554:                         live_mode=live_mode,
+0555:                         db_manager=self.db_manager,
+0556:                         kalshi_client=self.kalshi_client
+0557:                     )
+0558:                     
+0559:                     if success:
+0560:                         results['successful_executions'] += 1
+0561:                         results['positions_created'] += 1
+0562:                         results['total_capital_used'] += position_value
+0563:                         self.logger.info(f"✅ Executed position: {market_id} {intended_side} {quantity} at {price:.3f}")
+0564:                     else:
+
+================================================================================
+FILE: src/jobs/execute.py
+================================================================================
+
+--- Lines 9-29 ---
+0009: from typing import Optional, Dict
+0010: 
+0011: from src.utils.database import DatabaseManager, Position
+0012: from src.config.settings import settings
+0013: from src.utils.logging_setup import get_trading_logger
+0014: from src.clients.kalshi_client import KalshiClient, KalshiAPIError
+0015: from src.utils.market_prices import get_market_prices, is_tradeable_market
+0016: 
+0017: async def execute_position(
+0018:     position: Position, 
+0019:     live_mode: bool, 
+0020:     db_manager: DatabaseManager, 
+0021:     kalshi_client: KalshiClient
+0022: ) -> bool:
+0023:     """
+0024:     Executes a single trade position.
+0025:     
+0026:     Args:
+0027:         position: The position to execute.
+0028:         live_mode: Whether to execute a live or simulated trade.
+0029:         db_manager: The database manager instance.
+
+--- Lines 55-75 ---
+0055:                 "action": "buy",
+0056:                 "count": position.quantity,
+0057:                 "type_": "market"
+0058:             }
+0059:             
+0060:             # Add the appropriate price field based on side
+0061:             # For market orders, we use the ask price (what we're willing to pay)
+0062:             # get_market_prices normalizes both API v2 (dollar floats) and legacy (cent ints)
+0063:             # to dollar values (0.0–1.0). place_order expects cents (int), so multiply by 100.
+0064:             _yes_bid, yes_ask_dollars, _no_bid, no_ask_dollars = get_market_prices(market)
+0065: 
+0066:             # --- Price sanity checks (issue #42) ---
+0067:             # Guard 1: Collection/aggregate tickers return $1.00/$1.00 and are not
+0068:             # directly tradeable.  Placing an order against them yields HTTP 400
+0069:             # invalid_price.  Reject early if both asks are at or above $0.99.
+0070:             if not is_tradeable_market(market):
+0071:                 logger.warning(
+0072:                     f"⚠️  Skipping {position.market_id}: collection/aggregate ticker "
+0073:                     f"(yes_ask={yes_ask_dollars:.4f}, no_ask={no_ask_dollars:.4f}). "
+0074:                     "Both asks >= $0.99 — market is not directly tradeable (issue #42)."
+0075:                 )
+
+--- Lines 127-147 ---
+0127:                     f"⚠️  Insufficient balance for {position.market_id}: order needs "
+0128:                     f"~{order_cost_cents}¢ ({position.quantity} @ {ask_cents}¢) but only "
+0129:                     f"{available_cents}¢ available. Skipping order."
+0130:                 )
+0131:                 return False
+0132:             # --- End balance guard ---
+0133: 
+0134:             logger.info(f"Placing order with params: {order_params}")
+0135:             order_response = await kalshi_client.place_order(**order_params)
+0136:             
+0137:             # For a market order, the fill price is not guaranteed.
+0138:             # A more robust implementation would query the /fills endpoint
+0139:             # to confirm the execution price after the fact.
+0140:             # For now, we will optimistically assume it fills at the entry price.
+0141:             fill_price = position.entry_price
+0142: 
+0143:             await db_manager.update_position_to_live(position.id, fill_price)
+0144:             logger.info(f"✅ LIVE ORDER PLACED for {position.market_id}. Order ID: {order_response.get('order', {}).get('order_id')}")
+0145:             logger.info(f"💰 Real money used: ${position.quantity * fill_price:.2f}")
+0146:             return True
+0147: 
+
+--- Lines 201-221 ---
+0201:         if side == "yes":
+0202:             order_params["yes_price"] = limit_price_cents
+0203:         else:
+0204:             order_params["no_price"] = limit_price_cents
+0205:         
+0206:         logger.info(f"🎯 Placing SELL LIMIT order: {position.quantity} {side.upper()} at {limit_price_cents}¢ for {position.market_id}")
+0207:         
+0208:         # Place the sell limit order
+0209:         response = await kalshi_client.place_order(**order_params)
+0210:         
+0211:         if response and 'order' in response:
+0212:             order_id = response['order'].get('order_id', client_order_id)
+0213:             
+0214:             # Record the sell order in the database (we could add a sell_orders table if needed)
+0215:             logger.info(f"✅ SELL LIMIT ORDER placed successfully! Order ID: {order_id}")
+0216:             logger.info(f"   Market: {position.market_id}")
+0217:             logger.info(f"   Side: {side.upper()} (selling {position.quantity} shares)")
+0218:             logger.info(f"   Limit Price: {limit_price_cents}¢")
+0219:             logger.info(f"   Expected Proceeds: ${limit_price * position.quantity:.2f}")
+0220:             
+0221:             return True
+
+================================================================================
+FILE: src/clients/kalshi_client.py
+================================================================================
+
+--- Lines 331-351 ---
+0331:             params["start_ts"] = start_ts
+0332:         if end_ts:
+0333:             params["end_ts"] = end_ts
+0334:         
+0335:         return await self._make_authenticated_request(
+0336:             "GET", f"/trade-api/v2/markets/{ticker}/history", params=params, require_auth=False
+0337:         )
+0338:     
+0339:     async def place_order(
+0340:         self,
+0341:         ticker: str,
+0342:         client_order_id: str,
+0343:         side: str,
+0344:         action: str,
+0345:         count: int,
+0346:         type_: str = "market",
+0347:         yes_price: Optional[int] = None,
+0348:         no_price: Optional[int] = None,
+0349:         expiration_ts: Optional[int] = None
+0350:     ) -> Dict[str, Any]:
+0351:         """
+
+================================================================================
+FILE: src/utils/edge_filter.py
+================================================================================
+
+--- Lines 1-21 ---
+0001: """
+0002: Edge-Based Filtering Module
+0003: 
+0004: Implements the >10% edge filtering requirement recommended by Grok4 performance analysis.
+0005: Provides consistent edge filtering across all trading strategies.
+0006: 
+0007: Key Features:
+0008: - 10% minimum edge requirement for trading
+0009: - Adaptive edge thresholds based on confidence and risk
+0010: - Edge calculation utilities for different position types
+0011: - Filtering logic for market opportunities
+0012: """
+0013: 
+0014: from typing import Optional, Dict, Any, List
+0015: from dataclasses import dataclass
+0016: import math
+0017: 
+0018: 
+0019: @dataclass
+0020: class EdgeFilterResult:
+0021:     """Result of edge filtering analysis."""
+
+--- Lines 19-39 ---
+0019: @dataclass
+0020: class EdgeFilterResult:
+0021:     """Result of edge filtering analysis."""
+0022:     passes_filter: bool
+0023:     edge_magnitude: float
+0024:     edge_percentage: float
+0025:     side: str  # "YES" or "NO"
+0026:     reason: str
+0027:     confidence_adjusted_edge: float
+0028: 
+0029: 
+0030: class EdgeFilter:
+0031:     """
+0032:     Centralized edge filtering following Grok4 recommendations.
+0033:     
+0034:     UPDATED: More aggressive thresholds to allow more trading opportunities.
+0035:     """
+0036:     
+0037:     # LOOSENED: Allow more trading opportunities (approved 2026-03-29)
+0038:     MIN_EDGE_REQUIREMENT = 0.04        # LOOSENED: 4% minimum edge (was 8%)
+0039:     HIGH_CONFIDENCE_EDGE = 0.02        # LOOSENED: 3% edge for high confidence (was 6%)  
+
+--- Lines 31-51 ---
+0031:     """
+0032:     Centralized edge filtering following Grok4 recommendations.
+0033:     
+0034:     UPDATED: More aggressive thresholds to allow more trading opportunities.
+0035:     """
+0036:     
+0037:     # LOOSENED: Allow more trading opportunities (approved 2026-03-29)
+0038:     MIN_EDGE_REQUIREMENT = 0.04        # LOOSENED: 4% minimum edge (was 8%)
+0039:     HIGH_CONFIDENCE_EDGE = 0.02        # LOOSENED: 3% edge for high confidence (was 6%)  
+0040:     MEDIUM_CONFIDENCE_EDGE = 0.05      # LOOSENED: 5% edge for medium confidence (was 8%)
+0041:     LOW_CONFIDENCE_EDGE = 0.08         # LOOSENED: 8% edge for low confidence (was 12%)
+0042:     
+0043:     # LOOSENED: Lower confidence floor for more opportunities
+0044:     MIN_CONFIDENCE_FOR_TRADE = 0.35    # LOOSENED: 35% minimum confidence (was 50%)
+0045:     MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
+0046:     
+0047:     # UPDATED: More permissive quality filters
+0048:     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
+0049:     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
+0050:     
+0051:     @classmethod
+
+--- Lines 32-52 ---
+0032:     Centralized edge filtering following Grok4 recommendations.
+0033:     
+0034:     UPDATED: More aggressive thresholds to allow more trading opportunities.
+0035:     """
+0036:     
+0037:     # LOOSENED: Allow more trading opportunities (approved 2026-03-29)
+0038:     MIN_EDGE_REQUIREMENT = 0.04        # LOOSENED: 4% minimum edge (was 8%)
+0039:     HIGH_CONFIDENCE_EDGE = 0.02        # LOOSENED: 3% edge for high confidence (was 6%)  
+0040:     MEDIUM_CONFIDENCE_EDGE = 0.05      # LOOSENED: 5% edge for medium confidence (was 8%)
+0041:     LOW_CONFIDENCE_EDGE = 0.08         # LOOSENED: 8% edge for low confidence (was 12%)
+0042:     
+0043:     # LOOSENED: Lower confidence floor for more opportunities
+0044:     MIN_CONFIDENCE_FOR_TRADE = 0.35    # LOOSENED: 35% minimum confidence (was 50%)
+0045:     MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
+0046:     
+0047:     # UPDATED: More permissive quality filters
+0048:     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
+0049:     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
+0050:     
+0051:     @classmethod
+0052:     def calculate_edge(
+
+--- Lines 33-53 ---
+0033:     
+0034:     UPDATED: More aggressive thresholds to allow more trading opportunities.
+0035:     """
+0036:     
+0037:     # LOOSENED: Allow more trading opportunities (approved 2026-03-29)
+0038:     MIN_EDGE_REQUIREMENT = 0.04        # LOOSENED: 4% minimum edge (was 8%)
+0039:     HIGH_CONFIDENCE_EDGE = 0.02        # LOOSENED: 3% edge for high confidence (was 6%)  
+0040:     MEDIUM_CONFIDENCE_EDGE = 0.05      # LOOSENED: 5% edge for medium confidence (was 8%)
+0041:     LOW_CONFIDENCE_EDGE = 0.08         # LOOSENED: 8% edge for low confidence (was 12%)
+0042:     
+0043:     # LOOSENED: Lower confidence floor for more opportunities
+0044:     MIN_CONFIDENCE_FOR_TRADE = 0.35    # LOOSENED: 35% minimum confidence (was 50%)
+0045:     MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
+0046:     
+0047:     # UPDATED: More permissive quality filters
+0048:     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
+0049:     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
+0050:     
+0051:     @classmethod
+0052:     def calculate_edge(
+0053:         cls,
+
+--- Lines 35-55 ---
+0035:     """
+0036:     
+0037:     # LOOSENED: Allow more trading opportunities (approved 2026-03-29)
+0038:     MIN_EDGE_REQUIREMENT = 0.04        # LOOSENED: 4% minimum edge (was 8%)
+0039:     HIGH_CONFIDENCE_EDGE = 0.02        # LOOSENED: 3% edge for high confidence (was 6%)  
+0040:     MEDIUM_CONFIDENCE_EDGE = 0.05      # LOOSENED: 5% edge for medium confidence (was 8%)
+0041:     LOW_CONFIDENCE_EDGE = 0.08         # LOOSENED: 8% edge for low confidence (was 12%)
+0042:     
+0043:     # LOOSENED: Lower confidence floor for more opportunities
+0044:     MIN_CONFIDENCE_FOR_TRADE = 0.35    # LOOSENED: 35% minimum confidence (was 50%)
+0045:     MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
+0046:     
+0047:     # UPDATED: More permissive quality filters
+0048:     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
+0049:     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
+0050:     
+0051:     @classmethod
+0052:     def calculate_edge(
+0053:         cls,
+0054:         ai_probability: float,
+0055:         market_probability: float,
+
+--- Lines 36-56 ---
+0036:     
+0037:     # LOOSENED: Allow more trading opportunities (approved 2026-03-29)
+0038:     MIN_EDGE_REQUIREMENT = 0.04        # LOOSENED: 4% minimum edge (was 8%)
+0039:     HIGH_CONFIDENCE_EDGE = 0.02        # LOOSENED: 3% edge for high confidence (was 6%)  
+0040:     MEDIUM_CONFIDENCE_EDGE = 0.05      # LOOSENED: 5% edge for medium confidence (was 8%)
+0041:     LOW_CONFIDENCE_EDGE = 0.08         # LOOSENED: 8% edge for low confidence (was 12%)
+0042:     
+0043:     # LOOSENED: Lower confidence floor for more opportunities
+0044:     MIN_CONFIDENCE_FOR_TRADE = 0.35    # LOOSENED: 35% minimum confidence (was 50%)
+0045:     MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
+0046:     
+0047:     # UPDATED: More permissive quality filters
+0048:     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
+0049:     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
+0050:     
+0051:     @classmethod
+0052:     def calculate_edge(
+0053:         cls,
+0054:         ai_probability: float,
+0055:         market_probability: float,
+0056:         confidence: Optional[float] = None
+
+--- Lines 44-64 ---
+0044:     MIN_CONFIDENCE_FOR_TRADE = 0.35    # LOOSENED: 35% minimum confidence (was 50%)
+0045:     MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
+0046:     
+0047:     # UPDATED: More permissive quality filters
+0048:     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
+0049:     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
+0050:     
+0051:     @classmethod
+0052:     def calculate_edge(
+0053:         cls,
+0054:         ai_probability: float,
+0055:         market_probability: float,
+0056:         confidence: Optional[float] = None
+0057:     ) -> EdgeFilterResult:
+0058:         """
+0059:         Calculate edge and determine if it meets filtering criteria.
+0060:         
+0061:         Args:
+0062:             ai_probability: AI predicted probability (0.0 to 1.0)
+0063:             market_probability: Current market price/probability (0.0 to 1.0)
+0064:             confidence: AI confidence level (0.0 to 1.0)
+
+--- Lines 48-68 ---
+0048:     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
+0049:     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
+0050:     
+0051:     @classmethod
+0052:     def calculate_edge(
+0053:         cls,
+0054:         ai_probability: float,
+0055:         market_probability: float,
+0056:         confidence: Optional[float] = None
+0057:     ) -> EdgeFilterResult:
+0058:         """
+0059:         Calculate edge and determine if it meets filtering criteria.
+0060:         
+0061:         Args:
+0062:             ai_probability: AI predicted probability (0.0 to 1.0)
+0063:             market_probability: Current market price/probability (0.0 to 1.0)
+0064:             confidence: AI confidence level (0.0 to 1.0)
+0065:             
+0066:         Returns:
+0067:             EdgeFilterResult with filtering decision and details
+0068:         """
+
+--- Lines 56-76 ---
+0056:         confidence: Optional[float] = None
+0057:     ) -> EdgeFilterResult:
+0058:         """
+0059:         Calculate edge and determine if it meets filtering criteria.
+0060:         
+0061:         Args:
+0062:             ai_probability: AI predicted probability (0.0 to 1.0)
+0063:             market_probability: Current market price/probability (0.0 to 1.0)
+0064:             confidence: AI confidence level (0.0 to 1.0)
+0065:             
+0066:         Returns:
+0067:             EdgeFilterResult with filtering decision and details
+0068:         """
+0069:         
+0070:         # Validate inputs
+0071:         ai_probability = max(0.01, min(0.99, ai_probability))
+0072:         market_probability = max(0.01, min(0.99, market_probability))
+0073:         confidence = confidence or 0.7
+0074:         
+0075:         # Calculate raw edge (probability difference)
+0076:         edge_magnitude = ai_probability - market_probability
+
+--- Lines 65-85 ---
+0065:             
+0066:         Returns:
+0067:             EdgeFilterResult with filtering decision and details
+0068:         """
+0069:         
+0070:         # Validate inputs
+0071:         ai_probability = max(0.01, min(0.99, ai_probability))
+0072:         market_probability = max(0.01, min(0.99, market_probability))
+0073:         confidence = confidence or 0.7
+0074:         
+0075:         # Calculate raw edge (probability difference)
+0076:         edge_magnitude = ai_probability - market_probability
+0077:         edge_percentage = abs(edge_magnitude)
+0078:         
+0079:         # Determine position side based on edge direction
+0080:         if edge_magnitude > 0:
+0081:             side = "YES"  # AI thinks YES is underpriced
+0082:         else:
+0083:             side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
+0084:         
+0085:         # Confidence-adjusted edge thresholds
+
+--- Lines 77-97 ---
+0077:         edge_percentage = abs(edge_magnitude)
+0078:         
+0079:         # Determine position side based on edge direction
+0080:         if edge_magnitude > 0:
+0081:             side = "YES"  # AI thinks YES is underpriced
+0082:         else:
+0083:             side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
+0084:         
+0085:         # Confidence-adjusted edge thresholds
+0086:         if confidence >= 0.8:
+0087:             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+0088:         elif confidence >= 0.6:
+0089:             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+
+--- Lines 78-98 ---
+0078:         
+0079:         # Determine position side based on edge direction
+0080:         if edge_magnitude > 0:
+0081:             side = "YES"  # AI thinks YES is underpriced
+0082:         else:
+0083:             side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
+0084:         
+0085:         # Confidence-adjusted edge thresholds
+0086:         if confidence >= 0.8:
+0087:             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+0088:         elif confidence >= 0.6:
+0089:             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+
+--- Lines 79-99 ---
+0079:         # Determine position side based on edge direction
+0080:         if edge_magnitude > 0:
+0081:             side = "YES"  # AI thinks YES is underpriced
+0082:         else:
+0083:             side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
+0084:         
+0085:         # Confidence-adjusted edge thresholds
+0086:         if confidence >= 0.8:
+0087:             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+0088:         elif confidence >= 0.6:
+0089:             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+
+--- Lines 80-100 ---
+0080:         if edge_magnitude > 0:
+0081:             side = "YES"  # AI thinks YES is underpriced
+0082:         else:
+0083:             side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
+0084:         
+0085:         # Confidence-adjusted edge thresholds
+0086:         if confidence >= 0.8:
+0087:             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+0088:         elif confidence >= 0.6:
+0089:             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+
+--- Lines 81-101 ---
+0081:             side = "YES"  # AI thinks YES is underpriced
+0082:         else:
+0083:             side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
+0084:         
+0085:         # Confidence-adjusted edge thresholds
+0086:         if confidence >= 0.8:
+0087:             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+0088:         elif confidence >= 0.6:
+0089:             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+0101:         if not passes_confidence:
+
+--- Lines 83-103 ---
+0083:             side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
+0084:         
+0085:         # Confidence-adjusted edge thresholds
+0086:         if confidence >= 0.8:
+0087:             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+0088:         elif confidence >= 0.6:
+0089:             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+0101:         if not passes_confidence:
+0102:             passes_filter = False
+0103:             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
+
+--- Lines 85-105 ---
+0085:         # Confidence-adjusted edge thresholds
+0086:         if confidence >= 0.8:
+0087:             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+0088:         elif confidence >= 0.6:
+0089:             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+0101:         if not passes_confidence:
+0102:             passes_filter = False
+0103:             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
+0104:         elif not passes_basic_edge:
+0105:             passes_filter = False
+
+--- Lines 86-106 ---
+0086:         if confidence >= 0.8:
+0087:             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+0088:         elif confidence >= 0.6:
+0089:             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+0101:         if not passes_confidence:
+0102:             passes_filter = False
+0103:             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
+0104:         elif not passes_basic_edge:
+0105:             passes_filter = False
+0106:             reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+
+--- Lines 90-110 ---
+0090:         else:
+0091:             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+0092:         
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+0101:         if not passes_confidence:
+0102:             passes_filter = False
+0103:             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
+0104:         elif not passes_basic_edge:
+0105:             passes_filter = False
+0106:             reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+0107:         else:
+0108:             passes_filter = True
+0109:             reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"
+0110:         
+
+--- Lines 93-113 ---
+0093:         # Calculate confidence-adjusted edge
+0094:         confidence_adjusted_edge = edge_percentage * confidence
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+0101:         if not passes_confidence:
+0102:             passes_filter = False
+0103:             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
+0104:         elif not passes_basic_edge:
+0105:             passes_filter = False
+0106:             reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+0107:         else:
+0108:             passes_filter = True
+0109:             reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"
+0110:         
+0111:         return EdgeFilterResult(
+0112:             passes_filter=passes_filter,
+0113:             edge_magnitude=edge_magnitude,
+
+--- Lines 95-115 ---
+0095:         
+0096:         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
+0097:         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+0101:         if not passes_confidence:
+0102:             passes_filter = False
+0103:             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
+0104:         elif not passes_basic_edge:
+0105:             passes_filter = False
+0106:             reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+0107:         else:
+0108:             passes_filter = True
+0109:             reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"
+0110:         
+0111:         return EdgeFilterResult(
+0112:             passes_filter=passes_filter,
+0113:             edge_magnitude=edge_magnitude,
+0114:             edge_percentage=edge_percentage,
+0115:             side=side,
+
+--- Lines 98-118 ---
+0098:         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
+0099:         
+0100:         # Generate filtering decision and reason
+0101:         if not passes_confidence:
+0102:             passes_filter = False
+0103:             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
+0104:         elif not passes_basic_edge:
+0105:             passes_filter = False
+0106:             reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+0107:         else:
+0108:             passes_filter = True
+0109:             reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"
+0110:         
+0111:         return EdgeFilterResult(
+0112:             passes_filter=passes_filter,
+0113:             edge_magnitude=edge_magnitude,
+0114:             edge_percentage=edge_percentage,
+0115:             side=side,
+0116:             reason=reason,
+0117:             confidence_adjusted_edge=confidence_adjusted_edge
+0118:         )
+
+--- Lines 101-121 ---
+0101:         if not passes_confidence:
+0102:             passes_filter = False
+0103:             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
+0104:         elif not passes_basic_edge:
+0105:             passes_filter = False
+0106:             reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+0107:         else:
+0108:             passes_filter = True
+0109:             reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"
+0110:         
+0111:         return EdgeFilterResult(
+0112:             passes_filter=passes_filter,
+0113:             edge_magnitude=edge_magnitude,
+0114:             edge_percentage=edge_percentage,
+0115:             side=side,
+0116:             reason=reason,
+0117:             confidence_adjusted_edge=confidence_adjusted_edge
+0118:         )
+0119:     
+0120:     @classmethod
+0121:     def filter_opportunities(
+
+--- Lines 109-129 ---
+0109:             reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"
+0110:         
+0111:         return EdgeFilterResult(
+0112:             passes_filter=passes_filter,
+0113:             edge_magnitude=edge_magnitude,
+0114:             edge_percentage=edge_percentage,
+0115:             side=side,
+0116:             reason=reason,
+0117:             confidence_adjusted_edge=confidence_adjusted_edge
+0118:         )
+0119:     
+0120:     @classmethod
+0121:     def filter_opportunities(
+0122:         cls,
+0123:         opportunities: List[Dict[str, Any]],
+0124:         require_edge_filter: bool = True
+0125:     ) -> List[Dict[str, Any]]:
+0126:         """
+0127:         Filter a list of market opportunities based on edge requirements.
+0128:         
+0129:         Args:
+
+--- Lines 122-142 ---
+0122:         cls,
+0123:         opportunities: List[Dict[str, Any]],
+0124:         require_edge_filter: bool = True
+0125:     ) -> List[Dict[str, Any]]:
+0126:         """
+0127:         Filter a list of market opportunities based on edge requirements.
+0128:         
+0129:         Args:
+0130:             opportunities: List of opportunity dictionaries with edge, confidence, etc.
+0131:             require_edge_filter: Whether to apply edge filtering (default True)
+0132:             
+0133:         Returns:
+0134:             Filtered list of opportunities that meet edge requirements
+0135:         """
+0136:         if not require_edge_filter:
+0137:             return opportunities
+0138:         
+0139:         filtered_opportunities = []
+0140:         
+0141:         for opp in opportunities:
+0142:             # Extract required fields
+
+--- Lines 137-157 ---
+0137:             return opportunities
+0138:         
+0139:         filtered_opportunities = []
+0140:         
+0141:         for opp in opportunities:
+0142:             # Extract required fields
+0143:             ai_prob = opp.get('predicted_probability', 0.5)
+0144:             market_prob = opp.get('market_probability', 0.5)
+0145:             confidence = opp.get('confidence', 0.7)
+0146:             
+0147:             # Calculate edge
+0148:             edge_result = cls.calculate_edge(ai_prob, market_prob, confidence)
+0149:             
+0150:             # Add to filtered list if it passes
+0151:             if edge_result.passes_filter:
+0152:                 # Add edge analysis to opportunity
+0153:                 opp['edge_filter_result'] = edge_result
+0154:                 opp['filtered_edge'] = edge_result.edge_magnitude
+0155:                 opp['edge_percentage'] = edge_result.edge_percentage
+0156:                 opp['recommended_side'] = edge_result.side
+0157:                 
+
+--- Lines 140-160 ---
+0140:         
+0141:         for opp in opportunities:
+0142:             # Extract required fields
+0143:             ai_prob = opp.get('predicted_probability', 0.5)
+0144:             market_prob = opp.get('market_probability', 0.5)
+0145:             confidence = opp.get('confidence', 0.7)
+0146:             
+0147:             # Calculate edge
+0148:             edge_result = cls.calculate_edge(ai_prob, market_prob, confidence)
+0149:             
+0150:             # Add to filtered list if it passes
+0151:             if edge_result.passes_filter:
+0152:                 # Add edge analysis to opportunity
+0153:                 opp['edge_filter_result'] = edge_result
+0154:                 opp['filtered_edge'] = edge_result.edge_magnitude
+0155:                 opp['edge_percentage'] = edge_result.edge_percentage
+0156:                 opp['recommended_side'] = edge_result.side
+0157:                 
+0158:                 filtered_opportunities.append(opp)
+0159:         
+0160:         return filtered_opportunities
+
+--- Lines 159-179 ---
+0159:         
+0160:         return filtered_opportunities
+0161:     
+0162:     @classmethod
+0163:     def should_trade_market(
+0164:         cls,
+0165:         ai_probability: float,
+0166:         market_probability: float,
+0167:         confidence: float,
+0168:         additional_filters: Optional[Dict[str, Any]] = None
+0169:     ) -> tuple[bool, str, EdgeFilterResult]:
+0170:         """
+0171:         Comprehensive trading decision based on edge filtering.
+0172:         
+0173:         Args:
+0174:             ai_probability: AI predicted probability
+0175:             market_probability: Market price/probability  
+0176:             confidence: AI confidence level
+0177:             additional_filters: Optional additional filtering criteria
+0178:             
+0179:         Returns:
+
+--- Lines 168-188 ---
+0168:         additional_filters: Optional[Dict[str, Any]] = None
+0169:     ) -> tuple[bool, str, EdgeFilterResult]:
+0170:         """
+0171:         Comprehensive trading decision based on edge filtering.
+0172:         
+0173:         Args:
+0174:             ai_probability: AI predicted probability
+0175:             market_probability: Market price/probability  
+0176:             confidence: AI confidence level
+0177:             additional_filters: Optional additional filtering criteria
+0178:             
+0179:         Returns:
+0180:             (should_trade, reason, edge_result)
+0181:         """
+0182:         
+0183:         # Calculate edge
+0184:         edge_result = cls.calculate_edge(ai_probability, market_probability, confidence)
+0185:         
+0186:         # Basic edge filter
+0187:         if not edge_result.passes_filter:
+0188:             return False, edge_result.reason, edge_result
+
+--- Lines 176-196 ---
+0176:             confidence: AI confidence level
+0177:             additional_filters: Optional additional filtering criteria
+0178:             
+0179:         Returns:
+0180:             (should_trade, reason, edge_result)
+0181:         """
+0182:         
+0183:         # Calculate edge
+0184:         edge_result = cls.calculate_edge(ai_probability, market_probability, confidence)
+0185:         
+0186:         # Basic edge filter
+0187:         if not edge_result.passes_filter:
+0188:             return False, edge_result.reason, edge_result
+0189:         
+0190:         # Additional filters if provided
+0191:         if additional_filters:
+0192:             volume = additional_filters.get('volume', 0)
+0193:             min_volume = additional_filters.get('min_volume', 1000)
+0194:             
+0195:             if volume < min_volume:
+0196:                 return False, f"Volume {volume} below minimum {min_volume}", edge_result
+
+--- Lines 214-234 ---
+0214:         if not edge_results:
+0215:             return {"total": 0, "passed": 0, "pass_rate": 0.0}
+0216:         
+0217:         total = len(edge_results)
+0218:         passed = sum(1 for r in edge_results if r.passes_filter)
+0219:         pass_rate = passed / total
+0220:         
+0221:         avg_edge = sum(r.edge_percentage for r in edge_results) / total
+0222:         avg_confidence_adj = sum(r.confidence_adjusted_edge for r in edge_results) / total
+0223:         
+0224:         yes_positions = sum(1 for r in edge_results if r.side == "YES")
+0225:         no_positions = sum(1 for r in edge_results if r.side == "NO")
+0226:         
+0227:         return {
+0228:             "total_opportunities": total,
+0229:             "passed_filter": passed,
+0230:             "filtered_out": total - passed,
+0231:             "pass_rate": pass_rate,
+0232:             "average_edge": avg_edge,
+0233:             "average_confidence_adjusted_edge": avg_confidence_adj,
+0234:             "yes_positions": yes_positions,
+
+--- Lines 225-245 ---
+0225:         no_positions = sum(1 for r in edge_results if r.side == "NO")
+0226:         
+0227:         return {
+0228:             "total_opportunities": total,
+0229:             "passed_filter": passed,
+0230:             "filtered_out": total - passed,
+0231:             "pass_rate": pass_rate,
+0232:             "average_edge": avg_edge,
+0233:             "average_confidence_adjusted_edge": avg_confidence_adj,
+0234:             "yes_positions": yes_positions,
+0235:             "no_positions": no_positions,
+0236:             "side_balance": yes_positions / total if total > 0 else 0.0
+0237:         }
+0238: 
+0239: 
+0240: # Convenience functions for backward compatibility
+0241: def calculate_edge(ai_prob: float, market_prob: float, confidence: float = 0.7) -> EdgeFilterResult:
+0242:     """Convenience function for edge calculation."""
+0243:     return EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0244: 
+0245: 
+
+--- Lines 233-253 ---
+0233:             "average_confidence_adjusted_edge": avg_confidence_adj,
+0234:             "yes_positions": yes_positions,
+0235:             "no_positions": no_positions,
+0236:             "side_balance": yes_positions / total if total > 0 else 0.0
+0237:         }
+0238: 
+0239: 
+0240: # Convenience functions for backward compatibility
+0241: def calculate_edge(ai_prob: float, market_prob: float, confidence: float = 0.7) -> EdgeFilterResult:
+0242:     """Convenience function for edge calculation."""
+0243:     return EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0244: 
+0245: 
+0246: def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7) -> bool:
+0247:     """Simple boolean check for edge filtering."""
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+
+--- Lines 235-255 ---
+0235:             "no_positions": no_positions,
+0236:             "side_balance": yes_positions / total if total > 0 else 0.0
+0237:         }
+0238: 
+0239: 
+0240: # Convenience functions for backward compatibility
+0241: def calculate_edge(ai_prob: float, market_prob: float, confidence: float = 0.7) -> EdgeFilterResult:
+0242:     """Convenience function for edge calculation."""
+0243:     return EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0244: 
+0245: 
+0246: def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7) -> bool:
+0247:     """Simple boolean check for edge filtering."""
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+
+--- Lines 238-258 ---
+0238: 
+0239: 
+0240: # Convenience functions for backward compatibility
+0241: def calculate_edge(ai_prob: float, market_prob: float, confidence: float = 0.7) -> EdgeFilterResult:
+0242:     """Convenience function for edge calculation."""
+0243:     return EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0244: 
+0245: 
+0246: def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7) -> bool:
+0247:     """Simple boolean check for edge filtering."""
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+
+--- Lines 240-259 ---
+0240: # Convenience functions for backward compatibility
+0241: def calculate_edge(ai_prob: float, market_prob: float, confidence: float = 0.7) -> EdgeFilterResult:
+0242:     """Convenience function for edge calculation."""
+0243:     return EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0244: 
+0245: 
+0246: def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7) -> bool:
+0247:     """Simple boolean check for edge filtering."""
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+0259:         return EdgeFilter.LOW_CONFIDENCE_EDGE 
+
+--- Lines 244-259 ---
+0244: 
+0245: 
+0246: def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7) -> bool:
+0247:     """Simple boolean check for edge filtering."""
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+0259:         return EdgeFilter.LOW_CONFIDENCE_EDGE 
+
+--- Lines 245-259 ---
+0245: 
+0246: def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7) -> bool:
+0247:     """Simple boolean check for edge filtering."""
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+0259:         return EdgeFilter.LOW_CONFIDENCE_EDGE 
+
+--- Lines 246-259 ---
+0246: def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7) -> bool:
+0247:     """Simple boolean check for edge filtering."""
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+0259:         return EdgeFilter.LOW_CONFIDENCE_EDGE 
+
+--- Lines 247-259 ---
+0247:     """Simple boolean check for edge filtering."""
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+0259:         return EdgeFilter.LOW_CONFIDENCE_EDGE 
+
+--- Lines 248-259 ---
+0248:     result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+0259:         return EdgeFilter.LOW_CONFIDENCE_EDGE 
+
+--- Lines 249-259 ---
+0249:     return result.passes_filter
+0250: 
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+0259:         return EdgeFilter.LOW_CONFIDENCE_EDGE 
+
+--- Lines 251-259 ---
+0251: 
+0252: def get_minimum_edge_for_confidence(confidence: float) -> float:
+0253:     """Get the minimum edge required for a given confidence level."""
+0254:     if confidence >= 0.8:
+0255:         return EdgeFilter.HIGH_CONFIDENCE_EDGE
+0256:     elif confidence >= 0.6:
+0257:         return EdgeFilter.MEDIUM_CONFIDENCE_EDGE
+0258:     else:
+0259:         return EdgeFilter.LOW_CONFIDENCE_EDGE 

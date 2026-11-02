@@ -1,0 +1,7 @@
+[Unit]
+Description=Check and recover the Kalshi signals dashboard
+After=kalshi-signals.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/kalshi-signals/app/deploy/hetzner/healthcheck.sh

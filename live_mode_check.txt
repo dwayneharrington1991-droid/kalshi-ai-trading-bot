@@ -1,0 +1,24 @@
+src/config/settings.py:114:    live_trading_enabled: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true")
+src/config/settings.py:115:    paper_trading_mode: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() != "true")
+src/strategies/unified_trading_system.py.backup_20260801_050956:549:                    live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/unified_trading_system.py.backup_20260801_050956:550:                    self.logger.info(f"🎛️ Trading mode check: live_mode={live_mode} for market {opportunity.market_id}")
+src/strategies/unified_trading_system.py.backup_20260801_050956:552:                    success = await execute_position(
+src/strategies/unified_trading_system.py.backup_20260801_050956:554:                        live_mode=live_mode,
+src/strategies/market_making.py:414:            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/portfolio/immediate.py:382:            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/portfolio/immediate.py:383:            success = await execute_position(position, live_mode, db_manager, kalshi_client)
+src/strategies/portfolio/immediate.py.backup:382:            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/portfolio/immediate.py.backup:383:            success = await execute_position(position, live_mode, db_manager, kalshi_client)
+src/strategies/quick_flip_scalping.py.backup_20260801_050956:367:            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/quick_flip_scalping.py.backup_20260801_050956:369:            success = await execute_position(
+src/strategies/quick_flip_scalping.py.backup_20260801_050956:371:                live_mode=live_mode,
+src/strategies/quick_flip_scalping.py.backup_20260801_050956:499:            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/quick_flip_scalping.py:367:            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/quick_flip_scalping.py:369:            success = await execute_position(
+src/strategies/quick_flip_scalping.py:371:                live_mode=live_mode,
+src/strategies/quick_flip_scalping.py:499:            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/unified_trading_system.py:549:                    live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+src/strategies/unified_trading_system.py:550:                    self.logger.info(f"🎛️ Trading mode check: live_mode={live_mode} for market {opportunity.market_id}")
+src/strategies/unified_trading_system.py:552:                    success = await execute_position(
+src/strategies/unified_trading_system.py:554:                        live_mode=live_mode,
+src/jobs/execute.py:17:async def execute_position(

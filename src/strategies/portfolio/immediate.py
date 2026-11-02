@@ -6,7 +6,10 @@ former 1,300-line portfolio_optimization.py.
 """
 
 import logging
+import math
+from collections import Counter
 import numpy as np
+from dataclasses import replace
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -19,6 +22,176 @@ from src.utils.market_prices import get_market_prices
 from src.utils.position_sizing import binary_market_payout_odds, kelly_fraction
 
 from src.strategies.portfolio.models import MarketOpportunity
+from src.strategies.directional_policy import (
+    evaluate_directional_candidate,
+    classify_market_phase,
+    executable_liquidity,
+    has_current_structured_game_state,
+    is_sports_market,
+    log_directional_evaluation,
+    validate_directional_model_confidence,
+)
+from src.strategies.sports_markets import classify_sports_market_type, event_correlation_group
+
+
+def select_directional_analysis_markets(
+    markets: List[Market],
+    *,
+    limit: int,
+    min_probability: float,
+    max_probability: float,
+) -> tuple[List[Market], int]:
+    """Choose a bounded AI shortlist without pre-approving any trade.
+
+    The former volume-only shortlist was incompatible with the directional
+    policy: the complete AI budget could be spent on markets whose *cached*
+    quote was already outside the policy's executable probability band.  This
+    helper uses the locally ingested midpoint only as a routing hint.  Every
+    chosen market is still re-read from Kalshi and must pass the unchanged
+    quote, probability, edge, EV, liquidity, freshness, and execution gates.
+
+    Returns the bounded shortlist and the number of inputs whose cached YES or
+    NO midpoint was in the preferred price band.
+    """
+    bounded_limit = max(1, int(limit))
+
+    def volume_key(market: Market) -> float:
+        try:
+            return float(market.volume or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def cached_side_prices(market: Market) -> list[tuple[str, float]]:
+        values: list[tuple[str, float]] = []
+        for side, value in (("YES", market.yes_price), ("NO", market.no_price)):
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 < price < 1.0:
+                values.append((side, price))
+        return values
+
+    def preferred_prices(market: Market) -> list[tuple[str, float]]:
+        return [
+            (side, price) for side, price in cached_side_prices(market)
+            if min_probability <= price <= max_probability
+        ]
+
+    def freshness_key(market: Market) -> float:
+        value = getattr(market, "last_updated", None)
+        if isinstance(value, datetime):
+            return value.timestamp()
+        return 0.0
+
+    # Cached prices are not a prediction, so they must never approve an order.
+    # They are useful nevertheless for routing a scarce AI budget: a side above
+    # ``max_probability - min_edge`` cannot satisfy the *preferred* price +
+    # minimum-edge combination unless the model predicts outside the preferred
+    # band.  Prioritising feasible, fresher, liquid-market proxies prevents a
+    # handful of high-volume-but-poorly-priced markets from consuming all ten
+    # model calls.
+    min_edge = float(settings.trading.min_directional_edge)
+    preferred_ceiling_for_min_edge = max_probability - min_edge
+    target_price = min_probability + ((max_probability - min_probability) / 2.0)
+
+    def ranking_key(market: Market) -> tuple[float, ...]:
+        preferred = preferred_prices(market)
+        feasible = [price for _, price in preferred if price <= preferred_ceiling_for_min_edge]
+        best_distance = min(
+            (abs(price - target_price) for price in feasible),
+            default=1.0,
+        )
+        # Keep all tie breakers deterministic.  Volume is a liquidity proxy,
+        # not an executable-liquidity substitute; fresh order-book checks below
+        # remain mandatory before an opportunity can be accepted.
+        return (
+            1.0 if feasible else 0.0,
+            float(len(feasible)),
+            -best_distance,
+            freshness_key(market),
+            math.log1p(max(0.0, volume_key(market))),
+        )
+
+    ranked = sorted(markets, key=ranking_key, reverse=True)
+    preferred = [market for market in ranked if preferred_prices(market)]
+    preferred_ids = {market.market_id for market in preferred}
+    fallback = [market for market in ranked if market.market_id not in preferred_ids]
+    return (preferred + fallback)[:bounded_limit], len(preferred)
+
+
+def _directional_shortlist_market_metadata(
+    market: Market,
+    *,
+    min_probability: float,
+    max_probability: float,
+) -> dict[str, object]:
+    """Describe cached routing data without misrepresenting it as a live quote."""
+    min_edge = float(settings.trading.min_directional_edge)
+    ceiling = max_probability - min_edge
+    candidates = []
+    for side, raw_price in (("YES", market.yes_price), ("NO", market.no_price)):
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            continue
+        if min_probability <= price <= max_probability:
+            candidates.append((side, price))
+    side, price = min(
+        candidates,
+        key=lambda item: abs(item[1] - (min_probability + max_probability) / 2),
+        default=("UNKNOWN", None),
+    )
+    try:
+        volume_proxy = float(market.volume or 0.0)
+    except (TypeError, ValueError):
+        volume_proxy = 0.0
+    feasible = isinstance(price, float) and price <= ceiling
+    return {
+        "market": market.market_id,
+        "side": side,
+        # This is intentionally not named executable_price.  A fresh Kalshi
+        # quote and order book are read later before model admission.
+        "cached_price": round(price, 4) if isinstance(price, float) else None,
+        "implied_probability": round(price, 4) if isinstance(price, float) else None,
+        "pre_model_score": None,
+        "volume_proxy": volume_proxy,
+        "ranking_reason": (
+            "cached preferred side leaves preferred-band minimum-edge headroom"
+            if feasible else "cached preferred side requires model probability above preferred band"
+        ),
+    }
+
+
+def directional_shortlist_diagnostics(
+    markets: List[Market],
+    *,
+    min_probability: float,
+    max_probability: float,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    """Return safe cached-quote routing metadata for the selected shortlist.
+
+    ``pre_model_score`` is deliberately ``None``: this code has no cheap
+    predictive model, and pretending that a price/volume heuristic is a model
+    probability would create an unsafe feedback loop.  The log identifies the
+    cached side and routing reason only; live quotes, liquidity, model output,
+    and every admission gate are still checked later.
+    """
+    selected, _ = select_directional_analysis_markets(
+        markets,
+        limit=limit,
+        min_probability=min_probability,
+        max_probability=max_probability,
+    )
+    return [
+        _directional_shortlist_market_metadata(
+            market,
+            min_probability=min_probability,
+            max_probability=max_probability,
+        )
+        for market in selected
+    ]
 
 
 async def create_market_opportunities_from_markets(
@@ -33,27 +206,70 @@ async def create_market_opportunities_from_markets(
     """
     logger = get_trading_logger("portfolio_opportunities")
     opportunities = []
+    rejection_counts: Counter[str] = Counter()
+    input_market_count = len(markets)
     
     # Limit markets to prevent excessive AI costs and focus on best opportunities
-    max_markets_to_analyze = 10  # REDUCED: More selective (was 20, now 10) to focus on highest quality
-    if len(markets) > max_markets_to_analyze:
-        # Sort by volume and take top markets
-        markets = sorted(markets, key=lambda m: m.volume, reverse=True)[:max_markets_to_analyze]
-        logger.info(f"Limited to top {max_markets_to_analyze} markets by volume for AI analysis")
+    max_markets_to_analyze = 10
+    def safe_volume_proxy(market: Market) -> float:
+        try:
+            return float(getattr(market, "volume", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    volume_preview = sorted(markets, key=safe_volume_proxy, reverse=True)[:max_markets_to_analyze]
+    logger.info(
+        "DIRECTIONAL_SHORTLIST_PRE_RANK top_by_volume=%s",
+        [
+            _directional_shortlist_market_metadata(
+                market,
+                min_probability=settings.trading.min_preferred_probability,
+                max_probability=settings.trading.max_preferred_probability,
+            )
+            for market in volume_preview
+        ],
+    )
+    markets, preferred_price_candidates = select_directional_analysis_markets(
+        markets,
+        limit=max_markets_to_analyze,
+        min_probability=settings.trading.min_preferred_probability,
+        max_probability=settings.trading.max_preferred_probability,
+    )
+    logger.info(
+        "DIRECTIONAL_SHORTLIST_POST_RANK candidates=%s",
+        directional_shortlist_diagnostics(
+            markets,
+            min_probability=settings.trading.min_preferred_probability,
+            max_probability=settings.trading.max_preferred_probability,
+            limit=max_markets_to_analyze,
+        ),
+    )
+    if input_market_count > max_markets_to_analyze:
+        logger.info(
+            "Directional AI shortlist selected %s/%s markets; %s had a cached "
+            "YES or NO midpoint in the existing preferred price band",
+            len(markets), input_market_count, preferred_price_candidates,
+        )
     
     for market in markets:
         try:
             # Get current market data
             market_data = await kalshi_client.get_market(market.market_id)
-            if not market_data:
+            if not isinstance(market_data, dict) or not market_data:
+                rejection_counts["market lookup returned no usable market response"] += 1
                 continue
             
             # FIXED: Extract from nested 'market' object (same fix as immediate trading)
             market_info = market_data.get('market', {})
-            market_prob = market_info.get('yes_price', 50) / 100
+            if not isinstance(market_info, dict) or not market_info:
+                rejection_counts["market response missing market payload"] += 1
+                continue
+            yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_info)
+            market_prob = yes_ask
             
             # Skip markets with extreme prices (too risky for portfolio)
             if market_prob < 0.05 or market_prob > 0.95:
+                rejection_counts["YES executable price outside 5%-95% safety range"] += 1
                 continue
             
             # Get REAL AI prediction using fast analysis
@@ -64,13 +280,79 @@ async def create_market_opportunities_from_markets(
             # If AI analysis failed, skip this market
             if predicted_prob is None or confidence is None:
                 logger.warning(f"AI analysis failed for {market.market_id}, skipping")
+                rejection_counts["AI prediction unavailable or malformed"] += 1
                 continue
             
-            # Calculate metrics
-            edge = predicted_prob - market_prob
-            expected_return = abs(edge) * confidence
-            volatility = np.sqrt(market_prob * (1 - market_prob))
-            max_loss = market_prob if edge > 0 else (1 - market_prob)
+            sports_phase = classify_market_phase(
+                market_info, market.category, expiration_ts=market.expiration_ts
+            )
+            evaluation = evaluate_directional_candidate(
+                market_id=market.market_id,
+                predicted_yes_probability=predicted_prob,
+                yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask,
+                min_probability=settings.trading.min_preferred_probability,
+                max_preferred_probability=settings.trading.max_preferred_probability,
+                min_edge=settings.trading.min_directional_edge,
+                fee_estimate=settings.trading.directional_fee_estimate,
+                slippage_estimate=settings.trading.directional_slippage_estimate,
+                sports_phase=sports_phase,
+                event_title=str(market_info.get("event_title", market_info.get("title", market.title))),
+                market_type=classify_sports_market_type(market_info),
+            )
+            try:
+                orderbook = await kalshi_client.get_orderbook(market.market_id, depth=100)
+            except Exception:
+                orderbook = None
+            proposed_risk = float(
+                getattr(settings.trading, "overnight_canary_max_market_risk", 5.0)
+            )
+            proposed_quantity = (
+                max(1, int(proposed_risk / evaluation.market_implied_probability))
+                if evaluation.market_implied_probability > 0 else 0
+            )
+            liquidity = executable_liquidity(
+                orderbook, evaluation.side, evaluation.market_implied_probability
+            )
+            sports_live = (
+                is_sports_market(market_info, market.category)
+                and sports_phase in {"LIVE", "FAST_LIVE"}
+            )
+            structured_state_available = (
+                has_current_structured_game_state(market_info)
+                if sports_live else None
+            )
+            evaluation = replace(
+                evaluation, liquidity=liquidity,
+                proposed_quantity=float(proposed_quantity),
+                structured_game_state_available=structured_state_available,
+            )
+            if (
+                sports_live and not structured_state_available
+            ):
+                evaluation = replace(
+                    evaluation, accepted=False, ranking_score=float("-inf"),
+                    reason="current structured game state unavailable for live sports",
+                )
+            elif evaluation.accepted and liquidity < proposed_quantity:
+                evaluation = replace(
+                    evaluation, accepted=False, ranking_score=float("-inf"),
+                    reason=(f"insufficient executable liquidity: {liquidity:.2f} "
+                            f"contracts available for {proposed_quantity} requested"),
+                )
+            log_directional_evaluation(logger, evaluation)
+            if not evaluation.accepted:
+                rejection_counts[evaluation.reason] += 1
+                continue
+
+            # Normalize all downstream portfolio fields to the selected side.
+            # A valid NO trade previously retained the YES-relative edge and
+            # was then interpreted as a negative-edge bet by Kelly/allocation.
+            edge = evaluation.gross_edge
+            expected_return = evaluation.estimated_net_return
+            side_market_probability = evaluation.market_implied_probability
+            side_probability = evaluation.estimated_probability
+            volatility = np.sqrt(side_market_probability * (1 - side_market_probability))
+            max_loss = side_market_probability
             
             # Time to expiry
             time_to_expiry = 30.0  # Default 30 days
@@ -79,16 +361,19 @@ async def create_market_opportunities_from_markets(
                 time_to_expiry = (market.expiration_ts - time.time()) / 86400
                 time_to_expiry = max(0.1, time_to_expiry)
             
-            # Apply Grok4 edge filtering - 10% minimum edge requirement
-            from src.utils.edge_filter import EdgeFilter
-            edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
-            
-            if edge_result.passes_filter:  # Must pass 10% edge filter
+            # Confidence is evidence quality, not a second probability/edge
+            # calculation.  The centralized directional policy above already
+            # owns probability, side, edge, EV, anomaly, and liquidity gates.
+            confidence_ok, confidence_reason = validate_directional_model_confidence(
+                confidence
+            )
+
+            if confidence_ok:
                 opportunity = MarketOpportunity(
                     market_id=market.market_id,
                     market_title=market.title,
-                    predicted_probability=predicted_prob,
-                    market_probability=market_prob,
+                    predicted_probability=side_probability,
+                    market_probability=side_market_probability,
                     confidence=confidence,
                     edge=edge,
                     volatility=volatility,
@@ -101,27 +386,60 @@ async def create_market_opportunities_from_markets(
                     risk_adjusted_fraction=0.0,
                     sharpe_ratio=0.0,
                     sortino_ratio=0.0,
-                    max_drawdown_contribution=0.0
+                    max_drawdown_contribution=0.0,
+                    recommended_side=evaluation.side,
+                    side_probability=side_probability,
+                    side_market_probability=side_market_probability,
+                    net_expected_return=evaluation.estimated_net_return,
+                    ranking_score=evaluation.ranking_score,
+                    category=market.category,
+                    sports_phase=sports_phase,
+                    event_ticker=str(market_info.get("event_ticker", "")),
+                    event_title=str(market_info.get("event_title", market.title)),
+                    market_type=classify_sports_market_type(market_info),
+                    correlation_group=event_correlation_group(market_info),
+                    proposed_risk=float(getattr(settings.trading, "overnight_canary_max_market_risk", 5.0)),
+                    executable_liquidity=evaluation.liquidity,
+                    proposed_quantity=evaluation.proposed_quantity,
                 )
                 
-                # Add edge filter results to opportunity
-                opportunity.edge = edge_result.edge_magnitude  # Use filtered edge
-                opportunity.edge_percentage = edge_result.edge_percentage
-                opportunity.recommended_side = edge_result.side
+                # ``edge`` is side-aware so the optimizer never treats a valid
+                # NO opportunity as a negative-edge YES opportunity.
+                opportunity.edge = edge
+                opportunity.edge_percentage = edge
+                opportunity.recommended_side = evaluation.side
                 
                 opportunities.append(opportunity)
-                logger.info(f"✅ EDGE APPROVED: {market.market_id} - Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), Confidence: {confidence:.1%}, Reason: {edge_result.reason}")
+                logger.info(
+                    f"✅ DIRECTIONAL EVIDENCE APPROVED: {market.market_id} - "
+                    f"Side: {evaluation.side}, Edge: {evaluation.gross_edge:.1%}, "
+                    f"Confidence: {confidence:.1%}, Reason: {confidence_reason}"
+                )
                 
                 # 🚀 IMMEDIATE TRADING: Place trade for strong opportunities
                 if db_manager:
                     await _evaluate_immediate_trade(opportunity, db_manager, kalshi_client, total_capital)
             else:
-                logger.info(f"❌ EDGE FILTERED: {market.market_id} - {edge_result.reason}")
+                rejection_counts[confidence_reason] += 1
+                logger.info(
+                    f"❌ MODEL CONFIDENCE FILTERED: {market.market_id} - "
+                    f"{confidence_reason}"
+                )
             
         except Exception as e:
+            rejection_counts[f"unexpected {type(e).__name__}"] += 1
             logger.error(f"Error creating opportunity from {market.market_id}: {e}")
             continue
     
+    logger.info(
+        "DIRECTIONAL_OPPORTUNITY_SUMMARY input_markets=%s shortlisted=%s "
+        "cached_preferred_price_candidates=%s opportunities=%s rejection_counts=%s",
+        input_market_count,
+        len(markets),
+        preferred_price_candidates,
+        len(opportunities),
+        dict(sorted(rejection_counts.items())),
+    )
     logger.info(f"Created {len(opportunities)} opportunities from {len(markets)} markets")
     return opportunities
 
@@ -138,26 +456,24 @@ async def _evaluate_immediate_trade(
     logger = get_trading_logger("immediate_trading")  # Move logger definition to the top
     
     try:
-        # Use enhanced edge filtering for immediate trading decisions
-        from src.utils.edge_filter import EdgeFilter
-        
-        # Check if opportunity meets immediate trading criteria using edge filter
-        should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(
-            ai_probability=opportunity.predicted_probability,
-            market_probability=opportunity.market_probability,
-            confidence=opportunity.confidence,
-            additional_filters={
-                'volume': getattr(opportunity, 'volume', 1000),
-                'min_volume': 1000,
-                'time_to_expiry_days': opportunity.time_to_expiry,
-                'max_time_to_expiry': 365
-            }
+        # Reuse the same independent evidence-quality result.  The opportunity
+        # already passed the centralized directional economic policy.
+        should_trade, trade_reason = validate_directional_model_confidence(
+            opportunity.confidence
         )
+        volume = getattr(opportunity, 'volume', 1000)
+        if should_trade and volume < 1000:
+            should_trade, trade_reason = False, f"Volume {volume} below minimum 1000"
+        if should_trade and opportunity.time_to_expiry > 365:
+            should_trade = False
+            trade_reason = (
+                f"Time to expiry {opportunity.time_to_expiry} days exceeds maximum 365"
+            )
         
         # Additional criteria for immediate execution - MORE AGGRESSIVE
         strong_opportunity = (
             should_trade and
-            edge_result.edge_percentage >= 0.10 and  # DECREASED: 10% edge for immediate execution (was 18%)
+            opportunity.edge_percentage >= 0.10 and  # Immediate-only strength threshold
             opportunity.confidence >= 0.60 and       # DECREASED: 60% confidence (was 75%)
             opportunity.expected_return >= 0.05      # DECREASED: 5% expected return (was 8%)
         )
@@ -254,7 +570,7 @@ async def _evaluate_immediate_trade(
         import aiosqlite
         async with aiosqlite.connect(db_manager.db_path) as db:
             cursor = await db.execute(
-                "SELECT COUNT(*) FROM positions WHERE market_id = ?",
+                "SELECT COUNT(*) FROM positions WHERE market_id = ? AND status = 'open'",
                 (opportunity.market_id,)
             )
             result = await cursor.fetchone()
@@ -287,16 +603,23 @@ async def _evaluate_immediate_trade(
         
         # NO DOLLAR MINIMUM - we'll ensure at least 1 contract below
         
-        # Determine side based on edge direction
-        side = "NO" if opportunity.edge < 0 else "YES"  # Negative edge = market overpriced = bet NO
-        
-        # Calculate proper entry price (what we expect to pay)
-        if side == "YES":
-            entry_price = opportunity.market_probability  # Price for YES shares
-            shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
-        else:
-            entry_price = 1 - opportunity.market_probability  # Price for NO shares  
-            shares = max(1, int(position_size / entry_price))  # Minimum 1 contract
+        # The opportunity is already normalized to the selected side.  Never
+        # infer a NO purchase from a negative YES-relative edge: that legacy
+        # convention would invert the executable entry price after a valid NO
+        # decision had cleared the centralized policy.
+        side = opportunity.recommended_side
+        entry_price = float(
+            opportunity.side_market_probability or opportunity.market_probability
+        )
+        if side not in {"YES", "NO"} or not 0 < entry_price < 1:
+            logger.warning(
+                "Skipping immediate trade with invalid selected-side quote",
+                market_id=opportunity.market_id,
+                side=side,
+                entry_price=entry_price,
+            )
+            return
+        shares = max(1, int(position_size / entry_price))
         
         # Verify we can afford at least 1 contract
         min_cost = shares * entry_price
@@ -392,17 +715,25 @@ async def _evaluate_immediate_trade(
 def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
     """Calculate simple Kelly fraction for immediate trading.
 
-    Uses the shared kernel (src/utils/position_sizing.py); this wrapper owns
-    the side selection (YES on positive edge, NO otherwise), the 20% cap, and
-    the legacy 5% fallback for degenerate market prices.
+    Uses the selected-side probability and selected-side executable price.
+    The 20% cap and legacy 5% fallback are retained for degenerate prices.
     """
     try:
-        if opportunity.edge > 0:  # Betting YES
-            p = opportunity.predicted_probability
-            b = binary_market_payout_odds(opportunity.market_probability, bet_yes=True)
-        else:  # Betting NO
-            p = 1 - opportunity.predicted_probability
-            b = binary_market_payout_odds(opportunity.market_probability, bet_yes=False)
+        side = str(getattr(opportunity, "recommended_side", "")).upper()
+        if side not in {"YES", "NO"}:
+            # Backward compatibility for persisted/legacy opportunities that
+            # predate selected-side fields.
+            side = "YES" if opportunity.edge >= 0 else "NO"
+        if opportunity.side_probability > 0 and opportunity.side_market_probability > 0:
+            p = float(opportunity.side_probability)
+            price = float(opportunity.side_market_probability)
+        elif side == "YES":
+            p = float(opportunity.predicted_probability)
+            price = float(opportunity.market_probability)
+        else:
+            p = 1.0 - float(opportunity.predicted_probability)
+            price = 1.0 - float(opportunity.market_probability)
+        b = binary_market_payout_odds(price, bet_yes=True)
 
         if b <= 0:
             return 0.05  # degenerate price (e.g. NO at P=0): keep legacy fallback

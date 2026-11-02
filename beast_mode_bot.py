@@ -38,6 +38,9 @@ from src.utils.database import DatabaseManager
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.config.settings import settings
+from src.orders.reconciler import OrderReconciler
+from src.orders.repository import OrderRepository
+from src.orders.readiness import ReadinessContext, SubmissionReadinessEvaluator
 
 # Import Beast Mode components
 from src.strategies.unified_trading_system import run_unified_trading_system, TradingSystemConfig
@@ -69,6 +72,7 @@ class BeastModeBot:
         # Set live trading in settings
         settings.trading.live_trading_enabled = live_mode
         settings.trading.paper_trading_mode = not live_mode
+        settings.validate()
         
         # Add detailed logging for debugging
         self.logger.info(
@@ -120,6 +124,47 @@ class BeastModeBot:
             # not xAI directly. Cost tracking lives on this client.
             self.xai_client = XAIClient(db_manager=db_manager)
 
+            reconciler = None
+            if settings.trading.order_reconciliation_enabled:
+                if not settings.trading.reconciliation_shadow_mode:
+                    self.logger.error(
+                        "Order reconciliation refused: Phase 2 requires shadow mode"
+                    )
+                elif self.live_mode:
+                    reconciler = OrderReconciler(
+                        OrderRepository(db_manager.db_path), kalshi_client,
+                        shadow_mode=True, paper_mode=False,
+                        max_staleness_seconds=(
+                            settings.trading.reconciliation_max_staleness_seconds
+                        ),
+                        verification_timeout_seconds=(
+                            settings.trading.order_verification_timeout_seconds
+                        ),
+                    )
+                    if settings.trading.reconciliation_startup_required:
+                        startup_result = await reconciler.reconcile(trigger="startup", full=True)
+                        self.logger.info(
+                            "Startup shadow reconciliation finished",
+                            reconciliation_run_id=startup_result.run_id,
+                            status=startup_result.status,
+                        )
+                else:
+                    self.logger.info("Order reconciliation remains separate from paper mode")
+
+            startup_readiness = SubmissionReadinessEvaluator(OrderRepository(db_manager.db_path))
+            startup_report = await startup_readiness.evaluate(ReadinessContext(
+                live_mode=self.live_mode,
+                authoritative_execution_enabled=settings.trading.authoritative_live_execution_enabled,
+                reconciliation_enabled=settings.trading.order_reconciliation_enabled,
+                reconciliation_shadow_mode=settings.trading.reconciliation_shadow_mode,
+                kill_switch=settings.trading.live_order_submission_kill_switch,
+                configured_environment=settings.api.kalshi_environment,
+                client_environment=kalshi_client.environment,
+                production_acknowledgement=settings.trading.production_execution_acknowledgement,
+                reconciliation_max_age_seconds=settings.trading.reconciliation_health_max_age_seconds,
+            ), scope="startup")
+            startup_readiness.log(startup_report, self.logger)
+
             # Small delay to ensure everything is ready
             await asyncio.sleep(1)
             
@@ -142,6 +187,8 @@ class BeastModeBot:
                 asyncio.create_task(self._run_position_tracking(db_manager, kalshi_client)),
                 asyncio.create_task(self._run_performance_evaluation(db_manager))
             ]
+            if reconciler is not None:
+                tasks.append(asyncio.create_task(self._run_order_reconciliation(reconciler)))
             
             # Setup shutdown handler. Log which signal arrived so unexpected
             # shutdowns (issue #37) can be diagnosed. SIGINT = Ctrl-C from the
@@ -317,11 +364,37 @@ class BeastModeBot:
         while not self.shutdown_event.is_set():
             try:
                 # ✅ FIXED: Pass the shared database manager
-                await run_tracking(db_manager)
+                await run_tracking(
+                    db_manager, kalshi_client=kalshi_client,
+                    live_mode=self.live_mode,
+                )
                 await asyncio.sleep(120)  # Check positions every 2 minutes (slower to reduce API load)
             except Exception as e:
                 self.logger.error(f"Error in position tracking: {e}")
                 await asyncio.sleep(30)
+
+    async def _run_order_reconciliation(self, reconciler: OrderReconciler):
+        """Run read-only shadow reconciliation without gating legacy strategies."""
+        loop = asyncio.get_running_loop()
+        last_full = loop.time()
+        while not self.shutdown_event.is_set():
+            try:
+                interval = max(1, settings.trading.reconciliation_interval_seconds)
+                await asyncio.sleep(interval)
+                full_interval = max(interval, settings.trading.full_reconciliation_interval_seconds)
+                full = loop.time() - last_full >= full_interval
+                result = await reconciler.reconcile(trigger="periodic", full=full)
+                if full:
+                    last_full = loop.time()
+                self.logger.info(
+                    "Periodic shadow reconciliation finished",
+                    reconciliation_run_id=result.run_id, status=result.status, full=full,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.error("Shadow reconciliation loop error", error=str(exc))
+                await asyncio.sleep(max(1, settings.trading.reconciliation_interval_seconds))
 
     async def _run_performance_evaluation(self, db_manager: DatabaseManager):
         """Background task for performance evaluation."""
@@ -423,4 +496,4 @@ if __name__ == "__main__":
         print("\n👋 Beast Mode Bot stopped by user")
     except Exception as e:
         print(f"❌ Beast Mode Bot error: {e}")
-        raise 
+        raise

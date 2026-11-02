@@ -1,7 +1,4 @@
-"""
-Kalshi API client for trading operations.
-Handles authentication, market data, and trade execution.
-"""
+"""Read-only Kalshi API client for account and market data."""
 
 import asyncio
 import base64
@@ -14,12 +11,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 from urllib.parse import urlencode
+from urllib.parse import urlparse
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from src.config.settings import settings
+from src.orders.exchange_models import ExchangeFill, ExchangeOrder
 from src.utils.logging_setup import TradingLoggerMixin
 
 
@@ -30,16 +29,24 @@ class KalshiAPIError(Exception):
 
 class KalshiClient(TradingLoggerMixin):
     """
-    Kalshi API client for automated trading.
-    Handles authentication, market data retrieval, and trade execution.
+    Read-only Kalshi API client.
+
+    All API requests are restricted to GET before signing or network access.
     """
     
+    ENVIRONMENT_URLS = {
+        "production": "https://external-api.kalshi.com",
+        "demo": "https://external-api.demo.kalshi.co",
+    }
+
     def __init__(
         self, 
         api_key: Optional[str] = None, 
         private_key_path: str = None,
         max_retries: int = 5,
-        backoff_factor: float = 0.5
+        backoff_factor: float = 0.5,
+        environment: Optional[str] = None,
+        base_url: Optional[str] = None,
     ):
         """
         Initialize Kalshi client.
@@ -51,7 +58,22 @@ class KalshiClient(TradingLoggerMixin):
             backoff_factor: Factor for exponential backoff
         """
         self.api_key = api_key or settings.api.kalshi_api_key
-        self.base_url = settings.api.kalshi_base_url
+        self.environment = (environment or getattr(settings.api, "kalshi_environment", "production")).lower()
+        if self.environment not in self.ENVIRONMENT_URLS:
+            raise ValueError("Kalshi environment must be 'demo' or 'production'")
+        configured_url = getattr(settings.api, "kalshi_base_url", None)
+        self.base_url = (base_url or (
+            self.ENVIRONMENT_URLS[self.environment]
+            if environment is not None or self.environment == "demo"
+            else configured_url or self.ENVIRONMENT_URLS["production"]
+        )).rstrip("/")
+        selected_host = urlparse(self.base_url).hostname
+        production_host = urlparse(self.ENVIRONMENT_URLS["production"]).hostname
+        demo_host = urlparse(self.ENVIRONMENT_URLS["demo"]).hostname
+        if self.environment == "demo" and selected_host == production_host:
+            raise ValueError("Demo environment cannot use the production Kalshi host")
+        if self.environment == "production" and selected_host == demo_host:
+            raise ValueError("Production environment cannot use the demo Kalshi host")
         self.private_key_path = private_key_path or os.environ.get("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key.pem")
         self.private_key = None
         self.max_retries = max_retries
@@ -66,7 +88,12 @@ class KalshiClient(TradingLoggerMixin):
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)
         )
         
-        self.logger.info("Kalshi client initialized", api_key_length=len(self.api_key) if self.api_key else 0)
+        self.logger.info(
+            "Kalshi client initialized",
+            api_key_length=len(self.api_key) if self.api_key else 0,
+            environment=self.environment,
+            base_url=self.base_url,
+        )
     
     def _load_private_key(self) -> None:
         """Load private key from file."""
@@ -126,7 +153,7 @@ class KalshiClient(TradingLoggerMixin):
         require_auth: bool = True
     ) -> Dict[str, Any]:
         """
-        Make authenticated request to Kalshi API with retry logic.
+        Make an authenticated read-only request to Kalshi API with retry logic.
         
         Args:
             method: HTTP method
@@ -138,6 +165,11 @@ class KalshiClient(TradingLoggerMixin):
         Returns:
             API response data
         """
+        if method.upper() != "GET":
+            raise KalshiAPIError(
+                "Kalshi client is read-only; only GET requests are allowed"
+            )
+
         # Prepare request
         url = f"{self.base_url}{endpoint}"
         headers = {
@@ -228,21 +260,136 @@ class KalshiClient(TradingLoggerMixin):
             params["ticker"] = ticker
         return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/positions", params=params)
     
-    async def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
-        """Get order fills.""" 
+    async def get_fills(
+        self, ticker: Optional[str] = None, limit: int = 100,
+        cursor: Optional[str] = None, order_id: Optional[str] = None,
+        min_ts: Optional[int] = None, max_ts: Optional[int] = None,
+        subaccount: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of fills with authoritative portfolio filters."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
         params = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+        if order_id:
+            params["order_id"] = order_id
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/fills", params=params)
     
-    async def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> Dict[str, Any]:
-        """Get orders."""
-        params = {}
+    async def get_order(self, order_id: str) -> Dict[str, Any]:
+        """Get one authoritative order by exchange order ID."""
+        if not order_id or not order_id.strip():
+            raise ValueError("order_id is required")
+        return await self._make_authenticated_request(
+            "GET", f"/trade-api/v2/portfolio/orders/{order_id}"
+        )
+
+    async def get_orders(
+        self, ticker: Optional[str] = None, status: Optional[str] = None,
+        limit: int = 100, cursor: Optional[str] = None,
+        min_ts: Optional[int] = None, max_ts: Optional[int] = None,
+        subaccount: Optional[int] = None, client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of orders; client ID filtering is applied locally."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        params = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
         if status:
             params["status"] = status
-        return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/orders", params=params)
+        if cursor:
+            params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        if subaccount is not None:
+            params["subaccount"] = subaccount
+        response = await self._make_authenticated_request(
+            "GET", "/trade-api/v2/portfolio/orders", params=params
+        )
+        if client_order_id:
+            response = dict(response)
+            response["orders"] = [
+                order for order in response.get("orders", [])
+                if order.get("client_order_id") == client_order_id
+            ]
+        return response
+
+    async def iter_orders(self, **filters):
+        """Yield normalized orders across every cursor page."""
+        cursor = filters.pop("cursor", None)
+        seen_cursors = set()
+        seen_orders: Dict[str, ExchangeOrder] = {}
+        while True:
+            if cursor is not None:
+                if cursor in seen_cursors:
+                    raise KalshiAPIError(f"Repeated orders cursor: {cursor}")
+                seen_cursors.add(cursor)
+            response = await self.get_orders(cursor=cursor, **filters)
+            if not isinstance(response, dict) or not isinstance(response.get("orders", []), list):
+                raise KalshiAPIError("Malformed orders page")
+            if "cursor" not in response:
+                raise KalshiAPIError("Orders page is missing its pagination cursor")
+            for raw_order in response.get("orders", []):
+                order = ExchangeOrder.from_kalshi(raw_order)
+                previous = seen_orders.get(order.order_id)
+                if previous is not None:
+                    if previous != order:
+                        raise KalshiAPIError(f"Conflicting duplicate order: {order.order_id}")
+                    continue
+                seen_orders[order.order_id] = order
+                yield order
+            cursor = response["cursor"]
+            if cursor is not None and not isinstance(cursor, str):
+                raise KalshiAPIError("Orders page has an invalid pagination cursor")
+            if not cursor:
+                break
+
+    async def get_all_orders(self, **filters) -> List[ExchangeOrder]:
+        return [order async for order in self.iter_orders(**filters)]
+
+    async def iter_fills(self, **filters):
+        """Yield normalized fills across every cursor page."""
+        cursor = filters.pop("cursor", None)
+        seen_cursors = set()
+        seen_fills: Dict[str, ExchangeFill] = {}
+        while True:
+            if cursor is not None:
+                if cursor in seen_cursors:
+                    raise KalshiAPIError(f"Repeated fills cursor: {cursor}")
+                seen_cursors.add(cursor)
+            response = await self.get_fills(cursor=cursor, **filters)
+            if not isinstance(response, dict) or not isinstance(response.get("fills", []), list):
+                raise KalshiAPIError("Malformed fills page")
+            if "cursor" not in response:
+                raise KalshiAPIError("Fills page is missing its pagination cursor")
+            for raw_fill in response.get("fills", []):
+                fill = ExchangeFill.from_kalshi(raw_fill)
+                previous = seen_fills.get(fill.fill_id)
+                if previous is not None:
+                    if previous != fill:
+                        raise KalshiAPIError(f"Conflicting duplicate fill: {fill.fill_id}")
+                    continue
+                seen_fills[fill.fill_id] = fill
+                yield fill
+            cursor = response["cursor"]
+            if cursor is not None and not isinstance(cursor, str):
+                raise KalshiAPIError("Fills page has an invalid pagination cursor")
+            if not cursor:
+                break
+
+    async def get_all_fills(self, **filters) -> List[ExchangeFill]:
+        return [fill async for fill in self.iter_fills(**filters)]
     
     async def get_markets(
         self,
@@ -283,11 +430,93 @@ class KalshiClient(TradingLoggerMixin):
         return await self._make_authenticated_request(
             "GET", "/trade-api/v2/markets", params=params, require_auth=True
         )
+
+    async def get_events(
+        self,
+        limit: int = 200,
+        cursor: Optional[str] = None,
+        status: Optional[str] = None,
+        series_ticker: Optional[str] = None,
+        with_nested_markets: bool = True,
+        with_milestones: bool = True,
+        min_close_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of events with structured market and milestone metadata."""
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "with_nested_markets": str(with_nested_markets).lower(),
+            "with_milestones": str(with_milestones).lower(),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        if status:
+            params["status"] = status
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if min_close_ts is not None:
+            params["min_close_ts"] = int(min_close_ts)
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/events", params=params, require_auth=True
+        )
+
+    async def get_event(self, event_ticker: str, *, with_nested_markets: bool = True) -> Dict[str, Any]:
+        """Get one event and its markets without any write capability."""
+        if not event_ticker or not event_ticker.strip():
+            raise ValueError("event_ticker is required")
+        return await self._make_authenticated_request(
+            "GET",
+            f"/trade-api/v2/events/{event_ticker}",
+            params={"with_nested_markets": str(with_nested_markets).lower()},
+            require_auth=True,
+        )
+
+    async def get_milestones(
+        self,
+        limit: int = 500,
+        cursor: Optional[str] = None,
+        minimum_start_date: Optional[str] = None,
+        category: Optional[str] = None,
+        competition: Optional[str] = None,
+        type_: Optional[str] = None,
+        related_event_ticker: Optional[str] = None,
+        min_updated_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of structured milestones, including sports/game metadata."""
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        params: Dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if minimum_start_date:
+            params["minimum_start_date"] = minimum_start_date
+        if category:
+            params["category"] = category
+        if competition:
+            params["competition"] = competition
+        if type_:
+            params["type"] = type_
+        if related_event_ticker:
+            params["related_event_ticker"] = related_event_ticker
+        if min_updated_ts is not None:
+            params["min_updated_ts"] = int(min_updated_ts)
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/milestones", params=params, require_auth=True
+        )
     
     async def get_market(self, ticker: str) -> Dict[str, Any]:
         """Get specific market data."""
         return await self._make_authenticated_request(
             "GET", f"/trade-api/v2/markets/{ticker}", require_auth=False
+        )
+
+    async def get_series(self, series_ticker: str) -> Dict[str, Any]:
+        """Get authoritative series metadata, including its current fee model."""
+        if not series_ticker or not series_ticker.strip():
+            raise ValueError("series_ticker is required")
+        return await self._make_authenticated_request(
+            "GET", f"/trade-api/v2/series/{series_ticker}", require_auth=False
         )
     
     async def get_orderbook(self, ticker: str, depth: int = 100) -> Dict[str, Any]:
@@ -347,49 +576,13 @@ class KalshiClient(TradingLoggerMixin):
         no_price: Optional[int] = None,
         expiration_ts: Optional[int] = None
     ) -> Dict[str, Any]:
-        """
-        Place a trading order.
-        
-        Args:
-            ticker: Market ticker
-            client_order_id: Unique client order ID
-            side: "yes" or "no"
-            action: "buy" or "sell"
-            count: Number of contracts
-            type_: Order type ("market" or "limit")
-            yes_price: Yes price in cents (for limit orders)
-            no_price: No price in cents (for limit orders)
-            expiration_ts: Order expiration timestamp
-        
-        Returns:
-            Order response
-        """
-        order_data = {
-            "ticker": ticker,
-            "client_order_id": client_order_id,
-            "side": side,
-            "action": action,
-            "count": count,
-            "type": type_
-        }
-        
-        if yes_price is not None:
-            order_data["yes_price"] = yes_price
-        if no_price is not None:
-            order_data["no_price"] = no_price
-        if expiration_ts:
-            order_data["expiration_ts"] = expiration_ts
-        
-        return await self._make_authenticated_request(
-            "POST", "/trade-api/v2/portfolio/orders", json_data=order_data
-        )
-    
+        """Reject order submission in this read-only build."""
+        raise KalshiAPIError("Order submission is disabled in this read-only build")
+
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        """Cancel an order."""
-        return await self._make_authenticated_request(
-            "DELETE", f"/trade-api/v2/portfolio/orders/{order_id}"
-        )
-    
+        """Reject order cancellation in this read-only build."""
+        raise KalshiAPIError("Order cancellation is disabled in this read-only build")
+
     async def get_trades(
         self,
         ticker: Optional[str] = None,
@@ -428,4 +621,4 @@ class KalshiClient(TradingLoggerMixin):
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
-        await self.close() 
+        await self.close()

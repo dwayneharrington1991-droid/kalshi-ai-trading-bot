@@ -1,7 +1,4 @@
-"""
-Kalshi API client for trading operations.
-Handles authentication, market data, and trade execution.
-"""
+"""Read-only Kalshi API client for account and market data."""
 
 import asyncio
 import base64
@@ -11,7 +8,6 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 from urllib.parse import urlencode
@@ -31,8 +27,9 @@ class KalshiAPIError(Exception):
 
 class KalshiClient(TradingLoggerMixin):
     """
-    Kalshi API client for automated trading.
-    Handles authentication, market data retrieval, and trade execution.
+    Read-only Kalshi API client.
+
+    All API requests are restricted to GET before signing or network access.
     """
     
     def __init__(
@@ -127,7 +124,7 @@ class KalshiClient(TradingLoggerMixin):
         require_auth: bool = True
     ) -> Dict[str, Any]:
         """
-        Make authenticated request to Kalshi API with retry logic.
+        Make an authenticated read-only request to Kalshi API with retry logic.
         
         Args:
             method: HTTP method
@@ -139,6 +136,11 @@ class KalshiClient(TradingLoggerMixin):
         Returns:
             API response data
         """
+        if method.upper() != "GET":
+            raise KalshiAPIError(
+                "Kalshi client is read-only; only GET requests are allowed"
+            )
+
         # Prepare request
         url = f"{self.base_url}{endpoint}"
         headers = {
@@ -348,89 +350,12 @@ class KalshiClient(TradingLoggerMixin):
         no_price: Optional[int] = None,
         expiration_ts: Optional[int] = None
     ) -> Dict[str, Any]:
-        """
-        Place a trading order through Kalshi's Create Order V2 endpoint.
-
-        Existing callers may continue passing outcome-side orders such as
-        ``side="yes", action="buy"`` or ``side="no", action="buy"``.
-        They are converted to Kalshi's single YES-side bid/ask order book.
-        """
-        side_normalized = side.lower()
-        action_normalized = action.lower()
-
-        if side_normalized not in {"yes", "no"}:
-            raise ValueError("side must be 'yes' or 'no'")
-        if action_normalized not in {"buy", "sell"}:
-            raise ValueError("action must be 'buy' or 'sell'")
-
-        # Callers in this project sometimes pass count as text. Normalize it
-        # before any numeric comparison or fixed-point formatting.
-        try:
-            count_value = Decimal(str(count))
-        except (InvalidOperation, ValueError, TypeError) as exc:
-            raise ValueError(f"count must be numeric; got {count!r}") from exc
-
-        if not count_value.is_finite() or count_value <= 0:
-            raise ValueError("count must be a finite number greater than zero")
-
-        # Create Order V2 quotes every order from the YES side:
-        # bid = buy YES; ask = sell YES.
-        if side_normalized == "yes":
-            if yes_price is None:
-                raise ValueError("yes_price is required for YES orders")
-            yes_price_cents = int(yes_price)
-            book_side = "bid" if action_normalized == "buy" else "ask"
-        else:
-            if no_price is None:
-                raise ValueError("no_price is required for NO orders")
-            no_price_cents = int(no_price)
-            yes_price_cents = 100 - no_price_cents
-            book_side = "ask" if action_normalized == "buy" else "bid"
-
-        if not 0 < yes_price_cents < 100:
-            raise ValueError(
-                "Converted YES price must be between 1 and 99 cents; "
-                f"got {yes_price_cents}"
-            )
-
-        order_data = {
-            "ticker": ticker,
-            "client_order_id": client_order_id,
-            "side": book_side,
-            "count": f"{count_value:.2f}",
-            "price": f"{yes_price_cents / 100:.4f}",
-            "time_in_force": (
-                "immediate_or_cancel"
-                if type_.lower() == "market"
-                else "good_till_canceled"
-            ),
-            "self_trade_prevention_type": "taker_at_cross",
-            "post_only": False,
-            "cancel_order_on_pause": False,
-            "reduce_only": action_normalized == "sell",
-            "subaccount": 0,
-            "exchange_index": 0,
-        }
-
-        if expiration_ts:
-            order_data["expiration_time"] = int(expiration_ts)
-
-        response = await self._make_authenticated_request(
-            "POST",
-            "/trade-api/v2/portfolio/events/orders",
-            json_data=order_data,
-        )
-
-        # Preserve the response shape expected by the rest of this project.
-        return response if "order" in response else {"order": response}
+        """Reject order submission in this read-only build."""
+        raise KalshiAPIError("Order submission is disabled in this read-only build")
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        """Cancel an order through Kalshi's Cancel Order V2 endpoint."""
-        response = await self._make_authenticated_request(
-            "DELETE",
-            f"/trade-api/v2/portfolio/events/orders/{order_id}",
-        )
-        return response if "order" in response else {"order": response}
+        """Reject order cancellation in this read-only build."""
+        raise KalshiAPIError("Order cancellation is disabled in this read-only build")
 
     async def get_trades(
         self,

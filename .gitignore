@@ -7,6 +7,8 @@
 kalshi_private_key
 secrets.json
 config.json
+# Backup archives can bundle credentials and databases; keep them out of Git.
+backups/*.tar.gz
 
 # Database files
 *.db

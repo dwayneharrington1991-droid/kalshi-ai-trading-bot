@@ -564,7 +564,7 @@ def view(state, prior=None, opening=None, generated_at=None):
     return result
 
 
-def create(db, migrate_contract_summaries=True):
+def create(db, *, migrate_contract_summaries=True):
     db.execute(
         "CREATE TABLE IF NOT EXISTS btc_engine_opening (mode TEXT,ticker TEXT,generated_at TEXT,cutoff TEXT,closes_at TEXT,up REAL,status TEXT,payload TEXT,PRIMARY KEY(mode,ticker))"
     )
@@ -611,18 +611,20 @@ def create(db, migrate_contract_summaries=True):
     """
     )
     if migrate_contract_summaries:
-        # Additive, idempotent migration for small journals created before these
-        # summaries.  Large production journals defer this scan so live market
-        # ingestion cannot be blocked by startup maintenance.
-        db.execute(
-            """INSERT OR IGNORE INTO btc_engine_contracts
-            SELECT mode,ticker,closes_at,COUNT(*),MAX(timestamp)
-            FROM btc_engine_predictions GROUP BY mode,ticker"""
-        )
-        db.execute(
-            """INSERT OR IGNORE INTO btc_engine_contracts
-            SELECT mode,ticker,closes_at,0,NULL FROM btc_engine_opening"""
-        )
+        backfill_contract_summaries(db)
+
+
+def backfill_contract_summaries(db):
+    """Build derived contract summaries for a journal known to be safe to scan."""
+    db.execute(
+        """INSERT OR IGNORE INTO btc_engine_contracts
+        SELECT mode,ticker,closes_at,COUNT(*),MAX(timestamp)
+        FROM btc_engine_predictions GROUP BY mode,ticker"""
+    )
+    db.execute(
+        """INSERT OR IGNORE INTO btc_engine_contracts
+        SELECT mode,ticker,closes_at,0,NULL FROM btc_engine_opening"""
+    )
 
 
 def prior(db, ticker, mode):

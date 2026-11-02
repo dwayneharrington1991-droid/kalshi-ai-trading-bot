@@ -37,6 +37,17 @@ def test_incorrect_environment_blocks_startup():
 
 def test_failed_persistent_reconciliation_blocks_before_launch(tmp_path):
     fake_python = tmp_path / "python"
+    fake_git_dir = tmp_path / "bin"
+    fake_git_dir.mkdir()
+    fake_git = fake_git_dir / "git"
+    fake_git.write_text(
+        "#!/usr/bin/env bash\n"
+        '[[ "$*" == "merge-base --is-ancestor 91fe26c75dc24e7aaab4c729cf4deb7312686a9c HEAD" ]] '
+        "|| exit 99\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
     counter = tmp_path / "counter"
     fake_python.write_text(
         "#!/usr/bin/env bash\n"
@@ -53,6 +64,8 @@ def test_failed_persistent_reconciliation_blocks_before_launch(tmp_path):
     fake_python.chmod(0o700)
     environment = dict(os.environ)
     environment["CANARY_PYTHON"] = str(fake_python)
+    # Pass the repository-history precondition so this test reaches refresh failure.
+    environment["PATH"] = str(fake_git_dir) + os.pathsep + environment.get("PATH", "")
     result = run_start("I_APPROVE_OVERNIGHT_CANARY", "production", environment=environment)
     assert result.returncode == 2
     assert "persistent read-only reconciliation refresh failed" in result.stderr

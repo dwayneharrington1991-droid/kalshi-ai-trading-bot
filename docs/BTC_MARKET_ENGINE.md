@@ -140,6 +140,11 @@ test data. A minimum count is not a guarantee of skill. Use
 `--disable-scheduled-learning` with the server if archive-only evaluation is not
 wanted. Model and registry files remain excluded from Git.
 
+Large journals are not scanned synchronously during startup. Contract-summary
+backfill and optional indexes are deferred for journals over 512 MiB; existing
+records and model artifacts remain untouched, and new summaries continue to be
+recorded incrementally.
+
 Manual offline comparison, optional when enough official evidence exists:
 
 ```bash

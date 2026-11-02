@@ -452,7 +452,7 @@ class PublicFeed:
                     "maximum_requests_per_refresh": 5,
                 },
                 "diagnostics": {
-                    "status": "READY", "last_attempt_at": now.isoformat(),
+                    "status": "READY" if len(merged) == 1440 else "INCOMPLETE", "last_attempt_at": now.isoformat(),
                     "last_success_at": received.isoformat(), "error_type": None,
                     "retained_bars": len(merged),
                     "missing_bars": max(0, 1440 - len(merged)),

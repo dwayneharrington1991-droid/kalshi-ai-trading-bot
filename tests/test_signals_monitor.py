@@ -244,7 +244,9 @@ def test_incomplete_startup_candle_preload_retries_after_five_seconds():
         )
 
     feed = PublicFeed(get, multi_venue=False)
-    feed.candles(NOW)
+    result = feed.candles(NOW)
+    assert result["diagnostics"]["status"] == "INCOMPLETE"
+    assert result["diagnostics"]["missing_bars"] == 1440
     assert len(calls) == 5
     feed.candles(NOW + timedelta(seconds=4))
     assert len(calls) == 5

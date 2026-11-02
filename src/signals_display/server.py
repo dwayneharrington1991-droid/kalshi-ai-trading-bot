@@ -1225,7 +1225,48 @@ class Monitor:
             "response_generated_at": utcnow().isoformat(),
             "state_age_seconds": max(0, (utcnow() - last_tick).total_seconds()),
         }
+        state["combined_ai"] = {
+            "status": "WAIT — NO VERIFIED EDGE",
+            "model_id": None,
+            "validated": False,
+            "signal": None,
+            "reason": "No dedicated trained ensemble combining Opening AI and Scalp AI is loaded.",
+        }
         return state
+
+
+def dashboard_page():
+    body = Path(__file__).with_name("dashboard.html").read_bytes()
+    replacements = (
+        (
+            b'<h2 id="primary-settlement-title">SETTLEMENT FORECAST</h2>',
+            b'<h2 id="primary-settlement-title">SETTLEMENT FORECAST</h2>'
+            b'<p class="small"><strong>OPENING AI</strong> '
+            b'<span id="opening-ai-status" class="tag amber" role="status">WAIT</span></p>',
+        ),
+        (
+            b'<h2>LIVE SCALPING</h2>',
+            b'<h2>LIVE SCALPING</h2><p class="small"><strong>SCALPING AI</strong> '
+            b'<span id="scalp-ai-status" class="tag amber" role="status">WAIT</span></p>',
+        ),
+        (
+            b'<p id="primary-scalp-reason">No verified scalp opportunity.</p></article></section>',
+            b'<p id="primary-scalp-reason">No verified scalp opportunity.</p></article>'
+            b'<article class="card" id="combined-ai"><h2>COMBINED AI</h2>'
+            b'<div id="combined-ai-status" class="forecast-label amber" role="status">WAIT / NO VERIFIED EDGE</div>'
+            b'<p id="combined-ai-reason">No separate trained Opening+Scalp ensemble is loaded.</p>'
+            b'</article></section>',
+        ),
+        (
+            b"</body>",
+            b'<script src="/ai_status.js" defer></script></body>',
+        ),
+    )
+    for marker, replacement in replacements:
+        if body.count(marker) != 1:
+            raise RuntimeError("Dashboard markup changed; AI status panel cannot be inserted safely")
+        body = body.replace(marker, replacement, 1)
+    return body
 
 
 def make_handler(monitor):
@@ -1246,8 +1287,11 @@ def make_handler(monitor):
             query = parse_qs(parts.query)
             status_code = 200
             if route == "/":
-                body = Path(__file__).with_name("dashboard.html").read_bytes()
+                body = dashboard_page()
                 content_type = "text/html; charset=utf-8"
+            elif route == "/ai_status.js":
+                body = Path(__file__).with_name("ai_status.js").read_bytes()
+                content_type = "text/javascript; charset=utf-8"
             elif route == "/api/state-version":
                 try:
                     after = int(query.get("after", ["0"])[0])
@@ -1459,7 +1503,7 @@ def make_handler(monitor):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
             )
             self.end_headers()
             self.wfile.write(body)
@@ -1615,8 +1659,11 @@ def make_startup_handler(startup):
         def do_GET(self):
             route = urlsplit(self.path).path
             if route == "/":
-                body = Path(__file__).with_name("dashboard.html").read_bytes()
+                body = dashboard_page()
                 content_type, status = "text/html; charset=utf-8", 200
+            elif route == "/ai_status.js":
+                body = Path(__file__).with_name("ai_status.js").read_bytes()
+                content_type, status = "text/javascript; charset=utf-8", 200
             elif route in {"/healthz", "/api/startup"}:
                 body = json.dumps(startup.snapshot()).encode()
                 content_type, status = "application/json", 503

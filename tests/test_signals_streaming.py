@@ -90,6 +90,7 @@ def test_duplicates_do_not_invent_volume_or_price_updates():
     sequence = hub.sequence
     assert not hub.process_coinbase(trade(), NOW, 1)
     assert hub.sequence == sequence
+    assert hub.metrics["duplicate_messages"] == 1
     assert not hub.process_coinbase(trade(1), NOW, 1)
     assert len(hub.drain_observations()) == 1
 
@@ -98,12 +99,31 @@ def test_heartbeat_and_trade_do_not_refresh_old_quote_timestamps():
     hub = StreamHub(autostart=False)
     hub.process_coinbase(ticker(), NOW, 1)
     after = NOW + timedelta(seconds=6)
-    heartbeat = {"channel": "heartbeats", "sequence_num": 0, "events": []}
+    heartbeat = {"channel": "heartbeats", "sequence_num": 1, "events": []}
     hub.process_coinbase(heartbeat, after, 7)
     assert hub.snapshot(after)["reference"] is None
-    hub.process_coinbase(trade(at=after), after, 7)
+    hub.process_coinbase(trade(2, at=after), after, 7)
     feed = hub.snapshot(after)["feeds"]["Coinbase BTC/USD stream"]
     assert feed["status"] == "LIVE" and feed["data"]["bid"] is None and feed["data"]["ask"] is None
+
+
+def test_source_sequence_is_shared_across_channels_per_product():
+    hub = StreamHub(autostart=False)
+    assert hub.process_coinbase(ticker(10), NOW, 1)
+    heartbeat = {"channel": "heartbeats", "sequence_num": 11, "events": []}
+    assert not hub.process_coinbase(heartbeat, NOW, 1)
+    assert hub.process_coinbase(trade(12, identifier="after-heartbeat"), NOW, 1)
+    assert hub.product_sequences == {"BTC-USD": 12}
+    assert hub.metrics["missing_updates"] == 0
+
+
+def test_out_of_order_cross_channel_message_is_ignored_without_disconnect():
+    hub = StreamHub(autostart=False)
+    assert hub.process_coinbase(ticker(10), NOW, 1)
+    assert not hub.process_coinbase(trade(9), NOW, 1)
+    assert hub.metrics["out_of_order_messages"] == 1
+    assert hub.snapshot(NOW)["reference"] is not None
+    assert hub.metrics["last_error_code"] is None
 
 
 @pytest.mark.parametrize("change", ["gap", "future", "unknown_side", "crossed", "nonfinite"])
@@ -115,7 +135,7 @@ def test_bad_or_incomplete_source_data_is_rejected_and_reference_disabled(change
     elif change == "future":
         packet = ticker(1, NOW + timedelta(milliseconds=1))
     elif change == "unknown_side":
-        packet = trade(side="UNKNOWN")
+        packet = trade(1, side="UNKNOWN")
     elif change == "crossed":
         packet = ticker(1)
         packet["events"][0]["tickers"][0]["best_bid"] = "100100"
@@ -127,6 +147,7 @@ def test_bad_or_incomplete_source_data_is_rejected_and_reference_disabled(change
     assert hub.metrics["rejected_messages"] == 1
     if change == "gap":
         assert hub.metrics["missing_updates"] == 1
+        assert hub.metrics["last_error_code"] == "SOURCE_SEQUENCE_GAP"
 
 
 def test_bounded_backpressure_has_explicit_gap_marker_and_latest_price():
@@ -158,7 +179,7 @@ def test_reconnect_requires_fresh_data_and_cannot_reuse_previous_quote():
 def test_delayed_cross_channel_trade_does_not_rewind_latest_reference():
     hub = StreamHub(autostart=False)
     hub.process_coinbase(ticker(at=NOW, price="100005"), NOW, 1)
-    hub.process_coinbase(trade(at=NOW - timedelta(milliseconds=100)), NOW, 1)
+    hub.process_coinbase(trade(1, at=NOW - timedelta(milliseconds=100)), NOW, 1)
     assert hub.snapshot(NOW)["reference"]["price"] == 100005
     assert len(hub.drain_observations()) == 2  # Real trade still retained for flow.
 

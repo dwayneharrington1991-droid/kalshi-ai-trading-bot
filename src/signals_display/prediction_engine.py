@@ -564,7 +564,7 @@ def view(state, prior=None, opening=None, generated_at=None):
     return result
 
 
-def create(db):
+def create(db, *, migrate_contract_summaries=True):
     db.execute(
         "CREATE TABLE IF NOT EXISTS btc_engine_opening (mode TEXT,ticker TEXT,generated_at TEXT,cutoff TEXT,closes_at TEXT,up REAL,status TEXT,payload TEXT,PRIMARY KEY(mode,ticker))"
     )
@@ -610,8 +610,12 @@ def create(db):
         END;
     """
     )
-    # Additive, idempotent migration for journals created before these summaries.
-    # Existing immutable predictions and all raw history remain untouched.
+    if migrate_contract_summaries:
+        backfill_contract_summaries(db)
+
+
+def backfill_contract_summaries(db):
+    """Build derived contract summaries for a journal known to be safe to scan."""
     db.execute(
         """INSERT OR IGNORE INTO btc_engine_contracts
         SELECT mode,ticker,closes_at,COUNT(*),MAX(timestamp)

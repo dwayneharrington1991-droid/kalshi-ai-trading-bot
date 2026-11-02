@@ -374,8 +374,8 @@ def test_combined_forward_and_legacy_records_keep_total_replay_limit(tmp_path):
         _legacy_schema(db)
         create_schema(db)
         for i in range(3):
-            _legacy_record(db, row(i))
-            item = row(i + 3)
+            _legacy_record(db, row(i, ticker=f"KXBTC15M-LEGACY-{i}"))
+            item = row(i + 3, ticker=f"KXBTC15M-FORWARD-{i}")
             db.execute(
                 "INSERT INTO scalp_book_observations(mode,payload) VALUES (?,?)",
                 ("PUBLIC MARKET DATA", json.dumps(item)),
@@ -386,6 +386,26 @@ def test_combined_forward_and_legacy_records_keep_total_replay_limit(tmp_path):
     assert [v["recorded_at"] for v in loaded["records"]] == [
         row(i)["recorded_at"] for i in (3, 4, 5)
     ]
+
+
+def test_truncated_replay_excludes_partial_contract_at_left_boundary(tmp_path):
+    path = tmp_path / "truncated.db"
+    with sqlite3.connect(path) as db:
+        create_schema(db)
+        for seconds in (0, 1):
+            db.execute(
+                "INSERT INTO scalp_book_observations(mode,ticker,recorded_at,payload) VALUES (?,?,?,?)",
+                (
+                    "PUBLIC MARKET DATA",
+                    "KXBTC15M-PARTIAL",
+                    row(seconds)["recorded_at"],
+                    json.dumps(row(seconds)),
+                ),
+            )
+    loaded = load_journal(path, limit=1)
+    assert loaded["coverage"]["truncated"] is True
+    assert loaded["coverage"]["truncated_boundary_contracts_dropped"] == 1
+    assert loaded["records"] == []
 
 
 def test_official_payout_does_not_fabricate_a_target_hit_or_executable_exit():

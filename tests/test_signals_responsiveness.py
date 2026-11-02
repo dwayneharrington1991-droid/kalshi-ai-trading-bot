@@ -100,6 +100,72 @@ def test_large_journal_never_builds_missing_indexes_during_live_startup(tmp_path
             ).fetchone() is None
 
 
+def test_large_journal_defers_historical_contract_summary_backfill(tmp_path, monkeypatch):
+    journal = Journal(tmp_path / "large-summary.db")
+    with journal.connect() as db:
+        db.execute(
+            """INSERT INTO btc_engine_predictions
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "PUBLIC MARKET DATA",
+                "KXBTC15M-LEGACY",
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                0.5,
+                "test",
+                "v1",
+                "{}",
+            ),
+        )
+        db.execute("DELETE FROM btc_engine_contracts")
+        db.execute(
+            "DELETE FROM dashboard_migrations WHERE name=?",
+            ("btc_engine_contract_summaries_v1",),
+        )
+
+    real_stat = Path.stat
+
+    def large_stat(path, *args, **kwargs):
+        value = real_stat(path, *args, **kwargs)
+        if Path(path) == Path(journal.path):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                **{
+                    name: getattr(value, name)
+                    for name in dir(value)
+                    if name.startswith("st_") and name != "st_size"
+                },
+                st_size=513 * 1024 * 1024,
+            )
+        return value
+
+    monkeypatch.setattr(Path, "stat", large_stat)
+    statements = []
+    real_connect = journal.connect
+
+    class Traced:
+        def __enter__(self):
+            self.context = real_connect()
+            self.db = self.context.__enter__()
+            self.db.set_trace_callback(statements.append)
+            return self.db
+
+        def __exit__(self, *args):
+            return self.context.__exit__(*args)
+
+    monkeypatch.setattr(Journal, "connect", lambda self: Traced())
+    Journal(journal.path)
+    result = journal.ensure_performance_indexes()
+
+    assert result["status"] == "DEFERRED_LARGE_LIVE_JOURNAL"
+    assert result["deferred"] == ["btc_engine_contract_summaries"]
+    assert not any("GROUP BY" in statement.upper() for statement in statements)
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0] == 0
+
+
 def test_journal_initialization_never_executes_secondary_index_builds(tmp_path, monkeypatch):
     journal = Journal(tmp_path / "startup.db")
     with journal.connect() as db:

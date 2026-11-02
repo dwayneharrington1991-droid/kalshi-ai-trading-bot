@@ -263,7 +263,8 @@ def test_opening_selection_is_frozen_before_untouched_test_outcomes():
     assert report["test"]["selected_candidate"] != future["test"]["selected_candidate"]
     assert not report["promotion_allowed"]
     _, blocked = opening_models.evaluate(rows, used_test_contracts=report["test_contracts"])
-    assert blocked["status"] == "HOLDOUT_REUSE_BLOCKED"
+    assert blocked["status"] == "WAITING_FOR_UNTOUCHED_CHRONOLOGICAL_HOLDOUT"
+    assert blocked["fresh_holdout"]["available_tail_contracts"] == 0
 
 
 def test_gradient_boosting_is_bounded_and_shadow_only():
@@ -275,6 +276,47 @@ def test_gradient_boosting_is_bounded_and_shadow_only():
     assert len(model["stumps"]) <= 3
     p = opening_models.predict(model, rows[0]["features"], baseline_probability=0.5)
     assert 0 <= p <= 1
+
+
+def test_reused_opening_holdout_waits_for_a_fresh_block_then_uses_it_once():
+    from src.signals_display import opening_models
+
+    used = {row["ticker"] for row in synthetic_rows(194)[155:170]}
+    _candidate, waiting = opening_models.evaluate(
+        synthetic_rows(194), used_test_contracts=used
+    )
+    assert waiting["status"] == "WAITING_FOR_UNTOUCHED_CHRONOLOGICAL_HOLDOUT"
+    assert waiting["fresh_holdout"]["available_tail_contracts"] == 24
+    assert waiting["fresh_holdout"]["required_test_contracts"] == 30
+
+    candidate, report = opening_models.evaluate(
+        synthetic_rows(200), used_test_contracts=used
+    )
+    assert report["status"] == "SHADOW_CANDIDATE_PASSED_STATISTICAL_GATES"
+    assert candidate is not None
+    assert report["fresh_holdout"]["test_contracts"] == 30
+    assert not used.intersection(report["test_contracts"])
+    assert report["split_contracts"][0] >= 100
+    assert report["split_contracts"][1] >= 30
+    assert report["validation_labels_through"] < report["first_test_prediction"]
+
+
+def test_scheduled_opening_learning_archives_only_separate_shadow_reports(tmp_path):
+    from src.signals_display import opening_models
+
+    journal = Journal(tmp_path / "journal.db")
+    registry_path = tmp_path / "models" / "opening-model-registry"
+    result = opening_models.scheduled_evaluation(
+        journal.path, registry_path, now=NOW
+    )
+    assert result["status"] == "INSUFFICIENT_OPENING_LABELS"
+    assert result["active_model_changed"] is False
+    assert result["promotion_allowed"] is False
+    assert (registry_path / "latest-evaluation.json").is_file()
+    assert not (tmp_path / "models" / "signals_opening_model.json").exists()
+    assert opening_models.scheduled_evaluation(
+        journal.path, registry_path, now=NOW + timedelta(minutes=30)
+    )["status"] == "OPENING_EVALUATION_NOT_DUE"
 
 
 def eligible_candidate():

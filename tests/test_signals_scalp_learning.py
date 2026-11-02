@@ -63,3 +63,19 @@ def test_insufficient_history_cannot_fit_or_promote(monkeypatch):
     report = scalp_learning.evaluate_chronological([record(i) for i in range(89)])
     assert report["status"] == "INSUFFICIENT_FORWARD_SCALP_HISTORY"
     assert report["actionable"] is False
+
+
+def test_scheduled_evaluation_uses_bounded_multi_contract_history(tmp_path, monkeypatch):
+    observed = {}
+
+    def fake_load_journal(path, *, limit, mode):
+        observed.update(limit=limit, mode=mode)
+        return {"records": [], "coverage": {"status": "OBSERVED_FORWARD_BOOKS"}}
+
+    monkeypatch.setattr(scalp_learning, "load_journal", fake_load_journal)
+    report = scalp_learning.scheduled_evaluation(
+        tmp_path / "journal.db", tmp_path / "report.json", now=NOW
+    )
+    assert observed == {"limit": 100000, "mode": "PUBLIC MARKET DATA"}
+    assert report["status"] == "INSUFFICIENT_FORWARD_SCALP_HISTORY"
+    assert report["journal_coverage"]["status"] == "OBSERVED_FORWARD_BOOKS"

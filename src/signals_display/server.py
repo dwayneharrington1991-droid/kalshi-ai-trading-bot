@@ -191,8 +191,12 @@ class Monitor:
         )
         self.scheduled_learning = None
         self.scheduled_scalp_learning = None
+        self.scheduled_opening_learning = None
         if model_registry is not None:
             from .model_registry import scheduled_evaluation
+            from .opening_models import (
+                scheduled_evaluation as scheduled_opening_evaluation,
+            )
             from .scalp_learning import scheduled_evaluation as scheduled_scalp_evaluation
 
             self.scheduled_learning = CachedReport(
@@ -206,6 +210,14 @@ class Monitor:
                 ),
                 interval=3600,
                 name="scheduled-scalp-shadow-evaluation",
+            )
+            self.scheduled_opening_learning = CachedReport(
+                lambda: scheduled_opening_evaluation(
+                    self.journal.path,
+                    Path(model_registry).parent / "opening-model-registry",
+                ),
+                interval=3600,
+                name="scheduled-opening-shadow-evaluation",
             )
         startup_update("MONITOR_READY", "Intelligence monitor initialized")
 
@@ -287,6 +299,8 @@ class Monitor:
                 self.scheduled_learning.invalidate()
             if self.scheduled_scalp_learning:
                 self.scheduled_scalp_learning.invalidate()
+            if self.scheduled_opening_learning:
+                self.scheduled_opening_learning.invalidate()
 
     def update_maintenance(self, now):
         if self.maintenance_job is not None and self.maintenance_job.done():
@@ -467,6 +481,15 @@ class Monitor:
                         "result": scalp_evaluation["value"],
                         "active_model_changed": False,
                         "actionable": False,
+                    }
+                if self.scheduled_opening_learning is not None:
+                    opening_evaluation = self.scheduled_opening_learning.get()
+                    info["learning_status"]["scheduled_opening_evaluation"] = {
+                        "status": opening_evaluation["status"],
+                        "last_completed_at": opening_evaluation["generated_at"],
+                        "result": opening_evaluation["value"],
+                        "active_model_changed": False,
+                        "promotion_allowed": False,
                     }
                 if self.artifact is not None and result.settlement_up is not None:
                     if timestamp(self.artifact["labels_available_through"]) < now:
@@ -1141,6 +1164,10 @@ class Monitor:
             "websocket_reconnects": stream_public.get("reconnects"),
             "websocket_last_heartbeat": stream_public.get("last_heartbeat_received_at"),
             "websocket_last_error_type": stream_public.get("last_error"),
+            "websocket_last_error_code": stream_public.get("last_error_code"),
+            "websocket_missing_updates": stream_public.get("missing_updates"),
+            "websocket_duplicate_messages": stream_public.get("duplicate_messages"),
+            "websocket_out_of_order_messages": stream_public.get("out_of_order_messages"),
             "rest_status": state.get("streaming", {}).get("rest", {}).get("status"),
             "rest_root_failure": state.get("streaming", {}).get("rest", {}).get(
                 "root_failure"
@@ -1927,6 +1954,8 @@ def main():
             monitor.scheduled_learning.close()
         if monitor.scheduled_scalp_learning:
             monitor.scheduled_scalp_learning.close()
+        if monitor.scheduled_opening_learning:
+            monitor.scheduled_opening_learning.close()
         if isinstance(feed, PublicFeed):
             feed.close()
 

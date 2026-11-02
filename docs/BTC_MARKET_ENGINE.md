@@ -71,6 +71,9 @@ use bounded retry intervals; Retry-After is respected when numeric. Streams use
 bounded buffers, sequence checks, reconnection/backoff, stale checks and explicit
 overflow/gap counters. Unsupported book schemas invalidate the book and retain
 REST fallback; they are not interpreted by guessing price units.
+Coinbase sequence numbers are tracked per product across subscribed channels;
+duplicates and stale out-of-order messages are ignored, while a genuine sequence
+gap still triggers the existing reconnect and freshness safeguards.
 
 Kalshi signing accepts only the fixed WebSocket GET upgrade path after broker
 metadata verifies read-only scopes. The stream has no generic send function,
@@ -139,6 +142,20 @@ records exposed holdout contracts and refuses silently reusing them as untouched
 test data. A minimum count is not a guarantee of skill. Use
 `--disable-scheduled-learning` with the server if archive-only evaluation is not
 wanted. Model and registry files remain excluded from Git.
+
+When a conventional opening holdout has already been exposed, the evaluator
+waits for at least 30 eligible contracts in a new, unexposed chronological block
+after a sufficient earlier development/validation window. It does not relabel
+an old holdout as new. Scheduled opening evaluations write reports and shadow
+candidates only in the separate opening registry; they never overwrite the
+configured opening artifact or activate a model. The scheduled scalp evaluator
+uses a bounded 100,000-observation window and excludes any contract cut by a
+truncation boundary.
+
+Large journals are not scanned synchronously during startup. Contract-summary
+backfill and optional indexes are deferred for journals over 512 MiB; existing
+records and model artifacts remain untouched, and new summaries continue to be
+recorded incrementally.
 
 Manual offline comparison, optional when enough official evidence exists:
 

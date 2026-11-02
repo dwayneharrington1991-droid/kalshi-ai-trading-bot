@@ -250,6 +250,12 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
             # Keep malformed timing visible to evaluate's exclusion counters.
             return datetime.min.replace(tzinfo=timezone.utc)
 
+    def contract_ticker(record):
+        if not isinstance(record, dict):
+            return None
+        market = record.get("market")
+        return market.get("ticker") if isinstance(market, dict) else record.get("ticker")
+
     with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
         exists = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scalp_book_observations'"
@@ -272,6 +278,15 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
             else []
         )
         truncated = len(rows) > limit
+        boundary_tickers = set()
+        if truncated:
+            try:
+                first_omitted = json.loads(rows[0][0])
+                ticker = contract_ticker(first_omitted)
+                if ticker:
+                    boundary_tickers.add(ticker)
+            except (ValueError, TypeError):
+                pass
         rows = rows[-limit:]
         records, malformed = [], 0
         for row in rows:
@@ -288,6 +303,12 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
             legacy_count = len(legacy)
             records.extend(legacy)
             records.sort(key=available_time)
+        if boundary_tickers:
+            retained_tickers = {contract_ticker(record) for record in records}
+            boundary_tickers.intersection_update(retained_tickers)
+            records = [
+                record for record in records if contract_ticker(record) not in boundary_tickers
+            ]
         official_count = 0
         has_outcomes = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forecast_outcomes'"
@@ -338,7 +359,22 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
         # explicit legacy opt-in and settlement observations. Do not exceed
         # evaluate's memory bound when both journals contain a full window.
         if len(records) > limit:
+            omitted = records[:-limit]
             records, truncated = records[-limit:], True
+            omitted_tickers = {contract_ticker(record) for record in omitted}
+            kept_tickers = {contract_ticker(record) for record in records}
+            boundary_tickers.update(
+                ticker for ticker in omitted_tickers & kept_tickers if ticker
+            )
+            if boundary_tickers:
+                records = [
+                    record
+                    for record in records
+                    if contract_ticker(record) not in boundary_tickers
+                ]
+        official_count = sum(
+            record.get("type") == "official_settlement" for record in records
+        )
     return {
         "records": records,
         "coverage": {
@@ -349,11 +385,12 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
             "loaded_records": len(records),
             "malformed_records": malformed,
             "truncated": truncated,
+            "truncated_boundary_contracts_dropped": len(boundary_tickers),
             "verified_legacy_joined_records": legacy_count,
             "official_result_observations": official_count,
             "legacy_selection": legacy_reason,
             "record_limit": limit,
-            "reason": "Latest bounded observation window only; earlier paper positions are not reconstructed across a truncated boundary"
+            "reason": "Latest bounded observation window; any contract cut by a truncation boundary is excluded, and earlier paper positions are not reconstructed"
             if truncated
             else "Timestamped observation replay; displayed depth does not establish real fills",
         },

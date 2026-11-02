@@ -17,6 +17,7 @@ from .scalp_paper import PaperCriteria, evaluate, load_journal
 PROTOCOL = "chronological-scalp-shadow-v1"
 MIN_CONTRACTS = 90
 MIN_OBSERVED_TRADES = 30
+JOURNAL_RECORD_LIMIT = 100000
 GRID = tuple(
     PaperCriteria(minimum_target_probability=probability, maximum_spread=spread)
     for probability in (0.60, 0.65, 0.70)
@@ -149,7 +150,9 @@ def scheduled_evaluation(journal, output, now=None, minimum_hours=24):
                 }
         except (KeyError, ValueError, TypeError, json.JSONDecodeError):
             pass
-    source = load_journal(journal, limit=10000, mode="PUBLIC MARKET DATA")
+    source = load_journal(
+        journal, limit=JOURNAL_RECORD_LIMIT, mode="PUBLIC MARKET DATA"
+    )
     report = evaluate_chronological(source["records"])
     report["generated_at"] = now.isoformat()
     report["journal_coverage"] = source["coverage"]

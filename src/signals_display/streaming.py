@@ -31,6 +31,32 @@ def numeric(value, low=0, high=1e15):
     return number(float(value), low, high)
 
 
+def stream_error_code(error):
+    reason_code = getattr(error, "reason_code", None)
+    if isinstance(reason_code, str) and reason_code.isupper():
+        return reason_code
+    message_codes = {
+        "Clock discontinuity; fresh session required": "CLOCK_DISCONTINUITY",
+        "Public subscription rejected": "SUBSCRIPTION_REJECTED",
+        "Invalid source sequence": "INVALID_SOURCE_SEQUENCE",
+        "Source sequence gap; reconnect required": "SOURCE_SEQUENCE_GAP",
+        "Stale/future exchange event or clock mismatch": "STALE_OR_FUTURE_EVENT",
+        "Crossed or incompatible spot quote": "INVALID_SPOT_QUOTE",
+        "Unsupported maker direction": "UNSUPPORTED_MAKER_SIDE",
+    }
+    if isinstance(error, TimeoutError):
+        return "TRANSPORT_TIMEOUT"
+    if isinstance(error, (ValueError, KeyError, TypeError, OverflowError, AttributeError)):
+        return message_codes.get(str(error), "INVALID_OR_INCOMPLETE_MESSAGE")
+    return "TRANSPORT_ERROR"
+
+
+class InvalidStreamMessage(ValueError):
+    def __init__(self, reason_code):
+        super().__init__("Invalid or incomplete public stream message")
+        self.reason_code = reason_code
+
+
 class StreamHub:
     """Latest-value publication plus a bounded observation queue.
 
@@ -50,7 +76,7 @@ class StreamHub:
         self.pending = deque(maxlen=max_pending)
         self.feeds = {}
         self.sessions = {}
-        self.channel_sequences = {}
+        self.product_sequences = {}
         self.seen_ids = set()
         self.trade_ids = deque(maxlen=10000)
         self.kraken_ids = {}
@@ -65,6 +91,8 @@ class StreamHub:
             "accepted_observations": 0,
             "rejected_messages": 0,
             "missing_updates": 0,
+            "duplicate_messages": 0,
+            "out_of_order_messages": 0,
             "queue_dropped": 0,
             "pending_high_water": 0,
             "historical_snapshot_records_excluded": 0,
@@ -72,6 +100,7 @@ class StreamHub:
             "last_transport_ping_ms": None,
             "last_heartbeat_received_at": None,
             "last_error": None,
+            "last_error_code": None,
             "clock_status": "UNVERIFIED — event/receipt difference includes clock offset, publication and transport delay",
         }
         self.dropped_since_drain = 0
@@ -88,7 +117,7 @@ class StreamHub:
         with self.condition:
             self.sessions[venue] = self.sessions.get(venue, 0) + 1
             if venue == "coinbase":
-                self.channel_sequences.clear()
+                self.product_sequences.clear()
                 self.seen_ids.clear()
                 self.trade_ids.clear()
                 self._last_utc = self._last_monotonic = None
@@ -113,6 +142,7 @@ class StreamHub:
             self.metrics["last_error"] = (
                 type(error).__name__ if isinstance(error, Exception) else str(error)
             )
+            self.metrics["last_error_code"] = stream_error_code(error)
             self.sequence += 1
             self.condition.notify_all()
 
@@ -158,16 +188,35 @@ class StreamHub:
                 if seq is not None:
                     if type(seq) is not int or seq < 0:
                         raise ValueError("Invalid source sequence")
-                    previous = self.channel_sequences.get(channel)
-                    if previous is not None:
-                        if seq == previous:
-                            return False
-                        if seq < previous:
-                            raise ValueError("Out-of-order source sequence")
-                        if seq != previous + 1:
-                            self.metrics["missing_updates"] += seq - previous - 1
-                            raise ValueError("Source sequence gap; reconnect required")
-                    self.channel_sequences[channel] = seq
+                    product_ids = (
+                        {"BTC-USD"}
+                        if channel == "heartbeats"
+                        else {
+                            item.get("product_id")
+                            for event in data.get("events", [])
+                            for item in event.get(
+                                "tickers" if channel == "ticker" else "trades", []
+                            )
+                            if isinstance(item, dict) and item.get("product_id")
+                        }
+                    )
+                    if not product_ids:
+                        raise ValueError("Missing sequence product")
+                    for product_id in product_ids:
+                        previous = self.product_sequences.get(product_id)
+                        if previous is not None:
+                            if seq == previous:
+                                self.metrics["duplicate_messages"] += 1
+                                return False
+                            if seq < previous:
+                                self.metrics["out_of_order_messages"] += 1
+                                return False
+                            if seq != previous + 1:
+                                self.metrics["missing_updates"] += seq - previous - 1
+                                raise ValueError("Source sequence gap; reconnect required")
+                    self.product_sequences.update(
+                        {product_id: seq for product_id in product_ids}
+                    )
                 if channel == "heartbeats":
                     self.metrics["last_heartbeat_received_at"] = received_at.isoformat()
                     return False
@@ -228,7 +277,7 @@ class StreamHub:
             with self.condition:
                 self.metrics["rejected_messages"] += 1
             self.disconnected(exc)
-            raise ValueError("Invalid or incomplete public stream message") from None
+            raise InvalidStreamMessage(stream_error_code(exc)) from None
         finally:
             with self.condition:
                 self.metrics["last_processing_ms"] = round((perf_counter() - started) * 1000, 3)
@@ -307,6 +356,7 @@ class StreamHub:
             )
         self.feeds["Coinbase BTC/USD stream"] = feed
         self.metrics["last_error"] = None
+        self.metrics["last_error_code"] = None
         self._observe(observation)
 
     def _sample_kraken(self, now):

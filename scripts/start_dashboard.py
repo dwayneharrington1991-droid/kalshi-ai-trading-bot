@@ -113,7 +113,7 @@ def dashboard_page_ready(timeout=2):
 
 
 def forwarded_url(environment=None):
-    environment = environment or os.environ
+    environment = os.environ if environment is None else environment
     name = environment.get("CODESPACE_NAME")
     domain = environment.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
     return f"https://{name}-8765.{domain}/" if name and domain else None

@@ -383,6 +383,73 @@ def _eligible(groups):
     return None
 
 
+def _fresh_holdout_groups(rows, used_test_contracts, minimum_test=30):
+    """Find a contiguous chronological test window never exposed by the registry."""
+    used = set(used_test_contracts)
+    runs = []
+    start = None
+    for index, row in enumerate(rows + [None]):
+        is_used = row is None or row["ticker"] in used
+        if not is_used and start is None:
+            start = index
+        elif is_used and start is not None:
+            runs.append((start, index))
+            start = None
+
+    candidates = [
+        (start, end)
+        for start, end in runs
+        if end - start >= minimum_test and start >= 130
+    ]
+    failed_splits = []
+    for start, end in sorted(candidates, reverse=True):
+        test_start = end - minimum_test
+        development = rows[:test_start]
+        validation_count = max(30, round(len(development) * 0.30))
+        train_end = len(development) - validation_count
+        if train_end < 100:
+            continue
+        groups = _purge(
+            development[:train_end],
+            development[train_end:],
+            rows[test_start:end],
+        )
+        blocker = _eligible(groups)
+        if blocker is None:
+            return groups, {
+                "strategy": "latest contiguous unexposed chronological block",
+                "test_contracts": minimum_test,
+                "test_start_index": test_start,
+                "test_end_index": end,
+                "excluded_later_contracts": len(rows) - end,
+            }
+        failed_splits.append(
+            {"status": blocker, "split_contracts": _counts(groups)}
+        )
+
+    if failed_splits:
+        return None, {
+            "strategy": "latest contiguous unexposed chronological block",
+            "status": failed_splits[0]["status"],
+            "fresh_holdout_contracts": minimum_test,
+            "minimum_pretest_contracts": 130,
+            "failed_splits": failed_splits,
+        }
+
+    tail_start = len(rows)
+    for index in range(len(rows) - 1, -1, -1):
+        if rows[index]["ticker"] in used:
+            tail_start = index + 1
+            break
+    return None, {
+        "strategy": "latest contiguous unexposed chronological block",
+        "available_tail_contracts": len(rows) - tail_start,
+        "required_test_contracts": minimum_test,
+        "minimum_pretest_contracts": 130,
+        "status": "WAITING_FOR_UNTOUCHED_CHRONOLOGICAL_HOLDOUT",
+    }
+
+
 def _validate_rows(rows):
     ordered = sorted(rows, key=lambda r: (timestamp(r["closes_at"]), r["ticker"]))
     seen = set()
@@ -446,8 +513,34 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
     train, validation, test = groups
     overlap = {r["ticker"] for r in test} & set(used_test_contracts or ())
     if overlap:
-        report.update(status="HOLDOUT_REUSE_BLOCKED", holdout_overlap_contracts=len(overlap))
-        return None, report
+        fresh_groups, fresh_window = _fresh_holdout_groups(
+            rows, used_test_contracts
+        )
+        if fresh_groups is None:
+            report.update(
+                status=fresh_window["status"],
+                holdout_overlap_contracts=len(overlap),
+                fresh_holdout=fresh_window,
+                reason=(
+                    "The standard test window has exposed outcomes. A contiguous, "
+                    "unexposed chronological test block of at least 30 contracts "
+                    "and a sufficient earlier development window are required."
+                ),
+            )
+            return None, report
+        train, validation, test = fresh_groups
+        report["split_contracts"] = _counts(fresh_groups)
+        report["fresh_holdout"] = fresh_window
+        report["method"] = (
+            "Previously exposed test contracts are not reused. Train/validation "
+            "are selected chronologically from earlier eligible rows, purged by "
+            "label availability, and evaluated once on a later 30-contract "
+            "unexposed holdout."
+        )
+        blocker = _eligible(fresh_groups)
+        if blocker:
+            report.update(status=blocker, reason="Fresh holdout splits failed minimum evidence gates")
+            return None, report
     from .calibration import chronological_calibration, drift_report
 
     report["shadow_calibration"] = chronological_calibration(
@@ -668,6 +761,43 @@ def validate_artifact(data):
         if report["opening_contracts"] < BOOST_MIN_CONTRACTS:
             raise ValueError("Boosted opening candidate requires larger independent sample")
     return data
+
+
+def scheduled_evaluation(journal, directory, now=None, minimum_hours=1):
+    """Evaluate opening forecasts in a separate shadow registry; never activate."""
+    from .model_registry import ModelRegistry, atomic_json
+
+    now = now or datetime.now(timezone.utc)
+    registry = ModelRegistry(directory)
+    with registry.update_lock():
+        if not registry.due(now, minimum_hours=minimum_hours):
+            return {
+                "status": "OPENING_EVALUATION_NOT_DUE",
+                "active_model_changed": False,
+                "promotion_allowed": False,
+            }
+        with closing(
+            sqlite3.connect(Path(journal).resolve().as_uri() + "?mode=ro", uri=True)
+        ) as db:
+            rows = dataset(db, now)
+        artifact, report = evaluate(
+            rows, used_test_contracts=registry.used_test_contracts()
+        )
+        registry.record_evaluation(report, now)
+        atomic_json(registry.directory / "latest-evaluation.json", report)
+        if artifact is not None:
+            atomic_json(
+                registry.directory / "candidates" / f"{artifact['model_id']}.json",
+                artifact,
+            )
+        return {
+            "status": report["status"],
+            "eligible_opening_pairs": report["opening_contracts"],
+            "required_opening_pairs": report["required_contracts"],
+            "candidate_archived": artifact is not None,
+            "active_model_changed": False,
+            "promotion_allowed": False,
+        }
 
 
 def load_artifact(path):

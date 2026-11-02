@@ -77,7 +77,7 @@ The repo also ships scaffolding for things that aren't fully wired — multi-age
 
 ## Example Strategies
 
-Three strategies ship with the repo. **None of them is "the right answer."** They exist so you can run something end-to-end and see how the pieces connect, then fork the one closest to what you want to build.
+The repository includes paper strategies and historical order-execution code. The checked-in CLI and canary launchers are now read-only: live execution requests are rejected and no deployment path may submit or cancel orders.
 
 ### 1. AI Directional — `python cli.py run`
 
@@ -87,28 +87,32 @@ The default. For each candidate market, it calls a single LLM via OpenRouter (wi
 
 ```bash
 python cli.py run --paper          # paper trading
-python cli.py run --live           # live trading (real money)
+python cli.py run --live           # blocked: live execution is disabled
 ```
 
 Defaults: 15% max drawdown, 45% min confidence, 3% max position size, 30% max sector concentration, quarter-Kelly. All configurable in `src/config/settings.py`.
 
+This checkout is read-only with respect to trading. Live execution requests and
+the overnight canary are blocked; account and market data reads do not submit,
+modify, or cancel orders.
+
 ### 2. Safe Compounder — `python cli.py run --safe-compounder`
 
-Pure edge-based math, no LLM required. Scans every active Kalshi market for NO-side asks above a price threshold with a positive expected-value edge, then places resting maker orders one cent below the ask.
+Pure edge-based math, no LLM required. Scans active Kalshi markets and displays a paper/read-only preview; order submission is disabled.
 
 ```bash
 python cli.py run --safe-compounder              # dry-run preview
-python cli.py run --safe-compounder --live       # live execution
+python cli.py run --safe-compounder --live       # blocked: live execution is disabled
 
 # Run continuously instead of one cycle and exit:
-python cli.py run --safe-compounder --live --loop --interval 300
+python cli.py run --safe-compounder --loop --interval 300
 ```
 
-Rules: NO side only, YES last ≤ 20¢, NO ask > 80¢, edge > 5¢, max 10%/position, skips sports/entertainment/"mention" markets.
+Rules: NO side only, YES last ≤ 20¢, NO ask > 80¢, edge > 5¢, max 10%/position, skips sports/entertainment/"mention" markets. These are preview filters only.
 
 ### 3. Beast Mode — `python cli.py run --beast`
 
-Aggressive settings with no category guardrails. Available for comparison and experimentation — **not recommended for live trading**. Running this with real money historically led to significant losses on this repo.
+Aggressive settings with no category guardrails. Available for paper-mode comparison only.
 
 ---
 
@@ -116,21 +120,20 @@ Aggressive settings with no category guardrails. Available for comparison and ex
 
 Ctrl-C sends SIGINT and triggers graceful shutdown — the bot finishes the in-flight cycle, logs, and exits. Open positions remain on Kalshi until they resolve.
 
-If you want to **liquidate everything** before stepping away:
+To view a read-only estimate for open positions:
 
 ```bash
 # 1. Stop the bot
 Ctrl-C
 
-# 2. Place limit sells at the current best bid for every open position
+# 2. Display estimates only; this command never submits orders
 python cli.py close-all              # dry-run preview
-python cli.py close-all --live       # actually send orders
 
 # 3. Verify
 python cli.py status
 ```
 
-`close-all` queries Kalshi directly (not the local DB), so it works even when local state is stale. Sells are limit-priced, so they may rest unfilled on thin books — check Kalshi or `cli.py status` after a minute.
+`close-all` queries Kalshi directly (not the local DB) and displays estimates only. It never places or cancels orders; `--live` is rejected.
 
 ---
 

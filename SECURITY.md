@@ -11,19 +11,21 @@ unintended order placement, credential exposure, or position oversizing is in sc
 
 ## Handling Your Credentials
 
-- **Never commit** `.env`, `kalshi_private_key`, or any `*.pem` file. They are
-  gitignored, and CI runs a secret scan (gitleaks) on every push — but the scan
-  is a backstop, not a license to be careless.
+- **Never commit** `.env`, `kalshi_private_key`, any `*.pem` file, or backup
+  archives. Archives can contain private keys or databases and are not reliably
+  inspected by text-only secret scanners.
 - If a key ever lands in a commit (even one you amended away), **rotate it
   immediately** in your Kalshi account settings. Public git history is forever.
 - Use [Kalshi's demo environment](https://demo.kalshi.co) for development and
   experiments before pointing anything at production.
-- `LIVE_TRADING_ENABLED` defaults to `false`. Leave it that way until you have
-  read the execution path and tested in demo/paper mode.
+- The signals-only server uses a GET-only account client. The top-level CLI
+  rejects live execution, the shared Kalshi client rejects every non-GET
+  request, and the overnight canary launchers are disabled in this build.
+  Order submission and cancellation are unavailable.
 
 ## Test Suite Safety
 
 A plain `pytest` run is safe: tests that touch the real Kalshi API or spend LLM
-credits are marked `live` and skipped unless you explicitly opt in with
-`RUN_LIVE_TESTS=1 pytest -m live`. Some live tests **place real orders** — only
-run them against an account whose losses you accept.
+credits are marked `live` and skipped. Never opt into live tests; some legacy
+tests can place real orders. The signals-only deployment test path must not use
+live credentials.

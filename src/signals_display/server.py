@@ -832,7 +832,8 @@ class Monitor:
         self.account_candidate.require_readonly = True
         batch = self.account_candidate.snapshot()
         self.account_journal.bind(
-            self.account_candidate.credential_binding, allow_empty_rotation=True
+            self.account_candidate.credential_binding,  # gitleaks:allow - one-way journal binding digest
+            allow_empty_rotation=True,
         )
         Path(self.account_journal.path).chmod(0o600)
         self.account_journal.reconcile(batch)

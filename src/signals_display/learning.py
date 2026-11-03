@@ -308,6 +308,52 @@ def calibrate(model, rows):
     model["calibration"] = [a, b]
 
 
+def chronological_contract_partitions(contracts, used_test_contracts=None):
+    """Return chronological train/validation/test contract sets.
+
+    Once a registry has exposed a test contract, a later scheduled evaluation
+    may use that old period as development history, but it may never call it an
+    untouched test again.  The next test is therefore a forward block strictly
+    after the newest previously exposed contract.  Waiting for 30 genuinely new
+    contracts is safer than repeatedly scoring the same holdout.
+    """
+    contracts = list(contracts)
+    used = set(used_test_contracts or ())
+    exposed_positions = [i for i, ticker in enumerate(contracts) if ticker in used]
+    if not exposed_positions:
+        a, b = int(len(contracts) * 0.6), int(len(contracts) * 0.8)
+        return (
+            [set(contracts[:a]), set(contracts[a:b]), set(contracts[b:])],
+            {
+                "evaluation_mode": "INITIAL_CHRONOLOGICAL_HOLDOUT",
+                "previously_exposed_contracts": 0,
+                "unseen_forward_contracts": len(contracts[b:]),
+            },
+        )
+
+    last_exposed = max(exposed_positions)
+    development = contracts[: last_exposed + 1]
+    future = [ticker for ticker in contracts[last_exposed + 1 :] if ticker not in used]
+    info = {
+        "evaluation_mode": "FORWARD_UNSEEN_HOLDOUT",
+        "previously_exposed_contracts": len(set(contracts) & used),
+        "unseen_forward_contracts": len(future),
+    }
+    if len(future) < 30:
+        return None, info
+    validation_size = max(30, int(len(development) * 0.2))
+    if len(development) - validation_size < 100:
+        return None, info
+    return (
+        [
+            set(development[:-validation_size]),
+            set(development[-validation_size:]),
+            set(future),
+        ],
+        info,
+    )
+
+
 def compare(rows, *, used_test_contracts=None):
     contracts = sorted(
         {r["ticker"] for r in rows},
@@ -331,10 +377,16 @@ def compare(rows, *, used_test_contracts=None):
     }
     if len(contracts) < MIN_CONTRACTS:
         return None, report
-    n = len(contracts)
-    a = int(n * 0.6)
-    b = int(n * 0.8)
-    sets = [set(contracts[:a]), set(contracts[a:b]), set(contracts[b:])]
+    sets, partition = chronological_contract_partitions(contracts, used_test_contracts)
+    report.update(partition)
+    report["holdout_reuse_checked"] = used_test_contracts is not None
+    if sets is None:
+        report["status"] = "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT"
+        report["reason"] = (
+            "Previously exposed holdouts remain recorded; wait for at least 30 "
+            "later verified contracts before another forward evaluation"
+        )
+        return None, report
     groups = [[r for r in rows if r["ticker"] in s] for s in sets]
     val_start = min(timestamp(r["timestamp"]) for r in groups[1])
     test_start = min(timestamp(r["timestamp"]) for r in groups[2])
@@ -355,15 +407,9 @@ def compare(rows, *, used_test_contracts=None):
     if any(c < m for c, m in zip(counts, [100, 30, 30])):
         report["status"] = "INSUFFICIENT_PURGED_SPLITS"
         return None, report
-    if used_test_contracts is not None:
-        overlap = {r["ticker"] for r in test} & set(used_test_contracts)
-        if overlap:
-            report.update(
-                status="HOLDOUT_REUSE_BLOCKED",
-                holdout_overlap_contracts=len(overlap),
-                holdout_reuse_checked=True,
-            )
-            return None, report
+    overlap = {r["ticker"] for r in test} & set(used_test_contracts or ())
+    if overlap:
+        raise AssertionError("Forward holdout partition reused an exposed contract")
     if (
         min(sum(r["outcome"] == y for r in train) for y in (0, 1)) < 10
         or min(sum(r["outcome"] == y for r in val) for y in (0, 1)) < 5

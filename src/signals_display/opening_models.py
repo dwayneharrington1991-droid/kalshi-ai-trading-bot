@@ -436,8 +436,22 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
             "reason"
         ] = "Insufficient newly recorded frozen-feature openings; historical live forecasts cannot replace opening data"
         return None, report
-    a, b = int(len(rows) * 0.6), int(len(rows) * 0.8)
-    groups = _purge(rows[:a], rows[a:b], rows[b:])
+    contract_sets, partition = learning.chronological_contract_partitions(
+        [row["ticker"] for row in rows], used_test_contracts
+    )
+    report.update(partition)
+    if contract_sets is None:
+        report.update(
+            status="INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT",
+            reason=(
+                "Previously exposed opening holdouts remain recorded; wait for at "
+                "least 30 later frozen openings with verified outcomes"
+            ),
+        )
+        return None, report
+    groups = _purge(
+        *[[row for row in rows if row["ticker"] in group] for group in contract_sets]
+    )
     report["split_contracts"] = _counts(groups)
     blocker = _eligible(groups)
     if blocker:
@@ -446,8 +460,7 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
     train, validation, test = groups
     overlap = {r["ticker"] for r in test} & set(used_test_contracts or ())
     if overlap:
-        report.update(status="HOLDOUT_REUSE_BLOCKED", holdout_overlap_contracts=len(overlap))
-        return None, report
+        raise AssertionError("Forward opening holdout reused an exposed contract")
     from .calibration import chronological_calibration, drift_report
 
     report["shadow_calibration"] = chronological_calibration(
@@ -505,7 +518,10 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         reason="Shadow evaluation only. A live-horizon artifact is incompatible with opening-cutoff predictions; no model is activated automatically",
     )
     if include_walk_forward:
-        report["walk_forward"] = walk_forward(rows[:b])
+        development_contracts = contract_sets[0] | contract_sets[1]
+        report["walk_forward"] = walk_forward(
+            [row for row in rows if row["ticker"] in development_contracts]
+        )
         report["walk_forward"][
             "scope"
         ] = "Development contracts only; final untouched holdout excluded"

@@ -101,7 +101,7 @@ def test_ensemble_weights_and_calibration_do_not_see_future_test_labels():
     assert original["edge_status"] == "edge unverified"
 
 
-def test_holdout_exposure_blocks_reuse_before_fitting(monkeypatch):
+def test_holdout_exposure_waits_for_a_new_forward_block_before_fitting(monkeypatch):
     data = rows()
     monkeypatch.setattr(
         learning,
@@ -109,8 +109,19 @@ def test_holdout_exposure_blocks_reuse_before_fitting(monkeypatch):
         lambda *args: pytest.fail("Already exposed test labels must not be fitted/evaluated again"),
     )
     candidate, report = learning.compare(data, used_test_contracts={"C179"})
-    assert candidate is None and report["status"] == "HOLDOUT_REUSE_BLOCKED"
-    assert report["holdout_overlap_contracts"] == 1 and report["holdout_reuse_checked"]
+    assert candidate is None and report["status"] == "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT"
+    assert report["unseen_forward_contracts"] == 0 and report["holdout_reuse_checked"]
+
+
+def test_next_settlement_evaluation_uses_only_later_unseen_contracts():
+    initial = rows()
+    _candidate, first = learning.compare(initial, used_test_contracts=set())
+    _candidate, forward = learning.compare(
+        rows(210), used_test_contracts=set(first["test_contracts"])
+    )
+    assert forward["evaluation_mode"] == "FORWARD_UNSEEN_HOLDOUT"
+    assert forward["split_contracts"] == [144, 36, 30]
+    assert set(forward["test_contracts"]).isdisjoint(first["test_contracts"])
 
 
 def test_json_loader_validates_all_ensemble_members_and_weights(tmp_path):

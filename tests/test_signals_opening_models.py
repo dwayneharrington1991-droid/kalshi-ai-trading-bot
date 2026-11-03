@@ -263,7 +263,18 @@ def test_opening_selection_is_frozen_before_untouched_test_outcomes():
     assert report["test"]["selected_candidate"] != future["test"]["selected_candidate"]
     assert not report["promotion_allowed"]
     _, blocked = opening_models.evaluate(rows, used_test_contracts=report["test_contracts"])
-    assert blocked["status"] == "HOLDOUT_REUSE_BLOCKED"
+    assert blocked["status"] == "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT"
+    assert blocked["unseen_forward_contracts"] == 0
+
+    candidate, forward = opening_models.evaluate(
+        synthetic_rows(230), used_test_contracts=report["test_contracts"]
+    )
+    assert forward["evaluation_mode"] == "FORWARD_UNSEEN_HOLDOUT"
+    # Label-availability purging removes the boundary contract from each
+    # development partition; the untouched forward block remains complete.
+    assert forward["split_contracts"] == [159, 39, 30]
+    assert set(forward["test_contracts"]).isdisjoint(report["test_contracts"])
+    assert candidate is not None
 
 
 def test_gradient_boosting_is_bounded_and_shadow_only():

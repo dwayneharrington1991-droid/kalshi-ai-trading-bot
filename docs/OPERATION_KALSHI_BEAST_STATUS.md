@@ -2,7 +2,7 @@
 
 Updated: 2026-11-04 UTC
 
-Repository verification at this checkpoint: 1,012 tests passed, 8 skipped.
+Repository verification at this checkpoint: 1,013 tests passed, 8 skipped.
 The selective forward-signal protocol is integrated into Opening and
 Settlement evaluation but has not yet been run on a new untouched Oracle
 holdout. Production deployment and model promotion therefore remain separate,
@@ -44,6 +44,7 @@ claim.
 | Automated order execution | DISABLED | Signals service import boundary excludes clients/jobs/orders/strategies; no dashboard mutation routes. |
 | Selective 80% accuracy objective | IMPLEMENTED / UNVERIFIED | Validation-only abstention selection; untouched test reports accuracy, coverage, sample uncertainty, calibration and regimes. It never promotes a model and 80%/90% are objectives, not claims. |
 | Live AI signal chart | IMPLEMENTED | Bounded 1m/3m/5m/15m closed candles, volume, EMA/VWAP/Bollinger, optional RSI/MACD, strike/reference overlays and immutable BUY/EXIT markers. Unsupported 15s history is explicit; markers require verified risk gates or a fresh read-only held position. |
+| Settlement evaluation extraction | IMPLEMENTED / ORACLE UNVERIFIED | Uses compact contract summaries to rank scalar revisions before bounded JSON extraction, with targeted legacy fallback so valid historical rows are not dropped. Local 8.5 GB journal benchmark improved from ~21.1s to ~6.0s with identical eligible-row coverage. |
 
 ## Validation state last observed from Oracle output
 

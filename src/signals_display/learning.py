@@ -33,89 +33,188 @@ def dataset(db, asof=None):
     has_results = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forecast_outcomes'"
     ).fetchone()
-    if has_results:
-        # Begin with the compact official-outcome table and look up only its
-        # contracts in predictions.  The previous correlated EXISTS query
-        # started with every prediction revision; on a multi-gigabyte journal
-        # that could scan millions of JSON rows before finding the few hundred
-        # labelled contracts.  CROSS JOIN fixes the loop order while the
-        # existing predictions(ticker,mode) index provides bounded lookups.
-        source = """forecast_outcomes o CROSS JOIN predictions p
-          ON p.ticker=o.ticker AND p.mode='PUBLIC MARKET DATA'"""
-        columns = "p.ticker,p.timestamp,o.outcome,o.observed_at"
-        predicate = """o.origin='official'
-          AND julianday(o.observed_at)<=julianday(?)
-          AND p.settlement_origin='official'
-          AND p.settlement_up=o.outcome
-          AND p.settled_at IS NOT NULL
-          AND julianday(p.settled_at)<=julianday(?)"""
-        payload = "p.payload"
-        ordering = "p.timestamp,p.id"
-        parameters = (asof.isoformat(), asof.isoformat())
-    else:
-        source = "predictions p"
-        columns = "p.ticker,p.timestamp,p.settlement_up,p.settled_at"
-        predicate = """p.mode='PUBLIC MARKET DATA'
-          AND p.settlement_origin='official' AND p.settlement_up IS NOT NULL
-          AND julianday(p.settled_at)<=julianday(?)"""
-        payload = "p.payload"
-        ordering = "p.timestamp,p.id"
-        parameters = (asof.isoformat(),)
-    # Project only small scalar feature data inside SQLite. Cursor iteration
-    # never materializes gigabytes of historical JSON payloads in Python.
-    rows = db.execute(
-        f"""SELECT {columns},
-        json_extract({payload},'$.stale','$.market.closes_at',
+    has_contract_summaries = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='btc_engine_contracts'"
+    ).fetchone()
+    compact_count = (
+        db.execute(
+            "SELECT COUNT(*) FROM btc_engine_contracts WHERE mode='PUBLIC MARKET DATA'"
+        ).fetchone()[0]
+        if has_contract_summaries
+        else 0
+    )
+    payload_projection = """json_extract(p.payload,'$.stale','$.market.closes_at',
           '$.model.candidate_features.values','$.model.baseline_probability_up',
           '$.market.quotes.up.bid','$.market.quotes.up.ask',
           '$.market.quotes.down.bid','$.market.quotes.down.ask',
-          '$.market.fee_multiplier')
-        FROM {source} WHERE {predicate} ORDER BY {ordering}""",
-        parameters,
-    )
+          '$.market.fee_multiplier')"""
+    row_streams = []
+    if has_results:
+        if compact_count:
+            # Rank scalar prediction rows against the compact per-contract close
+            # time before touching large prediction JSON. This retains the exact
+            # first recorded row in each horizon while reducing JSON extraction
+            # from every revision to at most four rows per settled contract.
+            row_streams.append(
+                db.execute(
+                    f"""WITH ranked AS (
+                      SELECT p.id,p.ticker,p.timestamp,c.closes_at,o.outcome,o.observed_at,
+                        CASE
+                          WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>600 THEN '>10m'
+                          WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>300 THEN '5-10m'
+                          WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>120 THEN '2-5m'
+                          ELSE '<=2m' END AS horizon_bucket,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY p.ticker,CASE
+                            WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>600 THEN '>10m'
+                            WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>300 THEN '5-10m'
+                            WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>120 THEN '2-5m'
+                            ELSE '<=2m' END
+                          ORDER BY p.timestamp,p.id) AS rank
+                      FROM forecast_outcomes o CROSS JOIN btc_engine_contracts c
+                        ON c.ticker=o.ticker AND c.mode='PUBLIC MARKET DATA'
+                      CROSS JOIN predictions p
+                        ON p.ticker=c.ticker AND p.mode='PUBLIC MARKET DATA'
+                      WHERE o.origin='official'
+                        AND julianday(o.observed_at)<=julianday(?)
+                        AND p.settlement_origin='official' AND p.settlement_up=o.outcome
+                        AND p.settled_at IS NOT NULL
+                        AND julianday(p.settled_at)<=julianday(?)
+                        AND julianday(p.timestamp)<julianday(c.closes_at)
+                        AND julianday(c.closes_at)<=julianday(o.observed_at)
+                    )
+                    SELECT p.ticker,p.timestamp,r.outcome,r.observed_at,{payload_projection}
+                    FROM ranked r JOIN predictions p ON p.id=r.id
+                    WHERE r.rank<=30 ORDER BY p.timestamp,p.id""",
+                    (asof.isoformat(), asof.isoformat()),
+                )
+            )
+        # Preserve contracts recorded before the compact engine table existed.
+        # Only this bounded legacy subset uses the older revision scan.
+        compact_exclusion = (
+            """AND o.ticker NOT IN (
+              SELECT ticker FROM btc_engine_contracts
+              WHERE mode='PUBLIC MARKET DATA')"""
+            if compact_count
+            else ""
+        )
+        row_streams.append(
+            db.execute(
+                f"""SELECT p.ticker,p.timestamp,o.outcome,o.observed_at,{payload_projection}
+                FROM forecast_outcomes o CROSS JOIN predictions p
+                  ON p.ticker=o.ticker AND p.mode='PUBLIC MARKET DATA'
+                WHERE o.origin='official'
+                  AND julianday(o.observed_at)<=julianday(?)
+                  AND p.settlement_origin='official' AND p.settlement_up=o.outcome
+                  AND p.settled_at IS NOT NULL
+                  AND julianday(p.settled_at)<=julianday(?)
+                  {compact_exclusion}
+                ORDER BY p.timestamp,p.id""",
+                (asof.isoformat(), asof.isoformat()),
+            )
+        )
+    else:
+        row_streams.append(
+            db.execute(
+                f"""SELECT p.ticker,p.timestamp,p.settlement_up,p.settled_at,
+                {payload_projection} FROM predictions p
+                WHERE p.mode='PUBLIC MARKET DATA'
+                  AND p.settlement_origin='official' AND p.settlement_up IS NOT NULL
+                  AND julianday(p.settled_at)<=julianday(?)
+                ORDER BY p.timestamp,p.id""",
+                (asof.isoformat(),),
+            )
+        )
     selected = {}
-    for raw in rows:
-        stale, closes_at, f, baseline, bid, ask, down_bid, down_ask, fee_multiplier = json.loads(raw[4])
-        if (
-            stale
-            or not isinstance(f, dict)
-            or f.get("distance_scaled") is None
-            or f.get("return_1m") is None
-        ):
-            continue
-        t = timestamp(raw[1])
-        close = timestamp(closes_at)
-        if t >= close or not raw[3] or not close <= timestamp(raw[3]) <= asof:
-            continue
-        if (
-            type(baseline) not in (int, float)
-            or not math.isfinite(baseline)
-            or not 0 <= baseline <= 1
-        ):
-            continue
-        mid = (
-            (bid + ask) / 2
-            if all(type(v) in (int, float) and math.isfinite(v) for v in (bid, ask))
-            and 0 <= bid <= ask <= 1
-            else None
+
+    def consume(rows):
+        for raw in rows:
+            stale, closes_at, f, baseline, bid, ask, down_bid, down_ask, fee_multiplier = json.loads(raw[4])
+            if (
+                stale
+                or not isinstance(f, dict)
+                or f.get("distance_scaled") is None
+                or f.get("return_1m") is None
+            ):
+                continue
+            t = timestamp(raw[1])
+            close = timestamp(closes_at)
+            if t >= close or not raw[3] or not close <= timestamp(raw[3]) <= asof:
+                continue
+            if (
+                type(baseline) not in (int, float)
+                or not math.isfinite(baseline)
+                or not 0 <= baseline <= 1
+            ):
+                continue
+            mid = (
+                (bid + ask) / 2
+                if all(type(v) in (int, float) and math.isfinite(v) for v in (bid, ask))
+                and 0 <= bid <= ask <= 1
+                else None
+            )
+            key = (raw[0], horizon((close - t).total_seconds()))
+            selected.setdefault(
+                key,
+                dict(
+                    ticker=raw[0], timestamp=t.isoformat(), closes_at=close.isoformat(),
+                    label_available_at=raw[3], features=f, outcome=int(raw[2]),
+                    baseline=baseline, market=mid,
+                    executable_quotes={
+                        "up": {"bid": bid, "ask": ask},
+                        "down": {"bid": down_bid, "ask": down_ask},
+                    },
+                    fee_multiplier=fee_multiplier,
+                    remaining=(close - t).total_seconds(),
+                ),
+            )
+    for rows in row_streams:
+        consume(rows)
+
+    if has_results and compact_count:
+        expected = set(
+            db.execute(
+                """SELECT p.ticker,CASE
+                    WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>600 THEN '>10m'
+                    WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>300 THEN '5-10m'
+                    WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>120 THEN '2-5m'
+                    ELSE '<=2m' END AS horizon_bucket
+                FROM forecast_outcomes o CROSS JOIN btc_engine_contracts c
+                  ON c.ticker=o.ticker AND c.mode='PUBLIC MARKET DATA'
+                CROSS JOIN predictions p
+                  ON p.ticker=c.ticker AND p.mode='PUBLIC MARKET DATA'
+                WHERE o.origin='official'
+                  AND julianday(o.observed_at)<=julianday(?)
+                  AND p.settlement_origin='official' AND p.settlement_up=o.outcome
+                  AND p.settled_at IS NOT NULL
+                  AND julianday(p.settled_at)<=julianday(?)
+                  AND julianday(p.timestamp)<julianday(c.closes_at)
+                  AND julianday(c.closes_at)<=julianday(o.observed_at)
+                GROUP BY p.ticker,horizon_bucket""",
+                (asof.isoformat(), asof.isoformat()),
+            )
         )
-        key = (raw[0], horizon((close - t).total_seconds()))
-        selected.setdefault(
-            key,
-            dict(
-                ticker=raw[0],
-                timestamp=t.isoformat(),
-                closes_at=close.isoformat(),
-                label_available_at=raw[3],
-                features=f,
-                outcome=int(raw[2]),
-                baseline=baseline,
-                market=mid,
-                executable_quotes={"up": {"bid": bid, "ask": ask}, "down": {"bid": down_bid, "ask": down_ask}},
-                fee_multiplier=fee_multiplier,
-                remaining=(close - t).total_seconds(),
-            ),
-        )
+        missing_tickers = sorted({ticker for ticker, bucket in expected if (ticker, bucket) not in selected})
+        # A bounded first-candidate window normally resolves every horizon. If
+        # early rows were incomplete, rescan only affected contracts so no
+        # legitimate historical record is silently excluded by the fast path.
+        if missing_tickers:
+            placeholders = ",".join("?" for _ in missing_tickers)
+            consume(
+                db.execute(
+                    f"""SELECT p.ticker,p.timestamp,o.outcome,o.observed_at,{payload_projection}
+                    FROM forecast_outcomes o CROSS JOIN predictions p
+                      ON p.ticker=o.ticker AND p.mode='PUBLIC MARKET DATA'
+                    WHERE o.origin='official'
+                      AND julianday(o.observed_at)<=julianday(?)
+                      AND p.settlement_origin='official' AND p.settlement_up=o.outcome
+                      AND p.settled_at IS NOT NULL
+                      AND julianday(p.settled_at)<=julianday(?)
+                      AND p.ticker IN ({placeholders})
+                    ORDER BY p.timestamp,p.id""",
+                    (asof.isoformat(), asof.isoformat(), *missing_tickers),
+                )
+            )
     return list(selected.values())
 
 

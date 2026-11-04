@@ -307,6 +307,56 @@ def test_dataset_projects_small_features_and_does_not_invent_market_benchmark(tm
     assert "exists (select 1 from forecast_outcomes" not in dataset_query.lower()
 
 
+def test_dataset_fast_path_never_drops_valid_row_after_incomplete_candidates(tmp_path):
+    from src.signals_display.monitor import Journal
+
+    journal = Journal(tmp_path / "journal.db")
+    opened = NOW - timedelta(minutes=15)
+    closed = NOW - timedelta(minutes=1)
+    settled = NOW.isoformat()
+    invalid = {
+        "stale": True,
+        "market": {"closes_at": closed.isoformat(), "quotes": {}},
+        "model": {"candidate_features": {"values": {}}, "baseline_probability_up": 0.5},
+    }
+    valid = {
+        "stale": False,
+        "market": {"closes_at": closed.isoformat(), "quotes": {}},
+        "model": {
+            "candidate_features": {"values": {"distance_scaled": 0.2, "return_1m": 0.01}},
+            "baseline_probability_up": 0.6,
+        },
+    }
+    ticker = "KXBTC15M-FASTPATH"
+    with journal.connect() as db:
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            (ticker, "official", settled, 1),
+        )
+        db.execute(
+            "INSERT INTO btc_engine_contracts VALUES (?,?,?,?,?)",
+            ("PUBLIC MARKET DATA", ticker, closed.isoformat(), 31, opened.isoformat()),
+        )
+        for index in range(31):
+            at = opened + timedelta(seconds=index)
+            db.execute(
+                """INSERT INTO predictions
+                (mode,ticker,timestamp,payload,settlement_origin,settlement_up,settled_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (
+                    "PUBLIC MARKET DATA", ticker, at.isoformat(),
+                    json.dumps(valid if index == 30 else invalid), "official", 1, settled,
+                ),
+            )
+    with journal.read() as db:
+        queries = []
+        db.set_trace_callback(queries.append)
+        result = learning.dataset(db, NOW + timedelta(seconds=1))
+    assert len(result) == 1
+    assert result[0]["timestamp"] == (opened + timedelta(seconds=30)).isoformat()
+    assert any("row_number() over" in query.lower() for query in queries)
+
+
 def test_after_cost_assessment_withholds_profitable_edge_without_delayed_quotes():
     rows = [
         {

@@ -22,7 +22,7 @@ def load_sqlite_backup():
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh", "safe_upgrade_and_evaluate.sh", "run_isolated_ai_evaluation.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh", "safe_upgrade_and_evaluate.sh", "run_isolated_ai_evaluation.sh", "apply_live_pipeline_repair.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -195,6 +195,19 @@ def test_isolated_ai_evaluation_cannot_activate_or_write_production_registry():
     assert "AUTOMATED_TRADING=DISABLED" in script
     assert "--activate" not in script
     assert "timeout --signal=TERM --kill-after=30s 900" in script
+
+
+def test_live_pipeline_repair_is_atomic_bounded_and_signals_only():
+    script = (DEPLOY / "apply_live_pipeline_repair.sh").read_text()
+    assert "flock -n 8" in script
+    assert "cmp -s" in script
+    assert "mv -Tf" in script
+    assert "LIVE_REPAIR_ROLLED_BACK" in script
+    assert "historical_preload" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+    assert "remote_deploy.sh" not in script
+    assert "sqlite_backup.py" not in script
+    assert "--activate" not in script
 
 
 def test_host_configuration_is_derived_and_never_creates_approval_or_restarts():

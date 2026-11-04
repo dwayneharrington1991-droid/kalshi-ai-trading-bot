@@ -204,6 +204,8 @@ def test_live_pipeline_repair_is_atomic_bounded_and_signals_only():
     assert "mv -Tf" in script
     assert "LIVE_REPAIR_ROLLED_BACK" in script
     assert "historical_preload" in script
+    assert '--data-root "$DATA_ROOT" --require-models 0' in script
+    assert '--service "$SERVICE_NAME" --port 8765' not in script
     assert "AUTOMATED_TRADING=DISABLED" in script
     assert "remote_deploy.sh" not in script
     assert "sqlite_backup.py" not in script

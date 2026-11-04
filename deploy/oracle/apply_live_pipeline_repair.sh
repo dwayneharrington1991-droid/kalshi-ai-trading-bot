@@ -12,7 +12,7 @@ block() { echo "LIVE_REPAIR_BLOCKED: $*" >&2; exit 1; }
 [[ -r "$config" ]] || block "deployment configuration is unreadable"
 # shellcheck source=/dev/null
 source "$config"
-: "${DEPLOY_ROOT:?}" "${SERVICE_NAME:?}"
+: "${DEPLOY_ROOT:?}" "${SERVICE_NAME:?}" "${DATA_ROOT:?}"
 [[ "$SERVICE_NAME" == kalshi-signals.service ]] || block "unexpected service"
 [[ -L "$DEPLOY_ROOT/current" ]] || block "versioned current pointer missing"
 
@@ -62,7 +62,8 @@ sudo -n systemctl restart "$SERVICE_NAME"
 healthy=0
 for attempt in $(seq 1 90); do
   if "$release/.venv/bin/python3" "$release/deploy/oracle/health_check.py" \
-      --commit "$target" --service "$SERVICE_NAME" --port 8765 >/tmp/kalshi-live-repair-health.json 2>/dev/null; then
+      --commit "$target" --data-root "$DATA_ROOT" --require-models 0 \
+      >/tmp/kalshi-live-repair-health.json 2>/dev/null; then
     healthy=1
     break
   fi

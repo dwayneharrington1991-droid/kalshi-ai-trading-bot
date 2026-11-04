@@ -1505,7 +1505,7 @@ class Journal:
                 inserted += cursor.rowcount
         return inserted
 
-    def signal_chart(self, interval_seconds, limit=240, ticker=None):
+    def signal_chart(self, interval_seconds, limit=240, ticker=None, candle_fallback=None):
         """Return bounded closed bars and immutable markers for dashboard use."""
         from .signal_chart import MAX_CHART_BARS, SUPPORTED_INTERVALS, aggregate_candles
 
@@ -1549,6 +1549,18 @@ class Journal:
                 unique.setdefault(int(bar["start"]), bar)
             except (KeyError, ValueError, TypeError, json.JSONDecodeError):
                 continue
+        fallback_used = False
+        if not unique and isinstance(candle_fallback, dict):
+            # The verified 24-hour preload can complete before its first
+            # asynchronous journal write. Render those same closed source bars
+            # during that startup window; markers remain journal-only and
+            # immutable. No candle is interpolated or fabricated.
+            for bar in candle_fallback.get("candles", []):
+                try:
+                    unique.setdefault(int(bar["start"]), bar)
+                except (KeyError, ValueError, TypeError):
+                    continue
+            fallback_used = bool(unique)
         bars = aggregate_candles(list(unique.values()), interval_seconds)[-limit:]
         markers = [json.loads(row[0]) for row in reversed(marker_rows)]
         settled = [row for row in performance_rows if row[4] in (0, 1)]
@@ -1593,7 +1605,12 @@ class Journal:
             "markers": markers,
             "performance": marker_performance,
             "non_repainting": True,
-            "source": "Recorded Coinbase BTC-USD closed one-minute candles",
+            "source": (
+                "Verified live Coinbase preload; journal persistence pending"
+                if fallback_used
+                else "Recorded Coinbase BTC-USD closed one-minute candles"
+            ),
+            "journal_persistence_pending": fallback_used,
             "note": "Markers are append-only receipt-time records. Chart history is not an official settlement index.",
         }
 

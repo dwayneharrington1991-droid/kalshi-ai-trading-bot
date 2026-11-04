@@ -51,44 +51,57 @@ def dataset(db, asof=None):
     row_streams = []
     if has_results:
         if compact_count:
-            # Rank scalar prediction rows against the compact per-contract close
-            # time before touching large prediction JSON. This retains the exact
-            # first recorded row in each horizon while reducing JSON extraction
-            # from every revision to at most four rows per settled contract.
-            row_streams.append(
-                db.execute(
-                    f"""WITH ranked AS (
-                      SELECT p.id,p.ticker,p.timestamp,c.closes_at,o.outcome,o.observed_at,
-                        CASE
-                          WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>600 THEN '>10m'
-                          WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>300 THEN '5-10m'
-                          WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>120 THEN '2-5m'
-                          ELSE '<=2m' END AS horizon_bucket,
-                        ROW_NUMBER() OVER (
-                          PARTITION BY p.ticker,CASE
-                            WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>600 THEN '>10m'
-                            WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>300 THEN '5-10m'
-                            WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>120 THEN '2-5m'
-                            ELSE '<=2m' END
-                          ORDER BY p.timestamp,p.id) AS rank
-                      FROM forecast_outcomes o CROSS JOIN btc_engine_contracts c
-                        ON c.ticker=o.ticker AND c.mode='PUBLIC MARKET DATA'
-                      CROSS JOIN predictions p
-                        ON p.ticker=c.ticker AND p.mode='PUBLIC MARKET DATA'
-                      WHERE o.origin='official'
-                        AND julianday(o.observed_at)<=julianday(?)
-                        AND p.settlement_origin='official' AND p.settlement_up=o.outcome
-                        AND p.settled_at IS NOT NULL
-                        AND julianday(p.settled_at)<=julianday(?)
-                        AND julianday(p.timestamp)<julianday(c.closes_at)
-                        AND julianday(c.closes_at)<=julianday(o.observed_at)
-                    )
-                    SELECT p.ticker,p.timestamp,r.outcome,r.observed_at,{payload_projection}
-                    FROM ranked r JOIN predictions p ON p.id=r.id
-                    WHERE r.rank<=30 ORDER BY p.timestamp,p.id""",
-                    (asof.isoformat(), asof.isoformat()),
-                )
+            # A global ROW_NUMBER over the multi-gigabyte revision table made
+            # SQLite read and sort every historical row before returning a
+            # single candidate.  Seek through the existing ticker/mode index
+            # instead.  Each query reads only the earliest bounded candidates
+            # for one settled contract and horizon.
+            contracts = db.execute(
+                """SELECT c.ticker,c.closes_at,o.outcome,o.observed_at
+                FROM forecast_outcomes o JOIN btc_engine_contracts c
+                  ON c.ticker=o.ticker AND c.mode='PUBLIC MARKET DATA'
+                WHERE o.origin='official'
+                  AND julianday(o.observed_at)<=julianday(?)
+                  AND julianday(c.closes_at)<=julianday(o.observed_at)
+                ORDER BY c.closes_at,c.ticker""",
+                (asof.isoformat(),),
+            ).fetchall()
+            horizon_ranges = (
+                (">10m", 600, None),
+                ("5-10m", 300, 600),
+                ("2-5m", 120, 300),
+                ("<=2m", 0, 120),
             )
+            for ticker, closes_at, outcome, observed_at in contracts:
+                for _bucket, lower, upper in horizon_ranges:
+                    upper_clause = (
+                        "" if upper is None else
+                        "AND (julianday(?)-julianday(p.timestamp))*86400<=?"
+                    )
+                    parameters = [
+                        outcome, observed_at, outcome, asof.isoformat(),
+                        closes_at, closes_at, lower,
+                    ]
+                    if upper is not None:
+                        parameters.extend((closes_at, upper))
+                    parameters.extend((ticker,))
+                    row_streams.append(
+                        db.execute(
+                            f"""SELECT p.ticker,p.timestamp,?, ?,{payload_projection}
+                            FROM predictions p
+                            WHERE p.mode='PUBLIC MARKET DATA'
+                              AND p.settlement_origin='official'
+                              AND p.settlement_up=?
+                              AND p.settled_at IS NOT NULL
+                              AND julianday(p.settled_at)<=julianday(?)
+                              AND julianday(p.timestamp)<julianday(?)
+                              AND (julianday(?)-julianday(p.timestamp))*86400>?
+                              {upper_clause}
+                              AND p.ticker=?
+                            ORDER BY p.timestamp,p.id LIMIT 30""",
+                            parameters,
+                        )
+                    )
         # Preserve contracts recorded before the compact engine table existed.
         # Only this bounded legacy subset uses the older revision scan.
         compact_exclusion = (
@@ -172,29 +185,14 @@ def dataset(db, asof=None):
         consume(rows)
 
     if has_results and compact_count:
-        expected = set(
-            db.execute(
-                """SELECT p.ticker,CASE
-                    WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>600 THEN '>10m'
-                    WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>300 THEN '5-10m'
-                    WHEN (julianday(c.closes_at)-julianday(p.timestamp))*86400>120 THEN '2-5m'
-                    ELSE '<=2m' END AS horizon_bucket
-                FROM forecast_outcomes o CROSS JOIN btc_engine_contracts c
-                  ON c.ticker=o.ticker AND c.mode='PUBLIC MARKET DATA'
-                CROSS JOIN predictions p
-                  ON p.ticker=c.ticker AND p.mode='PUBLIC MARKET DATA'
-                WHERE o.origin='official'
-                  AND julianday(o.observed_at)<=julianday(?)
-                  AND p.settlement_origin='official' AND p.settlement_up=o.outcome
-                  AND p.settled_at IS NOT NULL
-                  AND julianday(p.settled_at)<=julianday(?)
-                  AND julianday(p.timestamp)<julianday(c.closes_at)
-                  AND julianday(c.closes_at)<=julianday(o.observed_at)
-                GROUP BY p.ticker,horizon_bucket""",
-                (asof.isoformat(), asof.isoformat()),
-            )
+        expected = {
+            (ticker, bucket)
+            for ticker, _close, _outcome, _observed in contracts
+            for bucket, _lower, _upper in horizon_ranges
+        }
+        missing_tickers = sorted(
+            {ticker for ticker, bucket in expected if (ticker, bucket) not in selected}
         )
-        missing_tickers = sorted({ticker for ticker, bucket in expected if (ticker, bucket) not in selected})
         # A bounded first-candidate window normally resolves every horizon. If
         # early rows were incomplete, rescan only affected contracts so no
         # legitimate historical record is silently excluded by the fast path.

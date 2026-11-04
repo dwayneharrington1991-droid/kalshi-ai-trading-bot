@@ -147,6 +147,23 @@ def test_chart_query_is_bounded_and_subminute_is_explicitly_unavailable(tmp_path
     assert unavailable["bars"] == []
 
 
+def test_chart_uses_verified_preload_while_first_journal_batch_is_pending(tmp_path):
+    journal = Journal(tmp_path / "signals.db")
+    preload = {
+        "source": "Coinbase BTC-USD public one-minute candles",
+        "received_at": NOW.isoformat(),
+        "candles": candles(60),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+    }
+    chart = journal.signal_chart(60, limit=30, candle_fallback=preload)
+    assert chart["status"] == "READY"
+    assert len(chart["bars"]) == 30
+    assert chart["journal_persistence_pending"] is True
+    assert "Verified live Coinbase preload" in chart["source"]
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_candles").fetchone()[0] == 0
+
+
 def test_marker_performance_uses_only_official_settlements_and_separates_actual_results(tmp_path):
     journal = Journal(tmp_path / "signals.db")
     state = entry_state()

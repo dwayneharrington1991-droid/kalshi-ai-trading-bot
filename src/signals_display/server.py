@@ -1402,7 +1402,12 @@ def make_handler(monitor):
                 except (KeyError, ValueError, TypeError):
                     self.send_error(400, "Use interval 15s/1m/3m/5m/15m and limit 30..500")
                     return
-                value = monitor.journal.signal_chart(interval_seconds, limit, ticker)
+                value = monitor.journal.signal_chart(
+                    interval_seconds,
+                    limit,
+                    ticker,
+                    candle_fallback=getattr(monitor.feed, "candle_cache", None),
+                )
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/api/market-history":

@@ -354,7 +354,8 @@ def test_dataset_fast_path_never_drops_valid_row_after_incomplete_candidates(tmp
         result = learning.dataset(db, NOW + timedelta(seconds=1))
     assert len(result) == 1
     assert result[0]["timestamp"] == (opened + timedelta(seconds=30)).isoformat()
-    assert any("row_number() over" in query.lower() for query in queries)
+    assert not any("row_number() over" in query.lower() for query in queries)
+    assert any("order by p.timestamp,p.id limit 30" in query.lower() for query in queries)
 
 
 def test_after_cost_assessment_withholds_profitable_edge_without_delayed_quotes():

@@ -2,6 +2,12 @@
 
 Updated: 2026-11-04 UTC
 
+Repository verification at this checkpoint: 1,004 tests passed, 8 skipped.
+The selective forward-signal protocol is integrated into Opening and
+Settlement evaluation but has not yet been run on a new untouched Oracle
+holdout. Production deployment and model promotion therefore remain separate,
+explicitly verified operations.
+
 This document records repository capability, integration status, external
 blockers, and production boundaries. It is not a performance or profitability
 claim.

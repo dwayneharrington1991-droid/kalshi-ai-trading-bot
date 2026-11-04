@@ -299,3 +299,25 @@ def test_dataset_projects_small_features_and_does_not_invent_market_benchmark(tm
     assert learning.market_score(result)["samples"] == 0
     assert len(json.dumps(result)) < 2000
     assert not any("select payload" in q.lower() for q in queries)
+    dataset_query = next(q for q in queries if "json_extract" in q.lower())
+    assert "forecast_outcomes o cross join predictions p" in dataset_query.lower()
+    assert "exists (select 1 from forecast_outcomes" not in dataset_query.lower()
+
+
+def test_after_cost_assessment_withholds_profitable_edge_without_delayed_quotes():
+    rows = [
+        {
+            "ticker": "KXBTC15M-COST",
+            "outcome": 1,
+            "fee_multiplier": 1,
+            "executable_quotes": {
+                "up": {"bid": 0.49, "ask": 0.50},
+                "down": {"bid": 0.48, "ask": 0.51},
+            },
+        }
+    ]
+    report = learning.after_cost_assessment([0.70], rows)
+    assert report["eligible_quote_observations"] == 1
+    assert report["fees_included"] is True
+    assert report["manual_execution_delay_supported"] is False
+    assert report["profitable_edge_demonstrated"] is False

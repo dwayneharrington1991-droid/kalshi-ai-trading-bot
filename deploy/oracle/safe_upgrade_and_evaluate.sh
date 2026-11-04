@@ -190,7 +190,7 @@ evaluation="$DEPLOY_ROOT/evaluations/$stamp-$target"
 
 set +e
 (
-  set -Eeuo pipefail
+  set -Euo pipefail
 
   settlement_registry="$evaluation/settlement-registry"
   opening_registry="$evaluation/opening-registry"
@@ -205,19 +205,21 @@ set +e
     cp -a "$production_opening_registry"/. "$opening_registry"/
   fi
 
-  timeout --signal=TERM --kill-after=30s 600 \
+  settlement_rc=0
+  timeout --signal=TERM --kill-after=30s 900 \
     "$new_current/.venv/bin/python3" \
     -m src.signals_display.learning \
     --journal "$JOURNAL_PATH" \
     --output "$evaluation/settlement.json" \
-    --registry "$settlement_registry"
+    --registry "$settlement_registry" || settlement_rc=$?
 
-  timeout --signal=TERM --kill-after=30s 600 \
+  opening_rc=0
+  timeout --signal=TERM --kill-after=30s 900 \
     "$new_current/.venv/bin/python3" \
     -m src.signals_display.opening_models \
     --journal "$JOURNAL_PATH" \
     --output "$evaluation/opening.json" \
-    --registry "$opening_registry"
+    --registry "$opening_registry" || opening_rc=$?
 
   "$new_current/.venv/bin/python3" - \
     "$evaluation/opening.report.json" \
@@ -249,6 +251,11 @@ for name, filename in (
 print("MODEL_ACTIVATION_PERFORMED=false")
 print("AUTOMATED_TRADING=DISABLED")
 PY
+  summary_rc=$?
+
+  echo "SETTLEMENT_EVALUATION_RC=$settlement_rc"
+  echo "OPENING_EVALUATION_RC=$opening_rc"
+  (( settlement_rc == 0 && opening_rc == 0 && summary_rc == 0 ))
 )
 
 evaluation_rc=$?

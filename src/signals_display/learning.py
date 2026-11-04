@@ -33,30 +33,49 @@ def dataset(db, asof=None):
     has_results = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forecast_outcomes'"
     ).fetchone()
-    result_filter = (
-        "AND EXISTS (SELECT 1 FROM forecast_outcomes o WHERE o.ticker=predictions.ticker "
-        "AND o.origin='official' AND o.outcome=predictions.settlement_up "
-        "AND julianday(o.observed_at)<=julianday(?)) "
-        if has_results
-        else ""
-    )
+    if has_results:
+        # Begin with the compact official-outcome table and look up only its
+        # contracts in predictions.  The previous correlated EXISTS query
+        # started with every prediction revision; on a multi-gigabyte journal
+        # that could scan millions of JSON rows before finding the few hundred
+        # labelled contracts.  CROSS JOIN fixes the loop order while the
+        # existing predictions(ticker,mode) index provides bounded lookups.
+        source = """forecast_outcomes o CROSS JOIN predictions p
+          ON p.ticker=o.ticker AND p.mode='PUBLIC MARKET DATA'"""
+        columns = "p.ticker,p.timestamp,o.outcome,o.observed_at"
+        predicate = """o.origin='official'
+          AND julianday(o.observed_at)<=julianday(?)
+          AND p.settlement_origin='official'
+          AND p.settlement_up=o.outcome
+          AND p.settled_at IS NOT NULL
+          AND julianday(p.settled_at)<=julianday(?)"""
+        payload = "p.payload"
+        ordering = "p.timestamp,p.id"
+        parameters = (asof.isoformat(), asof.isoformat())
+    else:
+        source = "predictions p"
+        columns = "p.ticker,p.timestamp,p.settlement_up,p.settled_at"
+        predicate = """p.mode='PUBLIC MARKET DATA'
+          AND p.settlement_origin='official' AND p.settlement_up IS NOT NULL
+          AND julianday(p.settled_at)<=julianday(?)"""
+        payload = "p.payload"
+        ordering = "p.timestamp,p.id"
+        parameters = (asof.isoformat(),)
     # Project only small scalar feature data inside SQLite. Cursor iteration
     # never materializes gigabytes of historical JSON payloads in Python.
     rows = db.execute(
-        """SELECT ticker,timestamp,settlement_up,settled_at,
-        json_extract(payload,'$.stale','$.market.closes_at',
+        f"""SELECT {columns},
+        json_extract({payload},'$.stale','$.market.closes_at',
           '$.model.candidate_features.values','$.model.baseline_probability_up',
-          '$.market.quotes.up.bid','$.market.quotes.up.ask')
-        FROM predictions WHERE mode='PUBLIC MARKET DATA'
-          AND settlement_origin='official' AND settlement_up IS NOT NULL
-          AND julianday(settled_at)<=julianday(?) """
-        + result_filter
-        + "ORDER BY timestamp,id",
-        (asof.isoformat(),) * (2 if has_results else 1),
+          '$.market.quotes.up.bid','$.market.quotes.up.ask',
+          '$.market.quotes.down.bid','$.market.quotes.down.ask',
+          '$.market.fee_multiplier')
+        FROM {source} WHERE {predicate} ORDER BY {ordering}""",
+        parameters,
     )
     selected = {}
     for raw in rows:
-        stale, closes_at, f, baseline, bid, ask = json.loads(raw[4])
+        stale, closes_at, f, baseline, bid, ask, down_bid, down_ask, fee_multiplier = json.loads(raw[4])
         if (
             stale
             or not isinstance(f, dict)
@@ -92,6 +111,8 @@ def dataset(db, asof=None):
                 outcome=int(raw[2]),
                 baseline=baseline,
                 market=mid,
+                executable_quotes={"up": {"bid": bid, "ask": ask}, "down": {"bid": down_bid, "ask": down_ask}},
+                fee_multiplier=fee_multiplier,
                 remaining=(close - t).total_seconds(),
             ),
         )
@@ -118,6 +139,52 @@ def official_label_count(db, asof):
 def market_score(rows):
     supported = [r for r in rows if r.get("market") is not None]
     return score([r["market"] for r in supported], [r["outcome"] for r in supported])
+
+
+def after_cost_assessment(probabilities, rows, *, slippage=0.01):
+    """Conservative one-contract quote-time counterfactual on the holdout.
+
+    Missing executable asks or fee metadata are withheld.  Historical records
+    do not contain a guaranteed quote after a manual execution delay, so this
+    diagnostic can never by itself demonstrate or activate a profitable edge.
+    """
+    from .edge_scanner import quantity_fee
+
+    observations = []
+    for probability_up, row in zip(probabilities, rows):
+        quotes = row.get("executable_quotes") or {}
+        multiplier = row.get("fee_multiplier")
+        if type(multiplier) not in (int, float) or not math.isfinite(multiplier):
+            continue
+        candidates = []
+        for side, probability in (("up", probability_up), ("down", 1 - probability_up)):
+            ask = (quotes.get(side) or {}).get("ask")
+            if type(ask) not in (int, float) or not math.isfinite(ask) or not 0 < ask < 1:
+                continue
+            fee = quantity_fee(ask, 1, multiplier)
+            cost = ask + slippage + fee
+            candidates.append((probability - cost, side, cost, fee))
+        if not candidates:
+            continue
+        edge, side, cost, fee = max(candidates)
+        if edge <= 0:
+            continue
+        won = row["outcome"] == (1 if side == "up" else 0)
+        observations.append(
+            {"ticker": row["ticker"], "side": side, "won": won, "net_pnl": (1 if won else 0) - cost, "entry_cost": cost, "fee": fee}
+        )
+    pnl = sum(item["net_pnl"] for item in observations)
+    return {
+        "protocol": "quote-time-one-contract-after-costs-v1",
+        "eligible_quote_observations": len(observations),
+        "simulated_net_pnl": pnl,
+        "average_net_pnl_per_call": pnl / len(observations) if observations else None,
+        "slippage_per_contract": slippage,
+        "fees_included": True,
+        "manual_execution_delay_supported": False,
+        "profitable_edge_demonstrated": False,
+        "reason": "Historical post-delay executable quotes are unavailable; quote-time results cannot verify a manually executable edge",
+    }
 
 
 def prepare_comparison(db, now, *, used_test_contracts=None):
@@ -509,10 +576,9 @@ def compare(rows, *, used_test_contracts=None):
             "note": "Validation diagnostic only; not causal evidence or a profitability claim",
         }
     # Selection is frozen before unsealing the untouched test labels.
+    test_probabilities = [row_predict(chosen, r) for r in test]
     tested = {
-        "selected_candidate": score(
-            [row_predict(chosen, r) for r in test], [r["outcome"] for r in test]
-        ),
+        "selected_candidate": score(test_probabilities, [r["outcome"] for r in test]),
         "zero_drift": score([r["baseline"] for r in test], [r["outcome"] for r in test]),
         "market_implied": market_score(test),
         "train_prior": score([prior] * len(test), [r["outcome"] for r in test]),
@@ -551,6 +617,7 @@ def compare(rows, *, used_test_contracts=None):
             for _, m, v in pool
         ],
         test=tested,
+        after_cost_test=after_cost_assessment(test_probabilities, test),
         test_by_horizon=by_horizon,
         feature_names=prep["names"],
         train_end=max(r["label_available_at"] for r in train),

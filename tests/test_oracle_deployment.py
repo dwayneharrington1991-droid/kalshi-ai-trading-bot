@@ -22,7 +22,7 @@ def load_sqlite_backup():
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh", "safe_upgrade_and_evaluate.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh", "safe_upgrade_and_evaluate.sh", "run_isolated_ai_evaluation.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -185,6 +185,16 @@ def test_safe_upgrade_validation_installs_dashboard_test_dependencies():
     assert '"${validation}[dev,dashboard]"' in script
     assert "MODEL_ACTIVATION_PERFORMED=false" in script
     assert "AUTOMATED_TRADING=DISABLED" in script
+
+
+def test_isolated_ai_evaluation_cannot_activate_or_write_production_registry():
+    script = (DEPLOY / "run_isolated_ai_evaluation.sh").read_text()
+    assert 'settlement_registry="$evaluation/settlement-registry"' in script
+    assert 'opening_registry="$evaluation/opening-registry"' in script
+    assert "MODEL_ACTIVATION_PERFORMED=false" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+    assert "--activate" not in script
+    assert "timeout --signal=TERM --kill-after=30s 900" in script
 
 
 def test_host_configuration_is_derived_and_never_creates_approval_or_restarts():

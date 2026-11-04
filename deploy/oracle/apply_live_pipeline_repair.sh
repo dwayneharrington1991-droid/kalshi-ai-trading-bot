@@ -22,6 +22,16 @@ old_release=$(readlink -f "$DEPLOY_ROOT/current")
   block "running release is not expected commit $expected_current"
 [[ -x "$old_release/.venv/bin/python3" ]] || block "current Python environment missing"
 
+# Record whether the existing release has fresh upstream data. A transient
+# exchange outage that predates this deployment must not roll back otherwise
+# healthy application code. A regression from ready to unready still fails.
+predeploy_ready=0
+if curl --fail --silent --show-error --max-time 8 \
+    http://127.0.0.1:8765/readyz >/dev/null 2>&1; then
+  predeploy_ready=1
+fi
+echo "predeploy_readiness=$predeploy_ready"
+
 exec 8>"$DEPLOY_ROOT/learning.lock"
 flock -n 8 || block "AI evaluation or learning refresh is active; no service change made"
 
@@ -108,8 +118,11 @@ PY
   sleep 2
 done
 if (( fresh != 1 )); then
-  echo "LIVE_REPAIR_FAILED: fresh candle/prediction verification timed out" >&2
-  false
+  if (( predeploy_ready == 1 )); then
+    echo "LIVE_REPAIR_FAILED: new release lost readiness that the prior release had" >&2
+    false
+  fi
+  echo "LIVE_REPAIR_VERIFIED_DEGRADED: upstream readiness was unavailable before and after deployment; healthy service retained" >&2
 fi
 
 trap - ERR

@@ -212,6 +212,15 @@ def test_live_pipeline_repair_is_atomic_bounded_and_signals_only():
     assert "--activate" not in script
 
 
+def test_live_pipeline_repair_distinguishes_upstream_outage_from_regression():
+    script = (DEPLOY / "apply_live_pipeline_repair.sh").read_text()
+    assert "predeploy_ready=0" in script
+    assert "http://127.0.0.1:8765/readyz" in script
+    assert "if (( predeploy_ready == 1 )); then" in script
+    assert "new release lost readiness that the prior release had" in script
+    assert "LIVE_REPAIR_VERIFIED_DEGRADED" in script
+
+
 def test_host_configuration_is_derived_and_never_creates_approval_or_restarts():
     setup = (DEPLOY / "configure_host.sh").read_text()
     assert "data/models/registry" in setup

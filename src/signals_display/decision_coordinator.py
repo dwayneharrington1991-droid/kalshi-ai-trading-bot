@@ -1,6 +1,8 @@
 """Fail-closed deterministic coordination of existing signals-only analytics."""
 from __future__ import annotations
 
+from .risk_controls import signal_kill_switch
+
 
 def _market_scout(state):
     health = state.get("market_health", {})
@@ -67,10 +69,13 @@ def _risk_guardian(state, scout, quant):
     live_up = quant["settlement"].get("up_probability")
     if opening_up is not None and live_up is not None and (opening_up - 0.5) * (live_up - 0.5) < 0:
         blockers.append("OPENING_AND_LIVE_DIRECTION_CONFLICT")
+    kill_switch = signal_kill_switch(state)
+    blockers.extend(reason for reason in kill_switch["reasons"] if reason not in blockers)
     return {
         "status": "BLOCKED" if blockers else "MANUAL_REVIEW_ONLY",
         "blockers": blockers,
         "stale_kill_switch": state.get("stale", True),
+        "signal_kill_switch": kill_switch,
         "automatic_execution_allowed": False,
     }
 

@@ -47,7 +47,7 @@ for name in run_dashboard.sh health_check.py sqlite_backup.py release-policy.jso
 done
 printf '%s\n' "$identity" > "$staging/.deployed-commit"
 "$PYTHON_BIN" -m venv "$staging/.venv"
-"$staging/.venv/bin/python3" -m pip install --disable-pip-version-check -e "$staging[dev]"
+"$staging/.venv/bin/python3" -m pip install --disable-pip-version-check -e "$staging[dev,dashboard]"
 
 required_tests=(tests/test_signals_monitor.py tests/test_signals_prediction_engine.py tests/test_signals_browser.py)
 for test_file in "${required_tests[@]}"; do

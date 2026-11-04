@@ -169,6 +169,7 @@ def test_baseline_preserves_dirty_source_and_captures_existing_account_mode():
     assert "MODEL_REGISTRY=/home/opc/kalshi-ai-trading-bot/data/models/registry" in config
     assert "ENABLE_ACCOUNT_READONLY=" not in config
     assert "--account-readonly" in baseline
+    assert '"$staging[dev,dashboard]"' in baseline
     assert "account-monitoring.flags" in baseline
     assert "--exclude='./data'" in baseline
     assert "--exclude='./.venv'" in baseline

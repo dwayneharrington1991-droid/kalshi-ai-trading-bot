@@ -22,7 +22,7 @@ def load_sqlite_backup():
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh", "safe_upgrade_and_evaluate.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -178,6 +178,13 @@ def test_baseline_preserves_dirty_source_and_captures_existing_account_mode():
     assert "Python 3.12" in baseline
     assert "systemctl restart" not in baseline
     assert "production-approved" not in baseline
+
+
+def test_safe_upgrade_validation_installs_dashboard_test_dependencies():
+    script = (DEPLOY / "safe_upgrade_and_evaluate.sh").read_text()
+    assert '"${validation}[dev,dashboard]"' in script
+    assert "MODEL_ACTIVATION_PERFORMED=false" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
 
 
 def test_host_configuration_is_derived_and_never_creates_approval_or_restarts():

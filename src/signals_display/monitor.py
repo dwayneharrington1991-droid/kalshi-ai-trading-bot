@@ -25,6 +25,7 @@ from .model import Display, evaluate, fee, number, timestamp
 from .edges import assess_edges
 from .reliability import metrics, wilson
 from .multi_asset import asset_of, ALIASES
+from .contract_rules import snapshot as contract_rule_snapshot
 
 UTC = timezone.utc
 LIVE_JOURNAL_MAINTENANCE_LIMIT_BYTES = 512 * 1024 * 1024
@@ -896,6 +897,7 @@ class PublicFeed:
                 }
             except (KeyError, ValueError, TypeError):
                 pass
+            frozen_rules = contract_rule_snapshot(raw, series, received_at=now.isoformat())
             result.append(
                 dict(
                     ticker=raw["ticker"],
@@ -905,12 +907,23 @@ class PublicFeed:
                     closes_at=close.isoformat(),
                     observed_at=now.isoformat(),
                     strike=raw.get("floor_strike"),
+                    strike_type=raw.get("strike_type"),
                     metadata_received_at=now.isoformat(),
                     settlement_reference=source,
                     up_definition="YES according to published contract settlement rules"
                     if orientation
                     else "unknown",
                     rules=raw.get("rules_primary", ""),
+                    rules_primary=raw.get("rules_primary", ""),
+                    rules_secondary=raw.get("rules_secondary", ""),
+                    settlement_spec=raw.get("settlement_spec"),
+                    price_level_structure=raw.get("price_level_structure"),
+                    price_ranges=raw.get("price_ranges"),
+                    tick_size_dollars=raw.get("tick_size_dollars"),
+                    contract_rule_snapshot=(
+                        frozen_rules.as_dict()
+                        if hasattr(frozen_rules, "as_dict") else frozen_rules
+                    ),
                     quotes=quotes,
                     fee_type=series.get("fee_type"),
                     fee_multiplier=series.get("fee_multiplier"),
@@ -918,16 +931,12 @@ class PublicFeed:
                     comparison_operator=">="
                     if orientation and "at least" in str(raw.get("rules_primary", "")).lower()
                     else None,
-                    averaging_seconds=60,
+                    averaging_seconds=getattr(
+                        frozen_rules, "averaging_window_seconds", None
+                    ),
                     averaging_rule_verified=(
-                        orientation
-                        and "CF Benchmarks" in source
-                        and str(raw.get("rules_primary", ""))
-                        .lower()
-                        .count("simple average of the sixty seconds")
-                        == 2
-                        and "at least" in str(raw.get("rules_primary", "")).lower()
-                        and "brti" in str(raw.get("rules_primary", "")).lower()
+                        getattr(frozen_rules, "rule_status", None)
+                        == "STRUCTURED_SETTLEMENT_RULE_VERIFIED"
                     ),
                 )
             )
@@ -2259,6 +2268,9 @@ class Journal:
             "reference_source": reference_source,
             "finalized": bool(finalized),
             "future_data_excluded": True,
+            "contract_rule_snapshot": market.get("contract_rule_snapshot", {
+                "rule_status": "UNAVAILABLE_AT_OPEN"
+            }),
         }
         with self.connect() as db:
             existing = db.execute(

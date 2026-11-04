@@ -28,6 +28,9 @@ def base_state():
             "validation": {"verified": False},
         },
         "account": {"status": "PUBLIC_ONLY"},
+        "settlement_intelligence": {
+            "rule_snapshot": {"rule_status": "STRUCTURED_SETTLEMENT_RULE_VERIFIED"}
+        },
     }
 
 

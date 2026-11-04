@@ -38,6 +38,7 @@ def _quant_analyst(state):
         },
         "edge_validation": edge.get("validation", {}),
         "edge_status": edge.get("label", "NO VERIFIED EDGE — WAIT"),
+        "settlement_intelligence": state.get("settlement_intelligence", {}),
     }
 
 
@@ -54,6 +55,11 @@ def _risk_guardian(state, scout, quant):
     validation = quant.get("edge_validation") or {}
     if not validation.get("verified", False):
         blockers.append("PROFITABLE_EDGE_UNVERIFIED")
+    rule_status = (
+        quant.get("settlement_intelligence", {}).get("rule_snapshot", {}).get("rule_status")
+    )
+    if rule_status != "STRUCTURED_SETTLEMENT_RULE_VERIFIED":
+        blockers.append("OFFICIAL_SETTLEMENT_CALCULATION_UNVERIFIED")
     account = state.get("account", {})
     if account.get("status") == "ACCOUNT_STALE":
         blockers.append("ACCOUNT_DATA_STALE")

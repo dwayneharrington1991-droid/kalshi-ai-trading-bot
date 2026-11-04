@@ -5,6 +5,7 @@ import argparse
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from decimal import Decimal
 from pathlib import Path
 import re
 import threading
@@ -25,6 +26,9 @@ from .scanner import context as scanner_context, qualify as scanner_qualify
 from .decision import assess as trade_decision
 from .decision_coordinator import coordinate as coordinate_intelligence
 from .news_intelligence import classify as classify_news
+from .contract_rules import snapshot as contract_rule_snapshot
+from .settlement_probability import estimate as settlement_probability
+from .fair_value import compare as compare_fair_value
 from .market_health import selection_summary, diagnose as diagnose_market
 from .prediction_engine import (
     view as engine_view,
@@ -578,6 +582,60 @@ class Monitor:
                             "artifact_status"
                         ] = "Future-trained artifact rejected at this prediction time"
             state = analyze(payload, now, self.target, self.stop, self.horizon, result, info)
+            rules = contract_rule_snapshot(
+                market_now or {}, getattr(self.feed, "last_series", {}) or {},
+                received_at=(market_now or {}).get("metadata_received_at", now.isoformat()),
+            )
+            state["contract_rules"] = (
+                (market_now or {}).get("contract_rule_snapshot")
+                or (rules.as_dict() if hasattr(rules, "as_dict") else rules)
+            )
+            probability = {"status": "UNAVAILABLE", "reason": "Contract or volatility inputs unavailable", "actionable": False}
+            fair_values = {}
+            if hasattr(rules, "as_dict"):
+                context = state.get("model", {}).get("btc_context", {})
+                probability = settlement_probability(
+                    reference=state.get("reference", {}).get("price"),
+                    strike=rules.strike,
+                    seconds_remaining=state.get("remaining_seconds"),
+                    realized_volatility_per_sqrt_second=context.get(
+                        "volatility_dollars_per_sqrt_second"
+                    ),
+                    jump_volatility_per_sqrt_second=0,
+                    data_uncertainty=0,
+                    comparison_operator=rules.comparison_operator,
+                    averaging_remaining_fraction=1,
+                )
+                yes_probability = probability.get("probability_yes")
+                for side, side_probability in (
+                    ("up", yes_probability),
+                    ("down", str(Decimal(1) - Decimal(yes_probability)) if yes_probability is not None else None),
+                ):
+                    quote = (state.get("market") or {}).get("quotes", {}).get(side, {})
+                    fair_values[side] = compare_fair_value(
+                        probability=side_probability,
+                        bid=quote.get("bid"), ask=quote.get("ask"),
+                        ask_depth=quote.get("ask_size"), quantity=1,
+                        fee_multiplier=(state.get("market") or {}).get("fee_multiplier"),
+                        price_increment=rules.price_increment, slippage_ticks=1,
+                    )
+            state["settlement_intelligence"] = {
+                "rule_snapshot": state["contract_rules"],
+                "time_to_settlement": probability,
+                "fair_values": fair_values,
+                "official_reference": {
+                    "status": "UNAVAILABLE_NO_AUTHORIZED_REALTIME_FEED",
+                    "source": getattr(rules, "settlement_source", None),
+                },
+                "estimated_reference": {
+                    "status": "AVAILABLE" if state.get("reference", {}).get("price") is not None else "UNAVAILABLE",
+                    "source": state.get("reference", {}).get("source"),
+                    "official": False,
+                    "warning": "External proxy; not the official settlement index.",
+                },
+                "model_status": "SHADOW_UNCALIBRATED",
+                "actionable": False,
+            }
             strip_markets = list(payload.get("multi_asset_markets", []))
             strip_references = dict(payload.get("multi_asset_references", {}))
             strip_histories = dict(payload.get("multi_asset_histories", {}))
@@ -1490,6 +1548,28 @@ def make_handler(monitor):
                     }
                 ).encode()
                 content_type = "application/json"
+            elif route == "/readyz":
+                state = monitor.snapshot()
+                health = state.get("market_health", {})
+                ready = bool(
+                    not state.get("stale", True)
+                    and health.get("contract_quotes_fresh")
+                    and health.get("reference_fresh")
+                    and state.get("market")
+                )
+                status_code = 200 if ready else 503
+                body = json.dumps({
+                    "status": "READY" if ready else "NOT_READY",
+                    "build_commit": monitor.build_commit,
+                    "signals_only": True,
+                    "contract": (state.get("market") or {}).get("ticker"),
+                    "contract_quotes_fresh": bool(health.get("contract_quotes_fresh")),
+                    "reference_fresh": bool(health.get("reference_fresh")),
+                    "stale_reasons": health.get("contract_quote_reasons", [])
+                        + health.get("reference_reasons", []),
+                    "note": "Readiness may fail during an external feed outage without making the dashboard process unhealthy.",
+                }).encode()
+                content_type = "application/json"
             elif route == "/health":
                 body, content_type = b"signals-only dashboard", "text/plain"
             else:
@@ -1665,7 +1745,7 @@ def make_startup_handler(startup):
             if route == "/":
                 body = Path(__file__).with_name("dashboard.html").read_bytes()
                 content_type, status = "text/html; charset=utf-8", 200
-            elif route in {"/healthz", "/api/startup"}:
+            elif route in {"/healthz", "/readyz", "/api/startup"}:
                 body = json.dumps(startup.snapshot()).encode()
                 content_type, status = "application/json", 503
             elif route in {"/api/state", "/api/details"}:

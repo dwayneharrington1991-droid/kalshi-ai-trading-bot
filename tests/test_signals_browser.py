@@ -327,9 +327,9 @@ def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_pat
             assert page.locator("#opening-prediction").evaluate(
                 "e=>e.getBoundingClientRect().top"
             ) < page.locator("#btc-engine").evaluate("e=>e.getBoundingClientRect().top")
-            assert page.locator("#btc-engine").evaluate(
-                "e=>e.getBoundingClientRect().top"
-            ) < page.locator("#next-move").evaluate("e=>e.getBoundingClientRect().top")
+            assert page.locator("#primary-live-probability").inner_text() == "60.0% UP · 40.0% DOWN"
+            assert page.locator("#signal-details-toggle").get_attribute("aria-expanded") == "false"
+            assert page.locator("#signal-details").get_attribute("aria-hidden") == "true"
             initial = page.locator("#engine-up-initial").inner_text()
             frozen_label = page.locator("#opening-direction").inner_text()
             frozen_probability = page.locator("#opening-up-prob").inner_text()
@@ -527,15 +527,11 @@ def test_model_market_chart_alerts_and_costs_stay_experimental_and_readonly(tmp_
                 "2 recorded model points"
             )
             assert page.evaluate("probabilityPoints.every(point=>point.up<.99)")
-            order = [
-                page.locator(selector).evaluate("element=>element.getBoundingClientRect().top")
-                for selector in (
-                    "#opening-prediction",
-                    "#btc-engine",
-                    "#model-market-panel",
-                    "#live-trades-panel",
-                )
-            ]
+            assert page.locator("#primary-live").inner_text() == "UP"
+            assert page.locator("#primary-live-probability").inner_text() == "65.0% UP · 35.0% DOWN"
+            page.locator("#signal-details-toggle").click()
+            assert page.locator("#signal-details-toggle").get_attribute("aria-expanded") == "true"
+            order = [page.locator(selector).evaluate("element=>element.getBoundingClientRect().top") for selector in ("#opening-prediction", "#btc-engine", "#model-market-panel")]
             assert order == sorted(order)
             playwright.expect(page.locator("#monitor-alert-events")).to_contain_text(
                 "Configured risk limit"
@@ -761,16 +757,10 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             assert "80 official outcomes" in page.locator("#opening-model-summary").inner_text()
             assert page.evaluate("lastState.prediction_engine.initial.direction") == "DOWN"
             assert page.evaluate("lastState.prediction_engine.initial.up") == 0.49994
-            order = [
-                page.locator(selector).evaluate("e=>e.getBoundingClientRect().top")
-                for selector in (
-                    "#opening-prediction",
-                    "#btc-engine",
-                    "#scalping-monitor",
-                    "#model-market-panel",
-                    "#live-trades-panel",
-                )
-            ]
+            assert page.locator("#primary-opening-probability").inner_text() == "50.0% UP · 50.0% DOWN"
+            assert page.locator("#primary-live-probability").inner_text() == "50.0% UP · 50.0% DOWN"
+            page.locator("#signal-details-toggle").click()
+            order = [page.locator(selector).evaluate("e=>e.getBoundingClientRect().top") for selector in ("#opening-prediction", "#btc-engine", "#scalping-monitor", "#model-market-panel")]
             assert order == sorted(order)
             assert page.locator("#scalp-monitor-signal").inner_text() == "CANDIDATE"
             assert page.locator("#scalp-monitor-action").inner_text() == "WAIT"

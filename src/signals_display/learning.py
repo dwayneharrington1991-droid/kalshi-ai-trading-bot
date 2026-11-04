@@ -200,6 +200,11 @@ def prepare_comparison(db, now, *, used_test_contracts=None):
         return artifact, report, []
     rows = dataset(db, now)
     artifact, report = compare(rows, used_test_contracts=used_test_contracts)
+    report["recorded_official_contracts"] = count
+    report["eligible_feature_contracts"] = len({row["ticker"] for row in rows})
+    report["excluded_official_contracts"] = max(
+        0, count - report["eligible_feature_contracts"]
+    )
     report["dataset_loaded"] = True
     return artifact, report, rows
 
@@ -395,6 +400,11 @@ def chronological_contract_partitions(contracts, used_test_contracts=None):
                 "evaluation_mode": "INITIAL_CHRONOLOGICAL_HOLDOUT",
                 "previously_exposed_contracts": 0,
                 "unseen_forward_contracts": len(contracts[b:]),
+                "available_eligible_contracts": len(contracts),
+                "development_contracts": b,
+                "required_unseen_forward_contracts": 30,
+                "additional_unseen_contracts_needed": max(0, 30 - len(contracts[b:])),
+                "last_exposed_contract": None,
             },
         )
 
@@ -405,6 +415,12 @@ def chronological_contract_partitions(contracts, used_test_contracts=None):
         "evaluation_mode": "FORWARD_UNSEEN_HOLDOUT",
         "previously_exposed_contracts": len(set(contracts) & used),
         "unseen_forward_contracts": len(future),
+        "available_eligible_contracts": len(contracts),
+        "development_contracts": len(development),
+        "required_unseen_forward_contracts": 30,
+        "additional_unseen_contracts_needed": max(0, 30 - len(future)),
+        "last_exposed_contract": contracts[last_exposed],
+        "registry_contracts_not_in_current_dataset": len(used - set(contracts)),
     }
     if len(future) < 30:
         return None, info

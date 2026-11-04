@@ -96,6 +96,18 @@ for name, filename in (("OPENING", sys.argv[1]), ("SETTLEMENT", sys.argv[2])):
     report = json.loads(path.read_text())
     print(f"{name}_STATUS={report.get('status', 'UNAVAILABLE')}")
     print(f"{name}_SPLIT={report.get('split_contracts')}")
+    print(f"{name}_ELIGIBLE_CONTRACTS={report.get('available_eligible_contracts', report.get('opening_contracts'))}")
+    print(f"{name}_PREVIOUSLY_EXPOSED={report.get('previously_exposed_contracts')}")
+    print(f"{name}_UNSEEN_FORWARD={report.get('unseen_forward_contracts')}")
+    print(f"{name}_REQUIRED_UNSEEN={report.get('required_unseen_forward_contracts', 30)}")
+    print(f"{name}_ADDITIONAL_NEEDED={report.get('additional_unseen_contracts_needed')}")
+    print(f"{name}_LAST_EXPOSED_CONTRACT={report.get('last_exposed_contract')}")
+    if name == "OPENING":
+        print(f"{name}_DATASET_COVERAGE={report.get('dataset_coverage')}")
+    else:
+        print(f"{name}_RECORDED_OFFICIAL={report.get('recorded_official_contracts')}")
+        print(f"{name}_EXCLUDED_OFFICIAL={report.get('excluded_official_contracts')}")
+        print(f"{name}_AFTER_COST_TEST={report.get('after_cost_test')}")
     print(f"{name}_TEST_METRICS={(report.get('test') or {}).get('selected_candidate')}")
     print(f"{name}_QUALIFIES_FOR_ACTIVATION=false")
 

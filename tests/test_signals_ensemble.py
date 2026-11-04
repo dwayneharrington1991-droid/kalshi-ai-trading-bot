@@ -111,6 +111,9 @@ def test_holdout_exposure_waits_for_a_new_forward_block_before_fitting(monkeypat
     candidate, report = learning.compare(data, used_test_contracts={"C179"})
     assert candidate is None and report["status"] == "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT"
     assert report["unseen_forward_contracts"] == 0 and report["holdout_reuse_checked"]
+    assert report["required_unseen_forward_contracts"] == 30
+    assert report["additional_unseen_contracts_needed"] == 30
+    assert report["last_exposed_contract"] == "C179"
 
 
 def test_next_settlement_evaluation_uses_only_later_unseen_contracts():

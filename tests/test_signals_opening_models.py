@@ -265,6 +265,8 @@ def test_opening_selection_is_frozen_before_untouched_test_outcomes():
     _, blocked = opening_models.evaluate(rows, used_test_contracts=report["test_contracts"])
     assert blocked["status"] == "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT"
     assert blocked["unseen_forward_contracts"] == 0
+    assert blocked["required_unseen_forward_contracts"] == 30
+    assert blocked["additional_unseen_contracts_needed"] == 30
 
     candidate, forward = opening_models.evaluate(
         synthetic_rows(230), used_test_contracts=report["test_contracts"]

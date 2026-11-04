@@ -776,6 +776,7 @@ def main():
     args = parser.parse_args()
     try:
         with closing(sqlite3.connect(args.journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            coverage = dataset_coverage(db)
             rows = dataset(db)
         from .model_registry import atomic_json, ModelRegistry
 
@@ -786,6 +787,7 @@ def main():
                 used_test_contracts=registry.used_test_contracts(),
                 include_walk_forward=args.walk_forward,
             )
+            report["dataset_coverage"] = coverage
             atomic_json(args.output.with_suffix(".report.json"), report)
             registry.record_evaluation(report, datetime.now(timezone.utc))
             if artifact:

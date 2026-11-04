@@ -812,6 +812,7 @@ class Monitor:
                 payload.get("coverage", {}).get("Federal Reserve public releases", {}), now
             )
             state["decision_intelligence"] = coordinate_intelligence(state)
+            self.journal.record_ai_signal_markers(state)
             self.journal.step(state)
             phases["journal_write"] = round((perf_counter() - journal_started) * 1000, 2)
             if isinstance(self.feed, PublicFeed):
@@ -1383,6 +1384,25 @@ def make_handler(monitor):
                     value["advanced_intelligence"] = attach_reliability(
                         value["advanced_intelligence"], monitor.engine_report.get()
                     )
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/signal-chart":
+                intervals = {"15s": 15, "1m": 60, "3m": 180, "5m": 300, "15m": 900}
+                try:
+                    interval_name = query.get("interval", ["1m"])[0]
+                    interval_seconds = intervals[interval_name]
+                    limit = int(query.get("limit", ["240"])[0])
+                    ticker = query.get("ticker", [None])[0]
+                    if not 30 <= limit <= 500:
+                        raise ValueError("Invalid chart limit")
+                    if ticker is not None and not re.fullmatch(
+                        r"KXBTC15M-[A-Za-z0-9_-]{1,100}", ticker
+                    ):
+                        raise ValueError("Invalid chart ticker")
+                except (KeyError, ValueError, TypeError):
+                    self.send_error(400, "Use interval 15s/1m/3m/5m/15m and limit 30..500")
+                    return
+                value = monitor.journal.signal_chart(interval_seconds, limit, ticker)
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/api/market-history":

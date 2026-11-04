@@ -1350,6 +1350,19 @@ class Journal:
                     first_observed_at TEXT NOT NULL,last_observed_at TEXT NOT NULL,
                     samples INTEGER NOT NULL,first_payload TEXT NOT NULL,last_payload TEXT NOT NULL,
                     PRIMARY KEY(mode,ticker,minute_start));
+                CREATE TABLE IF NOT EXISTS ai_signal_markers (
+                    id INTEGER PRIMARY KEY,marker_key TEXT NOT NULL UNIQUE,
+                    ticker TEXT NOT NULL,signal_type TEXT NOT NULL,created_at TEXT NOT NULL,
+                    btc_price REAL NOT NULL,contract_price REAL,probability REAL,
+                    after_cost_edge REAL,reason TEXT NOT NULL,data_freshness TEXT NOT NULL,
+                    risk_status TEXT NOT NULL,experimental INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,payload TEXT NOT NULL);
+                CREATE TRIGGER IF NOT EXISTS ai_signal_markers_no_update
+                    BEFORE UPDATE ON ai_signal_markers BEGIN
+                    SELECT RAISE(ABORT,'AI signal markers are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS ai_signal_markers_no_delete
+                    BEFORE DELETE ON ai_signal_markers BEGIN
+                    SELECT RAISE(ABORT,'AI signal markers are immutable'); END;
                 """
             )
 
@@ -1460,6 +1473,129 @@ class Journal:
                     continue
 
         self._last_candle_batch = batch
+
+    def record_ai_signal_markers(self, state):
+        """Append new non-repainting signals; never mutate prior markers."""
+        from .signal_chart import marker_is_chronological, markers_from_state
+
+        markers = markers_from_state(state)
+        if not markers:
+            return 0
+        inserted = 0
+        with self.connect() as db:
+            for marker in markers:
+                if not marker_is_chronological(marker, state.get("now")):
+                    continue
+                payload = json.dumps(marker, allow_nan=False, separators=(",", ":"))
+                cursor = db.execute(
+                    """INSERT OR IGNORE INTO ai_signal_markers
+                    (marker_key,ticker,signal_type,created_at,btc_price,contract_price,
+                     probability,after_cost_edge,reason,data_freshness,risk_status,
+                     experimental,fingerprint,payload)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        marker["marker_key"], marker["ticker"], marker["signal_type"],
+                        marker["timestamp"], marker["btc_price"], marker.get("contract_price"),
+                        marker.get("probability"), marker.get("after_cost_edge"),
+                        marker.get("reason") or "No reason recorded", marker["data_freshness"],
+                        marker.get("risk_status") or "UNAVAILABLE", bool(marker["experimental"]),
+                        marker["fingerprint"], payload,
+                    ),
+                )
+                inserted += cursor.rowcount
+        return inserted
+
+    def signal_chart(self, interval_seconds, limit=240, ticker=None):
+        """Return bounded closed bars and immutable markers for dashboard use."""
+        from .signal_chart import MAX_CHART_BARS, SUPPORTED_INTERVALS, aggregate_candles
+
+        if interval_seconds not in SUPPORTED_INTERVALS:
+            return {
+                "status": "INTERVAL_UNAVAILABLE",
+                "reason": "Sub-minute OHLCV history is not supplied by the verified candle source",
+                "interval_seconds": interval_seconds,
+                "bars": [], "markers": [],
+            }
+        limit = max(30, min(MAX_CHART_BARS, int(limit)))
+        source_limit = min(1600, limit * (interval_seconds // 60) + interval_seconds // 60)
+        with self.read() as db:
+            rows = db.execute(
+                """SELECT payload FROM btc_candles WHERE source LIKE 'Coinbase%'
+                ORDER BY start DESC LIMIT ?""",
+                (source_limit * 3,),
+            ).fetchall()
+            if ticker:
+                marker_rows = db.execute(
+                    "SELECT payload FROM ai_signal_markers WHERE ticker=? ORDER BY id DESC LIMIT 500",
+                    (ticker,),
+                ).fetchall()
+            else:
+                marker_rows = db.execute(
+                    "SELECT payload FROM ai_signal_markers ORDER BY id DESC LIMIT 500"
+                ).fetchall()
+            performance_rows = db.execute(
+                """SELECT m.ticker,m.signal_type,m.probability,m.after_cost_edge,o.outcome
+                FROM ai_signal_markers m LEFT JOIN forecast_outcomes o
+                ON o.ticker=m.ticker AND o.origin='official'
+                WHERE m.signal_type IN ('BUY UP','BUY DOWN') ORDER BY m.id"""
+            ).fetchall()
+            official_contracts = db.execute(
+                "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
+            ).fetchone()[0]
+        unique = {}
+        for row in rows:
+            try:
+                bar = json.loads(row[0])
+                unique.setdefault(int(bar["start"]), bar)
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        bars = aggregate_candles(list(unique.values()), interval_seconds)[-limit:]
+        markers = [json.loads(row[0]) for row in reversed(marker_rows)]
+        settled = [row for row in performance_rows if row[4] in (0, 1)]
+        correct = sum(
+            (row[1] == "BUY UP" and row[4] == 1)
+            or (row[1] == "BUY DOWN" and row[4] == 0)
+            for row in settled
+        )
+        pnl = []
+        for _ticker, signal_type, probability, edge, outcome in settled:
+            if all(type(value) in (int, float) for value in (probability, edge)):
+                side_probability = probability if signal_type == "BUY UP" else 1 - probability
+                estimated_cost = side_probability - edge
+                if 0 < estimated_cost < 1:
+                    won = outcome == (1 if signal_type == "BUY UP" else 0)
+                    pnl.append((1 if won else 0) - estimated_cost)
+        from .scores import wilson_interval
+
+        marker_performance = {
+            "actionable_signals": len(performance_rows),
+            "independently_settled_signals": len(settled),
+            "correct": correct,
+            "incorrect": len(settled) - correct,
+            "directional_accuracy": correct / len(settled) if settled else None,
+            "accuracy_interval_95": wilson_interval(correct, len(settled)),
+            "market_coverage": (
+                len({row[0] for row in performance_rows}) / official_contracts
+                if official_contracts
+                else None
+            ),
+            "counterfactual_after_cost_pnl": sum(pnl) if pnl else None,
+            "counterfactual_after_cost_samples": len(pnl),
+            "actual_realized_results": None,
+            "actual_results_reason": "Actual read-only account fills remain separate from chart-marker counterfactuals",
+            "edge_status": "edge unverified",
+        }
+        return {
+            "status": "READY" if bars else "NO_RECORDED_CANDLES",
+            "interval_seconds": interval_seconds,
+            "interval": SUPPORTED_INTERVALS[interval_seconds],
+            "bars": bars,
+            "markers": markers,
+            "performance": marker_performance,
+            "non_repainting": True,
+            "source": "Recorded Coinbase BTC-USD closed one-minute candles",
+            "note": "Markers are append-only receipt-time records. Chart history is not an official settlement index.",
+        }
 
     @staticmethod
     def _minute_memory_payload(state):

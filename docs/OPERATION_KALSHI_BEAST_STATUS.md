@@ -36,6 +36,7 @@ claim.
 | Health/readiness/recovery | IMPLEMENTED | `/healthz`, `/readyz`, worker heartbeat, service restart, bounded reconnect and atomic rollback. |
 | Simple dashboard | IMPLEMENTED | Opening, live Settlement and Scalp cards keep probabilities visible; diagnostics are collapsible. |
 | Automated order execution | DISABLED | Signals service import boundary excludes clients/jobs/orders/strategies; no dashboard mutation routes. |
+| Selective 80% accuracy objective | IMPLEMENTED / UNVERIFIED | Validation-only abstention selection; untouched test reports accuracy, coverage, sample uncertainty, calibration and regimes. It never promotes a model and 80%/90% are objectives, not claims. |
 
 ## Validation state last observed from Oracle output
 

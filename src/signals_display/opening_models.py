@@ -517,6 +517,14 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         else "DEFERRED_INSUFFICIENT_OPENING_LABELS",
         reason="Shadow evaluation only. A live-horizon artifact is incompatible with opening-cutoff predictions; no model is activated automatically",
     )
+    from .selective_evaluation import selective_report
+
+    report["selective_signal_evaluation"] = selective_report(
+        [_row_predict(selected, r) for r in validation],
+        validation,
+        ps,
+        test,
+    )
     if include_walk_forward:
         development_contracts = contract_sets[0] | contract_sets[1]
         report["walk_forward"] = walk_forward(

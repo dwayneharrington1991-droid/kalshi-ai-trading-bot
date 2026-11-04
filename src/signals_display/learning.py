@@ -653,6 +653,14 @@ def compare(rows, *, used_test_contracts=None):
         ),
         note="Final holdout is a predeclared deployment gate, never used to retune coefficients. No profitability or 90% accuracy claim. No repeat tuning against this test period.",
     )
+    from .selective_evaluation import selective_report
+
+    report["selective_signal_evaluation"] = selective_report(
+        [row_predict(chosen, r) for r in val],
+        val,
+        test_probabilities,
+        test,
+    )
     if not passed:
         return None, report
     cutoff = max(r["label_available_at"] for r in rows)

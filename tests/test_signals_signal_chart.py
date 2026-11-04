@@ -196,3 +196,5 @@ def test_dashboard_contains_incremental_chart_without_external_script():
     assert "BUY UP/DOWN refers to Kalshi YES/NO contracts" in page
     assert "lightweight-charts" not in page.lower()
     assert "setInterval(refreshSignalChart,5000)" in page
+    assert "interval:signalChart.interval,limit:'180'" in page
+    assert "nextLiveRenderAt=performance.now()+500" in page

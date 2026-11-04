@@ -169,7 +169,7 @@ def test_dashboard_uses_bounded_adaptive_polling_instead_of_250ms_full_renders()
     assert "scheduleRefresh(backoff)" in html
     assert "document.hidden?15000:3000" in html
     assert "version<=lastServerVersion" in html
-    assert "nextLiveRenderAt=performance.now()+250" in html
+    assert "nextLiveRenderAt=performance.now()+500" in html
     assert "function watchState()" in html
     assert "/api/state-version?after=" in html
     assert "setInterval(refreshDetails,10000)" in html

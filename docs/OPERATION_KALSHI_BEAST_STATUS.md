@@ -2,7 +2,8 @@
 
 Updated: 2026-11-04 UTC
 
-Repository verification at this checkpoint: 1,013 tests passed, 8 skipped.
+Repository verification before the final browser-throttling pass: 1,014 tests
+passed, 8 skipped. The final result is recorded with the release commit.
 The selective forward-signal protocol is integrated into Opening and
 Settlement evaluation but has not yet been run on a new untouched Oracle
 holdout. Production deployment and model promotion therefore remain separate,
@@ -44,15 +45,17 @@ claim.
 | Automated order execution | DISABLED | Signals service import boundary excludes clients/jobs/orders/strategies; no dashboard mutation routes. |
 | Selective 80% accuracy objective | IMPLEMENTED / UNVERIFIED | Validation-only abstention selection; untouched test reports accuracy, coverage, sample uncertainty, calibration and regimes. It never promotes a model and 80%/90% are objectives, not claims. |
 | Live AI signal chart | IMPLEMENTED | Bounded 1m/3m/5m/15m closed candles, volume, EMA/VWAP/Bollinger, optional RSI/MACD, strike/reference overlays and immutable BUY/EXIT markers. Unsupported 15s history is explicit; markers require verified risk gates or a fresh read-only held position. |
-| Settlement evaluation extraction | IMPLEMENTED / ORACLE UNVERIFIED | Uses compact contract summaries to rank scalar revisions before bounded JSON extraction, with targeted legacy fallback so valid historical rows are not dropped. Local 8.5 GB journal benchmark improved from ~21.1s to ~6.0s with identical eligible-row coverage. |
+| Settlement evaluation extraction | IMPLEMENTED / ORACLE RECHECK REQUIRED | Uses indexed per-contract/horizon reads instead of a global window sort over the multi-gigabyte revision table, with targeted legacy fallback so valid historical rows are not dropped. Local 8.5 GB journal benchmark is ~4.6s with identical eligible-row coverage. |
+| Browser responsiveness | IMPLEMENTED | Main state rendering is capped at 2 Hz, chart history is bounded to 180 bars, hidden tabs suspend live/chart work, details load only while open, and large research reports remain on independent cached endpoints. |
 
 ## Validation state last observed from Oracle output
 
-- Opening: 371 eligible frozen openings; 229 previously exposed; one contract
-  available for the next untouched 30-contract block. The previous 30-contract
-  report must be inspected rather than reused.
-- Settlement: the last isolated evaluation reached its 900-second bound and did
-  not produce a report. No activation conclusion is available.
+- Opening: 426 eligible frozen openings; 259 previously exposed; 26 genuinely
+  untouched forward contracts in the next block. Four additional qualifying
+  contracts are required before its 30-contract evaluation can be unsealed.
+- Settlement: the last isolated evaluation reached its 900-second bound under
+  the old global-window query and did not produce a report. The indexed repair
+  must be deployed and rerun before any activation conclusion is available.
 - No model promotion is performed by this change. The production evaluator and
   registry remain authoritative.
 

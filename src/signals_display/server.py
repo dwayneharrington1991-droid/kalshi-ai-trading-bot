@@ -23,6 +23,8 @@ from .account_state import (
 )
 from .scanner import context as scanner_context, qualify as scanner_qualify
 from .decision import assess as trade_decision
+from .decision_coordinator import coordinate as coordinate_intelligence
+from .news_intelligence import classify as classify_news
 from .market_health import selection_summary, diagnose as diagnose_market
 from .prediction_engine import (
     view as engine_view,
@@ -748,6 +750,10 @@ class Monitor:
             self.journal.record_feeds(payload.get("coverage", {}))
             self.journal.record_candles(payload.get("btc_candles", {}), now)
             state["trade_decision"] = trade_decision(state)
+            state["news_intelligence"] = classify_news(
+                payload.get("coverage", {}).get("Federal Reserve public releases", {}), now
+            )
+            state["decision_intelligence"] = coordinate_intelligence(state)
             self.journal.step(state)
             phases["journal_write"] = round((perf_counter() - journal_started) * 1000, 2)
             if isinstance(self.feed, PublicFeed):
@@ -1169,6 +1175,7 @@ class Monitor:
             account=state["account"],
             now=health_clock,
         )
+        state["decision_intelligence"] = coordinate_intelligence(state)
         reference = state.get("reference", {})
         market = state.get("market") or {}
         stream_public = state.get("streaming", {}).get("public", {})

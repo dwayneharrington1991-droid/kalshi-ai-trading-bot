@@ -426,6 +426,7 @@ class PublicFeed:
         try:
             merged = {}
             duplicate_intervals = []
+            conflicting_duplicate_intervals = []
             source_counts = {}
 
             def add_rows(rows, source, exchange_format=False):
@@ -454,7 +455,13 @@ class PublicFeed:
                         duplicate_intervals.append(start)
                         if any(float(existing[key]) != float(bar[key]) for key in
                                ("open", "high", "low", "close", "volume")):
-                            raise ValueError("Conflicting duplicate one-minute candle")
+                            # Public candle endpoints can revise an overlapping
+                            # boundary minute while we request the next missing
+                            # minute. Preserve the already accepted immutable
+                            # bar and record the disagreement; never discard an
+                            # otherwise complete 24-hour window or replace past
+                            # training input with a later revision.
+                            conflicting_duplicate_intervals.append(start)
                         continue
                     merged[start] = bar
                     source_counts[bar["source"]] = source_counts.get(bar["source"], 0) + 1
@@ -481,6 +488,9 @@ class PublicFeed:
                     status="READY", last_success_at=utcnow().isoformat(), error_type=None,
                     retained_bars=len(merged), missing_bars=0, missing_intervals=[],
                     duplicate_intervals=len(set(duplicate_intervals)),
+                    conflicting_duplicate_intervals=len(
+                        set(conflicting_duplicate_intervals)
+                    ),
                     cache_order=cache_order, source_counts=source_counts,
                 )
                 return {**(self.candle_cache or {}), "diagnostics": dict(self.candle_diagnostics)}
@@ -549,6 +559,9 @@ class PublicFeed:
                         for stamp in remaining[:20]
                     ],
                     "duplicate_intervals": len(set(duplicate_intervals)),
+                    "conflicting_duplicate_intervals": len(
+                        set(conflicting_duplicate_intervals)
+                    ),
                     "cache_order": cache_order,
                     "response_orders": response_orders,
                     "source_counts": source_counts,

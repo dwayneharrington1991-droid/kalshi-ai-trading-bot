@@ -47,6 +47,43 @@ def test_candle_preload_then_only_missing_minutes_are_requested(monkeypatch):
     assert second["candles"][-1]["start"] != first["candles"][-1]["start"]
 
 
+def test_overlapping_provider_revision_does_not_discard_complete_candle_window(monkeypatch):
+    from src.signals_display import monitor as module
+
+    clock = [NOW]
+    calls = [0]
+
+    def get(url, **_kwargs):
+        query = parse_qs(urlsplit(url).query)
+        left, right = int(query["start"][0]), int(query["end"][0])
+        calls[0] += 1
+        bars = []
+        for stamp in range(left, right, 60):
+            # After the initial preload, revise overlapping boundary bars.
+            close = "100009" if calls[0] > 5 and stamp < int(clock[0].timestamp()) // 60 * 60 - 60 else "100001"
+            bars.append(
+                dict(start=str(stamp), open="100000", high="100010", low="99999", close=close, volume="1")
+            )
+        return httpx.Response(200, json={"candles": bars}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(module, "utcnow", lambda: clock[0])
+    feed = PublicFeed(get)
+    first = feed.candles(clock[0])
+    clock[0] += timedelta(minutes=1)
+    second = feed.candles(clock[0])
+
+    assert len(second["candles"]) == 1440
+    assert second["diagnostics"]["status"] == "READY"
+    assert second["diagnostics"]["missing_bars"] == 0
+    assert second["diagnostics"]["conflicting_duplicate_intervals"] >= 1
+    assert second.get("error") is None
+    # Existing accepted history is immutable; only the new minute is appended.
+    first_by_start = {bar["start"]: bar for bar in first["candles"]}
+    second_by_start = {bar["start"]: bar for bar in second["candles"]}
+    overlap = set(first_by_start) & set(second_by_start)
+    assert all(first_by_start[start] == second_by_start[start] for start in overlap)
+
+
 def test_missing_coinbase_minutes_are_gap_filled_without_interpolation(monkeypatch):
     from src.signals_display import monitor as module
 

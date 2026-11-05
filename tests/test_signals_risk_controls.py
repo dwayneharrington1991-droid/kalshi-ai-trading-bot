@@ -29,7 +29,9 @@ def test_three_percent_drawdown_warns_without_execution_capability():
     assert result["drawdown_fraction"] == pytest.approx(0.03)
     assert result["warning"] is True
 
-    switch = signal_kill_switch({"stale": False, "account": account()})
+    switch = signal_kill_switch(
+        {"now": NOW.isoformat(), "stale": False, "account": account()}
+    )
     assert switch["active"] is True
     assert "ESTIMATED_DAILY_DRAWDOWN_AT_OR_ABOVE_3_PERCENT" in switch["reasons"]
     assert switch["automatic_execution_allowed"] is False

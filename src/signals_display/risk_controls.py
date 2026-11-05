@@ -94,7 +94,13 @@ def daily_drawdown(account, now=None, *, threshold=DEFAULT_DAILY_DRAWDOWN_WARNIN
 def signal_kill_switch(state, *, drawdown_threshold=DEFAULT_DAILY_DRAWDOWN_WARNING):
     """Return the complete fail-closed advisory signal suppression state."""
     account = state.get("account") or {}
-    drawdown = daily_drawdown(account, threshold=drawdown_threshold)
+    try:
+        evaluation_time = timestamp(state["now"]) if state.get("now") else None
+    except (TypeError, ValueError, AttributeError):
+        evaluation_time = None
+    drawdown = daily_drawdown(
+        account, evaluation_time, threshold=drawdown_threshold
+    )
     workers = ((state.get("feed_health") or {}).get("workers") or {})
     reasons = []
     if state.get("emergency_signal_kill_switch") is True:

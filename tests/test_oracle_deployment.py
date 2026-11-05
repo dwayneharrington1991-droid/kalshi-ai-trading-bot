@@ -456,3 +456,14 @@ def test_signals_service_import_boundary_excludes_execution_modules():
     for unsafe in ("src.jobs.execute", "cli.py", "place_order", "cancel_order"):
         assert unsafe not in wrapper
         assert unsafe not in override
+
+
+def test_background_evaluation_is_detached_non_promoting_and_signals_only():
+    script = (DEPLOY / "start_isolated_evaluation.sh").read_text()
+    assert "nohup flock -n" in script
+    assert "run_isolated_ai_evaluation.sh" in script
+    assert "DASHBOARD_NOT_BLOCKED=true" in script
+    assert "MODEL_PROMOTION_PERFORMED=false" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+    for unsafe in ("place_order", "cancel_order", "modify_order", "transfer"):
+        assert unsafe not in script

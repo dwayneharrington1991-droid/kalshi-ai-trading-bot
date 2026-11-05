@@ -467,3 +467,15 @@ def test_background_evaluation_is_detached_non_promoting_and_signals_only():
     assert "AUTOMATED_TRADING=DISABLED" in script
     for unsafe in ("place_order", "cancel_order", "modify_order", "transfer"):
         assert unsafe not in script
+
+
+def test_finalizer_is_guarded_atomic_and_starts_independent_audits():
+    script = (DEPLOY / "finalize_release.sh").read_text()
+    assert "apply_live_pipeline_repair.sh" in script
+    assert "start_isolated_evaluation.sh" in script
+    assert "observe_live_rollover.py" in script
+    assert "healthz" in script and "readyz" in script and "signal-chart" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+    assert "FINALIZE_ROLLED_BACK" in script
+    assert "A failed background evaluation must not roll back" in script
+    assert "git reset" not in script and "git clean" not in script

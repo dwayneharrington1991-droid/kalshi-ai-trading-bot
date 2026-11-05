@@ -182,6 +182,39 @@ def test_marker_performance_uses_only_official_settlements_and_separates_actual_
     assert report["actual_realized_results"] is None
 
 
+def test_chart_can_seed_from_immutable_opening_snapshot_without_rewriting_history(tmp_path):
+    journal = Journal(tmp_path / "signals.db")
+    payload = {
+        "ticker": TICKER,
+        "opens_at": NOW.isoformat(),
+        "captured_at": NOW.isoformat(),
+        "data_cutoff": NOW.isoformat(),
+        "history": {
+            "source": "Coinbase frozen journal history",
+            "received_at": NOW.isoformat(),
+            "candles": candles(60),
+        },
+        "reference_points": [],
+        "reference_source": "test",
+        "finalized": True,
+    }
+    with journal.connect() as db:
+        db.execute(
+            """INSERT INTO opening_input_snapshots
+            (mode,ticker,opens_at,captured_at,finalized,payload)
+            VALUES (?,?,?,?,?,?)""",
+            ("PUBLIC MARKET DATA", TICKER, NOW.isoformat(), NOW.isoformat(), 1,
+             json.dumps(payload)),
+        )
+    chart = journal.signal_chart(60, limit=30)
+    assert chart["status"] == "READY"
+    assert len(chart["bars"]) == 30
+    assert chart["fallback_kind"] == "IMMUTABLE_OPENING_SNAPSHOT"
+    assert chart["latest_bar_start"] == candles(60)[-1]["start"]
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_candles").fetchone()[0] == 0
+
+
 def test_marker_chronology_rejects_future_and_late_backfill():
     marker = {"timestamp": NOW.isoformat()}
     assert marker_is_chronological(marker, NOW + timedelta(seconds=5))

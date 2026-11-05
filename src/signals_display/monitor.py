@@ -1542,6 +1542,11 @@ class Journal:
             official_contracts = db.execute(
                 "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
             ).fetchone()[0]
+            snapshot_row = db.execute(
+                """SELECT payload FROM opening_input_snapshots
+                WHERE mode='PUBLIC MARKET DATA'
+                ORDER BY opens_at DESC LIMIT 1"""
+            ).fetchone()
         unique = {}
         for row in rows:
             try:
@@ -1550,6 +1555,7 @@ class Journal:
             except (KeyError, ValueError, TypeError, json.JSONDecodeError):
                 continue
         fallback_used = False
+        fallback_kind = None
         if not unique and isinstance(candle_fallback, dict):
             # The verified 24-hour preload can complete before its first
             # asynchronous journal write. Render those same closed source bars
@@ -1561,6 +1567,21 @@ class Journal:
                 except (KeyError, ValueError, TypeError):
                     continue
             fallback_used = bool(unique)
+            fallback_kind = "LIVE_VERIFIED_PRELOAD" if fallback_used else None
+        if not unique and snapshot_row:
+            # Opening snapshots contain the immutable, receipt-proven candle
+            # window used at that contract's cutoff. They are a safe durable
+            # startup seed when the additive chart table has not populated;
+            # timestamps are preserved and no later observation is backfilled.
+            try:
+                saved = json.loads(snapshot_row[0])
+                history = saved.get("history") or {}
+                for bar in history.get("candles", []):
+                    unique.setdefault(int(bar["start"]), bar)
+                fallback_used = bool(unique)
+                fallback_kind = "IMMUTABLE_OPENING_SNAPSHOT" if fallback_used else None
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                pass
         bars = aggregate_candles(list(unique.values()), interval_seconds)[-limit:]
         markers = [json.loads(row[0]) for row in reversed(marker_rows)]
         settled = [row for row in performance_rows if row[4] in (0, 1)]
@@ -1606,11 +1627,15 @@ class Journal:
             "performance": marker_performance,
             "non_repainting": True,
             "source": (
-                "Verified live Coinbase preload; journal persistence pending"
-                if fallback_used
+                "Verified live Coinbase preload; candle-table persistence pending"
+                if fallback_kind == "LIVE_VERIFIED_PRELOAD"
+                else "Immutable receipt-proven opening candle snapshot"
+                if fallback_kind == "IMMUTABLE_OPENING_SNAPSHOT"
                 else "Recorded Coinbase BTC-USD closed one-minute candles"
             ),
             "journal_persistence_pending": fallback_used,
+            "fallback_kind": fallback_kind,
+            "latest_bar_start": bars[-1]["start"] if bars else None,
             "note": "Markers are append-only receipt-time records. Chart history is not an official settlement index.",
         }
 

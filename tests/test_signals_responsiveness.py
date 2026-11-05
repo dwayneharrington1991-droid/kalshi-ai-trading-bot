@@ -321,6 +321,44 @@ def test_state_version_wait_wakes_immediately_without_database_or_model_work(tmp
     assert observed == [1]
 
 
+def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "j.db"))
+    first = int(NOW.timestamp()) - 60 * 60
+    monitor.latest_candles = {
+        "source": "Coinbase verified test preload",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+        "candles": [
+            {
+                "start": first + index * 60,
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 10 + index,
+            }
+            for index in range(60)
+        ],
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/signal-chart?interval=1m&limit=30",
+            timeout=2,
+        ) as response:
+            chart = json.load(response)
+        assert chart["status"] == "READY"
+        assert len(chart["bars"]) == 30
+        assert chart["journal_persistence_pending"] is True
+        assert "Verified live Coinbase preload" in chart["source"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_history_pages_are_indexed_bounded_and_do_not_run_research(tmp_path, monkeypatch):
     journal = Journal(tmp_path / "j.db")
     with journal.connect() as db:

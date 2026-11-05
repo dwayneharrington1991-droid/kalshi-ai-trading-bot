@@ -76,6 +76,10 @@ class Monitor:
     ):
         startup_update = startup_update or (lambda _stage, _message: None)
         self.feed, self.journal = feed, journal
+        # Keep the exact most recently collected candle payload on the monitor.
+        # PublicFeed owns asynchronous refreshes, but request handlers must not
+        # depend on its internal cache timing after a release restart.
+        self.latest_candles = None
         self.build_commit = build_commit
         self.target, self.stop, self.horizon = target, stop, horizon
         self.account_client = account_client
@@ -336,6 +340,12 @@ class Monitor:
                 if isinstance(payload, Exception):
                     raise payload
             phases["market_collection"] = round(collection_ms, 2)
+            collected_candles = payload.get("btc_candles")
+            if (
+                isinstance(collected_candles, dict)
+                and collected_candles.get("candles")
+            ):
+                self.latest_candles = collected_candles
             calculation_started = perf_counter()
             now = timestamp(payload["clock"]) if "clock" in payload else utcnow()
             coverage = payload.setdefault("coverage", {})
@@ -1406,7 +1416,10 @@ def make_handler(monitor):
                     interval_seconds,
                     limit,
                     ticker,
-                    candle_fallback=getattr(monitor.feed, "candle_cache", None),
+                    candle_fallback=(
+                        monitor.latest_candles
+                        or getattr(monitor.feed, "candle_cache", None)
+                    ),
                 )
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"

@@ -1507,7 +1507,12 @@ class Journal:
 
     def signal_chart(self, interval_seconds, limit=240, ticker=None, candle_fallback=None):
         """Return bounded closed bars and immutable markers for dashboard use."""
-        from .signal_chart import MAX_CHART_BARS, SUPPORTED_INTERVALS, aggregate_candles
+        from .signal_chart import (
+            MAX_CHART_BARS,
+            SUPPORTED_INTERVALS,
+            aggregate_candles,
+            normalize_recorded_candle,
+        )
 
         if interval_seconds not in SUPPORTED_INTERVALS:
             return {
@@ -1548,11 +1553,16 @@ class Journal:
                 ORDER BY opens_at DESC LIMIT 1"""
             ).fetchone()
         unique = {}
+        invalid_payloads = 0
         for row in rows:
             try:
-                bar = json.loads(row[0])
-                unique.setdefault(int(bar["start"]), bar)
+                bar = normalize_recorded_candle(json.loads(row[0]))
+                if bar is None:
+                    invalid_payloads += 1
+                    continue
+                unique.setdefault(bar["start"], bar)
             except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                invalid_payloads += 1
                 continue
         fallback_used = False
         fallback_kind = None
@@ -1562,10 +1572,9 @@ class Journal:
             # during that startup window; markers remain journal-only and
             # immutable. No candle is interpolated or fabricated.
             for bar in candle_fallback.get("candles", []):
-                try:
-                    unique.setdefault(int(bar["start"]), bar)
-                except (KeyError, ValueError, TypeError):
-                    continue
+                normalized = normalize_recorded_candle(bar)
+                if normalized is not None:
+                    unique.setdefault(normalized["start"], normalized)
             fallback_used = bool(unique)
             fallback_kind = "LIVE_VERIFIED_PRELOAD" if fallback_used else None
         if not unique and snapshot_row:
@@ -1577,7 +1586,9 @@ class Journal:
                 saved = json.loads(snapshot_row[0])
                 history = saved.get("history") or {}
                 for bar in history.get("candles", []):
-                    unique.setdefault(int(bar["start"]), bar)
+                    normalized = normalize_recorded_candle(bar)
+                    if normalized is not None:
+                        unique.setdefault(normalized["start"], normalized)
                 fallback_used = bool(unique)
                 fallback_kind = "IMMUTABLE_OPENING_SNAPSHOT" if fallback_used else None
             except (KeyError, ValueError, TypeError, json.JSONDecodeError):
@@ -1636,6 +1647,19 @@ class Journal:
             "journal_persistence_pending": fallback_used,
             "fallback_kind": fallback_kind,
             "latest_bar_start": bars[-1]["start"] if bars else None,
+            "candle_diagnostics": {
+                "queried_rows": len(rows),
+                "valid_unique_candles": len(unique),
+                "invalid_payloads": invalid_payloads,
+                "database_path": str(self.path),
+            },
+            "reason": (
+                None
+                if bars
+                else "RECORDED_CANDLE_PAYLOADS_INVALID"
+                if rows
+                else "NO_MATCHING_RECORDED_CANDLES"
+            ),
             "note": "Markers are append-only receipt-time records. Chart history is not an official settlement index.",
         }
 

@@ -12,22 +12,72 @@ SUPPORTED_INTERVALS = {60: "1m", 180: "3m", 300: "5m", 900: "15m"}
 MAX_CHART_BARS = 500
 
 
+def normalize_recorded_candle(raw):
+    """Normalize a real provider candle without changing its time or values.
+
+    Coinbase's JSON APIs encode OHLCV fields as decimal strings. Historical
+    journal rows preserve that wire representation, while newer test/replay
+    rows may contain numbers. Accept both representations and reject malformed,
+    non-finite, unaligned, or non-minute timestamps. Millisecond timestamps are
+    deliberately not guessed or rescaled.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        start_value = raw["start"]
+        if isinstance(start_value, bool):
+            return None
+        start_number = float(start_value)
+        start = int(start_number)
+        if not math.isfinite(start_number) or start_number != start:
+            return None
+        # Bounded Unix seconds: reject milliseconds and clearly invalid dates.
+        if not 1_230_768_000 <= start <= 4_102_444_800 or start % 60:
+            return None
+
+        values = {}
+        for key in ("open", "high", "low", "close"):
+            value = raw.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                return None
+            value = float(value)
+            if not math.isfinite(value):
+                return None
+            values[key] = value
+        if values["low"] > values["high"]:
+            return None
+
+        volume = raw.get("volume")
+        if volume is None:
+            normalized_volume = None
+        else:
+            if isinstance(volume, bool) or not isinstance(volume, (int, float, str)):
+                return None
+            normalized_volume = float(volume)
+            if not math.isfinite(normalized_volume) or normalized_volume < 0:
+                return None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+    return {
+        "start": start,
+        **values,
+        "volume": normalized_volume,
+        **({"source": raw["source"]} if raw.get("source") else {}),
+    }
+
+
 def aggregate_candles(candles, interval_seconds):
     """Aggregate closed one-minute bars without inventing sub-minute history."""
     if interval_seconds not in SUPPORTED_INTERVALS:
         raise ValueError("Chart interval is unsupported by recorded candle data")
     buckets = {}
-    for raw in sorted(candles, key=lambda row: int(row["start"])):
-        start = int(raw["start"])
-        if start % 60:
-            raise ValueError("Unaligned recorded candle")
-        values = [raw.get(key) for key in ("open", "high", "low", "close")]
-        if any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
-            continue
+    normalized = [value for raw in candles if (value := normalize_recorded_candle(raw))]
+    for raw in sorted(normalized, key=lambda row: row["start"]):
+        start = raw["start"]
         bucket = start - start % interval_seconds
         bar = buckets.get(bucket)
         volume = raw.get("volume")
-        volume = float(volume) if type(volume) in (int, float) and math.isfinite(volume) else None
         if bar is None:
             buckets[bucket] = {
                 "start": bucket,

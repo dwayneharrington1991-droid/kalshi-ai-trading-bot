@@ -147,6 +147,50 @@ def test_chart_query_is_bounded_and_subminute_is_explicitly_unavailable(tmp_path
     assert unavailable["bars"] == []
 
 
+def test_production_schema_reads_coinbase_decimal_string_payloads(tmp_path):
+    """Regression for 13,467 real rows producing zero chart bars on Oracle."""
+    journal = Journal(tmp_path / "signals.db")
+    real_rows = []
+    for bar in candles(180):
+        real_rows.append(
+            {
+                "start": str(bar["start"]),
+                "open": str(bar["open"]) + ".125",
+                "high": str(bar["high"]) + ".500",
+                "low": str(bar["low"]) + ".000",
+                "close": str(bar["close"]) + ".250",
+                "volume": str(bar["volume"]) + ".75",
+                "source": "Coinbase Advanced Trade one-minute candles",
+            }
+        )
+    data = {
+        "source": "Coinbase BTC-USD public one-minute candles; Exchange endpoint fills verified gaps",
+        "received_at": NOW.isoformat(),
+        "candles": real_rows,
+    }
+    journal.record_candles(data, NOW)
+
+    chart = journal.signal_chart(60, limit=180)
+    assert chart["status"] == "READY"
+    assert len(chart["bars"]) == 180
+    assert chart["latest_bar_start"] == int(real_rows[-1]["start"])
+    assert chart["fallback_kind"] is None
+    assert chart["journal_persistence_pending"] is False
+    assert chart["candle_diagnostics"] == {
+        "queried_rows": 180,
+        "valid_unique_candles": 180,
+        "invalid_payloads": 0,
+        "database_path": str(journal.path),
+    }
+    assert chart["markers"] == []
+
+
+def test_chart_rejects_millisecond_timestamps_instead_of_guessing_units():
+    raw = candles(1)[0]
+    raw = {**raw, "start": str(raw["start"] * 1000)}
+    assert aggregate_candles([raw], 60) == []
+
+
 def test_chart_uses_verified_preload_while_first_journal_batch_is_pending(tmp_path):
     journal = Journal(tmp_path / "signals.db")
     preload = {

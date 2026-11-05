@@ -478,4 +478,5 @@ def test_finalizer_is_guarded_atomic_and_starts_independent_audits():
     assert "AUTOMATED_TRADING=DISABLED" in script
     assert "FINALIZE_ROLLED_BACK" in script
     assert "A failed background evaluation must not roll back" in script
+    assert "curl -sS --max-time 10 http://127.0.0.1:8765/readyz" in script
     assert "git reset" not in script and "git clean" not in script

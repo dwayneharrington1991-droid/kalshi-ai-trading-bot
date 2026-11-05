@@ -52,8 +52,11 @@ sudo -n systemctl is-active --quiet "$SERVICE_NAME" ||
 
 health=$(curl -fsS --max-time 10 http://127.0.0.1:8765/healthz) ||
   rollback_final_verification "health endpoint failed"
-ready=$(curl -fsS --max-time 10 http://127.0.0.1:8765/readyz) ||
-  rollback_final_verification "readiness endpoint failed"
+# /readyz intentionally returns HTTP 503 during an upstream feed outage. Read
+# and validate its JSON without treating that external condition as a release
+# regression; apply_live_pipeline_repair.sh already compares pre/post readiness.
+ready=$(curl -sS --max-time 10 http://127.0.0.1:8765/readyz) ||
+  rollback_final_verification "readiness endpoint was unreachable"
 chart='{}'
 for _attempt in $(seq 1 30); do
   chart=$(curl -fsS --max-time 8 \

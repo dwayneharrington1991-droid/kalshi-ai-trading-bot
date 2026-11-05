@@ -58,7 +58,9 @@ health=$(curl -fsS --max-time 10 http://127.0.0.1:8765/healthz) ||
 ready=$(curl -sS --max-time 10 http://127.0.0.1:8765/readyz) ||
   rollback_final_verification "readiness endpoint was unreachable"
 chart='{}'
-for _attempt in $(seq 1 30); do
+chart_wait_seconds=120
+chart_attempts=$((chart_wait_seconds / 2))
+for attempt in $(seq 1 "$chart_attempts"); do
   chart=$(curl -fsS --max-time 8 \
     'http://127.0.0.1:8765/api/signal-chart?interval=1m&limit=180') || chart='{}'
   if "$current/.venv/bin/python3" - "$chart" <<'PY'
@@ -70,8 +72,61 @@ except Exception:
     raise SystemExit(1)
 PY
   then break; fi
+  if (( attempt == 1 || attempt % 10 == 0 )); then
+    "$current/.venv/bin/python3" - "$attempt" "$chart_attempts" "$chart" <<'PY' || true
+import json, sys
+try:
+    value = json.loads(sys.argv[3])
+except Exception:
+    value = {}
+print(
+    "chart_readiness_wait"
+    + " attempt=" + sys.argv[1]
+    + " max=" + sys.argv[2]
+    + " status=" + str(value.get("status", "UNREACHABLE"))
+    + " bars=" + str(len(value.get("bars") or []))
+    + " fallback=" + str(value.get("fallback_kind"))
+    + " persistence_pending=" + str(value.get("journal_persistence_pending"))
+)
+PY
+  fi
   sleep 2
 done
+
+if ! "$current/.venv/bin/python3" - "$chart" <<'PY'
+import json, sys
+try:
+    value = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if value.get("status") == "READY" and value.get("bars") else 1)
+PY
+then
+  chart_reason=$("$current/.venv/bin/python3" - "$chart" <<'PY'
+import json, sys
+try:
+    value = json.loads(sys.argv[1])
+except Exception:
+    value = {}
+print(
+    "status=" + str(value.get("status", "UNREACHABLE"))
+    + ",bars=" + str(len(value.get("bars") or []))
+    + ",fallback=" + str(value.get("fallback_kind"))
+    + ",persistence_pending=" + str(value.get("journal_persistence_pending"))
+    + ",latest_bar_start=" + str(value.get("latest_bar_start"))
+)
+PY
+  )
+  rollback_final_verification \
+    "chart not ready after ${chart_wait_seconds}s ($chart_reason)"
+fi
+
+# Re-read process and feed state after the bounded chart wait. Do not verify a
+# stale pre-wait health snapshot.
+health=$(curl -fsS --max-time 10 http://127.0.0.1:8765/healthz) ||
+  rollback_final_verification "health endpoint failed after chart readiness"
+ready=$(curl -sS --max-time 10 http://127.0.0.1:8765/readyz) ||
+  rollback_final_verification "readiness endpoint was unreachable after chart readiness"
 
 if ! "$current/.venv/bin/python3" - "$target" "$health" "$ready" "$chart" <<'PY'
 import json, sys

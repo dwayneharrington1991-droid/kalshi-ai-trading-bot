@@ -390,6 +390,54 @@ def test_verified_candles_persist_before_optional_intelligence_failure(tmp_path)
         assert db.execute("SELECT COUNT(*) FROM btc_candles").fetchone()[0] == 60
 
 
+def test_ready_preload_reaches_chart_before_prediction_worker_runs(tmp_path):
+    """Regression: Oracle had READY 1440 preload but NO_RECORDED_CANDLES."""
+    journal = Journal(tmp_path / "j.db")
+    monitor = Monitor(None, journal)
+    payload = frame()
+    first = int(NOW.timestamp()) - 60 * 60
+    payload["btc_candles"] = {
+        "source": "Coinbase BTC-USD public one-minute candles",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "retained_bars": 60, "missing_bars": 0},
+        "candles": [
+            {
+                "start": first + index * 60,
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 10 + index,
+            }
+            for index in range(60)
+        ],
+    }
+
+    # This is the collector handoff. Deliberately do not call monitor.tick().
+    assert monitor.accept_candle_batch(payload, NOW) is True
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/signal-chart?interval=1m&limit=30",
+            timeout=2,
+        ) as response:
+            chart = json.load(response)
+        assert chart["status"] == "READY"
+        assert len(chart["bars"]) == 30
+        assert chart["fallback_kind"] is None
+        assert chart["journal_persistence_pending"] is False
+        assert chart["markers"] == []
+        with journal.read() as db:
+            assert db.execute("SELECT COUNT(*) FROM btc_candles").fetchone()[0] == 60
+            assert db.execute("SELECT COUNT(*) FROM ai_signal_markers").fetchone()[0] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_history_pages_are_indexed_bounded_and_do_not_run_research(tmp_path, monkeypatch):
     journal = Journal(tmp_path / "j.db")
     with journal.connect() as db:

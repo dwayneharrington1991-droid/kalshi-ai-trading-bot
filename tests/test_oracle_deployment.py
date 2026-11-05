@@ -479,4 +479,7 @@ def test_finalizer_is_guarded_atomic_and_starts_independent_audits():
     assert "FINALIZE_ROLLED_BACK" in script
     assert "A failed background evaluation must not roll back" in script
     assert "curl -sS --max-time 10 http://127.0.0.1:8765/readyz" in script
+    assert "chart_wait_seconds=120" in script
+    assert "chart_readiness_wait" in script
+    assert "chart not ready after ${chart_wait_seconds}s" in script
     assert "git reset" not in script and "git clean" not in script

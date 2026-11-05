@@ -80,6 +80,7 @@ class Monitor:
         # PublicFeed owns asynchronous refreshes, but request handlers must not
         # depend on its internal cache timing after a release restart.
         self.latest_candles = None
+        self.candle_lock = threading.Lock()
         self.build_commit = build_commit
         self.target, self.stop, self.horizon = target, stop, horizon
         self.account_client = account_client
@@ -326,6 +327,24 @@ class Monitor:
             self.settlement_check = now
             self.maintenance_job = self.maintenance_pool.submit(self.maintain_settlements, now)
 
+    def accept_candle_batch(self, payload, received_at=None):
+        """Publish and persist verified closed candles at the collector boundary.
+
+        Public candle preload and prediction run on separate workers. Keeping
+        this handoff before the prediction mailbox prevents a healthy 1,440-bar
+        preload from temporarily producing an empty chart. The journal keeps
+        the provider's original timestamps; signal markers remain independent
+        append-only receipts and are never synthesized here.
+        """
+        candles = payload.get("btc_candles") if isinstance(payload, dict) else None
+        if not isinstance(candles, dict) or not candles.get("candles"):
+            return False
+        observed = received_at or utcnow()
+        with self.candle_lock:
+            self.latest_candles = candles
+            self.journal.record_candles(candles, observed)
+        return True
+
     def tick(self, collected=None):
         tick_started = perf_counter()
         phases = {}
@@ -340,16 +359,10 @@ class Monitor:
                 if isinstance(payload, Exception):
                     raise payload
             phases["market_collection"] = round(collection_ms, 2)
-            collected_candles = payload.get("btc_candles")
-            if (
-                isinstance(collected_candles, dict)
-                and collected_candles.get("candles")
-            ):
-                self.latest_candles = collected_candles
-                # Persist verified closed candles before optional analytics.
-                # A later indicator/account failure must never leave the chart
-                # empty while the preload itself is already READY.
-                self.journal.record_candles(collected_candles, utcnow())
+            # Replay mode and prediction-worker recovery still use this path;
+            # the public collector normally accepted the same immutable batch
+            # before placing it in the latest-value mailbox.
+            self.accept_candle_batch(payload, utcnow())
             calculation_started = perf_counter()
             now = timestamp(payload["clock"]) if "clock" in payload else utcnow()
             coverage = payload.setdefault("coverage", {})
@@ -2016,6 +2029,11 @@ def main():
                         "rest_error_type": type(exc).__name__,
                         "btc_candles": feed.sampled_candles(utcnow()),
                     }
+                # Candle history is chart input, not optional model output.
+                # Publish it before the prediction mailbox so a slow analysis
+                # cycle cannot leave /api/signal-chart empty after preload is
+                # already READY.
+                monitor.accept_candle_batch(payload, utcnow())
                 elapsed = perf_counter() - timer
                 mailbox.put((payload, started, utcnow(), elapsed * 1000))
                 monitor.worker_event("collector", "completed", failure)

@@ -880,6 +880,16 @@ class Monitor:
         with self.lock:
             self.state_version += 1
             published_at = utcnow()
+            processing_ms = (perf_counter() - tick_started) * 1000
+            for stage in ("market_collection", "prediction_calculation", "journal_write"):
+                if stage in phases:
+                    self.runtime_meter.observe(stage, phases[stage])
+            self.runtime_meter.observe("total_processing", processing_ms)
+            if "collection_completed" in locals():
+                self.runtime_meter.observe(
+                    "publish_after_collection",
+                    max(0, (published_at - collection_completed).total_seconds() * 1000),
+                )
             state["runtime"] = {
                 "state_version": self.state_version,
                 "collection_started_at": collection_started.isoformat()
@@ -890,7 +900,7 @@ class Monitor:
                 else None,
                 "published_at": published_at.isoformat(),
                 "phases_ms": phases,
-                "processing_ms": round((perf_counter() - tick_started) * 1000, 2),
+                "processing_ms": round(processing_ms, 2),
                 "update_interval_ms": round((tick_started - self.last_cycle_started) * 1000, 2)
                 if self.last_cycle_started is not None
                 else None,
@@ -899,6 +909,11 @@ class Monitor:
                 ),
                 "settlement_status": self.maintenance_error,
                 "resources": self.runtime_meter.sample(),
+                "latency_percentiles": self.runtime_meter.latency_summary(),
+                "latency_scope": (
+                    "Bounded recent in-process and public-request durations; "
+                    "not measured one-way exchange latency"
+                ),
             }
             self.state = state
             self.last_tick = published_at
@@ -1437,6 +1452,20 @@ def make_handler(monitor):
                         or getattr(monitor.feed, "candle_cache", None)
                     ),
                 )
+                with monitor.lock:
+                    developing = dict(
+                        ((monitor.state.get("model") or {}).get("developing_candle") or {})
+                    )
+                if developing.get("status") == "DEVELOPING":
+                    value["forming_candle"] = developing
+                else:
+                    value["forming_candle"] = None
+                latest = value.get("latest_bar_start")
+                value["latest_closed_candle_age_seconds"] = (
+                    max(0, utcnow().timestamp() - latest - interval_seconds)
+                    if isinstance(latest, (int, float))
+                    else None
+                )
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/api/market-history":
@@ -1629,6 +1658,15 @@ def make_handler(monitor):
             else:
                 self.send_error(404)
                 return
+            request_ms = (perf_counter() - request_started) * 1000
+            monitor.runtime_meter.observe(
+                "http_main_state"
+                if route == "/api/state" and query.get("view") == ["main"]
+                else "http_chart"
+                if route == "/api/signal-chart"
+                else "http_other",
+                request_ms,
+            )
             self.send_response(status_code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -1636,7 +1674,7 @@ def make_handler(monitor):
             self.send_header("X-Dashboard-Build", monitor.build_commit)
             self.send_header(
                 "Server-Timing",
-                "dashboard;dur=" + str(round((perf_counter() - request_started) * 1000, 2)),
+                "dashboard;dur=" + str(round(request_ms, 2)),
             )
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header(

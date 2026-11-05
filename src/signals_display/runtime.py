@@ -7,8 +7,10 @@ from time import monotonic, perf_counter
 from time import process_time
 import logging
 import json
+import math
 import resource
 from pathlib import Path
+from collections import deque
 
 
 class CachedReport:
@@ -95,6 +97,46 @@ class RuntimeMeter:
         self.cpu = process_time()
         self.logged = {}
         self.recent_errors = {}
+        self.latency_lock = threading.Lock()
+        self.latency_samples = {}
+
+    def observe(self, stage, milliseconds):
+        """Record a bounded processing latency sample, never provider latency."""
+        if stage not in {
+            "market_collection", "prediction_calculation", "journal_write",
+            "total_processing", "publish_after_collection", "http_main_state",
+            "http_chart", "http_other",
+        }:
+            return
+        if not isinstance(milliseconds, (int, float)) or milliseconds < 0:
+            return
+        with self.latency_lock:
+            self.latency_samples.setdefault(stage, deque(maxlen=300)).append(
+                float(milliseconds)
+            )
+
+    @staticmethod
+    def _percentile(ordered, fraction):
+        if not ordered:
+            return None
+        index = max(0, min(len(ordered) - 1, math.ceil(fraction * len(ordered)) - 1))
+        return round(ordered[index], 3)
+
+    def latency_summary(self):
+        """Return nearest-rank percentiles for the bounded recent window."""
+        with self.latency_lock:
+            values = {name: list(samples) for name, samples in self.latency_samples.items()}
+        return {
+            name: {
+                "samples": len(samples),
+                "p50_ms": self._percentile(ordered := sorted(samples), 0.50),
+                "p95_ms": self._percentile(ordered, 0.95),
+                "p99_ms": self._percentile(ordered, 0.99),
+                "latest_ms": round(samples[-1], 3),
+            }
+            for name, samples in values.items()
+            if samples
+        }
 
     def sample(self):
         wall, cpu = monotonic(), process_time()

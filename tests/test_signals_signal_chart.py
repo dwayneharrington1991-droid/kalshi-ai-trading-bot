@@ -275,3 +275,6 @@ def test_dashboard_contains_incremental_chart_without_external_script():
     assert "setInterval(refreshSignalChart,5000)" in page
     assert "interval:signalChart.interval,limit:'180'" in page
     assert "nextLiveRenderAt=performance.now()+500" in page
+    assert "BUY UP marker" in page and "BUY DOWN marker" in page
+    assert "kind==='BUY UP'" in page and "kind==='BUY DOWN'" in page
+    assert "data.forming_candle?' · 1 clearly faded developing proxy candle'" in page

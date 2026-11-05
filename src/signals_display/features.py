@@ -303,10 +303,12 @@ class DevelopingCandle:
                     "close": price,
                     "volume": None,
                     "status": "DEVELOPING",
+                    "observed_at": at.isoformat(),
                     "source": "Receipt-time proxy samples; volume unknown",
                 }
             self.bar.update(
-                high=max(self.bar["high"], price), low=min(self.bar["low"], price), close=price
+                high=max(self.bar["high"], price), low=min(self.bar["low"], price),
+                close=price, observed_at=at.isoformat(),
             )
             return dict(self.bar)
         except (KeyError, ValueError, TypeError):

@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 import pytest
 
 from src.signals_display.monitor import Journal, PublicFeed, analyze, utcnow
-from src.signals_display.runtime import CachedReport, LatestPayload
+from src.signals_display.runtime import CachedReport, LatestPayload, RuntimeMeter
 from src.signals_display.server import Monitor, StartupStatus, make_handler, make_startup_handler
 from tests.test_signals_display import NOW
 from tests.test_signals_monitor import frame
@@ -321,6 +321,26 @@ def test_state_version_wait_wakes_immediately_without_database_or_model_work(tmp
     assert observed == [1]
 
 
+def test_runtime_meter_reports_bounded_nearest_rank_percentiles():
+    meter = RuntimeMeter()
+    for value in range(1, 101):
+        meter.observe("total_processing", value)
+    for value in range(500):
+        meter.observe("http_chart", value)
+    meter.observe("untrusted-stage", 999999)
+    report = meter.latency_summary()
+    assert report["total_processing"] == {
+        "samples": 100,
+        "p50_ms": 50.0,
+        "p95_ms": 95.0,
+        "p99_ms": 99.0,
+        "latest_ms": 100.0,
+    }
+    assert report["http_chart"]["samples"] == 300
+    assert report["http_chart"]["latest_ms"] == 499.0
+    assert "untrusted-stage" not in report
+
+
 def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "j.db"))
     first = int(NOW.timestamp()) - 60 * 60
@@ -340,6 +360,19 @@ def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_
             for index in range(60)
         ],
     }
+    monitor.state["model"] = {
+        "developing_candle": {
+            "start": int(NOW.timestamp()) // 60 * 60,
+            "open": 200.0,
+            "high": 202.0,
+            "low": 199.0,
+            "close": 201.0,
+            "volume": None,
+            "status": "DEVELOPING",
+            "observed_at": NOW.isoformat(),
+            "source": "Receipt-time proxy samples; volume unknown",
+        }
+    }
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -353,6 +386,8 @@ def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_
         assert len(chart["bars"]) == 30
         assert chart["journal_persistence_pending"] is True
         assert "Verified live Coinbase preload" in chart["source"]
+        assert chart["forming_candle"]["status"] == "DEVELOPING"
+        assert chart["latest_closed_candle_age_seconds"] >= 0
     finally:
         server.shutdown()
         server.server_close()

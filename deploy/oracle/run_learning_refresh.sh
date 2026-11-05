@@ -22,15 +22,28 @@ flock -n 9 || {
 opening_registry="$(dirname "$OPENING_MODEL_ARTIFACT")/opening-model-registry"
 echo "learning_refresh_start commit=$(cat "$release/.deployed-commit")"
 
-# Both jobs open the signal journal read-only. General scheduled evaluation may
+# All three jobs open the signal journal read-only. General scheduled evaluation may
 # archive a candidate but cannot activate it. The opening job writes only a
 # statistically gated, opening-targeted artifact and its audit report.
+settlement_rc=0
 timeout --signal=TERM --kill-after=30s 600 \
   "$release/.venv/bin/python3" -m src.signals_display.learning \
   --journal "$JOURNAL_PATH" --output "$MODEL_ARTIFACT" \
-  --registry "$MODEL_REGISTRY" --scheduled --minimum-update-hours 24
+  --registry "$MODEL_REGISTRY" --scheduled --minimum-update-hours 1 || settlement_rc=$?
+opening_rc=0
 timeout --signal=TERM --kill-after=30s 600 \
   "$release/.venv/bin/python3" -m src.signals_display.opening_models \
   --journal "$JOURNAL_PATH" --output "$OPENING_MODEL_ARTIFACT" \
-  --registry "$opening_registry"
+  --registry "$opening_registry" || opening_rc=$?
+scalp_rc=0
+timeout --signal=TERM --kill-after=30s 600 \
+  "$release/.venv/bin/python3" -m src.signals_display.scalp_learning \
+  --journal "$JOURNAL_PATH" \
+  --output "$MODEL_REGISTRY/latest-scalp-evaluation.json" \
+  --minimum-update-hours 1 || scalp_rc=$?
+echo "learning_refresh_results settlement_rc=$settlement_rc opening_rc=$opening_rc scalp_rc=$scalp_rc"
+if (( settlement_rc != 0 || opening_rc != 0 || scalp_rc != 0 )); then
+  echo "learning_refresh_partial_or_failed" >&2
+  exit 1
+fi
 echo "learning_refresh_complete commit=$(cat "$release/.deployed-commit")"

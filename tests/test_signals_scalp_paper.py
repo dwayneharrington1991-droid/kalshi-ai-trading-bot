@@ -84,6 +84,34 @@ def candidate(report):
     return report["strategies"]["candidate"]
 
 
+def test_contract_bounded_loader_preserves_many_forward_contracts(tmp_path):
+    path = tmp_path / "scalp.db"
+    db = sqlite3.connect(path)
+    create_schema(db)
+    db.execute("CREATE TABLE forecast_outcomes(ticker TEXT,origin TEXT,outcome INTEGER,observed_at TEXT)")
+    for contract in range(12):
+        ticker = f"KXBTC15M-PAPER-{contract}"
+        for second in range(40):
+            payload = row(second, ticker=ticker)
+            db.execute(
+                "INSERT INTO scalp_book_observations(mode,ticker,observed_at,generated_at,recorded_at,payload) VALUES (?,?,?,?,?,?)",
+                ("PUBLIC MARKET DATA", ticker, payload["market"]["observed_at"],
+                 payload["generated_at"], payload["recorded_at"], json.dumps(payload)),
+            )
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            (ticker, "official", contract % 2, (NOW + timedelta(minutes=15)).isoformat()),
+        )
+    db.commit(); db.close()
+    loaded = load_journal(
+        path, limit=1000, contract_limit=10, per_contract_limit=30
+    )
+    books = [r for r in loaded["records"] if r.get("type") != "official_settlement"]
+    assert len({_contract["market"]["ticker"] for _contract in books}) == 10
+    assert len(books) == 300
+    assert loaded["coverage"]["official_result_observations"] == 10
+
+
 def test_target_uses_actual_after_delay_quote_and_both_costs():
     result = evaluate([row(0), row(3), row(4, bid=0.62, ask=0.64)])
     stats = candidate(result)

@@ -191,6 +191,8 @@ def test_isolated_ai_evaluation_cannot_activate_or_write_production_registry():
     script = (DEPLOY / "run_isolated_ai_evaluation.sh").read_text()
     assert 'settlement_registry="$evaluation/settlement-registry"' in script
     assert 'opening_registry="$evaluation/opening-registry"' in script
+    assert "src.signals_display.scalp_learning" in script
+    assert "SCALP_EVALUATION_RC" in script
     assert "MODEL_ACTIVATION_PERFORMED=false" in script
     assert "AUTOMATED_TRADING=DISABLED" in script
     assert "--activate" not in script
@@ -332,9 +334,11 @@ def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
     runner = (DEPLOY / "run_learning_refresh.sh").read_text()
     override = (DEPLOY / "kalshi-learning.override.conf.example").read_text()
     assert "flock -n" in runner
-    assert runner.count("timeout --signal=TERM") == 2
+    assert runner.count("timeout --signal=TERM") == 3
     assert "--scheduled" in runner
     assert "src.signals_display.opening_models" in runner
+    assert "src.signals_display.scalp_learning" in runner
+    assert all(name in runner for name in ("settlement_rc", "opening_rc", "scalp_rc"))
     assert "TimeoutStartSec=22min" in override
     assert "NoNewPrivileges=true" in override
     assert "run_learning_refresh.sh" in override

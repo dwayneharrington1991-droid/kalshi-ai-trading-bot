@@ -80,6 +80,16 @@ opening_rc=0
     --registry "$opening_registry"
 ) || opening_rc=$?
 
+scalp_rc=0
+(
+  cd "$source_tree"
+  timeout --signal=TERM --kill-after=30s 900 \
+    "$current/.venv/bin/python3" -m src.signals_display.scalp_learning \
+    --journal "$JOURNAL_PATH" \
+    --output "$evaluation/scalp.report.json" \
+    --minimum-update-hours 1
+) || scalp_rc=$?
+
 "$current/.venv/bin/python3" - \
   "$evaluation/opening.report.json" \
   "$evaluation/settlement.report.json" <<'PY'
@@ -115,10 +125,27 @@ print("MODEL_ACTIVATION_PERFORMED=false")
 print("AUTOMATED_TRADING=DISABLED")
 PY
 
+"$current/.venv/bin/python3" - "$evaluation/scalp.report.json" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    print("SCALP_STATUS=UNAVAILABLE")
+    print("SCALP_QUALIFIES_FOR_ACTIVATION=false")
+else:
+    report = json.loads(path.read_text())
+    print(f"SCALP_STATUS={report.get('status', 'UNAVAILABLE')}")
+    print(f"SCALP_CONTRACTS={report.get('contracts')}")
+    print(f"SCALP_SPLIT={report.get('split_contracts')}")
+    print(f"SCALP_TEST_METRICS={report.get('test')}")
+    print("SCALP_QUALIFIES_FOR_ACTIVATION=false")
+PY
+
 echo "SETTLEMENT_EVALUATION_RC=$settlement_rc"
 echo "OPENING_EVALUATION_RC=$opening_rc"
+echo "SCALP_EVALUATION_RC=$scalp_rc"
 echo "ISOLATED_EVALUATION=$evaluation"
-if (( settlement_rc == 0 && opening_rc == 0 )); then
+if (( settlement_rc == 0 && opening_rc == 0 && scalp_rc == 0 )); then
   echo "ISOLATED_EVALUATION_STATUS=COMPLETE"
 else
   echo "ISOLATED_EVALUATION_STATUS=PARTIAL_OR_FAILED"

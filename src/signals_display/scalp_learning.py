@@ -149,9 +149,32 @@ def scheduled_evaluation(journal, output, now=None, minimum_hours=24):
                 }
         except (KeyError, ValueError, TypeError, json.JSONDecodeError):
             pass
-    source = load_journal(journal, limit=10000, mode="PUBLIC MARKET DATA")
+    source = load_journal(
+        journal, limit=100000, mode="PUBLIC MARKET DATA",
+        contract_limit=120, per_contract_limit=360,
+    )
     report = evaluate_chronological(source["records"])
     report["generated_at"] = now.isoformat()
     report["journal_coverage"] = source["coverage"]
     atomic_json(output, report)
     return report
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--journal", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--minimum-update-hours", type=int, default=1)
+    args = parser.parse_args()
+    try:
+        report = scheduled_evaluation(
+            args.journal, args.output, minimum_hours=args.minimum_update_hours
+        )
+        print(json.dumps(report, sort_keys=True))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        parser.error(str(exc))
+
+
+if __name__ == "__main__":
+    main()

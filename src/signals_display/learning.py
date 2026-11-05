@@ -98,6 +98,9 @@ def dataset(db, asof=None):
                               AND (julianday(?)-julianday(p.timestamp))*86400>?
                               {upper_clause}
                               AND p.ticker=?
+                              AND COALESCE(json_extract(p.payload,'$.stale'),1)=0
+                              AND json_type(p.payload,'$.model.candidate_features.values.distance_scaled') IN ('integer','real')
+                              AND json_type(p.payload,'$.model.candidate_features.values.return_1m') IN ('integer','real')
                             ORDER BY p.timestamp,p.id LIMIT 30""",
                             parameters,
                         )
@@ -190,29 +193,11 @@ def dataset(db, asof=None):
             for ticker, _close, _outcome, _observed in contracts
             for bucket, _lower, _upper in horizon_ranges
         }
-        missing_tickers = sorted(
-            {ticker for ticker, bucket in expected if (ticker, bucket) not in selected}
-        )
-        # A bounded first-candidate window normally resolves every horizon. If
-        # early rows were incomplete, rescan only affected contracts so no
-        # legitimate historical record is silently excluded by the fast path.
-        if missing_tickers:
-            placeholders = ",".join("?" for _ in missing_tickers)
-            consume(
-                db.execute(
-                    f"""SELECT p.ticker,p.timestamp,o.outcome,o.observed_at,{payload_projection}
-                    FROM forecast_outcomes o CROSS JOIN predictions p
-                      ON p.ticker=o.ticker AND p.mode='PUBLIC MARKET DATA'
-                    WHERE o.origin='official'
-                      AND julianday(o.observed_at)<=julianday(?)
-                      AND p.settlement_origin='official' AND p.settlement_up=o.outcome
-                      AND p.settled_at IS NOT NULL
-                      AND julianday(p.settled_at)<=julianday(?)
-                      AND p.ticker IN ({placeholders})
-                    ORDER BY p.timestamp,p.id""",
-                    (asof.isoformat(), asof.isoformat(), *missing_tickers),
-                )
-            )
+        # Missing horizons remain explicit exclusions.  Never fall back to a
+        # multi-contract payload rescan: on the preserved production journal
+        # that query read gigabytes and repeatedly exceeded the bounded
+        # evaluator deadline.  The indexed per-contract queries above select
+        # the first 30 *usable* rows for each horizon instead.
     return list(selected.values())
 
 

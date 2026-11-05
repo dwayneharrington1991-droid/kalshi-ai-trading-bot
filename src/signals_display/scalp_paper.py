@@ -236,7 +236,8 @@ def _verified_legacy(db, mode, limit):
     )
 
 
-def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verified_legacy=False):
+def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verified_legacy=False,
+                 contract_limit=None, per_contract_limit=360):
     """Bounded, read-only normalized records; never load legacy payload blobs."""
     if type(limit) is not int or not 1 <= limit <= 100000:
         raise ValueError("Record limit must be 1..100000")
@@ -263,15 +264,43 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
                     "reason": "No normalized pre-outcome book journal. Legacy prediction rows do not prove actual generation/recording times; collect forward observations instead.",
                 },
             }
-        rows = (
-            db.execute(
-                "SELECT payload FROM (SELECT id,payload FROM scalp_book_observations WHERE mode=? ORDER BY id DESC LIMIT ?) ORDER BY id",
-                (mode, limit + 1),
-            ).fetchall()
-            if exists
-            else []
-        )
-        truncated = len(rows) > limit
+        sampled_contracts = None
+        if exists and contract_limit is not None:
+            if type(contract_limit) is not int or not 1 <= contract_limit <= 250:
+                raise ValueError("Contract limit must be 1..250")
+            if type(per_contract_limit) is not int or not 30 <= per_contract_limit <= 1000:
+                raise ValueError("Per-contract record limit must be 30..1000")
+            tickers = [row[0] for row in db.execute(
+                """SELECT ticker FROM scalp_book_observations WHERE mode=?
+                GROUP BY ticker ORDER BY MAX(id) DESC LIMIT ?""", (mode, contract_limit)
+            )]
+            sampled_contracts = len(tickers)
+            rows = []
+            for ticker in tickers:
+                rows.extend(db.execute(
+                    """SELECT payload FROM (SELECT id,payload FROM scalp_book_observations
+                    WHERE mode=? AND ticker=? ORDER BY id DESC LIMIT ?) ORDER BY id""",
+                    (mode, ticker, per_contract_limit),
+                ).fetchall())
+            def row_time(row):
+                try:
+                    return available_time(json.loads(row[0]))
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    return datetime.min.replace(tzinfo=timezone.utc)
+            rows.sort(key=row_time)
+            if len(rows) > limit:
+                rows = rows[-limit:]
+            truncated = len(tickers) == contract_limit
+        else:
+            rows = (
+                db.execute(
+                    "SELECT payload FROM (SELECT id,payload FROM scalp_book_observations WHERE mode=? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                    (mode, limit + 1),
+                ).fetchall()
+                if exists
+                else []
+            )
+            truncated = len(rows) > limit
         rows = rows[-limit:]
         records, malformed = [], 0
         for row in rows:
@@ -353,6 +382,8 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
             "official_result_observations": official_count,
             "legacy_selection": legacy_reason,
             "record_limit": limit,
+            "sampled_contracts": sampled_contracts,
+            "per_contract_record_limit": per_contract_limit if sampled_contracts is not None else None,
             "reason": "Latest bounded observation window only; earlier paper positions are not reconstructed across a truncated boundary"
             if truncated
             else "Timestamped observation replay; displayed depth does not establish real fills",

@@ -483,3 +483,36 @@ def test_finalizer_is_guarded_atomic_and_starts_independent_audits():
     assert "chart_readiness_wait" in script
     assert "chart not ready after ${chart_wait_seconds}s" in script
     assert "git reset" not in script and "git clean" not in script
+
+
+def test_ai_readiness_auditor_is_read_only_and_never_promotes():
+    path = DEPLOY / "audit_ai_readiness.py"
+    source = path.read_text()
+    assert "?mode=ro" in source
+    assert "PRAGMA query_only=ON" in source
+    assert "MODEL | LABELED MARKETS | FORWARD VALIDATION" in source
+    for forbidden in (
+        "INSERT ", "UPDATE ", "DELETE ", "ModelRegistry.activate",
+        "place_order", "cancel_order", "modify_order", "transfer_funds",
+    ):
+        assert forbidden not in source
+
+    spec = importlib.util.spec_from_file_location("audit_ai_readiness", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    row = module.model_row(
+        "OPENING",
+        {
+            "status": "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT",
+            "unseen_forward_contracts": 26,
+            "required_unseen_forward_contracts": 30,
+            "additional_unseen_contracts_needed": 4,
+            "promotion_allowed": False,
+        },
+        426,
+        False,
+        "No dedicated opening artifact configured",
+    )
+    assert row["status"] == "SHADOW"
+    assert row["additional_needed"] == 4
+    assert "needs 4 additional" in row["what_is_missing"]

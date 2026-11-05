@@ -346,6 +346,10 @@ class Monitor:
                 and collected_candles.get("candles")
             ):
                 self.latest_candles = collected_candles
+                # Persist verified closed candles before optional analytics.
+                # A later indicator/account failure must never leave the chart
+                # empty while the preload itself is already READY.
+                self.journal.record_candles(collected_candles, utcnow())
             calculation_started = perf_counter()
             now = timestamp(payload["clock"]) if "clock" in payload else utcnow()
             coverage = payload.setdefault("coverage", {})
@@ -816,7 +820,6 @@ class Monitor:
             )
             journal_started = perf_counter()
             self.journal.record_feeds(payload.get("coverage", {}))
-            self.journal.record_candles(payload.get("btc_candles", {}), now)
             state["trade_decision"] = trade_decision(state)
             state["news_intelligence"] = classify_news(
                 payload.get("coverage", {}).get("Federal Reserve public releases", {}), now

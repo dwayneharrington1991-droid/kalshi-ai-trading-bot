@@ -359,6 +359,37 @@ def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_
         thread.join(timeout=2)
 
 
+def test_verified_candles_persist_before_optional_intelligence_failure(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    monitor = Monitor(None, journal)
+    payload = frame()
+    first = int(NOW.timestamp()) - 60 * 60
+    payload["btc_candles"] = {
+        "source": "Coinbase verified test preload",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+        "candles": [
+            {
+                "start": first + index * 60,
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 10 + index,
+            }
+            for index in range(60)
+        ],
+    }
+
+    def fail_optional(*_args, **_kwargs):
+        raise RuntimeError("optional analysis failed")
+
+    monitor.advanced.summarize = fail_optional
+    monitor.tick((payload, NOW, NOW, 1.0))
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_candles").fetchone()[0] == 60
+
+
 def test_history_pages_are_indexed_bounded_and_do_not_run_research(tmp_path, monkeypatch):
     journal = Journal(tmp_path / "j.db")
     with journal.connect() as db:

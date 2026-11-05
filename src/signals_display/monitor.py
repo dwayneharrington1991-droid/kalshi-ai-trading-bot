@@ -21,6 +21,7 @@ from .coverage import FeedHub
 from . import prediction_engine
 from . import scalp_paper
 from . import edge_scanner
+from . import strategy_paper
 from .model import Display, evaluate, fee, number, timestamp
 from .edges import assess_edges
 from .reliability import metrics, wilson
@@ -1311,6 +1312,7 @@ class Journal:
                 )
             scalp_paper.create_schema(db)
             edge_scanner.create_schema(db)
+            strategy_paper.create_schema(db)
             db.execute(
                 "CREATE TABLE IF NOT EXISTS forecast_outcomes (ticker TEXT,origin TEXT,observed_at TEXT,outcome INTEGER,PRIMARY KEY(ticker,origin))"
             )
@@ -1816,6 +1818,10 @@ class Journal:
         market = state["market"]
         capture_learning = self._learning_sample_due(state)
         with self.connect() as db:
+            strategy_paper.record_and_resolve(
+                db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+            )
+
             for card in state.get("market_strip", []):
                 try:
                     db.execute(
@@ -2180,6 +2186,10 @@ class Journal:
                         pnl if immediate else None,
                     ),
                 )
+
+    def strategy_performance(self):
+        with self.read() as db:
+            return strategy_paper.performance(db)
 
     def settle(self, ticker, yes_result, mode, observed_at=None):
         if yes_result not in {"yes", "no"}:

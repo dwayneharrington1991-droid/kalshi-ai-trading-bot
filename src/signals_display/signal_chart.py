@@ -100,6 +100,22 @@ def aggregate_candles(candles, interval_seconds):
 
 
 def _entry_marker(state):
+    dual = state.get("dual_strategy") or {}
+    selected = (dual.get("strategies") or {}).get(dual.get("recommended_strategy"))
+    if selected and selected.get("actionable") is True:
+        market = state.get("market") or {}
+        reference = state.get("reference") or {}
+        return {
+            "marker_key": f"ENTRY:{market.get('ticker')}:{selected['strategy']}:{selected['action']}",
+            "ticker": market.get("ticker"), "strategy": selected["strategy"],
+            "signal_type": selected["action"], "timestamp": dual.get("timestamp") or state.get("now"),
+            "btc_price": reference.get("price"), "contract_price": selected.get("proposed_entry"),
+            "target_exit": selected.get("target_exit"), "maximum_potential_loss": selected.get("maximum_potential_loss"),
+            "estimated_net_profit": selected.get("estimated_net_profit"), "quantity": selected.get("quantity"),
+            "probability": selected.get("confidence"), "after_cost_edge": selected.get("expected_value"),
+            "reason": selected.get("reason"), "data_freshness": "FRESH", "risk_status": "VERIFIED_GATES_PASSED",
+            "experimental": False,
+        }
     edge = state.get("edge_scanner") or {}
     decision = state.get("decision_intelligence") or {}
     guardian = ((decision.get("components") or {}).get("risk_guardian") or {})

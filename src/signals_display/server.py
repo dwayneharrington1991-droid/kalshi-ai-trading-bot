@@ -48,6 +48,7 @@ from .alerts import MonitoringAlerts, risk_alerts
 from .scalp_monitor import diagnose as diagnose_scalp, ScalpCriteria
 from .advanced import AdvancedIntelligence, attach_reliability, refresh_status
 from .edge_scanner import calculate as calculate_edge_scanner, performance as edge_performance
+from .strategy_paper import evaluate as evaluate_dual_strategy
 from .multi_asset import MarketStrip
 
 OPENING_PRELOAD_SECONDS = 120
@@ -838,6 +839,9 @@ class Monitor:
                 payload.get("coverage", {}).get("Federal Reserve public releases", {}), now
             )
             state["decision_intelligence"] = coordinate_intelligence(state)
+            state["dual_strategy"] = evaluate_dual_strategy(
+                state, paper_performance=self.journal.strategy_performance()
+            )
             self.journal.record_ai_signal_markers(state)
             self.journal.step(state)
             phases["journal_write"] = round((perf_counter() - journal_started) * 1000, 2)
@@ -1327,6 +1331,9 @@ class Monitor:
         }
         state["scalping_monitor"] = diagnose_scalp(
             state, self.scalp_criteria, account=state["account"], now=health_clock
+        )
+        state["dual_strategy"] = evaluate_dual_strategy(
+            state, paper_performance=self.journal.strategy_performance()
         )
         state["connection_diagnostics"] = {
             "credentials": credential_status(),

@@ -15,6 +15,14 @@ release=$(readlink -f "$DEPLOY_ROOT/current")
   echo "learning_refresh_failed reason=journal_unavailable" >&2; exit 1;
 }
 
+# Use the same lock domain as deployment and isolated evaluation.  The
+# service-specific lock additionally prevents two timer invocations from
+# entering the refresh together.  Locks are always acquired in this order;
+# no other script acquires them in reverse order.
+exec 8>"$DEPLOY_ROOT/learning.lock"
+flock -n 8 || {
+  echo "learning_refresh_skipped reason=deployment_or_evaluation_is_running" >&2; exit 0;
+}
 exec 9>"$DEPLOY_ROOT/learning-refresh.lock"
 flock -n 9 || {
   echo "learning_refresh_skipped reason=another_refresh_is_running" >&2; exit 0;

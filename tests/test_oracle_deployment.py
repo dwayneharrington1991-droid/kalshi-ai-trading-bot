@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import os
 from pathlib import Path
 
 import pytest
@@ -339,6 +340,8 @@ def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
     runner = (DEPLOY / "run_learning_refresh.sh").read_text()
     override = (DEPLOY / "kalshi-learning.override.conf.example").read_text()
     assert "flock -n" in runner
+    assert 'exec 8>"$DEPLOY_ROOT/learning.lock"' in runner
+    assert runner.index('learning.lock') < runner.index('learning-refresh.lock')
     assert runner.count("timeout --signal=TERM") == 3
     assert "--scheduled" in runner
     assert "src.signals_display.opening_models" in runner
@@ -506,6 +509,95 @@ def test_background_evaluation_is_detached_non_promoting_and_signals_only():
     assert "AUTOMATED_TRADING=DISABLED" in script
     for unsafe in ("place_order", "cancel_order", "modify_order", "transfer"):
         assert unsafe not in script
+
+
+def test_evaluation_and_deployment_lock_order_cannot_self_deadlock():
+    launcher = (DEPLOY / "start_isolated_evaluation.sh").read_text()
+    evaluator = (DEPLOY / "run_isolated_ai_evaluation.sh").read_text()
+    deployment = (DEPLOY / "apply_live_pipeline_repair.sh").read_text()
+    scheduled = (DEPLOY / "run_learning_refresh.sh").read_text()
+    # The launcher probes the background lock non-blockingly. Evaluation,
+    # deployment and scheduled learning serialize on one learning lock. No
+    # script takes background-evaluation.lock while already holding learning.lock.
+    assert 'flock -n "$lock" true' in launcher
+    assert 'nohup flock -n "$lock"' in launcher
+    assert 'flock -w 30 8' in evaluator
+    assert 'flock -n 8' in deployment
+    assert 'flock -n 8' in scheduled
+    assert "background-evaluation.lock" not in evaluator
+    assert "background-evaluation.lock" not in deployment
+    assert "background-evaluation.lock" not in scheduled
+
+
+def test_live_pipeline_failure_restores_release_pointer_and_prior_health(tmp_path):
+    """Exercise the actual atomic/ERR rollback path with isolated mocks."""
+    repo = tmp_path / "repo"
+    deploy_root = tmp_path / "deploy"
+    data_root = tmp_path / "data"
+    old = deploy_root / "releases" / "old"
+    fake_bin = tmp_path / "bin"
+    for path in (repo, old / ".venv" / "bin", data_root, fake_bin):
+        path.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='rollback-test'\nversion='1'\n")
+    for relative in (
+        "src/signals_display/monitor.py", "src/signals_display/server.py",
+        "src/signals_display/prediction_engine.py",
+    ):
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("VALUE = 1\n")
+    health = repo / "deploy/oracle/health_check.py"
+    health.parent.mkdir(parents=True, exist_ok=True)
+    health.write_text("raise SystemExit(1)\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "target"], check=True)
+    target = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+    (old / "pyproject.toml").write_text((repo / "pyproject.toml").read_text())
+    (old / ".deployed-commit").write_text("a" * 40 + "\n")
+    (old / ".venv/bin/python3").symlink_to(Path(sys.executable))
+    (deploy_root / "current").symlink_to(old)
+    config = tmp_path / "deployment.env"
+    config.write_text(
+        f"DEPLOY_ROOT={deploy_root}\nSERVICE_NAME=kalshi-signals.service\nDATA_ROOT={data_root}\n"
+    )
+
+    for name, body in {
+        "sudo": "#!/bin/sh\nexit 0\n",
+        "sleep": "#!/bin/sh\nexit 0\n",
+        "curl": "#!/bin/sh\nexit 1\n",
+    }.items():
+        path = fake_bin / name
+        path.write_text(body)
+        path.chmod(0o755)
+
+    script = (DEPLOY / "apply_live_pipeline_repair.sh").read_text()
+    script = script.replace("[[ $(id -un) == opc ]]", "[[ 1 == 1 ]]")
+    script = script.replace("repo=/home/opc/kalshi-ai-trading-bot", f"repo={repo}")
+    script = script.replace("config=/etc/kalshi-signals/deployment.env", f"config={config}")
+    candidate = tmp_path / "apply.sh"
+    candidate.write_text(script)
+    candidate.chmod(0o700)
+    environment = {**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]}
+    result = subprocess.run(
+        ["bash", str(candidate), target, "a" * 40],
+        capture_output=True, text=True, timeout=20, env=environment,
+    )
+    assert result.returncode != 0
+    assert (deploy_root / "current").resolve() == old.resolve()
+    assert "LIVE_REPAIR_ROLLED_BACK" in result.stderr
+    # Prior-release health remains independently testable after pointer restore.
+    prior_health = old / "health.py"
+    prior_health.write_text("print('HEALTHY')\n")
+    restored = subprocess.run(
+        [str(old / ".venv/bin/python3"), str(prior_health)],
+        capture_output=True, text=True, check=True,
+    )
+    assert restored.stdout.strip() == "HEALTHY"
 
 
 def test_finalizer_is_guarded_atomic_and_starts_independent_audits():

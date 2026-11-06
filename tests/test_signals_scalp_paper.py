@@ -135,6 +135,17 @@ def test_old_receipt_cannot_fill_after_delay_and_price_cap_can_miss():
     assert candidate(moved)["simulated_trades"] == 0
 
 
+def test_zero_candidates_report_exact_rejection_reasons():
+    missing = row(0, candidate=False)
+    stale = row(3)
+    stale["candidate_data_stale"] = True
+    result = evaluate([missing, stale])
+    reasons = result["coverage"]["candidate_rejection_reasons"]
+    assert reasons["NO_MODEL_CANDIDATES_RECORDED"] == 1
+    assert reasons["DATA_STALE_AT_RECORDING"] == 1
+    assert result["coverage"]["model_candidate_windows"] == 0
+
+
 def test_partial_entry_and_exit_use_depth_once_and_round_each_fee():
     result = evaluate(
         [

@@ -8,6 +8,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+from time import perf_counter
 
 from .model import timestamp
 from .model_registry import atomic_json
@@ -133,7 +134,7 @@ def evaluate_chronological(records):
     return result
 
 
-def scheduled_evaluation(journal, output, now=None, minimum_hours=24):
+def scheduled_evaluation(journal, output, now=None, minimum_hours=24, progress=None):
     now = now or datetime.now(timezone.utc)
     output = Path(output)
     if output.is_file() and output.stat().st_size <= 5_000_000:
@@ -149,11 +150,15 @@ def scheduled_evaluation(journal, output, now=None, minimum_hours=24):
                 }
         except (KeyError, ValueError, TypeError, json.JSONDecodeError):
             pass
+    started = perf_counter()
+    if progress: progress("load_start", 0.0, {})
     source = load_journal(
         journal, limit=100000, mode="PUBLIC MARKET DATA",
         contract_limit=120, per_contract_limit=360,
     )
+    if progress: progress("load_complete", perf_counter()-started, source["coverage"])
     report = evaluate_chronological(source["records"])
+    if progress: progress("comparison_complete", perf_counter()-started, {"status": report.get("status"), "contracts": report.get("contracts")})
     report["generated_at"] = now.isoformat()
     report["journal_coverage"] = source["coverage"]
     atomic_json(output, report)
@@ -168,9 +173,21 @@ def main():
     parser.add_argument("--minimum-update-hours", type=int, default=1)
     args = parser.parse_args()
     try:
+        import resource
+        started = perf_counter()
+        def progress(stage, elapsed, values):
+            print(
+                "EVALUATION_PROGRESS component=SCALP "
+                f"stage={stage} elapsed_seconds={elapsed:.3f} "
+                f"max_rss_kib={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss} "
+                + " ".join(f"{k}={v}" for k, v in values.items() if not isinstance(v, dict)),
+                flush=True,
+            )
         report = scheduled_evaluation(
-            args.journal, args.output, minimum_hours=args.minimum_update_hours
+            args.journal, args.output, minimum_hours=args.minimum_update_hours,
+            progress=progress,
         )
+        progress("complete", perf_counter()-started, {"status": report.get("status")})
         print(json.dumps(report, sort_keys=True))
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(str(exc))

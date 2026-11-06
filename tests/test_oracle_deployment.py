@@ -197,6 +197,11 @@ def test_isolated_ai_evaluation_cannot_activate_or_write_production_registry():
     assert "AUTOMATED_TRADING=DISABLED" in script
     assert "--activate" not in script
     assert "timeout --signal=TERM --kill-after=30s 900" in script
+    assert "EVALUATION_STAGE=SETTLEMENT" in script
+    assert "EVALUATION_STAGE=OPENING" in script
+    assert "EVALUATION_STAGE=SCALP" in script
+    assert "EVALUATION_TIMEOUT" in script
+    assert "failure_report" in script
 
 
 def test_live_pipeline_repair_is_atomic_bounded_and_signals_only():

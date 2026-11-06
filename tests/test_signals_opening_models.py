@@ -159,12 +159,15 @@ def test_opening_dataset_uses_only_frozen_feature_records_and_official_outcomes(
     )
     with journal.read() as db:
         rows = opening_models.dataset(db, NOW + timedelta(minutes=17))
+        coverage = opening_models.dataset_coverage(db, NOW + timedelta(minutes=17))
     assert len(rows) == 1 and rows[0]["features"] == {
         name: value
         for name, value in original["frozen_features"]["values"].items()
         if value is not None
     }
     assert rows[0]["market"] is None and rows[0]["timestamp"] == original["generated_at"]
+    assert coverage["newest_eligible_contract"] == original["ticker"]
+    assert coverage["recent_official_eligibility"][-1]["status"] == "ELIGIBLE"
     candidate, report = opening_models.evaluate(rows)
     assert candidate is None and report["status"] == "INSUFFICIENT_OPENING_LABELS"
     assert not report["active_model_changed"] and not report["promotion_allowed"]

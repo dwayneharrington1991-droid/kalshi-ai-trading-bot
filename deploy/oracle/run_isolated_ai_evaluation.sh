@@ -52,6 +52,32 @@ opening_registry="$evaluation/opening-registry"
 mkdir -p "$source_tree" "$settlement_registry" "$opening_registry"
 git -C "$repo" archive "$target" | tar -x -C "$source_tree"
 
+failure_report() {
+  local path=$1 component=$2 rc=$3 elapsed=$4
+  [[ -f "$path" ]] && return 0
+  "$current/.venv/bin/python3" - "$path" "$component" "$rc" "$elapsed" <<'PY'
+import json, os, sys, tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+path, component, rc, elapsed = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+status = "EVALUATION_TIMEOUT" if rc == 124 else "EVALUATION_FAILED"
+value = {
+    "status": status, "component": component, "return_code": rc,
+    "elapsed_seconds": elapsed, "generated_at": datetime.now(timezone.utc).isoformat(),
+    "trained": False, "promotion_allowed": False, "active_model_changed": False,
+    "reason": "Bounded evaluator timed out" if rc == 124 else "Evaluator exited unsuccessfully",
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".failure-", suffix=".json", dir=path.parent)
+try:
+    with os.fdopen(fd, "w") as handle:
+        json.dump(value, handle, sort_keys=True, indent=2); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PY
+}
+
 if [[ -d "$MODEL_REGISTRY" ]]; then
   cp -a "$MODEL_REGISTRY"/. "$settlement_registry"/
 fi
@@ -61,6 +87,8 @@ if [[ -d "$production_opening_registry" ]]; then
 fi
 
 settlement_rc=0
+settlement_started=$SECONDS
+echo "EVALUATION_STAGE=SETTLEMENT status=STARTED"
 (
   cd "$source_tree"
   timeout --signal=TERM --kill-after=30s 900 \
@@ -69,8 +97,13 @@ settlement_rc=0
     --output "$evaluation/settlement.json" \
     --registry "$settlement_registry"
 ) || settlement_rc=$?
+settlement_elapsed=$((SECONDS-settlement_started))
+echo "EVALUATION_STAGE=SETTLEMENT status=FINISHED rc=$settlement_rc elapsed_seconds=$settlement_elapsed"
+(( settlement_rc == 0 )) || failure_report "$evaluation/settlement.report.json" SETTLEMENT "$settlement_rc" "$settlement_elapsed"
 
 opening_rc=0
+opening_started=$SECONDS
+echo "EVALUATION_STAGE=OPENING status=STARTED"
 (
   cd "$source_tree"
   timeout --signal=TERM --kill-after=30s 900 \
@@ -79,8 +112,13 @@ opening_rc=0
     --output "$evaluation/opening.json" \
     --registry "$opening_registry"
 ) || opening_rc=$?
+opening_elapsed=$((SECONDS-opening_started))
+echo "EVALUATION_STAGE=OPENING status=FINISHED rc=$opening_rc elapsed_seconds=$opening_elapsed"
+(( opening_rc == 0 )) || failure_report "$evaluation/opening.report.json" OPENING "$opening_rc" "$opening_elapsed"
 
 scalp_rc=0
+scalp_started=$SECONDS
+echo "EVALUATION_STAGE=SCALP status=STARTED"
 (
   cd "$source_tree"
   timeout --signal=TERM --kill-after=30s 900 \
@@ -89,6 +127,9 @@ scalp_rc=0
     --output "$evaluation/scalp.report.json" \
     --minimum-update-hours 1
 ) || scalp_rc=$?
+scalp_elapsed=$((SECONDS-scalp_started))
+echo "EVALUATION_STAGE=SCALP status=FINISHED rc=$scalp_rc elapsed_seconds=$scalp_elapsed"
+(( scalp_rc == 0 )) || failure_report "$evaluation/scalp.report.json" SCALP "$scalp_rc" "$scalp_elapsed"
 
 "$current/.venv/bin/python3" - \
   "$evaluation/opening.report.json" \

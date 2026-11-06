@@ -359,6 +359,50 @@ def test_dataset_fast_path_never_drops_valid_row_after_incomplete_candidates(tmp
     assert not any("p.ticker in (" in query.lower() for query in queries)
 
 
+def test_horizon_summary_uses_one_exact_compact_join_instead_of_revision_scans(tmp_path):
+    from src.signals_display.monitor import Journal
+
+    journal = Journal(tmp_path / "journal.db")
+    opened, closed = NOW - timedelta(minutes=15), NOW - timedelta(minutes=1)
+    ticker, settled = "KXBTC15M-HORIZON", NOW.isoformat()
+    valid = {
+        "stale": False,
+        "market": {"closes_at": closed.isoformat(), "quotes": {}},
+        "model": {
+            "candidate_features": {"values": {"distance_scaled": .2, "return_1m": .01}},
+            "baseline_probability_up": .6,
+        },
+    }
+    chosen = opened + timedelta(minutes=10)
+    with journal.connect() as db:
+        db.execute("INSERT INTO forecast_outcomes VALUES (?,?,?,?)", (ticker, "official", settled, 1))
+        db.execute("INSERT INTO btc_engine_contracts VALUES (?,?,?,?,?)", ("PUBLIC MARKET DATA", ticker, closed.isoformat(), 401, chosen.isoformat()))
+        for index in range(400):
+            at = opened + timedelta(seconds=index)
+            db.execute(
+                """INSERT INTO predictions(mode,ticker,timestamp,payload,settlement_origin,settlement_up,settled_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                ("PUBLIC MARKET DATA", ticker, at.isoformat(), json.dumps({"stale": True}), "official", 1, settled),
+            )
+        db.execute(
+            """INSERT INTO predictions(mode,ticker,timestamp,payload,settlement_origin,settlement_up,settled_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            ("PUBLIC MARKET DATA", ticker, chosen.isoformat(), json.dumps(valid), "official", 1, settled),
+        )
+        db.execute(
+            "INSERT INTO btc_engine_horizons VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("PUBLIC MARKET DATA", ticker, "2-5m", chosen.isoformat(), chosen.isoformat(), closed.isoformat(), .6, "normal", "v", "{}"),
+        )
+    with journal.read() as db:
+        queries = []
+        db.set_trace_callback(queries.append)
+        result = learning.dataset(db, NOW + timedelta(seconds=1))
+    assert len(result) == 1 and result[0]["ticker"] == ticker
+    horizon_queries = [q for q in queries if "from btc_engine_horizons h" in q.lower()]
+    assert len(horizon_queries) == 1
+    assert not any("order by p.timestamp,p.id limit 30" in q.lower() for q in queries)
+
+
 def test_after_cost_assessment_withholds_profitable_edge_without_delayed_quotes():
     rows = [
         {

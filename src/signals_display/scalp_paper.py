@@ -496,6 +496,47 @@ def _chosen(row, criteria):
     )
 
 
+def _rejection_reasons(row, criteria):
+    """Explain shadow candidate rejection without changing any threshold."""
+    if not row["forecast_cutoff_verified"]:
+        return ["MISSING_VERIFIED_FORECAST_CUTOFF"]
+    if row.get("candidate_data_stale"):
+        return ["DATA_STALE_AT_RECORDING"]
+    scanner = row.get("scanner") or {}
+    if scanner.get("macro_blackout"):
+        return ["MACRO_BLACKOUT"]
+    if scanner.get("high_slippage_risk"):
+        return ["HIGH_SLIPPAGE_RISK"]
+    candidates = row.get("candidates") or []
+    if not candidates:
+        return ["NO_MODEL_CANDIDATES_RECORDED"]
+    reasons = []
+    for item in candidates:
+        try:
+            definition = item["model_definition"]
+            if (
+                definition.get("fee_type") != row["market"]["fee_type"]
+                or number(definition.get("fee_multiplier"), 0, 100) != row["multiplier"]
+            ):
+                reasons.append("FEE_DEFINITION_MISMATCH"); continue
+            if any(
+                abs(number(definition[name], 0, 10000) - getattr(criteria, name)) > 1e-8
+                for name in ("quantity", "target", "stop", "holding_seconds", "manual_delay_seconds", "slippage_per_leg")
+            ):
+                reasons.append("PREDECLARED_STRATEGY_MISMATCH"); continue
+            if number(item["target_probability_given_entry"], 0, 1) < criteria.minimum_target_probability:
+                reasons.append("TARGET_PROBABILITY_BELOW_THRESHOLD")
+            if number(item["net_expected_profit_per_opportunity"], -1, 1) <= 0:
+                reasons.append("NONPOSITIVE_EXPECTED_VALUE")
+            if number(item["net_ev_sampling_interval"][0], -1, 1) <= 0:
+                reasons.append("EXPECTED_VALUE_INTERVAL_NOT_POSITIVE")
+            if item["entered_paths"] < criteria.minimum_entered_paths:
+                reasons.append("INSUFFICIENT_MONTE_CARLO_ENTRY_PATHS")
+        except (KeyError, ValueError, TypeError, IndexError):
+            reasons.append("MALFORMED_OR_INCOMPLETE_MODEL_EVENT")
+    return sorted(set(reasons)) or ["AMBIGUOUS_EQUAL_EDGE_CANDIDATES"]
+
+
 class _Strategy:
     def __init__(self, name, criteria):
         self.name, self.criteria = name, criteria
@@ -912,6 +953,10 @@ def evaluate(records, criteria=None):
 
     windows = {window_key(r) for r in books}
     qualified_windows = {window_key(r) for r in books if _chosen(r, c) is not None}
+    rejection_counts = Counter()
+    for row in books:
+        if _chosen(row, c) is None:
+            rejection_counts.update(_rejection_reasons(row, c))
     result = {
         "protocol": VERSION,
         "status": "PAPER_REPLAY_ONLY" if len(books) >= 2 else "INSUFFICIENT_HISTORICAL_ORDER_BOOKS",
@@ -927,6 +972,7 @@ def evaluate(records, criteria=None):
             else None,
             "window_scope": "Observed contract/UTC interval windows; model candidate presence before execution/risk filters, never an actionable call or a fill",
             "excluded": {k: v for k, v in excluded.items() if v},
+            "candidate_rejection_reasons": dict(rejection_counts.most_common()),
             "first_available_at": accepted[0]["at"].isoformat() if accepted else None,
             "last_available_at": accepted[-1]["at"].isoformat() if accepted else None,
             "contracts": len({r["ticker"] for r in accepted}),

@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+from time import perf_counter
 
 from .features import FEATURES
 from .model import timestamp
@@ -72,7 +73,43 @@ def dataset(db, asof=None):
                 ("2-5m", 120, 300),
                 ("<=2m", 0, 120),
             )
+            has_horizons = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='btc_engine_horizons'"
+            ).fetchone()
+            horizon_contracts = set()
+            if has_horizons:
+                horizon_contracts = {
+                    row[0] for row in db.execute(
+                        """SELECT DISTINCT ticker FROM btc_engine_horizons
+                        WHERE mode='PUBLIC MARKET DATA'"""
+                    )
+                }
+                # The horizon table contains at most four timestamps per
+                # contract. Join those exact timestamps back to the compact
+                # prediction evidence once. This replaces roughly 4*N JSON
+                # scans and ORDER BY operations on the multi-gigabyte revision
+                # journal while preserving the same receipt-time rows.
+                row_streams.append(
+                    db.execute(
+                        f"""SELECT p.ticker,p.timestamp,o.outcome,o.observed_at,{payload_projection}
+                        FROM btc_engine_horizons h
+                        JOIN forecast_outcomes o ON o.ticker=h.ticker AND o.origin='official'
+                        JOIN predictions p ON p.ticker=h.ticker
+                          AND p.mode=h.mode AND p.timestamp=h.timestamp
+                        WHERE h.mode='PUBLIC MARKET DATA'
+                          AND julianday(o.observed_at)<=julianday(?)
+                          AND p.settlement_origin='official'
+                          AND p.settlement_up=o.outcome
+                          AND p.settled_at IS NOT NULL
+                          AND julianday(p.settled_at)<=julianday(?)
+                          AND julianday(p.timestamp)<julianday(h.closes_at)
+                        ORDER BY h.closes_at,h.ticker,h.horizon""",
+                        (asof.isoformat(), asof.isoformat()),
+                    )
+                )
             for ticker, closes_at, outcome, observed_at in contracts:
+                if ticker in horizon_contracts:
+                    continue
                 for _bucket, lower, upper in horizon_ranges:
                     upper_clause = (
                         "" if upper is None else
@@ -269,8 +306,13 @@ def after_cost_assessment(probabilities, rows, *, slippage=0.01):
     }
 
 
-def prepare_comparison(db, now, *, used_test_contracts=None):
+def prepare_comparison(db, now, *, used_test_contracts=None, progress=None):
+    started = perf_counter()
+    def emit(stage, **values):
+        if progress:
+            progress(stage, perf_counter() - started, values)
     count = official_label_count(db, now)
+    emit("official_labels", count=count)
     if count < MIN_CONTRACTS:
         artifact, report = compare([])
         report.update(
@@ -281,7 +323,9 @@ def prepare_comparison(db, now, *, used_test_contracts=None):
         )
         return artifact, report, []
     rows = dataset(db, now)
+    emit("dataset_loaded", rows=len(rows), contracts=len({r["ticker"] for r in rows}))
     artifact, report = compare(rows, used_test_contracts=used_test_contracts)
+    emit("model_comparison_complete", status=report.get("status"), trained=report.get("trained"))
     report["recorded_official_contracts"] = count
     report["eligible_feature_contracts"] = len({row["ticker"] for row in rows})
     report["excluded_official_contracts"] = max(
@@ -915,11 +959,24 @@ def main():
             # A read-only connection cannot create or modify the user's journal.
             db = sqlite3.connect("file:" + str(args.journal.resolve()) + "?mode=ro", uri=True)
             try:
+                import resource
+                evaluation_started = perf_counter()
+                def progress(stage, elapsed, values):
+                    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    print(
+                        "EVALUATION_PROGRESS component=SETTLEMENT "
+                        f"stage={stage} elapsed_seconds={elapsed:.3f} max_rss_kib={rss} "
+                        + " ".join(f"{k}={v}" for k, v in values.items()),
+                        flush=True,
+                    )
+                progress("start", 0.0, {})
                 artifact, report, rows = prepare_comparison(
                     db,
                     now,
                     used_test_contracts=registry.used_test_contracts() if registry else None,
+                    progress=progress,
                 )
+                progress("complete", perf_counter() - evaluation_started, {"status": report.get("status")})
             finally:
                 db.close()
             if args.walk_forward:

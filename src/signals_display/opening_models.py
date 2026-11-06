@@ -13,6 +13,7 @@ import math
 import re
 from pathlib import Path
 import sqlite3
+from time import perf_counter
 
 from . import learning
 from .features import FEATURES
@@ -116,9 +117,11 @@ def dataset_coverage(db, asof=None):
     asof = asof or datetime.now(timezone.utc)
     counts = {}
     eligible = []
+    recent = []
     for raw in _opening_rows(db, asof):
         row, reason = _assess_opening(raw, asof)
         counts[reason] = counts.get(reason, 0) + 1
+        recent.append({"ticker": raw[0], "label_available_at": raw[6], "status": reason})
         if row is not None:
             eligible.append(row)
     total = sum(counts.values())
@@ -133,6 +136,9 @@ def dataset_coverage(db, asof=None):
         "minimum_for_first_shadow_evaluation": MIN_CONTRACTS,
         "remaining_to_first_shadow_evaluation": max(0, MIN_CONTRACTS - len(eligible)),
         "edge_status": "edge unverified",
+        "recent_official_eligibility": recent[-20:],
+        "newest_eligible_contract": eligible[-1]["ticker"] if eligible else None,
+        "newest_eligible_label_available_at": eligible[-1]["label_available_at"] if eligible else None,
     }
 
 
@@ -783,9 +789,21 @@ def main():
     )
     args = parser.parse_args()
     try:
+        import resource
+        started = perf_counter()
+        def progress(stage, **values):
+            print(
+                "EVALUATION_PROGRESS component=OPENING "
+                f"stage={stage} elapsed_seconds={perf_counter()-started:.3f} "
+                f"max_rss_kib={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss} "
+                + " ".join(f"{k}={v}" for k, v in values.items()),
+                flush=True,
+            )
+        progress("start")
         with closing(sqlite3.connect(args.journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             coverage = dataset_coverage(db)
             rows = dataset(db)
+        progress("dataset_loaded", rows=len(rows), official=coverage["official_settled_contracts"])
         from .model_registry import atomic_json, ModelRegistry
 
         registry = ModelRegistry(args.registry)
@@ -795,6 +813,7 @@ def main():
                 used_test_contracts=registry.used_test_contracts(),
                 include_walk_forward=args.walk_forward,
             )
+            progress("model_comparison_complete", status=report.get("status"), trained=report.get("trained"))
             report["dataset_coverage"] = coverage
             atomic_json(args.output.with_suffix(".report.json"), report)
             registry.record_evaluation(report, datetime.now(timezone.utc))
@@ -803,6 +822,7 @@ def main():
         print(
             f"{report['status']}: {report['opening_contracts']} eligible frozen-feature openings; shadow only, edge unverified"
         )
+        progress("complete", status=report.get("status"))
     except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
         parser.error(str(exc))
 

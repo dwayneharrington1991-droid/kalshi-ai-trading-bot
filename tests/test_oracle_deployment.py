@@ -361,6 +361,27 @@ def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
         assert unsafe not in override
 
 
+def test_consolidated_live_audit_is_bounded_read_only_and_covers_every_subsystem():
+    audit = (DEPLOY / "audit_live_system.py").read_text()
+    compile(audit, "audit_live_system.py", "exec")
+    assert "mode=ro" in audit and "PRAGMA query_only=ON" in audit
+    assert all(route in audit for route in (
+        "/healthz", "/readyz", "/api/state?view=main", "/api/signal-chart"
+    ))
+    assert all(unit in audit for unit in (
+        "kalshi-signals.service", "kalshi-learning.service", "kalshi-learning.timer"
+    ))
+    assert 'for name in ("opening", "settlement", "scalp")' in audit
+    assert all(name in audit for name in (
+        "learning-status", "runtime", "required_indexes_missing",
+    ))
+    for unsafe in (
+        "place_order", "cancel_order", "modify_order", "DELETE FROM",
+        "UPDATE ", "INSERT ", "systemctl restart", "systemctl stop",
+    ):
+        assert unsafe not in audit
+
+
 def test_account_activation_is_get_only_verified_and_rolls_back_on_failure():
     script = (DEPLOY / "enable_readonly_account.sh").read_text()
     assert "ENABLE_ACCOUNT_READONLY=1" in script

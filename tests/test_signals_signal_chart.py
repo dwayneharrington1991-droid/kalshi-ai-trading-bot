@@ -278,6 +278,8 @@ def test_dashboard_contains_incremental_chart_without_external_script():
     assert "updateLiveChartCandle(state)" in page
     assert 'id="opening-score"' in page
     assert "correct · " in page and " wrong" in page
+    assert 'id="learning-cycle"' in page
+    assert "s.background_learning" in page
     assert "interval:signalChart.interval,limit:'180'" in page
     assert "nextLiveRenderAt=performance.now()+500" in page
     assert "BUY UP marker" in page and "BUY DOWN marker" in page

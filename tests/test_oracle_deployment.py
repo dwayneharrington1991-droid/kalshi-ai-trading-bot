@@ -351,6 +351,8 @@ def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
     assert "TimeoutStartSec=22min" in override
     assert "NoNewPrivileges=true" in override
     assert "run_learning_refresh.sh" in override
+    launcher = (DEPLOY / "run_dashboard.sh").read_text()
+    assert '--learning-status "$DEPLOY_ROOT/learning-status/latest.json"' in launcher
     dashboard_override = (DEPLOY / "kalshi-signals.override.conf.example").read_text()
     assert "StartLimitIntervalSec=300" in dashboard_override
     assert "StartLimitBurst=10" in dashboard_override

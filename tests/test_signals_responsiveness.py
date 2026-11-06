@@ -347,6 +347,33 @@ def test_runtime_meter_reports_bounded_nearest_rank_percentiles():
     assert meter.failures()["journal_indexes"]["error_type"] == "OperationalError"
 
 
+def test_background_learning_status_is_bounded_cached_and_safety_marked(tmp_path):
+    status = tmp_path / "latest.json"
+    status.write_text(json.dumps({
+        "status": "COMPLETE",
+        "finished_at": utcnow().isoformat(),
+        "automated_trading": "DISABLED",
+        "model_promotion_performed": False,
+        "stages": {
+            "settlement": {"return_code": 0},
+            "opening": {"return_code": 0},
+            "scalp": {"return_code": 0},
+        },
+    }))
+    monitor = Monitor(
+        None, Journal(tmp_path / "journal.db"), learning_status_path=status
+    )
+    result = monitor.background_learning_status()
+    assert result["status"] == "COMPLETE"
+    assert result["automated_trading"] == "DISABLED"
+    assert result["stale"] is False
+
+    status.write_text(json.dumps({"status": "COMPLETE", "automated_trading": "ENABLED"}))
+    result = monitor.background_learning_status()
+    assert result["status"] == "STATUS_UNREADABLE"
+    assert result["error_type"] == "ValueError"
+
+
 def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "j.db"))
     first = int(NOW.timestamp()) - 60 * 60

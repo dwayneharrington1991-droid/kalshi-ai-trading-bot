@@ -71,6 +71,7 @@ class Monitor:
         account_client=None,
         account_store=None,
         model_registry=None,
+        learning_status_path=None,
         opening_model_artifact=None,
         build_commit="unknown",
         startup_update=None,
@@ -83,6 +84,14 @@ class Monitor:
         self.latest_candles = None
         self.candle_lock = threading.Lock()
         self.build_commit = build_commit
+        self.learning_status_path = (
+            Path(learning_status_path) if learning_status_path is not None else None
+        )
+        self.learning_status_cache = {
+            "status": "NOT_CONFIGURED" if learning_status_path is None else "NO_COMPLETED_CYCLE",
+            "reason": "No durable scheduled-learning result has been recorded yet",
+        }
+        self.learning_status_mtime = None
         self.target, self.stop, self.horizon = target, stop, horizon
         self.account_client = account_client
         self.account_candidate = None
@@ -227,6 +236,40 @@ class Monitor:
                 name="scheduled-scalp-shadow-evaluation",
             )
         startup_update("MONITOR_READY", "Intelligence monitor initialized")
+
+    def background_learning_status(self):
+        """Read the small atomic scheduler result without touching model state."""
+        path = self.learning_status_path
+        if path is None:
+            return dict(self.learning_status_cache)
+        try:
+            stat = path.stat()
+            if stat.st_size > 65536:
+                raise ValueError("status file exceeds bounded size")
+            if self.learning_status_mtime != stat.st_mtime_ns:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(value, dict) or value.get("automated_trading") != "DISABLED":
+                    raise ValueError("invalid learning status safety marker")
+                self.learning_status_cache = value
+                self.learning_status_mtime = stat.st_mtime_ns
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.learning_status_cache = {
+                "status": "STATUS_UNREADABLE",
+                "error_type": type(exc).__name__,
+                "reason": "Scheduled-learning status is unavailable; live inference continues independently",
+                "automated_trading": "DISABLED",
+            }
+        result = dict(self.learning_status_cache)
+        try:
+            finished = timestamp(result["finished_at"])
+            result["age_seconds"] = max(0, (utcnow() - finished).total_seconds())
+            result["stale"] = result["age_seconds"] > 26 * 3600
+        except (KeyError, ValueError, TypeError, AttributeError):
+            result["age_seconds"] = None
+            result["stale"] = True
+        return result
 
     def worker_event(self, name, event, error=None):
         with self.worker_lock:
@@ -1371,6 +1414,7 @@ class Monitor:
             "response_generated_at": utcnow().isoformat(),
             "state_age_seconds": max(0, (utcnow() - last_tick).total_seconds()),
         }
+        state["background_learning"] = self.background_learning_status()
         return state
 
 
@@ -1925,6 +1969,7 @@ def main():
         "--opening-model-artifact", type=Path, default=Path("signals_opening_model.json")
     )
     parser.add_argument("--model-registry", type=Path, default=Path("signals_model_registry"))
+    parser.add_argument("--learning-status", type=Path)
     parser.add_argument(
         "--disable-scheduled-learning",
         action="store_true",
@@ -2017,6 +2062,7 @@ def main():
             and not args.disable_model
             and not args.disable_scheduled_learning
             else None,
+            learning_status_path=args.learning_status,
             startup_update=startup.update,
         )
     except Exception as exc:

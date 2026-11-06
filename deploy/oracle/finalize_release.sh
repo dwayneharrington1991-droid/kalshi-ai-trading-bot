@@ -154,8 +154,15 @@ then
   rollback_final_verification "final dashboard or chart verification failed"
 fi
 
-# A failed background evaluation must not roll back a healthy dashboard.
-"$current/deploy/oracle/start_isolated_evaluation.sh" "$target"
+# A failed background evaluation must not roll back a healthy dashboard.  The
+# guarded deployment wrapper deliberately owns background-evaluation.lock until
+# its postdeployment audit completes, so this normally reports ALREADY_RUNNING.
+# If the launcher itself is broken, retain the verified release and report the
+# independent evaluation failure explicitly.
+if ! "$current/deploy/oracle/start_isolated_evaluation.sh" "$target"; then
+  echo "AI_EVALUATION_BACKGROUND=LAUNCH_FAILED" >&2
+  echo "AI_EVALUATION_FAILURE_DOES_NOT_INVALIDATE_DEPLOYMENT=true" >&2
+fi
 
 mkdir -p "$DEPLOY_ROOT/live-observations"
 observation="$DEPLOY_ROOT/live-observations/$(date -u +%Y%m%dT%H%M%SZ)-$target.json"

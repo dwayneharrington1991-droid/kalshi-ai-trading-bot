@@ -511,6 +511,16 @@ def test_background_evaluation_is_detached_non_promoting_and_signals_only():
         assert unsafe not in script
 
 
+def test_finalizer_does_not_fail_a_verified_release_when_evaluation_launch_fails():
+    script = (DEPLOY / "finalize_release.sh").read_text()
+    launch = '"$current/deploy/oracle/start_isolated_evaluation.sh" "$target"'
+    assert f"if ! {launch}; then" in script
+    assert "AI_EVALUATION_BACKGROUND=LAUNCH_FAILED" in script
+    assert "AI_EVALUATION_FAILURE_DOES_NOT_INVALIDATE_DEPLOYMENT=true" in script
+    # Deployment verification and chart readiness must precede evaluation.
+    assert script.index('print("DEPLOYMENT=SUCCESS")') < script.index(launch)
+
+
 def test_evaluation_and_deployment_lock_order_cannot_self_deadlock():
     launcher = (DEPLOY / "start_isolated_evaluation.sh").read_text()
     evaluator = (DEPLOY / "run_isolated_ai_evaluation.sh").read_text()

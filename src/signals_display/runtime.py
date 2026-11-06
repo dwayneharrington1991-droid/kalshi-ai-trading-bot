@@ -103,7 +103,8 @@ class RuntimeMeter:
     def observe(self, stage, milliseconds):
         """Record a bounded processing latency sample, never provider latency."""
         if stage not in {
-            "market_collection", "prediction_calculation", "journal_write",
+            "market_collection", "advanced_analysis", "prediction_calculation",
+            "account_manual_scheduling", "journal_write",
             "total_processing", "publish_after_collection", "http_main_state",
             "http_chart", "http_other",
         }:
@@ -165,7 +166,10 @@ class RuntimeMeter:
     def error(self, component, error_type):
         # Callers pass exception TYPE only; never exception messages, account
         # payloads, authentication headers, file contents or arbitrary URLs.
-        if component not in {"public_rest", "account_sync", "settlement", "prediction"}:
+        if component not in {
+            "public_rest", "account_sync", "settlement", "prediction",
+            "journal_indexes",
+        }:
             return
         if not isinstance(error_type, str) or not error_type.isidentifier():
             error_type = "RedactedError"

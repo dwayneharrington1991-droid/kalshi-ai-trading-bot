@@ -328,6 +328,9 @@ def test_runtime_meter_reports_bounded_nearest_rank_percentiles():
     for value in range(500):
         meter.observe("http_chart", value)
     meter.observe("untrusted-stage", 999999)
+    meter.observe("advanced_analysis", 12.5)
+    meter.observe("account_manual_scheduling", 3.5)
+    meter.error("journal_indexes", "OperationalError")
     report = meter.latency_summary()
     assert report["total_processing"] == {
         "samples": 100,
@@ -339,6 +342,9 @@ def test_runtime_meter_reports_bounded_nearest_rank_percentiles():
     assert report["http_chart"]["samples"] == 300
     assert report["http_chart"]["latest_ms"] == 499.0
     assert "untrusted-stage" not in report
+    assert report["advanced_analysis"]["latest_ms"] == 12.5
+    assert report["account_manual_scheduling"]["latest_ms"] == 3.5
+    assert meter.failures()["journal_indexes"]["error_type"] == "OperationalError"
 
 
 def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_path):
@@ -506,7 +512,14 @@ def test_fast_main_state_and_pagination_during_blocked_research(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "j.db"))
     monitor.state = analyze(frame(), NOW)
     monitor.state_version = 1
-    monitor.state["model"] = {"version": "test", "coverage": {"raw": "x" * 150000}}
+    monitor.state["model"] = {
+        "version": "test",
+        "coverage": {"raw": "x" * 150000},
+        "developing_candle": {
+            "status": "DEVELOPING", "start": 1, "open": 2,
+            "high": 3, "low": 1, "close": 2.5,
+        },
+    }
     started, release = threading.Event(), threading.Event()
 
     def slow():
@@ -531,6 +544,7 @@ def test_fast_main_state_and_pagination_during_blocked_research(tmp_path):
         data = get("/api/state?view=main")
         assert perf_counter() - timer < 1
         assert "coverage" not in data["model"] and data["market"]
+        assert data["model"]["developing_candle"]["status"] == "DEVELOPING"
         assert "connection_diagnostics" not in data and "streaming" not in data
         assert "blockers" not in data["scalping_monitor"]
         assert "checks" not in data["scalping_monitor"]

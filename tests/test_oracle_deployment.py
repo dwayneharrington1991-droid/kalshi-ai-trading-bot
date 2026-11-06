@@ -344,9 +344,16 @@ def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
     assert "src.signals_display.opening_models" in runner
     assert "src.signals_display.scalp_learning" in runner
     assert all(name in runner for name in ("settlement_rc", "opening_rc", "scalp_rc"))
+    assert "learning-status" in runner and "latest.json" in runner
+    assert all(name in runner for name in (
+        "settlement_elapsed", "opening_elapsed", "scalp_elapsed"
+    ))
     assert "TimeoutStartSec=22min" in override
     assert "NoNewPrivileges=true" in override
     assert "run_learning_refresh.sh" in override
+    dashboard_override = (DEPLOY / "kalshi-signals.override.conf.example").read_text()
+    assert "StartLimitIntervalSec=300" in dashboard_override
+    assert "StartLimitBurst=10" in dashboard_override
     for unsafe in ("place_order", "cancel_order", "transfer", "src.jobs", "src.orders"):
         assert unsafe not in runner
         assert unsafe not in override

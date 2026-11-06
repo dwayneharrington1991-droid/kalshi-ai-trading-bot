@@ -1,3 +1,9 @@
+[Unit]
+# Expose a persistent configuration/programming failure instead of restarting
+# forever. Transient failures retain ten recovery attempts over five minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
 [Service]
 WorkingDirectory=/home/opc/kalshi-ai-trading-bot/.deploy/current
 ExecStart=

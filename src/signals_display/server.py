@@ -885,7 +885,10 @@ class Monitor:
             self.state_version += 1
             published_at = utcnow()
             processing_ms = (perf_counter() - tick_started) * 1000
-            for stage in ("market_collection", "prediction_calculation", "journal_write"):
+            for stage in (
+                "market_collection", "advanced_analysis", "prediction_calculation",
+                "account_manual_scheduling", "journal_write",
+            ):
                 if stage in phases:
                     self.runtime_meter.observe(stage, phases[stage])
             self.runtime_meter.observe("total_processing", processing_ms)
@@ -1417,7 +1420,10 @@ def make_handler(monitor):
                     value["model"] = {
                         k: v
                         for k, v in value.get("model", {}).items()
-                        if k in {"version", "enabled", "validated", "overall_reason", "scalp_reason"}
+                        if k in {
+                            "version", "enabled", "validated", "overall_reason",
+                            "scalp_reason", "developing_candle",
+                        }
                     }
                     value["scalping_monitor"] = {
                         k: v for k, v in value.get("scalping_monitor", {}).items()

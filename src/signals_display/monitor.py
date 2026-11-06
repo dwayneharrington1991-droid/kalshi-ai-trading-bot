@@ -745,8 +745,13 @@ class PublicFeed:
         history_ready = sorted(
             asset for asset, item in histories.items() if len(item.get("candles", [])) >= 1440
         )
+        # This worker powers the optional *additional-market* strip.  The
+        # primary KXBTC15M contract is selected by ``poll`` above and must not
+        # be described as missing merely because this auxiliary scan found no
+        # other compatible cards.
         diagnostics = {
-            "status": "READY" if candidates else "NO_COMPATIBLE_MARKETS",
+            "scope": "ADDITIONAL_MARKETS_ONLY",
+            "status": "READY" if candidates else "NO_ADDITIONAL_COMPATIBLE_MARKETS",
             "last_attempt_at": attempted_at, "last_success_at": utcnow().isoformat(),
             "error_type": None, "markets_scanned": len(rows),
             "compatible_markets": len(candidates), "rejections": rejections,
@@ -756,7 +761,7 @@ class PublicFeed:
             "reason": (
                 "Compatible listings discovered; individual cards still require verified rules and opening inputs"
                 if candidates else
-                "Kalshi returned no supported 15-minute listing in the current/pre-open window"
+                "No additional supported 15-minute listing was found in the current/pre-open window; the primary KXBTC15M contract is monitored separately"
             ),
         }
         return {"markets": candidates, "references": references, "histories": histories,
@@ -1519,7 +1524,13 @@ class Journal:
         if interval_seconds not in SUPPORTED_INTERVALS:
             return {
                 "status": "INTERVAL_UNAVAILABLE",
-                "reason": "Sub-minute OHLCV history is not supplied by the verified candle source",
+                "reason": (
+                    "Verified Coinbase one-minute OHLCV cannot be subdivided into real "
+                    "15-second candles. Timestamped sub-minute trades with complete "
+                    "interval coverage have not been recorded, so no bars are fabricated."
+                ),
+                "required_data": "Continuous timestamped sub-minute trades with volume and receipt-time validation",
+                "available_source": "Recorded Coinbase closed one-minute OHLCV",
                 "interval_seconds": interval_seconds,
                 "bars": [], "markers": [],
             }

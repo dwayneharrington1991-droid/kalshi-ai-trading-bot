@@ -106,13 +106,30 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
     # HOLD: payout-at-settlement economics from an independently calibrated
     # probability and the executable ask, including fee and slippage.
     hold_options = []
+    hold_rejections = {
+        "missing_executable_quote_or_probability": 0,
+        "missing_fee_or_liquidity": 0,
+        "edge_below_minimum": 0,
+        "spread_too_wide": 0,
+        "exposure_below_one_contract": 0,
+    }
     for side, item in (edge.get("sides") or {}).items():
         if not item.get("executable"):
+            hold_rejections["missing_executable_quote_or_probability"] += 1
             continue
         ev = item.get("net_expected_profit_per_contract")
         spread = item.get("spread")
         entry_cost = (item.get("entry_price_with_slippage") or 0) + (item.get("estimated_fee_per_contract") or 0)
-        qty = _quantity(entry_cost, item.get("available_liquidity"), max_exposure)
+        liquidity = item.get("available_liquidity")
+        if liquidity is None or market.get("fee_multiplier") is None:
+            hold_rejections["missing_fee_or_liquidity"] += 1
+        qty = _quantity(entry_cost, liquidity, max_exposure)
+        if not qty:
+            hold_rejections["exposure_below_one_contract"] += 1
+        if type(ev) not in (int, float) or ev < 0.02:
+            hold_rejections["edge_below_minimum"] += 1
+        if type(spread) not in (int, float) or spread > 0.08:
+            hold_rejections["spread_too_wide"] += 1
         if qty and type(ev) in (int, float) and ev >= 0.02 and type(spread) in (int, float) and spread <= 0.08:
             hold_options.append((ev, side, item, entry_cost, qty))
     if hold_options:
@@ -132,6 +149,14 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
 
     # SCALP: target-before-stop/time estimate is a distinct prediction problem.
     scalp_options = []
+    scalp_rejections = {
+        "incomplete_target_stop_quote": 0,
+        "unknown_fees": 0,
+        "exposure_below_one_contract": 0,
+        "edge_below_minimum": 0,
+        "spread_too_wide": 0,
+        "probability_below_minimum": 0,
+    }
     for side, item in (monitor.get("sides") or {}).items():
         ask = item.get("ask")
         target = item.get("target_bid")
@@ -141,12 +166,22 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
         ev = item.get("net_expected_profit")
         liquidity = item.get("ask_size")
         if not all(type(x) in (int, float) for x in (ask, target, stop, spread, probability, ev)):
+            scalp_rejections["incomplete_target_stop_quote"] += 1
             continue
         entry_fee = quantity_fee(ask, 1, multiplier) if type(multiplier) in (int, float) else None
         if entry_fee is None:
+            scalp_rejections["unknown_fees"] += 1
             continue
         entry_cost = ask + entry_fee + (item.get("slippage") or 0)
         qty = _quantity(entry_cost, liquidity, max_exposure)
+        if not qty:
+            scalp_rejections["exposure_below_one_contract"] += 1
+        if ev < 0.01:
+            scalp_rejections["edge_below_minimum"] += 1
+        if spread > 0.03:
+            scalp_rejections["spread_too_wide"] += 1
+        if probability < 0.60:
+            scalp_rejections["probability_below_minimum"] += 1
         if qty and ev >= 0.01 and spread <= 0.03 and probability >= 0.60:
             scalp_options.append((ev, side, item, entry_cost, qty))
     if scalp_options:
@@ -166,6 +201,15 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
         else:
             scalp["reason"] = "; ".join(global_blockers or [scalp_validation["reason"]])
 
+    if not hold_options:
+        hold["reason"] = "WAIT: " + ", ".join(
+            f"{name}={count}" for name, count in hold_rejections.items() if count
+        ) if any(hold_rejections.values()) else "WAIT: no compatible settlement-side market inputs"
+    if not scalp_options:
+        scalp["reason"] = "WAIT: " + ", ".join(
+            f"{name}={count}" for name, count in scalp_rejections.items() if count
+        ) if any(scalp_rejections.values()) else "WAIT: no compatible target-before-stop market inputs"
+
     actionable = [value for value in (scalp, hold) if value["actionable"]]
     selected = max(actionable, key=lambda value: value["expected_value"]) if actionable else None
     return {
@@ -175,6 +219,11 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
         "action": selected["action"] if selected else "WAIT",
         "reason": selected["reason"] if selected else (global_blockers[0] if global_blockers else "Neither independently validated strategy has verified positive after-cost edge"),
         "strategies": {"SCALP": scalp, "HOLD": hold},
+        "input_diagnostics": {
+            "global_blockers": global_blockers,
+            "HOLD": hold_rejections,
+            "SCALP": scalp_rejections,
+        },
         "paper_limits": {"maximum_exposure_per_signal": max_exposure, "daily_loss_limit": daily_loss_limit},
         "paper_performance": paper_performance or {},
         "execution": "MANUAL_ONLY",

@@ -145,6 +145,8 @@ def test_chart_query_is_bounded_and_subminute_is_explicitly_unavailable(tmp_path
     unavailable = journal.signal_chart(15, ticker=TICKER)
     assert unavailable["status"] == "INTERVAL_UNAVAILABLE"
     assert unavailable["bars"] == []
+    assert "no bars are fabricated" in unavailable["reason"]
+    assert "sub-minute trades" in unavailable["required_data"]
 
 
 def test_production_schema_reads_coinbase_decimal_string_payloads(tmp_path):

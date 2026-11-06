@@ -114,3 +114,25 @@ def test_hold_outcome_requires_official_settlement_and_never_invents_fill():
     row = db.execute("SELECT outcome_type,payload FROM strategy_paper_outcomes").fetchone()
     assert row["outcome_type"] == "OFFICIAL_SETTLEMENT"
     assert '"actual_fill":false' in row["payload"]
+
+
+def test_wait_explains_exact_missing_strategy_inputs():
+    value = state()
+    value["edge_scanner"]["sides"] = {
+        "up": {"executable": False},
+        "down": {"executable": False},
+    }
+    value["scalping_monitor"]["sides"] = {
+        "up": {"ask": .61},
+        "down": {},
+    }
+    result = evaluate(value)
+    assert result["action"] == "WAIT"
+    assert result["input_diagnostics"]["HOLD"][
+        "missing_executable_quote_or_probability"
+    ] == 2
+    assert result["input_diagnostics"]["SCALP"][
+        "incomplete_target_stop_quote"
+    ] == 2
+    assert "missing_executable_quote_or_probability=2" in result["strategies"]["HOLD"]["reason"]
+    assert "incomplete_target_stop_quote=2" in result["strategies"]["SCALP"]["reason"]

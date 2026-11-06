@@ -1099,6 +1099,19 @@ def opening_forecast(
         generated_at=generated_at.isoformat(),
         data_cutoff=opened.isoformat(),
         opening_delay_seconds=max(0, (generated_at - opened).total_seconds()),
+        timing_diagnostic={
+            "forecast_computation_delay_seconds": max(
+                0, (generated_at - opened).total_seconds()
+            ),
+            "data_cutoff_integrity": "PREOPEN_ONLY",
+            "threshold_metadata_received_at": market.get(
+                "metadata_received_at", market.get("observed_at")
+            ),
+            "note": (
+                "A positive delay records when the immutable forecast became "
+                "displayable. Every price input remains cut off at contract open."
+            ),
+        },
         up=None,
         down=None,
         direction="UNCLEAR",

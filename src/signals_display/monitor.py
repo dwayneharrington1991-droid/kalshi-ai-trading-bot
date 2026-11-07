@@ -2333,7 +2333,7 @@ class Journal:
                 "WHERE status='EXPERIMENTAL' AND probability_up IS NOT NULL AND outcome IS NOT NULL"
             ).fetchall()
             opening_rows = db.execute(
-                """SELECT o.up,f.outcome FROM btc_engine_opening o
+                """SELECT o.up,o.payload,f.outcome FROM btc_engine_opening o
                 JOIN forecast_outcomes f ON f.ticker=o.ticker AND f.origin='official'
                 WHERE o.mode='PUBLIC MARKET DATA' AND o.up IS NOT NULL
                 ORDER BY o.generated_at"""
@@ -2356,13 +2356,20 @@ class Journal:
         for group in multi_asset.values():
             group["brier"] /= group["settled_samples"]
             group["status"] = "INSUFFICIENT_FOR_ASSET_MODEL_PROMOTION"
-        from .prediction_engine import direction_label
+        from .prediction_engine import recorded_opening_direction
+
+        def saved_direction(row):
+            try:
+                value = json.loads(row["payload"]) if row["payload"] else {"up": row["up"]}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {"up": row["up"]}
+            return recorded_opening_direction(value)
 
         opening_directional = [
-            row for row in opening_rows if direction_label(row["up"]) in {"UP", "DOWN"}
+            row for row in opening_rows if saved_direction(row) in {"UP", "DOWN"}
         ]
         opening_correct = sum(
-            (direction_label(row["up"]) == "UP") == bool(row["outcome"])
+            (saved_direction(row) == "UP") == bool(row["outcome"])
             for row in opening_directional
         )
         opening_accuracy = {
@@ -2414,7 +2421,7 @@ class Journal:
                 "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
             ).fetchone()[0]
             openings = db.execute(
-                """SELECT b.up,o.outcome FROM btc_engine_opening b
+                """SELECT b.up,b.payload,o.outcome FROM btc_engine_opening b
                 JOIN forecast_outcomes o ON o.ticker=b.ticker AND o.origin='official'
                 WHERE b.mode='PUBLIC MARKET DATA' AND b.up IS NOT NULL"""
             ).fetchall()
@@ -2422,11 +2429,19 @@ class Journal:
                 "SELECT COUNT(*),COALESCE(SUM(samples),0),MAX(last_observed_at) "
                 "FROM intelligence_minute_memory"
             ).fetchone()
-        from .prediction_engine import direction_label, wilson_interval
+        from .prediction_engine import recorded_opening_direction, wilson_interval
 
-        directional = [row for row in openings if direction_label(row[0]) in {"UP", "DOWN"}]
+        def saved_direction(row):
+            try:
+                value = json.loads(row[1]) if row[1] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {}
+            value.setdefault("up", row[0])
+            return recorded_opening_direction(value)
+
+        directional = [row for row in openings if saved_direction(row) in {"UP", "DOWN"}]
         correct = sum(
-            (direction_label(row[0]) == "UP") == bool(row[1]) for row in directional
+            (saved_direction(row) == "UP") == bool(row[2]) for row in directional
         )
         total = len(directional)
         return {
@@ -2439,6 +2454,8 @@ class Journal:
             "incorrect_directional_openings": total - correct,
             "opening_directional_accuracy": correct / total if total else None,
             "opening_accuracy_interval": wilson_interval(correct, total),
+            "directional_coverage": total / len(openings) if openings else None,
+            "wait_openings": len(openings) - total,
             "unclear_openings": len(openings) - total,
             "minute_memory_records": memory[0],
             "second_level_samples": memory[1],
@@ -2745,7 +2762,7 @@ class Journal:
                     opening_verified = False
 
             direction = (
-                prediction_engine.direction_label(probability)
+                prediction_engine.recorded_opening_direction(opening)
                 if opening_verified
                 else "UNCLEAR"
             )

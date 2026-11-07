@@ -86,6 +86,36 @@ def test_frozen_features_exclude_future_reference_and_microstructure_context():
     assert future["frozen_features"]["max_input_received_at"] <= NOW.isoformat()
 
 
+def test_multi_hour_candlestick_features_are_frozen_from_closed_history_only():
+    data = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=1))
+    result = engine.opening_forecast(market(), data, points(), NOW + timedelta(seconds=2))
+    values = result["frozen_features"]["values"]
+    for window in ("15m", "30m", "1h", "2h", "4h", "6h", "12h", "24h"):
+        prefix = f"opening_{window}_"
+        assert values[prefix + "return"] is not None
+        assert values[prefix + "body_fraction"] is not None
+        assert values[prefix + "wick_asymmetry"] is not None
+        assert values[prefix + "realized_volatility"] is not None
+        assert values[prefix + "relative_volume"] is not None
+        assert values[prefix + "momentum_acceleration"] is not None
+        assert values[prefix + "structure_strength"] is not None
+        assert values[prefix + "compression_ratio"] is not None
+        assert values[prefix + "breakout_state"] in {-1.0, -0.5, 0.0, 0.5, 1.0}
+    changed = deepcopy(data)
+    changed["candles"].append(
+        {
+            "start": int(NOW.timestamp()),
+            "open": 1,
+            "high": 1_000_000,
+            "low": 1,
+            "close": 1_000_000,
+            "volume": 1_000_000,
+        }
+    )
+    future = engine.opening_forecast(market(), changed, points(), NOW + timedelta(seconds=2))
+    assert future["frozen_features"]["values"] == values
+
+
 def test_asof_microstructure_is_recorded_as_candidate_not_probability_boost():
     baseline = opening()
     result = opening(
@@ -332,6 +362,37 @@ def test_only_opening_target_artifact_available_before_open_can_be_used():
         opening(candidate_artifact=incompatible)["model"]
         == "opening24h-zero-drift-final-average-v1"
     )
+
+
+def test_selective_candidate_decision_is_saved_and_not_repainted():
+    candidate = eligible_candidate()
+    candidate["decision_policy"]["threshold"] = 0.99
+    candidate["report"]["selective_signal_evaluation"]["selected_threshold"] = 0.99
+    result = opening(candidate_artifact=candidate)
+    assert result["direction"] == "WAIT"
+    assert result["decision_policy"]["threshold"] == 0.99
+    changed = {**result, "up": 0.999}
+    assert engine.recorded_opening_direction(changed) == "WAIT"
+
+
+def test_read_only_opening_audit_scores_immutable_official_records(tmp_path):
+    from src.signals_display.opening_accuracy_audit import audit
+
+    journal = Journal(tmp_path / "audit.db")
+    result = opening()
+    journal.opening_record(
+        result["ticker"], "PUBLIC MARKET DATA", result, NOW + timedelta(seconds=2)
+    )
+    journal.settle(
+        result["ticker"], "yes", "PUBLIC MARKET DATA", (NOW + timedelta(minutes=16)).isoformat()
+    )
+    with journal.read() as db:
+        report = audit(db, NOW + timedelta(minutes=17))
+    assert report["read_only"] is True
+    assert report["scored_probability_records"] == 1
+    assert report["duplicate_opening_tickers"] == 0
+    assert report["duplicate_official_outcome_tickers"] == 0
+    assert report["integrity"]["future_inputs_accepted"] == 0
 
 
 def test_selected_candidate_keeps_independent_baseline_for_future_training(tmp_path):

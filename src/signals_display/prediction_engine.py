@@ -33,6 +33,24 @@ def direction_label(probability, unavailable="UNCLEAR"):
     )
 
 
+def recorded_opening_direction(opening):
+    """Preserve the original selective decision instead of reconstructing it."""
+    if isinstance(opening, dict):
+        saved = opening.get("direction")
+        # WAIT/UNCLEAR is itself the immutable decision.  Directional labels
+        # from the new selective candidate are also frozen.  Older records
+        # predate an explicit abstention policy, so retain their historical
+        # probability-derived scoring (including neutral display ties).
+        selective = (
+            str(opening.get("model", "")).startswith("opening-candidate/")
+            or opening.get("decision_policy") is not None
+            or opening.get("model_selection", {}).get("status") == "EXPERIMENTAL_OPENING_CANDIDATE"
+        )
+        if saved in {"WAIT", "UNCLEAR"} or (selective and saved in {"UP", "DOWN", "NEUTRAL"}):
+            return saved
+    return direction_label((opening or {}).get("up"))
+
+
 def opening_diagnostics(opening, model_info=None):
     """Explain saved model selection without editing immutable historical rows."""
     opening, model_info = opening or {}, model_info or {}
@@ -88,7 +106,7 @@ def opening_diagnostics(opening, model_info=None):
         ),
         "raw_probability_up": opening.get("up"),
         "displayed_probabilities": displayed,
-        "display_direction": direction_label(opening.get("up")),
+        "display_direction": recorded_opening_direction(opening),
         "saved_direction": opening.get("direction"),
         "direction_policy": DIRECTION_POLICY,
         "near_neutral_reason": (
@@ -126,6 +144,174 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     )
     closes = [float(b["close"]) for b in bars]
     returns = [math.log(b / a) for a, b in zip(closes, closes[1:])]
+    from .features import OPENING_WINDOWS
+
+    window_minutes = {
+        "15m": 15,
+        "30m": 30,
+        "1h": 60,
+        "2h": 120,
+        "4h": 240,
+        "6h": 360,
+        "12h": 720,
+        "24h": 1440,
+    }
+    for label in OPENING_WINDOWS:
+        count = window_minutes[label]
+        if len(bars) < count:
+            continue
+        group = bars[-count:]
+        first, last = group[0], group[-1]
+        o, c = float(first["open"]), float(last["close"])
+        high = max(float(b["high"]) for b in group)
+        low = min(float(b["low"]) for b in group)
+        span = max(high - low, 1e-12)
+        minute_returns = [
+            math.log(float(b["close"]) / float(a["close"])) for a, b in zip(group, group[1:])
+        ]
+        true_ranges = [
+            max(
+                float(b["high"]) - float(b["low"]),
+                abs(float(b["high"]) - float(a["close"])),
+                abs(float(b["low"]) - float(a["close"])),
+            )
+            for a, b in zip(group, group[1:])
+        ]
+        latest_o, latest_h, latest_l, latest_c = (
+            float(last[k]) for k in ("open", "high", "low", "close")
+        )
+        latest_span = max(latest_h - latest_l, 1e-12)
+        body = latest_c - latest_o
+        previous = group[-2] if len(group) > 1 else last
+        previous_o, previous_h, previous_l, previous_c = (
+            float(previous[k]) for k in ("open", "high", "low", "close")
+        )
+        directions = [
+            1
+            if float(b["close"]) > float(b["open"])
+            else -1
+            if float(b["close"]) < float(b["open"])
+            else 0
+            for b in group
+        ]
+        streak = 0
+        for value in reversed(directions):
+            if not value or (streak and (streak > 0) != (value > 0)):
+                break
+            streak += value
+        half = max(1, len(group) // 2)
+        older, newer = group[:half], group[half:]
+        older_high = max(float(b["high"]) for b in older)
+        older_low = min(float(b["low"]) for b in older)
+        newer_high = max(float(b["high"]) for b in newer)
+        newer_low = min(float(b["low"]) for b in newer)
+        structure = 0
+        if newer:
+            if newer_high > older_high and newer_low > older_low:
+                structure = 1
+            elif newer_high < older_high and newer_low < older_low:
+                structure = -1
+        structure_strength = ((newer_high - older_high) + (newer_low - older_low)) / (
+            2 * max(o, 1e-12)
+        )
+        prior = group[:-1]
+        breakout = 0
+        if prior:
+            resistance = max(float(b["high"]) for b in prior)
+            support = min(float(b["low"]) for b in prior)
+            breakout = (
+                1
+                if latest_c > resistance
+                else -1
+                if latest_c < support
+                else (-0.5 if latest_h > resistance else 0.5 if latest_l < support else 0)
+            )
+        volumes = [float(b["volume"]) for b in group if b.get("volume") is not None]
+        prior_volume = mean(volumes[:-1]) if len(volumes) > 1 else None
+        relative_volume = volumes[-1] / prior_volume if prior_volume else None
+        third = max(1, len(minute_returns) // 3)
+        recent_momentum = mean(minute_returns[-third:]) if minute_returns else 0.0
+        prior_momentum = (
+            mean(minute_returns[-2 * third : -third]) if len(minute_returns) >= 2 * third else 0.0
+        )
+        momentum_acceleration = recent_momentum - prior_momentum
+        trend_sign = 1 if c > o else -1 if c < o else 0
+        momentum_exhaustion = trend_sign * (abs(prior_momentum) - abs(recent_momentum))
+        old_returns = minute_returns[:half]
+        new_returns = minute_returns[-half:]
+        old_variance = mean([r * r for r in old_returns]) if old_returns else None
+        new_variance = mean([r * r for r in new_returns]) if new_returns else None
+        volatility_expansion = (
+            new_variance / old_variance if old_variance and new_variance is not None else None
+        )
+        upper_wick = (latest_h - max(latest_o, latest_c)) / latest_span
+        lower_wick = (min(latest_o, latest_c) - latest_l) / latest_span
+        body_fraction = body / latest_span
+        compression_ratio = span / max(o, 1e-12)
+        prefix = f"opening_{label}_"
+        values.update(
+            {
+                prefix + "return": c / o - 1,
+                prefix + "body_fraction": body_fraction,
+                prefix + "directional_strength": body_fraction,
+                prefix + "upper_wick_fraction": upper_wick,
+                prefix + "lower_wick_fraction": lower_wick,
+                prefix + "wick_asymmetry": lower_wick - upper_wick,
+                prefix
+                + "realized_volatility": math.sqrt(
+                    sum(r * r for r in minute_returns) / len(minute_returns)
+                )
+                if minute_returns
+                else None,
+                prefix + "atr_fraction": mean(true_ranges) / latest_c if true_ranges else None,
+                prefix + "relative_volume": relative_volume,
+                prefix + "volume_spike": max(relative_volume - 1, 0)
+                if relative_volume is not None
+                else None,
+                prefix + "price_volume_divergence": trend_sign * (1 - relative_volume)
+                if relative_volume is not None
+                else None,
+                prefix + "doji": int(abs(body) / latest_span <= 0.1),
+                prefix
+                + "bullish_engulfing": int(
+                    body > 0
+                    and previous_c < previous_o
+                    and latest_o <= previous_c
+                    and latest_c >= previous_o
+                ),
+                prefix
+                + "bearish_engulfing": int(
+                    body < 0
+                    and previous_c > previous_o
+                    and latest_o >= previous_c
+                    and latest_c <= previous_o
+                ),
+                prefix + "hammer_score": lower_wick - upper_wick - abs(body_fraction),
+                prefix + "shooting_star_score": upper_wick - lower_wick - abs(body_fraction),
+                prefix + "inside_bar": int(latest_h <= previous_h and latest_l >= previous_l),
+                prefix + "outside_bar": int(latest_h >= previous_h and latest_l <= previous_l),
+                prefix + "rejection_direction": 1
+                if (min(latest_o, latest_c) - latest_l) > 2 * abs(body)
+                else -1
+                if (latest_h - max(latest_o, latest_c)) > 2 * abs(body)
+                else 0,
+                prefix + "consecutive_direction": streak,
+                prefix + "momentum_acceleration": momentum_acceleration,
+                prefix + "momentum_exhaustion": momentum_exhaustion,
+                prefix + "structure": structure,
+                prefix + "structure_strength": structure_strength,
+                prefix + "breakout_state": breakout,
+                prefix + "support_rejection": lower_wick
+                if latest_l <= min(float(b["low"]) for b in prior or group)
+                else 0.0,
+                prefix + "resistance_rejection": upper_wick
+                if latest_h >= max(float(b["high"]) for b in prior or group)
+                else 0.0,
+                prefix + "volatility_expansion": volatility_expansion,
+                prefix + "consolidation": int(compression_ratio < 0.003),
+                prefix + "compression_ratio": compression_ratio,
+            }
+        )
     for minutes in (1, 3, 5, 15, 30, 60):
         if len(closes) > minutes:
             values[f"return_{minutes}m"] = math.log(closes[-1] / closes[-minutes - 1])
@@ -370,12 +556,11 @@ def context24(data, now):
         for minutes in (1, 3, 5, 15, 30, 60):
             grouped = rows if minutes == 1 else aggregate(rows, minutes)
             recent = rows[-minutes:]
-            prior = rows[-2 * minutes:-minutes]
+            prior = rows[-2 * minutes : -minutes]
             recent_volume = sum(bar["volume"] for bar in recent)
             prior_volume = sum(bar["volume"] for bar in prior)
             trailing_return = (
-                closes[-1] / closes[-minutes - 1] - 1
-                if len(closes) > minutes else None
+                closes[-1] / closes[-minutes - 1] - 1 if len(closes) > minutes else None
             )
             frames[str(minutes) + "m"] = {
                 "closed_bars": len(grouped),
@@ -385,13 +570,18 @@ def context24(data, now):
                 else None,
                 "latest_volume": grouped[-1]["volume"] if grouped else None,
                 "trailing_return": trailing_return,
-                "direction": "UP" if trailing_return is not None and trailing_return > 0
-                else "DOWN" if trailing_return is not None and trailing_return < 0
-                else "FLAT" if trailing_return == 0 else "UNAVAILABLE",
+                "direction": "UP"
+                if trailing_return is not None and trailing_return > 0
+                else "DOWN"
+                if trailing_return is not None and trailing_return < 0
+                else "FLAT"
+                if trailing_return == 0
+                else "UNAVAILABLE",
                 "rolling_volume": recent_volume,
                 "prior_rolling_volume": prior_volume if len(prior) == minutes else None,
                 "volume_ratio": recent_volume / prior_volume
-                if len(prior) == minutes and prior_volume > 0 else None,
+                if len(prior) == minutes and prior_volume > 0
+                else None,
                 "as_of": cutoff,
                 "input_policy": "Closed one-minute proxy candles only; rolling window ending at the latest verified close",
             }
@@ -399,8 +589,11 @@ def context24(data, now):
             "closed_bars": len(rows),
             "latest_close": closes[-1],
             "trailing_return": features["return_24h"],
-            "direction": "UP" if features["return_24h"] > 0 else "DOWN"
-            if features["return_24h"] < 0 else "FLAT",
+            "direction": "UP"
+            if features["return_24h"] > 0
+            else "DOWN"
+            if features["return_24h"] < 0
+            else "FLAT",
             "rolling_volume": volume,
             "as_of": cutoff,
             "input_policy": "Exactly 1,440 contiguous closed one-minute proxy candles",
@@ -1100,9 +1293,7 @@ def opening_forecast(
         data_cutoff=opened.isoformat(),
         opening_delay_seconds=max(0, (generated_at - opened).total_seconds()),
         timing_diagnostic={
-            "forecast_computation_delay_seconds": max(
-                0, (generated_at - opened).total_seconds()
-            ),
+            "forecast_computation_delay_seconds": max(0, (generated_at - opened).total_seconds()),
             "data_cutoff_integrity": "PREOPEN_ONLY",
             "threshold_metadata_received_at": market.get(
                 "metadata_received_at", market.get("observed_at")
@@ -1262,7 +1453,9 @@ def opening_forecast(
             and interval[1] < 0.60
         )
         result["opening_quality_guard"] = {
-            "status": "INSUFFICIENT_PREDICTIVE_CONFIDENCE" if weak_fallback else "COLLECTING_EVIDENCE",
+            "status": "INSUFFICIENT_PREDICTIVE_CONFIDENCE"
+            if weak_fallback
+            else "COLLECTING_EVIDENCE",
             "past_only_evidence": forward,
             "rule": "After at least 20 past official directional openings, suppress the fallback direction when the 95% Wilson upper accuracy bound is below 60%; probabilities remain recorded unchanged",
             "probability_changed": False,
@@ -1276,7 +1469,11 @@ def opening_forecast(
             result["reason"] += "; opening direction withheld by past-only quality guard"
         result["baseline_probability_up"] = p
         if candidate_artifact is not None:
-            from .opening_models import eligible_at_opening, predict as candidate_predict
+            from .opening_models import (
+                decision as candidate_decision,
+                eligible_at_opening,
+                predict as candidate_predict,
+            )
 
             if eligible_at_opening(candidate_artifact, opened):
                 candidate_p = number(
@@ -1291,11 +1488,12 @@ def opening_forecast(
                 result.update(
                     up=candidate_p,
                     down=1 - candidate_p,
-                    direction=direction_label(candidate_p),
+                    direction=candidate_decision(candidate_artifact, candidate_p),
                     displayed_probabilities=display_probability_pair(candidate_p),
                     model="opening-candidate/" + candidate_artifact["model_id"],
                     reason="Explicitly configured opening-only candidate passed chronological probabilistic gates; frozen as-of-opening features only; experimental, edge unverified",
                 )
+                result["decision_policy"] = candidate_artifact["decision_policy"]
                 result["model_selection"].update(
                     status="EXPERIMENTAL_OPENING_CANDIDATE",
                     opening_ensemble_active=candidate_artifact["model"]["kind"]
@@ -1310,7 +1508,7 @@ def opening_forecast(
                 )
                 result["confidence"] = {
                     "status": "EXPERIMENTAL CALIBRATED CANDIDATE",
-                    "reason": "Validation-only calibration and opening-only held-out statistical gates passed; live calibration, model/basis error and profitable edge remain unverified",
+                    "reason": "Validation-selected UP/DOWN/WAIT threshold and opening-only held-out probabilistic gates passed; live accuracy and profitable edge remain unverified",
                 }
                 result["settlement_price_estimate"][
                     "label"
@@ -1345,30 +1543,44 @@ def opening_forecast(
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         result["reason"] = str(exc)
     shadow = [
-        "RSI", "MACD", "VWAP", "EMA", "Bollinger Bands", "volume",
-        "order flow", "order-book imbalance", "CVD", "market microstructure",
+        "RSI",
+        "MACD",
+        "VWAP",
+        "EMA",
+        "Bollinger Bands",
+        "volume",
+        "order flow",
+        "order-book imbalance",
+        "CVD",
+        "market microstructure",
     ]
     if str(result.get("model", "")).startswith("opening-candidate/"):
         active = [
-            name for name, value in result.get("frozen_features", {}).get("values", {}).items()
+            name
+            for name, value in result.get("frozen_features", {}).get("values", {}).items()
             if value is not None
         ]
         model_role = "chronologically eligible experimental opening-only candidate"
     else:
-        active = [
-            "latest pre-opening proxy price",
-            "official contract threshold",
-            "proxy-to-threshold opening basis anchor",
-            "24-hour realized volatility",
-            "contract duration and final-60-second averaging rule",
-            "zero expected drift",
-        ] if result.get("up") is not None else []
+        active = (
+            [
+                "latest pre-opening proxy price",
+                "official contract threshold",
+                "proxy-to-threshold opening basis anchor",
+                "24-hour realized volatility",
+                "contract duration and final-60-second averaging rule",
+                "zero expected drift",
+            ]
+            if result.get("up") is not None
+            else []
+        )
         model_role = "experimental zero-drift statistical fallback"
     result["feature_usage"] = {
         "model_role": model_role,
         "active_probability_inputs": active,
         "available_shadow_features": [
-            name for name, value in result.get("frozen_features", {}).get("values", {}).items()
+            name
+            for name, value in result.get("frozen_features", {}).get("values", {}).items()
             if value is not None
         ],
         "inactive_directional_feature_groups": shadow,
@@ -1432,7 +1644,7 @@ def save_opening(db, mode, opening, wall_now):
             "kind": "opening",
             "threshold": saved.get("threshold"),
             "baseline_up": saved.get("baseline_probability_up", saved["up"]),
-            "direction": direction_label(saved["up"]),
+            "direction": recorded_opening_direction(saved),
             "direction_policy": DIRECTION_POLICY,
             "opens_at": saved.get("opens_at"),
             "data_quality": saved.get("data_quality", {}),

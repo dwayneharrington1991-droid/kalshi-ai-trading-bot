@@ -121,6 +121,10 @@ def test_multitimeframe_availability_and_no_invented_30_second_bars():
     assert result["timeframes"]["15m"]["closed_bars"] == 96
     assert result["timeframes"]["1h"]["closed_bars"] == 24
     assert result["timeframes"]["1m"]["ema"]["periods"]["200"]["status"] == "READY"
+    assert result["timeframes"]["1m"]["trend_momentum"]["status"] == "READY"
+    assert result["candidate_features"]["advanced_1m_atr14_fraction"] > 0
+    assert 0 <= result["candidate_features"]["advanced_1m_adx14"] <= 100
+    assert 0 <= result["candidate_features"]["advanced_1m_stochastic_k14"] <= 100
     assert result["timeframes"]["5m"]["ema"]["periods"]["200"]["status"] == "UNAVAILABLE"
     assert result["timeframes"]["1h"]["rsi"]["status"] == "READY"
     assert result["timeframes"]["1h"]["macd"]["standard"]["status"] == "UNAVAILABLE"

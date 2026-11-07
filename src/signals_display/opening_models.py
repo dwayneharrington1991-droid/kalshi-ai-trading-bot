@@ -16,14 +16,53 @@ import sqlite3
 from time import perf_counter
 
 from . import learning
-from .features import FEATURES
+from .features import FEATURES, OPENING_CANDLE_FEATURES
 from .model import timestamp
 from .scores import score
 
 MIN_CONTRACTS = learning.MIN_CONTRACTS
 BOOST_MIN_CONTRACTS = 500
-PROTOCOL = "opening-frozen-linear-ensemble-stumps-shadow-v1"
+PROTOCOL = "opening-frozen-linear-ensemble-stumps-shadow-v2"
 FEATURE_VERSION = "opening-asof-features-v2"
+
+PRICE_CORE = {
+    "distance_scaled",
+    "remaining_fraction",
+    "return_1m",
+    "return_3m",
+    "return_5m",
+    "return_15m",
+    "return_30m",
+    "return_60m",
+    "return_24h",
+    "acceleration",
+    "body_fraction",
+    "upper_wick",
+    "lower_wick",
+    "range_fraction",
+    "breakout_distance",
+    "volatility_change",
+    "relative_volume",
+    "candle_body_range_ratio",
+    "candle_close_range_position",
+    "candle_volume_weighted_move",
+    "candle_atr_zscore_20",
+    "candle_unusual_expansion",
+}
+FEATURE_SETS = {
+    "price_core": PRICE_CORE,
+    "multi_hour_candlestick": PRICE_CORE | set(OPENING_CANDLE_FEATURES),
+    "price_technical": PRICE_CORE
+    | {
+        "rsi_14",
+        "macd_scaled",
+        "ema_gap",
+        "vwap_deviation",
+        "bollinger_z",
+        "volatility_24h",
+    },
+    "all_receipt_proven": set(FEATURES),
+}
 
 
 def _opening_rows(db, asof):
@@ -98,14 +137,23 @@ def _assess_opening(raw, asof):
         return None, "INVALID_BASELINE_PROBABILITY"
     if not math.isfinite(baseline) or not 0 <= baseline <= 1:
         return None, "INVALID_BASELINE_PROBABILITY"
-    return dict(
-        ticker=raw[0], timestamp=generated.isoformat(), opens_at=opened.isoformat(),
-        closes_at=closed.isoformat(), label_available_at=observed.isoformat(),
-        features=features, outcome=int(raw[7]), baseline=baseline, market=None,
-        remaining=(closed - opened).total_seconds(),
-        opening_delay_seconds=(generated - opened).total_seconds(),
-        regime=opening.get("regime", "unavailable"),
-    ), "ELIGIBLE"
+    return (
+        dict(
+            ticker=raw[0],
+            timestamp=generated.isoformat(),
+            opens_at=opened.isoformat(),
+            closes_at=closed.isoformat(),
+            label_available_at=observed.isoformat(),
+            features=features,
+            outcome=int(raw[7]),
+            baseline=baseline,
+            market=None,
+            remaining=(closed - opened).total_seconds(),
+            opening_delay_seconds=(generated - opened).total_seconds(),
+            regime=opening.get("regime", "unavailable"),
+        ),
+        "ELIGIBLE",
+    )
 
 
 def dataset_coverage(db, asof=None):
@@ -138,7 +186,9 @@ def dataset_coverage(db, asof=None):
         "edge_status": "edge unverified",
         "recent_official_eligibility": recent[-20:],
         "newest_eligible_contract": eligible[-1]["ticker"] if eligible else None,
-        "newest_eligible_label_available_at": eligible[-1]["label_available_at"] if eligible else None,
+        "newest_eligible_label_available_at": eligible[-1]["label_available_at"]
+        if eligible
+        else None,
     }
 
 
@@ -201,6 +251,16 @@ def predict(model, features, *, baseline_probability=None):
             if weight
         )
     return learning.predict(model, features, baseline_probability=baseline_probability)
+
+
+def decision(artifact, probability):
+    """Apply only the symmetric abstention threshold frozen on validation."""
+    validate_artifact(artifact)
+    threshold = artifact["decision_policy"]["threshold"]
+    p = float(probability)
+    if not math.isfinite(p) or not 0 <= p <= 1:
+        raise ValueError("Opening decision probability must be finite and within [0,1]")
+    return "UP" if p >= threshold else "DOWN" if p <= 1 - threshold else "WAIT"
 
 
 def _row_predict(model, row):
@@ -304,24 +364,39 @@ def _ensemble(components, validation):
     )
 
 
+def _preprocess_subset(train, allowed):
+    reduced = [
+        {
+            **row,
+            "features": {name: value for name, value in row["features"].items() if name in allowed},
+        }
+        for row in train
+    ]
+    return learning.preprocess(reduced)
+
+
 def _pool(train, validation, total_contracts):
-    prep = learning.preprocess(train)
-    if not prep["names"]:
-        return []
     result = []
-    for kind in ("logistic", "ridge"):
-        for l2 in (0.1, 1.0):
-            model = learning.fit(train, kind, l2, prep)
-            learning.calibrate(model, validation)
-            result.append(
-                (
-                    score(
-                        [_row_predict(model, r) for r in validation],
-                        [r["outcome"] for r in validation],
-                    ),
-                    model,
+    for feature_set, allowed in FEATURE_SETS.items():
+        prep = _preprocess_subset(train, allowed)
+        if not prep["names"]:
+            continue
+        for kind in ("logistic", "ridge"):
+            for l2 in (0.1, 1.0):
+                model = learning.fit(train, kind, l2, prep)
+                model["feature_set"] = feature_set
+                learning.calibrate(model, validation)
+                result.append(
+                    (
+                        score(
+                            [_row_predict(model, r) for r in validation],
+                            [r["outcome"] for r in validation],
+                        ),
+                        model,
+                    )
                 )
-            )
+    if not result:
+        return []
     members = [
         min(
             (item for item in result if item[1]["kind"] == kind),
@@ -330,7 +405,9 @@ def _pool(train, validation, total_contracts):
         for kind in ("logistic", "ridge")
     ]
     if total_contracts >= BOOST_MIN_CONTRACTS:
+        prep = _preprocess_subset(train, FEATURE_SETS["all_receipt_proven"])
         boost = fit_boost(train, prep)
+        boost["feature_set"] = "all_receipt_proven"
         _calibrate_boost(boost, validation)
         result.append(
             (
@@ -455,9 +532,7 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
             ),
         )
         return None, report
-    groups = _purge(
-        *[[row for row in rows if row["ticker"] in group] for group in contract_sets]
-    )
+    groups = _purge(*[[row for row in rows if row["ticker"] in group] for group in contract_sets])
     report["split_contracts"] = _counts(groups)
     blocker = _eligible(groups)
     if blocker:
@@ -501,6 +576,7 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         else "EXPERIMENTAL_FALLBACK_RETAINED",
         trained=True,
         selected_before_test=selected["kind"],
+        selected_feature_set_before_test=selected.get("feature_set", "ensemble"),
         selected_model_fingerprint=hashlib.sha256(
             json.dumps(selected, sort_keys=True).encode()
         ).hexdigest(),
@@ -508,8 +584,21 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         validation_baseline=val_baseline,
         validation_train_prior=val_prior,
         candidate_validation=[
-            {"kind": model["kind"], "metrics": metrics} for metrics, model in pool
+            {
+                "kind": model["kind"],
+                "feature_set": model.get("feature_set", "ensemble"),
+                "metrics": metrics,
+            }
+            for metrics, model in pool
         ],
+        feature_ablation={
+            name: min(
+                (metrics for metrics, model in pool if model.get("feature_set") == name),
+                key=lambda metrics: (metrics["log_loss"], metrics["brier"]),
+                default=None,
+            )
+            for name in FEATURE_SETS
+        },
         test=tested,
         test_uncertainty=learning.uncertainty(ps, test),
         test_contracts=[r["ticker"] for r in test],
@@ -541,6 +630,17 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         ] = "Development contracts only; final untouched holdout excluded"
     if not passed:
         return None, report
+    selective = report["selective_signal_evaluation"]
+    decision_threshold = selective.get("selected_threshold")
+    if decision_threshold is None:
+        report.update(
+            status="SELECTIVE_WAIT_POLICY_UNAVAILABLE",
+            reason=(
+                "Probabilistic gates passed, but validation did not contain enough "
+                "independent calls to freeze an UP/DOWN/WAIT threshold"
+            ),
+        )
+        return None, report
     fingerprint = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
     created_at = datetime.now(timezone.utc).isoformat()
     return {
@@ -561,6 +661,12 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         "forecast_activation": "EXPLICIT_CONFIGURATION_ONLY",
         "automatic_activation": False,
         "activation_allowed": False,
+        "decision_policy": {
+            "kind": "validation_selected_symmetric_abstention",
+            "threshold": decision_threshold,
+            "selected_before_untouched_test": True,
+            "otherwise": "WAIT",
+        },
     }, report
 
 
@@ -644,6 +750,18 @@ def validate_artifact(data):
         raise ValueError("Artifact is not an explicitly opening-targeted forecast candidate")
     validate_model(data["model"])
     report = data["report"]
+    policy = data.get("decision_policy")
+    if (
+        not isinstance(policy, dict)
+        or policy.get("kind") != "validation_selected_symmetric_abstention"
+        or policy.get("selected_before_untouched_test") is not True
+        or type(policy.get("threshold")) not in (int, float)
+        or not 0.5 < policy["threshold"] < 1
+        or policy.get("otherwise") != "WAIT"
+        or policy["threshold"]
+        != (report.get("selective_signal_evaluation") or {}).get("selected_threshold")
+    ):
+        raise ValueError("Opening artifact lacks a validation-selected WAIT policy")
     counts = report["split_contracts"]
     if (
         report.get("status") != "SHADOW_CANDIDATE_PASSED_STATISTICAL_GATES"
@@ -790,7 +908,9 @@ def main():
     args = parser.parse_args()
     try:
         import resource
+
         started = perf_counter()
+
         def progress(stage, **values):
             print(
                 "EVALUATION_PROGRESS component=OPENING "
@@ -799,6 +919,7 @@ def main():
                 + " ".join(f"{k}={v}" for k, v in values.items()),
                 flush=True,
             )
+
         progress("start")
         with closing(sqlite3.connect(args.journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             coverage = dataset_coverage(db)
@@ -813,7 +934,11 @@ def main():
                 used_test_contracts=registry.used_test_contracts(),
                 include_walk_forward=args.walk_forward,
             )
-            progress("model_comparison_complete", status=report.get("status"), trained=report.get("trained"))
+            progress(
+                "model_comparison_complete",
+                status=report.get("status"),
+                trained=report.get("trained"),
+            )
             report["dataset_coverage"] = coverage
             atomic_json(args.output.with_suffix(".report.json"), report)
             registry.record_evaluation(report, datetime.now(timezone.utc))

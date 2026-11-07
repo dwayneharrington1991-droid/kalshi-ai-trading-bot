@@ -8,6 +8,44 @@ from .advanced_indicators import FEATURE_NAMES as TECHNICAL_FEATURES
 from .advanced_flow import FEATURE_NAMES as FLOW_FEATURES
 from .momentum_confirmation import FEATURES as ADAPTIVE_MOMENTUM_FEATURES
 
+OPENING_WINDOWS = ("15m", "30m", "1h", "2h", "4h", "6h", "12h", "24h")
+OPENING_CANDLE_FEATURES = tuple(
+    f"opening_{window}_{name}"
+    for window in OPENING_WINDOWS
+    for name in (
+        "return",
+        "body_fraction",
+        "directional_strength",
+        "upper_wick_fraction",
+        "lower_wick_fraction",
+        "wick_asymmetry",
+        "realized_volatility",
+        "atr_fraction",
+        "relative_volume",
+        "volume_spike",
+        "price_volume_divergence",
+        "doji",
+        "bullish_engulfing",
+        "bearish_engulfing",
+        "hammer_score",
+        "shooting_star_score",
+        "inside_bar",
+        "outside_bar",
+        "rejection_direction",
+        "consecutive_direction",
+        "momentum_acceleration",
+        "momentum_exhaustion",
+        "structure",
+        "structure_strength",
+        "breakout_state",
+        "support_rejection",
+        "resistance_rejection",
+        "volatility_expansion",
+        "consolidation",
+        "compression_ratio",
+    )
+)
+
 FEATURES = (
     (
         "distance_scaled",
@@ -83,6 +121,7 @@ FEATURES = (
     + TECHNICAL_FEATURES
     + FLOW_FEATURES
     + ADAPTIVE_MOMENTUM_FEATURES
+    + OPENING_CANDLE_FEATURES
 )
 
 
@@ -148,19 +187,24 @@ def extract(payload, market, now):
         prior_volumes = [bar[5] for bar in bars[-21:-1]]
         prior_volume_mean = sum(prior_volumes) / len(prior_volumes) if prior_volumes else None
         true_ranges = [
-            max(current[2] - current[3], abs(current[2] - previous[4]),
-                abs(current[3] - previous[4]))
+            max(
+                current[2] - current[3],
+                abs(current[2] - previous[4]),
+                abs(current[3] - previous[4]),
+            )
             for previous, current in zip(bars, bars[1:])
         ]
         prior_ranges = true_ranges[-21:-1]
         range_mean = sum(prior_ranges) / len(prior_ranges) if len(prior_ranges) == 20 else None
         range_std = (
             math.sqrt(sum((item - range_mean) ** 2 for item in prior_ranges) / 20)
-            if range_mean is not None else None
+            if range_mean is not None
+            else None
         )
         atr_zscore = (
             (true_ranges[-1] - range_mean) / range_std
-            if true_ranges and range_std and range_std > 0 else None
+            if true_ranges and range_std and range_std > 0
+            else None
         )
         values.update(
             body_fraction=(c - o) / scale,
@@ -170,10 +214,10 @@ def extract(payload, market, now):
             candle_body_range_ratio=abs(c - o) / scale,
             candle_close_range_position=(c - l) / scale,
             candle_volume_weighted_move=(c / o - 1) * (v / prior_volume_mean)
-            if prior_volume_mean and prior_volume_mean > 0 else None,
+            if prior_volume_mean and prior_volume_mean > 0
+            else None,
             candle_atr_zscore_20=atr_zscore,
-            candle_unusual_expansion=int(atr_zscore > 1.5)
-            if atr_zscore is not None else None,
+            candle_unusual_expansion=int(atr_zscore > 1.5) if atr_zscore is not None else None,
         )
         if len(bars) > 20:
             prior = bars[-21:-1]
@@ -189,11 +233,24 @@ def extract(payload, market, now):
         diagnostics.append("CANDLE_FEATURES_UNAVAILABLE: " + str(exc))
         bars = []
         for name in (
-            "return_1m", "return_3m", "return_5m", "return_15m", "return_30m",
-            "return_60m", "acceleration", "body_fraction", "upper_wick", "lower_wick",
-            "range_fraction", "breakout_distance", "volatility_change", "relative_volume",
-            "candle_body_range_ratio", "candle_close_range_position",
-            "candle_volume_weighted_move", "candle_atr_zscore_20",
+            "return_1m",
+            "return_3m",
+            "return_5m",
+            "return_15m",
+            "return_30m",
+            "return_60m",
+            "acceleration",
+            "body_fraction",
+            "upper_wick",
+            "lower_wick",
+            "range_fraction",
+            "breakout_distance",
+            "volatility_change",
+            "relative_volume",
+            "candle_body_range_ratio",
+            "candle_close_range_position",
+            "candle_volume_weighted_move",
+            "candle_atr_zscore_20",
             "candle_unusual_expansion",
         ):
             values[name] = None
@@ -262,9 +319,7 @@ def extract(payload, market, now):
                     item["order_book_imbalance_top3"], -1, 1
                 )
             if item.get("micro_price_deviation") is not None:
-                values["spot_micro_price_deviation"] = number(
-                    item["micro_price_deviation"], -1, 1
-                )
+                values["spot_micro_price_deviation"] = number(item["micro_price_deviation"], -1, 1)
     except (KeyError, ValueError, TypeError):
         pass
     return {
@@ -307,8 +362,10 @@ class DevelopingCandle:
                     "source": "Receipt-time proxy samples; volume unknown",
                 }
             self.bar.update(
-                high=max(self.bar["high"], price), low=min(self.bar["low"], price),
-                close=price, observed_at=at.isoformat(),
+                high=max(self.bar["high"], price),
+                low=min(self.bar["low"], price),
+                close=price,
+                observed_at=at.isoformat(),
             )
             return dict(self.bar)
         except (KeyError, ValueError, TypeError):

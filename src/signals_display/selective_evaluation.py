@@ -53,6 +53,8 @@ def _metrics(probabilities, rows, threshold):
     signals = _independent(probabilities, rows, threshold)
     correct = sum(direction == row["outcome"] for _, direction, row in signals)
     count = len(signals)
+    up = [(direction, row) for _, direction, row in signals if direction == 1]
+    down = [(direction, row) for _, direction, row in signals if direction == 0]
     probabilities_selected = [probability for probability, _, _ in signals]
     outcomes = [row["outcome"] for _, _, row in signals]
     probabilistic = score(probabilities_selected, outcomes)
@@ -60,8 +62,13 @@ def _metrics(probabilities, rows, threshold):
     return {
         "independent_signals": count,
         "eligible_markets": len(contracts),
+        "wait_markets": max(0, len(contracts) - count),
         "actionable_market_coverage": count / len(contracts) if contracts else 0,
         "actionable_directional_accuracy": correct / count if count else None,
+        "up_precision": sum(row["outcome"] == 1 for _, row in up) / len(up) if up else None,
+        "up_signals": len(up),
+        "down_precision": sum(row["outcome"] == 0 for _, row in down) / len(down) if down else None,
+        "down_signals": len(down),
         "accuracy_interval_95": wilson(correct, count) if count else None,
         "brier": probabilistic.get("brier"),
         "log_loss": probabilistic.get("log_loss"),
@@ -139,8 +146,7 @@ def _regime_reports(probabilities, rows, threshold):
                 buckets[str(value)][1].append(row)
         if buckets:
             result[name] = {
-                value: _metrics(ps, subset, threshold)
-                for value, (ps, subset) in buckets.items()
+                value: _metrics(ps, subset, threshold) for value, (ps, subset) in buckets.items()
             }
     return result
 
@@ -181,10 +187,15 @@ def selective_report(validation_probabilities, validation_rows, test_probabiliti
     # none meets it, retain the most accurate diagnostic threshold. Test data
     # never participates in this choice.
     if meeting_target:
-        chosen = max(pool, key=lambda item: (item["actionable_market_coverage"], item["independent_signals"]))
+        chosen = max(
+            pool, key=lambda item: (item["actionable_market_coverage"], item["independent_signals"])
+        )
         selection_reason = "validation target met; highest validation coverage"
     else:
-        chosen = max(pool, key=lambda item: (item["actionable_directional_accuracy"], item["independent_signals"]))
+        chosen = max(
+            pool,
+            key=lambda item: (item["actionable_directional_accuracy"], item["independent_signals"]),
+        )
         selection_reason = "validation target not met; diagnostic best validation accuracy"
     threshold = chosen["threshold"]
     test = _metrics(test_probabilities, test_rows, threshold)

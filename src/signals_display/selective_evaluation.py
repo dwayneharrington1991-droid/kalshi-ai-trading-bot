@@ -18,6 +18,7 @@ PROTOCOL = "validation-selected-abstention-forward-test-v1"
 THRESHOLDS = (0.55, 0.60, 0.65, 0.70, 0.75, 0.80)
 TARGET_ACCURACY = 0.80
 MIN_VALIDATION_SIGNALS = 15
+COVERAGE_TARGETS = (0.10, 0.25, 0.50, 0.75, 1.0)
 
 
 def _direction(probability, threshold):
@@ -205,6 +206,26 @@ def selective_report(validation_probabilities, validation_rows, test_probabiliti
         and test["actionable_directional_accuracy"] is not None
         and test["actionable_directional_accuracy"] >= TARGET_ACCURACY
     )
+    coverage_scenarios = {}
+    for target in COVERAGE_TARGETS:
+        # The threshold is chosen using validation coverage only.  Test
+        # outcomes never select a coverage scenario or alter its threshold.
+        validation_choice = min(
+            candidates,
+            key=lambda item: (
+                abs(item["actionable_market_coverage"] - target),
+                -item["independent_signals"],
+            ),
+        )
+        coverage_scenarios[f"{int(target * 100)}%"] = {
+            "target_coverage": target,
+            "selected_threshold": validation_choice["threshold"],
+            "validation": validation_choice,
+            "test": _metrics(
+                test_probabilities, test_rows, validation_choice["threshold"]
+            ),
+            "selected_before_test": True,
+        }
     return {
         "protocol": PROTOCOL,
         "status": "UNTOUCHED_TEST_REPORTED",
@@ -215,6 +236,7 @@ def selective_report(validation_probabilities, validation_rows, test_probabiliti
         "validation": chosen,
         "validation_candidates": candidates,
         "test": test,
+        "coverage_scenarios": coverage_scenarios,
         "promotion_allowed": False,
         "note": "An accuracy objective is not a profitability claim. Coverage, calibration, costs and independent forward sample uncertainty remain required.",
     }

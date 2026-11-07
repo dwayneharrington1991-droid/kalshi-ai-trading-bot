@@ -101,6 +101,9 @@ def test_multi_hour_candlestick_features_are_frozen_from_closed_history_only():
         assert values[prefix + "structure_strength"] is not None
         assert values[prefix + "compression_ratio"] is not None
         assert values[prefix + "breakout_state"] in {-1.0, -0.5, 0.0, 0.5, 1.0}
+    assert -1 <= values["opening_multitimeframe_alignment"] <= 1
+    assert 0 <= values["opening_multitimeframe_conflict_rate"] <= 1
+    assert values["opening_short_long_return_divergence"] is not None
     changed = deepcopy(data)
     changed["candles"].append(
         {

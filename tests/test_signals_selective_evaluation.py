@@ -33,6 +33,11 @@ def test_threshold_is_selected_on_validation_and_reports_test_coverage():
     assert report["test"]["actionable_directional_accuracy"] == 1
     assert report["test"]["accuracy_interval_95"][0] < 1
     assert report["test"]["by_regime"]["volatility"]["high"]["independent_signals"] == 30
+    assert set(report["coverage_scenarios"]) == {"10%", "25%", "50%", "75%", "100%"}
+    assert all(
+        scenario["selected_before_test"] is True
+        for scenario in report["coverage_scenarios"].values()
+    )
     assert report["promotion_allowed"] is False
 
 
@@ -44,6 +49,11 @@ def test_future_test_labels_cannot_change_selected_threshold():
     b = selective_report(confident_for(validation), validation, confident_for(test), reversed_test)
     assert a["selected_threshold"] == b["selected_threshold"]
     assert a["validation"] == b["validation"]
+    assert {
+        name: item["selected_threshold"] for name, item in a["coverage_scenarios"].items()
+    } == {
+        name: item["selected_threshold"] for name, item in b["coverage_scenarios"].items()
+    }
     assert a["test"]["actionable_directional_accuracy"] != b["test"]["actionable_directional_accuracy"]
 
 

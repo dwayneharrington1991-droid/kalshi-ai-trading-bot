@@ -184,6 +184,11 @@ def test_baseline_preserves_dirty_source_and_captures_existing_account_mode():
 def test_safe_upgrade_validation_installs_dashboard_test_dependencies():
     script = (DEPLOY / "safe_upgrade_and_evaluate.sh").read_text()
     assert '"${validation}[dev,dashboard]"' in script
+    assert 'exec 7>"$DEPLOY_ROOT/learning.lock"' in script
+    assert 'exec 8>"$DEPLOY_ROOT/learning-refresh.lock"' in script
+    assert script.index('exec 7>"$DEPLOY_ROOT/learning.lock"') < script.index(
+        'exec 8>"$DEPLOY_ROOT/learning-refresh.lock"'
+    )
     assert "MODEL_ACTIVATION_PERFORMED=false" in script
     assert "AUTOMATED_TRADING=DISABLED" in script
 

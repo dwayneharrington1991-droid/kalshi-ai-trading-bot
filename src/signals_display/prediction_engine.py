@@ -156,6 +156,7 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
         "12h": 720,
         "24h": 1440,
     }
+    window_returns = {}
     for label in OPENING_WINDOWS:
         count = window_minutes[label]
         if len(bars) < count:
@@ -249,9 +250,10 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
         body_fraction = body / latest_span
         compression_ratio = span / max(o, 1e-12)
         prefix = f"opening_{label}_"
+        window_returns[label] = c / o - 1
         values.update(
             {
-                prefix + "return": c / o - 1,
+                prefix + "return": window_returns[label],
                 prefix + "body_fraction": body_fraction,
                 prefix + "directional_strength": body_fraction,
                 prefix + "upper_wick_fraction": upper_wick,
@@ -311,6 +313,18 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
                 prefix + "consolidation": int(compression_ratio < 0.003),
                 prefix + "compression_ratio": compression_ratio,
             }
+        )
+    if len(window_returns) == len(OPENING_WINDOWS):
+        signs = [
+            1 if window_returns[label] > 0 else -1 if window_returns[label] < 0 else 0
+            for label in OPENING_WINDOWS
+        ]
+        values["opening_multitimeframe_alignment"] = sum(signs) / len(signs)
+        values["opening_multitimeframe_conflict_rate"] = sum(
+            a != b for a, b in zip(signs, signs[1:])
+        ) / (len(signs) - 1)
+        values["opening_short_long_return_divergence"] = (
+            window_returns["15m"] - window_returns["24h"]
         )
     for minutes in (1, 3, 5, 15, 30, 60):
         if len(closes) > minutes:

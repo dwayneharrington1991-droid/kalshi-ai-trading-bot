@@ -43,8 +43,14 @@ service_state=$(sudo -n systemctl show "$SERVICE_NAME" \
 [[ "$service_state" == *"$DEPLOY_ROOT/current/deploy/oracle/run_dashboard.sh"* ]] ||
   block "service is not using the atomic release launcher"
 
+# Match the scheduled refresh lock order exactly.  Holding both locks prevents
+# an isolated evaluation or timer-driven refresh from starting while the
+# release pointer and service are switched, without stopping or disabling the
+# timer itself.
+exec 7>"$DEPLOY_ROOT/learning.lock"
+flock -w 30 7 || block "learning evaluation currently owns its lock"
 exec 8>"$DEPLOY_ROOT/learning-refresh.lock"
-flock -w 30 8 || block "learning evaluation currently owns its lock"
+flock -w 30 8 || block "scheduled learning refresh currently owns its lock"
 
 git -C "$repo" fetch --no-tags origin codex/oracle-opening-hold-repair
 git -C "$repo" cat-file -e "$target^{commit}" ||

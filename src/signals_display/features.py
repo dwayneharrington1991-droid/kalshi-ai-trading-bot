@@ -44,6 +44,10 @@ OPENING_CANDLE_FEATURES = tuple(
         "consolidation",
         "compression_ratio",
     )
+) + (
+    "opening_multitimeframe_alignment",
+    "opening_multitimeframe_conflict_rate",
+    "opening_short_long_return_divergence",
 )
 
 FEATURES = (

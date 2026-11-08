@@ -1513,11 +1513,38 @@ def make_handler(monitor):
                     developing = dict(
                         ((monitor.state.get("model") or {}).get("developing_candle") or {})
                     )
-                if developing.get("status") == "DEVELOPING":
-                    value["forming_candle"] = developing
-                else:
-                    value["forming_candle"] = None
+                value["forming_candle"] = None
+                if developing.get("status") == "DEVELOPING" and value.get("status") == "READY":
+                    try:
+                        start = int(developing["start"])
+                        bucket = start - start % interval_seconds
+                        forming = {
+                            **developing,
+                            "start": bucket,
+                            "interval_seconds": interval_seconds,
+                        }
+                        # A larger-timeframe aggregate can contain completed
+                        # one-minute source bars from its still-open bucket.
+                        # Move that partial aggregate into the faded developing
+                        # candle so it is never presented twice or called closed.
+                        bars = value.get("bars") or []
+                        if bars and bars[-1].get("start") == bucket:
+                            partial = bars.pop()
+                            forming.update(
+                                open=partial["open"],
+                                high=max(float(partial["high"]), float(developing["high"])),
+                                low=min(float(partial["low"]), float(developing["low"])),
+                                close=float(developing["close"]),
+                                volume=partial.get("volume"),
+                                source_bars=partial.get("source_bars", 0),
+                            )
+                        value["forming_candle"] = forming
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        value["forming_candle"] = None
                 latest = value.get("latest_bar_start")
+                if value.get("bars"):
+                    latest = value["bars"][-1]["start"]
+                    value["latest_bar_start"] = latest
                 value["latest_closed_candle_age_seconds"] = (
                     max(0, utcnow().timestamp() - latest - interval_seconds)
                     if isinstance(latest, (int, float))

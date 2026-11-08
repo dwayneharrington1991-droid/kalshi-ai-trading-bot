@@ -421,6 +421,19 @@ def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_
         assert "Verified live Coinbase preload" in chart["source"]
         assert chart["forming_candle"]["status"] == "DEVELOPING"
         assert chart["latest_closed_candle_age_seconds"] >= 0
+
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/signal-chart?interval=3m&limit=30",
+            timeout=2,
+        ) as response:
+            wider = json.load(response)
+        bucket = int(NOW.timestamp()) // 180 * 180
+        assert wider["forming_candle"]["start"] == bucket
+        assert wider["forming_candle"]["interval_seconds"] == 180
+        assert wider["forming_candle"]["open"] == 158
+        assert wider["forming_candle"]["close"] == 201
+        assert all(bar["start"] < bucket for bar in wider["bars"])
+        assert wider["latest_bar_start"] == wider["bars"][-1]["start"]
     finally:
         server.shutdown()
         server.server_close()

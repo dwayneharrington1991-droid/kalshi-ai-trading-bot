@@ -17,8 +17,9 @@ from .scores import score, wilson_interval
 
 SCALP_PROTOCOL = "executable-scalp-edge-v1"
 HOLD_PROTOCOL = "executable-settlement-edge-v1"
-MAX_EXPOSURE_DOLLARS = 2.0
-DAILY_LOSS_LIMIT_DOLLARS = 5.0
+MAX_TRADE_EXPOSURE_DOLLARS = 1.0
+MAX_TOTAL_EXPOSURE_DOLLARS = 5.0
+DAILY_LOSS_LIMIT_DOLLARS = 2.0
 
 
 def _validation(state, strategy):
@@ -48,7 +49,7 @@ def _quantity(entry_cost, liquidity, cap):
     try:
         cost = number(entry_cost, 0.000001, 1)
         depth = math.floor(number(liquidity, 1, 1e12))
-        limit = number(cap, 1, 2)
+        limit = number(cap, 0.01, MAX_TRADE_EXPOSURE_DOLLARS)
         return max(0, min(depth, math.floor((limit + 1e-12) / cost)))
     except (TypeError, ValueError, OverflowError):
         return 0
@@ -60,6 +61,8 @@ def _blank(strategy, validation, reason):
         "action": "WAIT",
         "side": None,
         "actionable": False,
+        "paper_actionable": False,
+        "paper_only": True,
         "validation": validation,
         "proposed_entry": None,
         "target_exit": None,
@@ -74,10 +77,20 @@ def _blank(strategy, validation, reason):
     }
 
 
-def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY_LOSS_LIMIT_DOLLARS, paper_performance=None):
+def evaluate(
+    state,
+    *,
+    max_exposure=MAX_TRADE_EXPOSURE_DOLLARS,
+    max_total_exposure=MAX_TOTAL_EXPOSURE_DOLLARS,
+    daily_loss_limit=DAILY_LOSS_LIMIT_DOLLARS,
+    paper_performance=None,
+):
     """Compare independently gated SCALP and HOLD counterfactuals."""
-    max_exposure = number(max_exposure, 1, 2)
-    daily_loss_limit = number(daily_loss_limit, 0.01, 5)
+    max_exposure = number(max_exposure, 0.01, MAX_TRADE_EXPOSURE_DOLLARS)
+    max_total_exposure = number(
+        max_total_exposure, max_exposure, MAX_TOTAL_EXPOSURE_DOLLARS
+    )
+    daily_loss_limit = number(daily_loss_limit, 0.01, DAILY_LOSS_LIMIT_DOLLARS)
     market = state.get("market") or {}
     guardian = (((state.get("decision_intelligence") or {}).get("components") or {}).get("risk_guardian") or {})
     global_blockers = []
@@ -87,13 +100,18 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
         global_blockers.append("RISK_GUARDIAN_BLOCKED")
     if (guardian.get("signal_kill_switch") or {}).get("active"):
         global_blockers.append("SIGNAL_KILL_SWITCH")
+    paper_performance = paper_performance or {}
     daily_pnl = sum(
-        value.get("today_net_profit") or 0
-        for value in (paper_performance or {}).values()
-        if isinstance(value, dict)
+        (paper_performance.get(strategy) or {}).get("today_net_profit") or 0
+        for strategy in ("SCALP", "HOLD")
     )
+    portfolio = paper_performance.get("portfolio") or {}
+    open_exposure = portfolio.get("open_exposure") or 0
+    open_sides = set(portfolio.get("open_economic_sides") or ())
     if daily_pnl <= -daily_loss_limit:
         global_blockers.append("PAPER_DAILY_LOSS_LIMIT")
+    if open_exposure >= max_total_exposure:
+        global_blockers.append("PAPER_MAXIMUM_TOTAL_EXPOSURE")
 
     hold_validation = _validation(state, "HOLD")
     scalp_validation = _validation(state, "SCALP")
@@ -102,6 +120,17 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
     edge = state.get("edge_scanner") or {}
     monitor = state.get("scalping_monitor") or {}
     multiplier = market.get("fee_multiplier")
+    opening = (state.get("prediction_engine") or {}).get("initial") or {}
+    opening_direction = opening.get("direction")
+    opening_probability = opening.get("up")
+    opening_candidate = bool(
+        str(opening.get("model", "")).startswith("opening-candidate/")
+        and opening_direction in {"UP", "DOWN"}
+        and type(opening_probability) in (int, float)
+        and math.isfinite(opening_probability)
+        and 0 <= opening_probability <= 1
+        and (not opening.get("ticker") or opening.get("ticker") == market.get("ticker"))
+    )
 
     # HOLD: payout-at-settlement economics from an independently calibrated
     # probability and the executable ask, including fee and slippage.
@@ -114,16 +143,32 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
         "exposure_below_one_contract": 0,
     }
     for side, item in (edge.get("sides") or {}).items():
+        item = dict(item)
         if not item.get("executable"):
             hold_rejections["missing_executable_quote_or_probability"] += 1
             continue
-        ev = item.get("net_expected_profit_per_contract")
         spread = item.get("spread")
         entry_cost = (item.get("entry_price_with_slippage") or 0) + (item.get("estimated_fee_per_contract") or 0)
+        if opening_candidate:
+            expected_side = "up" if opening_direction == "UP" else "down"
+            if side != expected_side:
+                continue
+            probability = opening_probability if side == "up" else 1 - opening_probability
+            item["model_probability"] = probability
+            item["net_expected_profit_per_contract"] = probability - entry_cost
+            item["paper_signal_source"] = "immutable_candlestick_opening_candidate"
+        else:
+            item["paper_signal_source"] = "settlement_shadow_candidate"
+        ev = item.get("net_expected_profit_per_contract")
         liquidity = item.get("available_liquidity")
         if liquidity is None or market.get("fee_multiplier") is None:
             hold_rejections["missing_fee_or_liquidity"] += 1
-        qty = _quantity(entry_cost, liquidity, max_exposure)
+        if f"{market.get('ticker')}:{side}" in open_sides:
+            hold_rejections.setdefault("no_averaging_down", 0)
+            hold_rejections["no_averaging_down"] += 1
+            continue
+        available_exposure = min(max_exposure, max_total_exposure - open_exposure)
+        qty = _quantity(entry_cost, liquidity, available_exposure)
         if not qty:
             hold_rejections["exposure_below_one_contract"] += 1
         if type(ev) not in (int, float) or ev < 0.02:
@@ -134,15 +179,20 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
             hold_options.append((ev, side, item, entry_cost, qty))
     if hold_options:
         ev, side, item, entry_cost, qty = max(hold_options)
-        if hold_validation["verified"] and not global_blockers:
+        if not global_blockers:
             hold.update(
-                action="BUY UP" if side == "up" else "BUY DOWN", side=side,
-                actionable=True, proposed_entry=item["market_purchase_price"], target_exit=1.0,
+                action="PAPER BUY UP" if side == "up" else "PAPER BUY DOWN", side=side,
+                actionable=False, paper_actionable=True,
+                proposed_entry=item["market_purchase_price"], target_exit=1.0,
                 quantity=qty, hypothetical_exposure=qty * entry_cost,
                 maximum_potential_loss=qty * entry_cost,
                 estimated_net_profit=qty * ev, expected_value=qty * ev,
                 confidence=item.get("model_probability"),
-                reason="Verified settlement edge after ask, slippage, fee and displayed-depth checks",
+                signal_source=item["paper_signal_source"],
+                reason=(
+                    "Automated paper-only settlement candidate after ask, slippage, fee and displayed-depth checks; "
+                    + hold_validation["status"]
+                ),
             )
         else:
             hold["reason"] = "; ".join(global_blockers or [hold_validation["reason"]])
@@ -173,7 +223,12 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
             scalp_rejections["unknown_fees"] += 1
             continue
         entry_cost = ask + entry_fee + (item.get("slippage") or 0)
-        qty = _quantity(entry_cost, liquidity, max_exposure)
+        if f"{market.get('ticker')}:{side}" in open_sides:
+            scalp_rejections.setdefault("no_averaging_down", 0)
+            scalp_rejections["no_averaging_down"] += 1
+            continue
+        available_exposure = min(max_exposure, max_total_exposure - open_exposure)
+        qty = _quantity(entry_cost, liquidity, available_exposure)
         if not qty:
             scalp_rejections["exposure_below_one_contract"] += 1
         if ev < 0.01:
@@ -186,17 +241,23 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
             scalp_options.append((ev, side, item, entry_cost, qty))
     if scalp_options:
         ev, side, item, entry_cost, qty = max(scalp_options)
-        if scalp_validation["verified"] and not global_blockers:
+        if not global_blockers:
             scalp.update(
-                action="BUY UP" if side == "up" else "BUY DOWN", side=side,
-                actionable=True, proposed_entry=item["ask"], target_exit=item["target_bid"],
+                action="PAPER BUY UP" if side == "up" else "PAPER BUY DOWN", side=side,
+                actionable=False, paper_actionable=True,
+                proposed_entry=item["ask"], target_exit=item["target_bid"],
                 stop_exit=item["stop_bid"], quantity=qty,
                 hypothetical_exposure=qty * entry_cost,
                 maximum_potential_loss=qty * max(0, entry_cost - item["stop_bid"]),
                 estimated_net_profit=qty * ev, expected_value=qty * ev,
                 confidence=item["target_probability"],
                 holding_seconds=item.get("holding_seconds"),
-                reason="Verified target-before-stop/time edge after spread, fees, slippage and depth",
+                exit_slippage=item.get("slippage"),
+                signal_source="scalp_shadow_probability",
+                reason=(
+                    "Automated paper-only target-before-stop candidate after spread, fees, slippage and depth; "
+                    + scalp_validation["status"]
+                ),
             )
         else:
             scalp["reason"] = "; ".join(global_blockers or [scalp_validation["reason"]])
@@ -210,7 +271,7 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
             f"{name}={count}" for name, count in scalp_rejections.items() if count
         ) if any(scalp_rejections.values()) else "WAIT: no compatible target-before-stop market inputs"
 
-    actionable = [value for value in (scalp, hold) if value["actionable"]]
+    actionable = [value for value in (scalp, hold) if value["paper_actionable"]]
     selected = max(actionable, key=lambda value: value["expected_value"]) if actionable else None
     return {
         "timestamp": state.get("now"),
@@ -224,9 +285,16 @@ def evaluate(state, *, max_exposure=MAX_EXPOSURE_DOLLARS, daily_loss_limit=DAILY
             "HOLD": hold_rejections,
             "SCALP": scalp_rejections,
         },
-        "paper_limits": {"maximum_exposure_per_signal": max_exposure, "daily_loss_limit": daily_loss_limit},
-        "paper_performance": paper_performance or {},
-        "execution": "MANUAL_ONLY",
+        "paper_limits": {
+            "maximum_exposure_per_signal": max_exposure,
+            "maximum_total_exposure": max_total_exposure,
+            "daily_loss_limit": daily_loss_limit,
+            "no_averaging_down": True,
+        },
+        "paper_performance": paper_performance,
+        "execution": "AUTOMATED_PAPER_ONLY",
+        "execution_capability": False,
+        "live_orders_possible": False,
         "fills_are_hypothetical": True,
         "global_blockers": global_blockers,
     }
@@ -257,7 +325,7 @@ def record_and_resolve(db, state, recorded_at):
     ticker = market.get("ticker")
     now = timestamp(recorded_at) if isinstance(recorded_at, str) else recorded_at
     selected = evaluation.get("strategies", {}).get(evaluation.get("recommended_strategy"))
-    if selected and selected.get("actionable") and ticker:
+    if selected and selected.get("paper_actionable") and ticker and not state.get("stale", True):
         created = timestamp(evaluation["timestamp"])
         horizon = selected.get("holding_seconds") or max(1, int(state.get("remaining_seconds") or 1))
         deadline = min(created + timedelta(seconds=horizon), timestamp(market["closes_at"]))
@@ -265,12 +333,38 @@ def record_and_resolve(db, state, recorded_at):
         # not manufacture additional paper positions.
         key = f"{ticker}:{selected['strategy']}:{selected['side']}"
         payload = {**selected, "signal_key": key, "ticker": ticker, "created_at": created.isoformat(), "deadline": deadline.isoformat(), "fill_status": "COUNTERFACTUAL_DISPLAYED_QUOTE"}
-        db.execute("""INSERT OR IGNORE INTO strategy_paper_signals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
-            key,ticker,selected["strategy"],selected["side"],created.isoformat(),deadline.isoformat(),
-            selected["proposed_entry"],selected["target_exit"],selected.get("stop_exit"),selected["quantity"],
-            selected["hypothetical_exposure"],selected["maximum_potential_loss"],selected["estimated_net_profit"],
-            selected["confidence"],json.dumps(payload,allow_nan=False,separators=(",",":")),
-        ))
+        exposure = float(selected["hypothetical_exposure"])
+        open_exposure = db.execute(
+            """SELECT COALESCE(SUM(s.exposure),0) FROM strategy_paper_signals s
+            LEFT JOIN strategy_paper_outcomes o USING(signal_key)
+            WHERE o.signal_key IS NULL"""
+        ).fetchone()[0]
+        same_side_open = db.execute(
+            """SELECT 1 FROM strategy_paper_signals s
+            LEFT JOIN strategy_paper_outcomes o USING(signal_key)
+            WHERE o.signal_key IS NULL AND s.ticker=? AND s.side=? LIMIT 1""",
+            (ticker, selected["side"]),
+        ).fetchone()
+        day = created.date().isoformat()
+        today_pnl = db.execute(
+            """SELECT COALESCE(SUM(o.net_pnl),0) FROM strategy_paper_outcomes o
+            JOIN strategy_paper_signals s USING(signal_key)
+            WHERE substr(o.evaluated_at,1,10)=?""",
+            (day,),
+        ).fetchone()[0]
+        risk_ok = (
+            exposure <= MAX_TRADE_EXPOSURE_DOLLARS + 1e-12
+            and open_exposure + exposure <= MAX_TOTAL_EXPOSURE_DOLLARS + 1e-12
+            and today_pnl > -DAILY_LOSS_LIMIT_DOLLARS
+            and same_side_open is None
+        )
+        if risk_ok:
+            db.execute("""INSERT OR IGNORE INTO strategy_paper_signals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                key,ticker,selected["strategy"],selected["side"],created.isoformat(),deadline.isoformat(),
+                selected["proposed_entry"],selected["target_exit"],selected.get("stop_exit"),selected["quantity"],
+                exposure,selected["maximum_potential_loss"],selected["estimated_net_profit"],
+                selected["confidence"],json.dumps(payload,allow_nan=False,separators=(",",":")),
+            ))
 
     open_rows = db.execute("""SELECT s.* FROM strategy_paper_signals s LEFT JOIN strategy_paper_outcomes o USING(signal_key) WHERE o.signal_key IS NULL ORDER BY s.created_at LIMIT 100""").fetchall()
     official = {row[0]: row[1] for row in db.execute("SELECT ticker,outcome FROM forecast_outcomes WHERE origin='official'")}
@@ -294,9 +388,15 @@ def record_and_resolve(db, state, recorded_at):
         if exit_price is None:
             continue
         multiplier = market.get("fee_multiplier") if ticker == item["ticker"] else 1
-        exit_fee = quantity_fee(exit_price, item["quantity"], multiplier)
+        payload = json.loads(item["payload"])
+        observed_exit = exit_price
+        if outcome_type == "OFFICIAL_SETTLEMENT":
+            exit_fee = 0.0
+        else:
+            exit_price = max(0.0, exit_price - float(payload.get("exit_slippage") or 0))
+            exit_fee = quantity_fee(exit_price, item["quantity"], multiplier)
         net = item["quantity"] * exit_price - exit_fee - item["exposure"]
-        outcome = {"signal_key": item["signal_key"], "evaluated_at": now.isoformat(), "outcome_type": outcome_type, "observed_exit_bid": exit_price, "exit_fee": exit_fee, "net_pnl": net, "actual_fill": False}
+        outcome = {"signal_key": item["signal_key"], "evaluated_at": now.isoformat(), "outcome_type": outcome_type, "observed_exit_bid": observed_exit, "simulated_exit_price": exit_price, "exit_slippage": observed_exit-exit_price, "exit_fee": exit_fee, "net_pnl": net, "actual_fill": False}
         db.execute("INSERT OR IGNORE INTO strategy_paper_outcomes VALUES (?,?,?,?,?,?,?)", (
             item["signal_key"],now.isoformat(),outcome_type,exit_price,net,int(net > 0),json.dumps(outcome,allow_nan=False,separators=(",",":")),
         ))
@@ -316,6 +416,7 @@ def performance(db):
             equity += value; peak = max(peak, equity); drawdown = max(drawdown, peak - equity)
         metrics = score([r["probability"] for r in closed], [r["correct"] for r in closed]) if closed else {}
         wins = sum(r["correct"] for r in closed)
+        invested = sum(r["exposure"] for r in closed)
         today = timestamp(rows[-1]["created_at"]).date() if rows else None
         today_pnl = sum(
             r["net_pnl"] for r in closed if timestamp(r["created_at"]).date() == today
@@ -325,9 +426,33 @@ def performance(db):
             "losses": len(closed)-wins, "win_rate": wins/len(closed) if closed else None,
             "signal_coverage": len({r["ticker"] for r in signals}) / official_contracts if official_contracts else None,
             "win_rate_interval_95": wilson_interval(wins,len(closed)), "net_profit": sum(pnl) if pnl else None,
+            "total_return": sum(pnl) / invested if invested else None,
             "maximum_drawdown": drawdown if closed else None, "brier": metrics.get("brier"),
             "today_net_profit": today_pnl,
             "log_loss": metrics.get("log_loss"), "expected_calibration_error": metrics.get("expected_calibration_error"),
             "edge_status": "UNVERIFIED" if len(closed) < 30 else "REQUIRES_INDEPENDENT_REVIEW",
         }
-    return {"SCALP": summary("SCALP"), "HOLD": summary("HOLD"), "actual_fills": 0, "scope": "Immutable displayed-quote counterfactuals; not actual executions"}
+    open_rows = [row for row in rows if row["net_pnl"] is None]
+    closed_rows = [row for row in rows if row["net_pnl"] is not None]
+    invested = sum(row["exposure"] for row in closed_rows)
+    net = sum(row["net_pnl"] for row in closed_rows)
+    return {
+        "SCALP": summary("SCALP"),
+        "HOLD": summary("HOLD"),
+        "portfolio": {
+            "open_positions": len(open_rows),
+            "open_exposure": sum(row["exposure"] for row in open_rows),
+            "open_economic_sides": sorted(
+                {f"{row['ticker']}:{row['side']}" for row in open_rows}
+            ),
+            "closed_trades": len(closed_rows),
+            "net_profit": net if closed_rows else None,
+            "total_return": net / invested if invested else None,
+            "maximum_total_exposure": MAX_TOTAL_EXPOSURE_DOLLARS,
+            "maximum_trade_exposure": MAX_TRADE_EXPOSURE_DOLLARS,
+            "daily_loss_limit": DAILY_LOSS_LIMIT_DOLLARS,
+            "no_averaging_down": True,
+        },
+        "actual_fills": 0,
+        "scope": "Immutable displayed-quote counterfactuals; not actual executions",
+    }

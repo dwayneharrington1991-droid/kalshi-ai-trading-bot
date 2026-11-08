@@ -53,16 +53,19 @@ def database():
 def test_strategies_are_independently_gated_and_best_after_cost_ev_wins():
     value = evaluate(state())
     assert value["recommended_strategy"] == "HOLD"
-    assert value["action"] == "BUY UP"
-    assert value["strategies"]["HOLD"]["hypothetical_exposure"] <= 2
-    assert value["strategies"]["SCALP"]["actionable"] is True
-    assert value["execution"] == "MANUAL_ONLY"
+    assert value["action"] == "PAPER BUY UP"
+    assert value["strategies"]["HOLD"]["hypothetical_exposure"] <= 1
+    assert value["strategies"]["SCALP"]["paper_actionable"] is True
+    assert value["strategies"]["SCALP"]["actionable"] is False
+    assert value["execution"] == "AUTOMATED_PAPER_ONLY"
+    assert value["execution_capability"] is False
 
     unvalidated = state()
     del unvalidated["model"]["learning_status"]["scalp_heldout_report"]
     result = evaluate(unvalidated)
-    assert result["strategies"]["SCALP"]["action"] == "WAIT"
-    assert result["strategies"]["HOLD"]["action"] == "BUY UP"
+    assert result["strategies"]["SCALP"]["action"] == "PAPER BUY UP"
+    assert result["strategies"]["SCALP"]["validation"]["status"] == "SHADOW_UNVALIDATED"
+    assert result["strategies"]["HOLD"]["action"] == "PAPER BUY UP"
 
 
 @pytest.mark.parametrize("change", ["stale", "spread", "loss_limit", "kill_switch"])
@@ -71,7 +74,7 @@ def test_risk_filters_fail_closed(change):
     performance_report = None
     if change == "stale": value["stale"] = True
     if change == "spread": value["edge_scanner"]["sides"]["up"]["spread"] = .20
-    if change == "loss_limit": performance_report = {"SCALP": {"today_net_profit": -3}, "HOLD": {"today_net_profit": -2}}
+    if change == "loss_limit": performance_report = {"SCALP": {"today_net_profit": -2}, "HOLD": {"today_net_profit": 0}}
     if change == "kill_switch": value["decision_intelligence"]["components"]["risk_guardian"]["signal_kill_switch"]["active"] = True
     result = evaluate(value, paper_performance=performance_report)
     if change == "spread":
@@ -97,6 +100,8 @@ def test_signal_and_outcome_are_append_only_and_repeated_states_do_not_duplicate
     report = performance(db)["SCALP"]
     assert report["settled_or_observed_outcomes"] == 1
     assert report["net_profit"] is not None
+    assert report["total_return"] is not None
+    assert performance(db)["portfolio"]["total_return"] is not None
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         db.execute("UPDATE strategy_paper_signals SET entry=0")
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
@@ -113,7 +118,97 @@ def test_hold_outcome_requires_official_settlement_and_never_invents_fill():
     record_and_resolve(db, value, NOW + timedelta(minutes=11))
     row = db.execute("SELECT outcome_type,payload FROM strategy_paper_outcomes").fetchone()
     assert row["outcome_type"] == "OFFICIAL_SETTLEMENT"
+    assert '"exit_fee":0.0' in row["payload"]
     assert '"actual_fill":false' in row["payload"]
+
+
+def test_database_boundary_enforces_total_exposure_and_no_averaging_down():
+    db = database()
+    value = state()
+    value["dual_strategy"] = evaluate(value)
+    record_and_resolve(db, value, NOW)
+    assert db.execute("SELECT COUNT(*) FROM strategy_paper_signals").fetchone()[0] == 1
+
+    # A different strategy cannot add to the same contract side.
+    duplicate = state()
+    duplicate["edge_scanner"]["sides"]["up"]["net_expected_profit_per_contract"] = 0.01
+    duplicate["dual_strategy"] = evaluate(duplicate)
+    record_and_resolve(db, duplicate, NOW + timedelta(seconds=1))
+    assert db.execute("SELECT COUNT(*) FROM strategy_paper_signals").fetchone()[0] == 1
+
+    # Independently forged oversized paper state is rejected by persistence.
+    oversized = state()
+    oversized["market"]["ticker"] = TICKER + "-OTHER"
+    oversized["dual_strategy"] = evaluate(oversized)
+    selected = oversized["dual_strategy"]["strategies"]["HOLD"]
+    selected["hypothetical_exposure"] = 5.01
+    selected["paper_actionable"] = True
+    oversized["dual_strategy"]["recommended_strategy"] = "HOLD"
+    record_and_resolve(db, oversized, NOW + timedelta(seconds=2))
+    assert db.execute("SELECT COUNT(*) FROM strategy_paper_signals").fetchone()[0] == 1
+
+
+def test_database_boundary_enforces_five_dollar_portfolio_cap_and_stale_block():
+    db = database()
+    for index in range(8):
+        value = state()
+        value["market"]["ticker"] = f"{TICKER}-{index}"
+        value["dual_strategy"] = evaluate(value)
+        record_and_resolve(db, value, NOW + timedelta(seconds=index))
+
+    rows = db.execute(
+        "SELECT COUNT(*),SUM(exposure) FROM strategy_paper_signals"
+    ).fetchone()
+    assert rows[0] == 7
+    assert rows[1] <= 5
+
+    stale = state()
+    stale["market"]["ticker"] = TICKER + "-STALE"
+    stale["dual_strategy"] = evaluate(stale)
+    # Persistence rejects stale input even if an upstream object is forged.
+    stale["stale"] = True
+    selected = stale["dual_strategy"]["strategies"]["HOLD"]
+    selected["paper_actionable"] = True
+    stale["dual_strategy"]["recommended_strategy"] = "HOLD"
+    record_and_resolve(db, stale, NOW + timedelta(seconds=9))
+    assert db.execute("SELECT COUNT(*) FROM strategy_paper_signals").fetchone()[0] == 7
+
+
+def test_database_boundary_enforces_two_dollar_daily_loss_stop():
+    db = database()
+    value = state()
+    value["market"]["ticker"] = TICKER + "-PRIOR"
+    value["dual_strategy"] = evaluate(value)
+    record_and_resolve(db, value, NOW)
+    key = db.execute("SELECT signal_key FROM strategy_paper_signals").fetchone()[0]
+    db.execute(
+        "INSERT INTO strategy_paper_outcomes VALUES (?,?,?,?,?,?,?)",
+        (key, NOW.isoformat(), "OFFICIAL_SETTLEMENT", 0, -2, 0, "{}"),
+    )
+
+    blocked = state()
+    blocked["market"]["ticker"] = TICKER + "-AFTER-LOSS"
+    blocked["dual_strategy"] = evaluate(blocked)
+    record_and_resolve(db, blocked, NOW + timedelta(seconds=1))
+    assert db.execute("SELECT COUNT(*) FROM strategy_paper_signals").fetchone()[0] == 1
+
+
+def test_immutable_candlestick_opening_candidate_drives_paper_hold_only():
+    value = state()
+    value["prediction_engine"] = {
+        "initial": {
+            "ticker": TICKER,
+            "model": "opening-candidate/abc123",
+            "direction": "UP",
+            "up": 0.80,
+        }
+    }
+    result = evaluate(value)
+    hold = result["strategies"]["HOLD"]
+    assert hold["paper_actionable"] is True
+    assert hold["action"] == "PAPER BUY UP"
+    assert hold["signal_source"] == "immutable_candlestick_opening_candidate"
+    assert hold["actionable"] is False
 
 
 def test_wait_explains_exact_missing_strategy_inputs():

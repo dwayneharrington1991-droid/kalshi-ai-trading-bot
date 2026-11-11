@@ -4,6 +4,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 import json
 import threading
+from time import monotonic
 
 import pytest
 
@@ -33,6 +34,93 @@ def test_complete_dashboard_remains_accessible_while_intelligence_initializes():
             playwright.expect(page.locator("#freshness")).to_have_text("WARMING UP")
             playwright.expect(page.locator("#running-build")).to_have_text("startup")
             assert "Opening preserved journals" in page.locator("#market-health-summary").inner_text()
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_live_chart_advances_without_click_and_preserves_selected_interval(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"), stop=0.15)
+    monitor.state = analyze(frame(), NOW, stop=0.15)
+    first = int(NOW.timestamp()) - 60 * 60
+    monitor.latest_candles = {
+        "source": "Coinbase verified browser fixture",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+        "candles": [
+            {
+                "start": first + index * 60,
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 10 + index,
+            }
+            for index in range(60)
+        ],
+    }
+
+    def developing(close, observed):
+        return {
+            "start": int(observed.timestamp()) // 60 * 60,
+            "open": 200.0,
+            "high": max(202.0, close),
+            "low": 199.0,
+            "close": close,
+            "volume": None,
+            "status": "DEVELOPING",
+            "observed_at": observed.isoformat(),
+            "source": "Receipt-time proxy samples; volume unknown",
+        }
+
+    monitor.state["model"] = {"developing_candle": developing(201.0, NOW)}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#chart-freshness")).to_have_text("LIVE")
+            assert page.evaluate("signalChart.forming_candle?.close") == 201
+
+            updated = NOW + timedelta(seconds=1)
+            with monitor.lock:
+                monitor.state = {
+                    **monitor.state,
+                    "now": updated.isoformat(),
+                    "model": {"developing_candle": developing(204.0, updated)},
+                }
+                monitor.state_version += 1
+                monitor.lock.notify_all()
+            started = monotonic()
+            while page.evaluate("signalChart.forming_candle?.close") != 204:
+                assert monotonic() - started < 2
+                page.wait_for_timeout(50)
+            assert monotonic() - started < 1.5
+            assert page.evaluate("signalChart.forming_candle?.close") == 204
+
+            page.locator('[data-chart-interval="3m"]').click()
+            page.reload()
+            playwright.expect(page.locator('[data-chart-interval="3m"]')).to_have_class(
+                "active"
+            )
+            assert page.evaluate("signalChart.interval") == "3m"
+
+            page.locator('[data-chart-interval="15s"]').click()
+            playwright.expect(page.locator("#chart-status")).to_contain_text(
+                "cannot be subdivided into real 15-second candles"
+            )
+            assert page.evaluate("signalChart.bars.length") == 0
+            assert page.evaluate("document.querySelector('#ai-chart-canvas')._chartLayout") is None
             assert not errors
             browser.close()
     finally:

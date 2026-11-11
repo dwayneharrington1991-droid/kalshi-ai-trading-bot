@@ -2198,9 +2198,9 @@ class Journal:
                     ),
                 )
 
-    def strategy_performance(self):
+    def strategy_performance(self, asof=None):
         with self.read() as db:
-            return strategy_paper.performance(db)
+            return strategy_paper.performance(db, asof=asof)
 
     def settle(self, ticker, yes_result, mode, observed_at=None):
         if yes_result not in {"yes", "no"}:
@@ -2226,11 +2226,20 @@ class Journal:
             if not rows:
                 break
             # Decode outside the writer lock. Preserve legacy mapping safeguards.
-            updates = [
-                (int(yes_result == "yes"), origin, seen, row["id"])
-                for row in rows
-                if json.loads(row["payload"])["market"].get("mapping_verified", True)
-            ]
+            updates = []
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload"])
+                    market = payload["market"]
+                    mapping_verified = market.get("mapping_verified", True)
+                except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+                    # Preserve malformed legacy evidence unchanged. One bad
+                    # payload must not prevent later, independently valid
+                    # predictions for the same official contract from being
+                    # reconciled and scored.
+                    continue
+                if mapping_verified is True:
+                    updates.append((int(yes_result == "yes"), origin, seen, row["id"]))
             with self.connect() as db:
                 db.executemany(
                     "UPDATE predictions SET settlement_up=?,settlement_origin=?,settled_at=? WHERE id=?",

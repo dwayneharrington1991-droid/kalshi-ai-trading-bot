@@ -122,6 +122,21 @@ def test_hold_outcome_requires_official_settlement_and_never_invents_fill():
     assert '"actual_fill":false' in row["payload"]
 
 
+def test_daily_paper_pnl_rolls_over_with_evaluation_date():
+    db = database()
+    value = state()
+    value["edge_scanner"]["sides"]["up"]["net_expected_profit_per_contract"] = .01
+    value["dual_strategy"] = evaluate(value)
+    record_and_resolve(db, value, NOW)
+    value["market"]["quotes"]["up"]["bid"] = .50
+    record_and_resolve(db, value, NOW + timedelta(seconds=5))
+
+    same_day = performance(db, asof=NOW + timedelta(hours=1))["SCALP"]
+    next_day = performance(db, asof=NOW + timedelta(days=1))["SCALP"]
+    assert same_day["today_net_profit"] < 0
+    assert next_day["today_net_profit"] == 0
+
+
 def test_database_boundary_enforces_total_exposure_and_no_averaging_down():
     db = database()
     value = state()

@@ -6,7 +6,7 @@ size supports the proposed integer quantity.  It is never called a real fill.
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import math
 
@@ -402,7 +402,9 @@ def record_and_resolve(db, state, recorded_at):
         ))
 
 
-def performance(db):
+def performance(db, asof=None):
+    asof = timestamp(asof) if isinstance(asof, str) else asof
+    asof = asof or datetime.now(timezone.utc)
     rows = [dict(row) for row in db.execute("""SELECT s.*,o.net_pnl,o.correct,o.outcome_type FROM strategy_paper_signals s LEFT JOIN strategy_paper_outcomes o USING(signal_key) ORDER BY s.created_at""")]
     official_contracts = db.execute(
         "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
@@ -417,10 +419,10 @@ def performance(db):
         metrics = score([r["probability"] for r in closed], [r["correct"] for r in closed]) if closed else {}
         wins = sum(r["correct"] for r in closed)
         invested = sum(r["exposure"] for r in closed)
-        today = timestamp(rows[-1]["created_at"]).date() if rows else None
+        today = asof.date()
         today_pnl = sum(
             r["net_pnl"] for r in closed if timestamp(r["created_at"]).date() == today
-        ) if today else 0.0
+        )
         return {
             "signals": len(signals), "settled_or_observed_outcomes": len(closed), "wins": wins,
             "losses": len(closed)-wins, "win_rate": wins/len(closed) if closed else None,

@@ -883,7 +883,7 @@ class Monitor:
             )
             state["decision_intelligence"] = coordinate_intelligence(state)
             state["dual_strategy"] = evaluate_dual_strategy(
-                state, paper_performance=self.journal.strategy_performance()
+                state, paper_performance=self.journal.strategy_performance(state["now"])
             )
             self.journal.record_ai_signal_markers(state)
             self.journal.step(state)
@@ -1379,7 +1379,7 @@ class Monitor:
             state, self.scalp_criteria, account=state["account"], now=health_clock
         )
         state["dual_strategy"] = evaluate_dual_strategy(
-            state, paper_performance=self.journal.strategy_performance()
+            state, paper_performance=self.journal.strategy_performance(health_clock)
         )
         state["connection_diagnostics"] = {
             "credentials": credential_status(),

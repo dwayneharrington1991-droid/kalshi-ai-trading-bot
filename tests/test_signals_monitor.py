@@ -273,6 +273,46 @@ def test_counterfactual_journal_deduplicates_and_includes_spread_and_fees(tmp_pa
     assert all(p["settlement_up"] == 1 for p in journal.history()["predictions"])
 
 
+def test_settlement_skips_malformed_legacy_payload_without_blocking_valid_rows(tmp_path):
+    journal = Journal(tmp_path / "journal.db")
+    state = analyze(frame(), NOW, stop=0.15)
+    journal.step(state)
+    with journal.connect() as db:
+        db.execute(
+            """INSERT INTO predictions
+            (mode,ticker,timestamp,direction,scalp,probability_up,probability_down,payload)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                state["mode"],
+                state["market"]["ticker"],
+                (NOW + timedelta(seconds=1)).isoformat(),
+                "UP",
+                "WAIT",
+                0.6,
+                0.4,
+                "{malformed legacy payload",
+            ),
+        )
+
+    assert journal.settle(
+        state["market"]["ticker"], "yes", state["mode"],
+        (NOW + timedelta(minutes=16)).isoformat(),
+    )
+    with journal.read() as db:
+        rows = db.execute(
+            "SELECT payload,settlement_up,settlement_origin FROM predictions ORDER BY id"
+        ).fetchall()
+        outcome = db.execute(
+            "SELECT outcome FROM forecast_outcomes WHERE ticker=? AND origin='replay'",
+            (state["market"]["ticker"],),
+        ).fetchone()
+    assert rows[0]["settlement_up"] == 1
+    assert rows[0]["settlement_origin"] == "replay"
+    assert rows[1]["settlement_up"] is None
+    assert rows[1]["settlement_origin"] == "legacy_unknown"
+    assert outcome["outcome"] == 1
+
+
 @pytest.mark.parametrize(
     "seconds,expected", [(6, "UNOBSERVED_DATA_GAP"), (61, "UNOBSERVED_TIME_LIMIT")]
 )

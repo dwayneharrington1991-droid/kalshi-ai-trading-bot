@@ -662,3 +662,35 @@ def test_ai_readiness_auditor_is_read_only_and_never_promotes():
     assert row["status"] == "SHADOW"
     assert row["additional_needed"] == 4
     assert "needs 4 additional" in row["what_is_missing"]
+
+
+def test_preview_8768_switch_is_narrow_idempotent_and_rollback_guarded():
+    path = DEPLOY / "switch_preview_8768.sh"
+    source = path.read_text()
+    assert path.stat().st_mode & 0o111
+    assert "set -Eeuo pipefail" in source
+    assert "a739646155cbe36e324e4b5f9c6f58a0cedbc4a8" in source
+    assert "/home/opc/kalshi-preview-upgrade/logs/upgraded-live-8768.db" in source
+    assert "/home/opc/kalshi-preview-repair-a739646" in source
+    assert 'readonly HOST=127.0.0.1' in source and 'readonly PORT=8768' in source
+    assert "MIN_FREE_BYTES" in source and "free storage below 10 GiB" in source
+    assert "PREVIEW_ALREADY_DEPLOYED" in source
+    assert "process_has_environment" in source and "PYTHONPATH=$NEW_ROOT" in source
+    assert 'new_args=(-P)' in source and "--disable-scheduled-learning" in source
+    assert "kill -TERM \"$old_pid\"" in source
+    assert "wait_stopped" in source and "db_open_pids" in source
+    assert "start_old_in_memory" in source and "rollback_on_error" in source
+    assert "PREVIEW_DEPLOY_SUCCESS" in source
+    assert "execution_capability" in source and "signals_only" in source
+    assert "candle-integrity" in source and "readyz" in source
+    assert "port 8765 listener changed" in source
+    assert "port 8767 listener changed" in source
+    for forbidden in (
+        "fuser -k", "pkill", "kill -9", "rm -", "VACUUM", "DELETE FROM",
+        "systemctl restart", "systemctl stop", "--account-readonly",
+    ):
+        # The account flag appears only in a refusal case, never in new_args.
+        if forbidden == "--account-readonly":
+            assert 'new_args+=(--account-readonly)' not in source
+        else:
+            assert forbidden not in source

@@ -173,6 +173,43 @@ def test_large_journal_defers_historical_contract_summary_backfill(tmp_path, mon
         assert db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0] == 0
 
 
+def test_deferred_contract_summary_backfill_is_bounded_resumable_and_read_only(tmp_path):
+    journal = Journal(tmp_path / "bounded-summary.db")
+    with journal.connect() as db:
+        for index in range(5):
+            ticker = f"KXBTC15M-LEGACY-{index}"
+            for revision in range(index + 1):
+                at = (NOW + timedelta(seconds=revision)).isoformat()
+                db.execute(
+                    "INSERT INTO btc_engine_predictions VALUES (?,?,?,?,?,?,?,?,?)",
+                    ("PUBLIC MARKET DATA", ticker, at, at, NOW.isoformat(), 0.5,
+                     "test", "v1", '{"immutable":true}'),
+                )
+        before = db.execute(
+            "SELECT COUNT(*),SUM(LENGTH(payload)) FROM btc_engine_predictions"
+        ).fetchone()
+        db.execute("DELETE FROM btc_engine_contracts")
+        db.execute(
+            "DELETE FROM dashboard_migrations WHERE name=?",
+            ("btc_engine_contract_summaries_v1",),
+        )
+
+    first = journal.backfill_contract_summaries(limit=2)
+    assert first["status"] == "IN_PROGRESS" and first["processed"] == 2
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0] == 2
+    for _ in range(10):
+        result = journal.backfill_contract_summaries(limit=2)
+        if result["status"] == "COMPLETE":
+            break
+    assert result["status"] == "COMPLETE"
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0] == 5
+        assert db.execute(
+            "SELECT COUNT(*),SUM(LENGTH(payload)) FROM btc_engine_predictions"
+        ).fetchone() == before
+
+
 def test_journal_initialization_never_executes_secondary_index_builds(tmp_path, monkeypatch):
     journal = Journal(tmp_path / "startup.db")
     with journal.connect() as db:
@@ -986,6 +1023,7 @@ def test_storage_health_is_constant_time_and_preserves_database(tmp_path):
 
 def test_new_official_settlement_invalidates_learning_count_immediately():
     class JournalStub:
+        def backfill_contract_summaries(self, limit): assert limit == 20
         def backfill_contract_reviews(self, limit): assert limit == 20
         def seed_settlement_queue(self): pass
         def due_settlements(self, _now): return ["KXBTC15M-MOCK"]

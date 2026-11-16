@@ -355,6 +355,7 @@ class Monitor:
     def maintain_settlements(self, now):
         # Older settled forecasts may predate the compact review table. Process
         # a bounded batch in maintenance so live collection is never blocked.
+        self.journal.backfill_contract_summaries(limit=20)
         self.journal.backfill_contract_reviews(limit=20)
         self.journal.seed_settlement_queue()
         learned = False

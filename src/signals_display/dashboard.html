@@ -157,9 +157,10 @@ function primaryView(s){
   const scalp=!s.stale&&m.actionable===true&&m.recommendation==='SCALP UP'?'SCALP UP':!s.stale&&m.actionable===true&&m.recommendation==='SCALP DOWN'?'SCALP DOWN':'WAIT';
   const openingModel=audit.opening_ensemble_active?'AI ACTIVE':audit.model_id||i.model?'SHADOW / EXPERIMENTAL':'BASELINE / UNAVAILABLE';
   const liveModel=e.model_status||s.settlement_intelligence?.model_status||'EXPERIMENTAL';
-  const minimalConfidence=Number.isFinite(i.up)?Math.max(i.up,Number.isFinite(i.down)?i.down:1-i.up):null;
+  const calibratedOpening=i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE',minimalConfidence=calibratedOpening&&Number.isFinite(i.up)?Math.max(i.up,Number.isFinite(i.down)?i.down:1-i.up):null;
   txt('minimal-opening-call',openingDirection);$('minimal-opening-call').className=openingDirection==='UP'?'green':openingDirection==='DOWN'?'red':'amber';
   txt('minimal-opening-confidence',minimalConfidence==null?'—':prob(minimalConfidence));$('minimal-opening-confidence').className=openingUsable?'green':'amber';
+  $('minimal-opening-confidence').title=openingUsable?'Calibrated probability assigned to the immutable UP/DOWN opening call.':minimalConfidence!=null?'Larger calibrated outcome probability. The model still says WAIT because neither side crossed the validation-selected directional threshold.':'No calibrated opening probability was available at the immutable cutoff.';
   txt('minimal-opening-call-note',openingUsable?'Immutable opening decision.':Number.isFinite(i.up)?'The trained AI deliberately selected WAIT under its validation-frozen threshold.':'A valid immutable opening snapshot is unavailable.');
   txt('minimal-opening-confidence-note',Number.isFinite(i.up)?prob(i.up)+' UP · '+prob(Number.isFinite(i.down)?i.down:1-i.up)+' DOWN'+(Number.isFinite(i.decision_policy?.threshold)?' · threshold '+prob(i.decision_policy.threshold):''):'Probability unavailable.');
   txt('primary-contract',e.ticker||s.market?.ticker||'Waiting for KXBTC15M');

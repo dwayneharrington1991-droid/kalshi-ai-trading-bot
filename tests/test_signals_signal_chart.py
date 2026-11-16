@@ -6,6 +6,7 @@ import pytest
 
 from src.signals_display.monitor import Journal
 from src.signals_display.signal_chart import (
+    LiveTradeCandles,
     aggregate_candles,
     marker_is_chronological,
     markers_from_state,
@@ -283,6 +284,13 @@ def test_dashboard_contains_incremental_chart_without_external_script():
     assert "formingFresh=Number.isFinite(formingAt)" in page
     assert "WAITING / NO LIVE PRICE" in page
     assert "updateLiveChartCandle(state)" in page
+    assert "/api/live-chart?limit=180" in page
+    assert "setInterval(refreshLiveTradeChart,500)" in page
+    assert "AI evaluated the frozen opening snapshot and selected WAIT" in page
+    assert "directional threshold" in page
+    assert 'id="minimal-opening-call"' in page
+    assert 'id="minimal-opening-confidence"' in page
+    assert "main>:not(#minimal-opening){display:none!important}" in page
     assert 'id="opening-score"' in page
     assert "const openingUsable=Number.isFinite(i.up)" in page
     assert "Current LIVE staleness cannot change it" in page
@@ -296,3 +304,58 @@ def test_dashboard_contains_incremental_chart_without_external_script():
     assert "BUY UP marker" in page and "BUY DOWN marker" in page
     assert "kind==='BUY UP'" in page and "kind==='BUY DOWN'" in page
     assert "data.forming_candle?' · 1 clearly faded developing proxy candle'" in page
+
+
+def _trade(identifier, second, price, volume=1.0, received_delay=0.1):
+    event = NOW + timedelta(seconds=second)
+    return {
+        "source": "Coinbase BTC/USD stream",
+        "kind": "trade",
+        "price": price,
+        "volume": volume,
+        "trade_id": identifier,
+        "event_at": event.isoformat(),
+        "received_at": (event + timedelta(seconds=received_delay)).isoformat(),
+        "session_id": "session-1",
+    }
+
+
+def test_live_trade_candles_use_genuine_event_time_ohlcv_and_volume():
+    chart = LiveTradeCandles()
+    assert chart.observe(_trade("later", 9, 103, 0.3))
+    assert chart.observe(_trade("first", 2, 100, 0.1))
+    assert chart.observe(_trade("middle", 5, 98, 0.2))
+    snapshot = chart.snapshot(NOW + timedelta(seconds=21))
+    assert snapshot["status"] == "READY"
+    assert snapshot["bars"] == [{
+        "start": int(NOW.timestamp()), "open": 100.0, "high": 103.0,
+        "low": 98.0, "close": 103.0, "volume": pytest.approx(0.6),
+        "trades": 3, "source": "Coinbase BTC-USD market_trades WebSocket",
+        "interval_seconds": 15,
+    }]
+    assert snapshot["diagnostics"]["out_of_order_trades"] == 2
+    assert snapshot["latency"]["samples"] == 3
+
+
+def test_live_trade_candles_reject_duplicates_bad_timestamps_and_repainting():
+    chart = LiveTradeCandles()
+    first = _trade("one", 1, 100)
+    assert chart.observe(first)
+    assert not chart.observe(first)
+    assert not chart.observe(_trade("future-receipt", 2, 101, received_delay=-1))
+    chart.snapshot(NOW + timedelta(seconds=21))
+    assert not chart.observe(_trade("late-after-close", 3, 99))
+    snapshot = chart.snapshot(NOW + timedelta(seconds=30))
+    assert snapshot["bars"][0]["open"] == snapshot["bars"][0]["close"] == 100
+    assert snapshot["diagnostics"]["duplicate_trades"] == 1
+    assert snapshot["diagnostics"]["rejected_trades"] == 2
+
+
+def test_live_trade_candles_do_not_invent_empty_intervals():
+    chart = LiveTradeCandles()
+    chart.observe(_trade("first", 1, 100))
+    chart.observe(_trade("third", 31, 102))
+    snapshot = chart.snapshot(NOW + timedelta(seconds=51))
+    assert [bar["start"] for bar in snapshot["bars"]] == [
+        int(NOW.timestamp()), int(NOW.timestamp()) + 30,
+    ]

@@ -108,6 +108,16 @@ def opening_diagnostics(opening, model_info=None):
         "displayed_probabilities": displayed,
         "display_direction": recorded_opening_direction(opening),
         "saved_direction": opening.get("direction"),
+        "confidence": opening.get("confidence"),
+        "selective_decision_policy": opening.get("decision_policy"),
+        "directional_threshold": (opening.get("decision_policy") or {}).get("threshold"),
+        "model_selection_status": selection.get("status"),
+        "model_loaded_at": selection.get("loaded_at"),
+        "model_available_at": selection.get("available_at"),
+        "labels_available_through": selection.get("labels_available_through"),
+        "opening_timestamp": opening.get("opens_at"),
+        "prediction_timestamp": opening.get("generated_at"),
+        "input_data_cutoff": opening.get("data_cutoff"),
         "direction_policy": DIRECTION_POLICY,
         "near_neutral_reason": (
             "Both probabilities round to 50.0% at the displayed 0.1-percentage-point precision; direction is NEUTRAL. The unrounded estimate is preserved."

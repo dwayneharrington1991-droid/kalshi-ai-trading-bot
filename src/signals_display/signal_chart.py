@@ -4,12 +4,167 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import deque
+from threading import RLock
 
 from .model import timestamp
 
 
 SUPPORTED_INTERVALS = {60: "1m", 180: "3m", 300: "5m", 900: "15m"}
 MAX_CHART_BARS = 500
+
+
+class LiveTradeCandles:
+    """Bounded genuine 15-second OHLCV built only from exchange trades."""
+
+    def __init__(self, interval_seconds=15, max_bars=500, max_seen=20_000):
+        if interval_seconds != 15 or not 30 <= max_bars <= 2_000:
+            raise ValueError("Live chart supports bounded genuine 15-second bars")
+        self.interval_seconds = interval_seconds
+        self.max_bars = max_bars
+        self.bars = {}
+        self.seen = set()
+        self.seen_order = deque(maxlen=max_seen)
+        self.lock = RLock()
+        self.metrics = {
+            "accepted_trades": 0,
+            "duplicate_trades": 0,
+            "rejected_trades": 0,
+            "out_of_order_trades": 0,
+        }
+        self.last_event_at = None
+        self.last_received_at = None
+        self.last_event_second = None
+        self.finalized_through = None
+        self.event_to_receipt_ms = deque(maxlen=2_000)
+
+    def observe(self, observation):
+        try:
+            if observation.get("kind") != "trade" or not str(
+                observation.get("source", "")
+            ).startswith("Coinbase BTC/USD"):
+                return False
+            event = timestamp(observation["event_at"])
+            received = timestamp(observation["received_at"])
+            delay = (received - event).total_seconds()
+            if not 0 <= delay <= 5:
+                raise ValueError("trade event/receipt timing")
+            price = float(observation["price"])
+            volume = float(observation["volume"])
+            if not math.isfinite(price) or price <= 0 or not math.isfinite(volume) or volume <= 0:
+                raise ValueError("trade values")
+            identity = (
+                observation.get("source"),
+                observation.get("session_id"),
+                str(observation["trade_id"]),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
+            with self.lock:
+                self.metrics["rejected_trades"] += 1
+            return False
+        event_second = event.timestamp()
+        start = int(event_second) // self.interval_seconds * self.interval_seconds
+        with self.lock:
+            if identity in self.seen:
+                self.metrics["duplicate_trades"] += 1
+                return False
+            if self.finalized_through is not None and start <= self.finalized_through:
+                # A late execution must never repaint a bar already published
+                # as closed. It remains counted diagnostically, not charted.
+                self.metrics["rejected_trades"] += 1
+                return False
+            if len(self.seen_order) == self.seen_order.maxlen:
+                self.seen.discard(self.seen_order[0])
+            self.seen_order.append(identity)
+            self.seen.add(identity)
+            if self.last_event_second is not None and event_second < self.last_event_second:
+                self.metrics["out_of_order_trades"] += 1
+            self.last_event_second = max(self.last_event_second or event_second, event_second)
+            bar = self.bars.get(start)
+            if bar is None:
+                bar = self.bars[start] = {
+                    "start": start,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "volume": volume,
+                    "trades": 1,
+                    "first_event": event_second,
+                    "last_event": event_second,
+                }
+            else:
+                bar["high"] = max(bar["high"], price)
+                bar["low"] = min(bar["low"], price)
+                bar["volume"] += volume
+                bar["trades"] += 1
+                if event_second < bar["first_event"]:
+                    bar["first_event"], bar["open"] = event_second, price
+                if event_second >= bar["last_event"]:
+                    bar["last_event"], bar["close"] = event_second, price
+            while len(self.bars) > self.max_bars + 2:
+                del self.bars[min(self.bars)]
+            self.last_event_at = event.isoformat()
+            self.last_received_at = received.isoformat()
+            self.event_to_receipt_ms.append(delay * 1000)
+            self.metrics["accepted_trades"] += 1
+        return True
+
+    @staticmethod
+    def _percentile(values, fraction):
+        if not values:
+            return None
+        ordered = sorted(values)
+        return round(ordered[min(len(ordered) - 1, int((len(ordered) - 1) * fraction))], 3)
+
+    def snapshot(self, now, limit=180, finalization_delay_seconds=5):
+        current = timestamp(now) if isinstance(now, str) else now
+        with self.lock:
+            rows = [dict(self.bars[key]) for key in sorted(self.bars)]
+            delays = list(self.event_to_receipt_ms)
+            metrics = dict(self.metrics)
+            last_event_at, last_received_at = self.last_event_at, self.last_received_at
+        cutoff = current.timestamp() - finalization_delay_seconds
+        closed, forming = [], None
+        for row in rows:
+            public = {k: v for k, v in row.items() if k not in {"first_event", "last_event"}}
+            public["source"] = "Coinbase BTC-USD market_trades WebSocket"
+            public["interval_seconds"] = self.interval_seconds
+            if row["start"] + self.interval_seconds <= cutoff:
+                closed.append(public)
+            else:
+                forming = {**public, "status": "DEVELOPING", "observed_at": last_received_at}
+        if closed:
+            with self.lock:
+                self.finalized_through = max(
+                    self.finalized_through or closed[-1]["start"], closed[-1]["start"]
+                )
+        age = (
+            (current - timestamp(last_received_at)).total_seconds()
+            if last_received_at is not None
+            else None
+        )
+        return {
+            "status": "READY" if closed else "WARMING_UP" if forming else "NO_RECORDED_TRADES",
+            "interval": "15s",
+            "interval_seconds": 15,
+            "bars": closed[-max(30, min(MAX_CHART_BARS, int(limit))):],
+            "forming_candle": forming,
+            "last_trade_event_at": last_event_at,
+            "last_trade_received_at": last_received_at,
+            "last_trade_age_seconds": age,
+            "finalization_delay_seconds": finalization_delay_seconds,
+            "latency": {
+                "event_to_receipt_p50_ms": self._percentile(delays, 0.50),
+                "event_to_receipt_p95_ms": self._percentile(delays, 0.95),
+                "event_to_receipt_p99_ms": self._percentile(delays, 0.99),
+                "samples": len(delays),
+                "note": "Exchange-event to local socket receipt; includes clock offset and publication delay.",
+            },
+            "diagnostics": metrics,
+            "source": "Genuine timestamped Coinbase BTC-USD market_trades WebSocket executions",
+            "non_repainting": "Five-second bounded finalization delay admits late genuine trades; finalized bars are not modified.",
+        }
 
 
 def normalize_recorded_candle(raw):

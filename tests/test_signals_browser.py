@@ -77,6 +77,18 @@ def test_live_chart_advances_without_click_and_preserves_selected_interval(tmp_p
         }
 
     monitor.state["model"] = {"developing_candle": developing(201.0, NOW)}
+    monitor.state["feed_health"] = {"coinbase_websocket_status": "LIVE"}
+    for index, (second, price, volume) in enumerate(
+        [(1, 200.0, 0.1), (8, 204.0, 0.2), (16, 202.0, 0.3)]
+    ):
+        event = NOW + timedelta(seconds=second)
+        assert monitor.live_trade_chart.observe({
+            "source": "Coinbase BTC/USD stream", "kind": "trade",
+            "price": price, "volume": volume, "trade_id": str(index),
+            "event_at": event.isoformat(),
+            "received_at": (event + timedelta(milliseconds=50)).isoformat(),
+            "session_id": "browser-test",
+        })
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -117,10 +129,11 @@ def test_live_chart_advances_without_click_and_preserves_selected_interval(tmp_p
 
             page.locator('[data-chart-interval="15s"]').click()
             playwright.expect(page.locator("#chart-status")).to_contain_text(
-                "cannot be subdivided into real 15-second candles"
+                "genuine closed 15s bars"
             )
-            assert page.evaluate("signalChart.bars.length") == 0
-            assert page.evaluate("document.querySelector('#ai-chart-canvas')._chartLayout") is None
+            assert page.evaluate("signalChart.bars.length") >= 1
+            assert page.evaluate("signalChart.bars[0].volume") == pytest.approx(0.3)
+            assert page.evaluate("document.querySelector('#ai-chart-canvas')._chartLayout") is not None
             assert not errors
             browser.close()
     finally:

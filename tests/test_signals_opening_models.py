@@ -45,6 +45,31 @@ def test_real_direction_and_complementary_rounding_remain_visible():
     assert engine.display_probability_pair(float("nan"))["up"] is None
 
 
+def test_opening_diagnostics_exposes_wait_probability_policy_and_asof_times():
+    saved = {
+        "model": "opening-candidate/test-model", "up": 0.61, "direction": "WAIT",
+        "opens_at": "2026-11-16T12:00:00+00:00",
+        "generated_at": "2026-11-16T12:00:01+00:00",
+        "data_cutoff": "2026-11-16T12:00:00+00:00",
+        "confidence": {"status": "EXPERIMENTAL CALIBRATED CANDIDATE"},
+        "decision_policy": {"threshold": 0.65, "otherwise": "WAIT"},
+        "model_selection": {
+            "status": "EXPERIMENTAL_OPENING_CANDIDATE",
+            "opening_ensemble_active": True,
+            "loaded_at": "2026-11-16T11:00:00+00:00",
+            "available_at": "2026-11-16T10:00:00+00:00",
+            "labels_available_through": "2026-11-15T00:00:00+00:00",
+        },
+    }
+    audit = engine.opening_diagnostics(saved)
+    assert audit["raw_probability_up"] == 0.61
+    assert audit["display_direction"] == "WAIT"
+    assert audit["directional_threshold"] == 0.65
+    assert audit["model_selection_status"] == "EXPERIMENTAL_OPENING_CANDIDATE"
+    assert audit["model_loaded_at"] < audit["opening_timestamp"]
+    assert audit["input_data_cutoff"] == audit["opening_timestamp"]
+
+
 def test_opening_fallback_explains_model_and_feature_role_not_constant_probability():
     result = opening(
         audit_context={

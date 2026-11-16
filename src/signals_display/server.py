@@ -108,6 +108,9 @@ class Monitor:
         # into 0/1440. Nothing in this cache may be updated after its opening.
         self.preopening_histories = {}
         self.candle_lock = threading.Lock()
+        from .signal_chart import LiveTradeCandles
+
+        self.live_trade_chart = LiveTradeCandles()
         self.build_commit = build_commit
         self.learning_status_path = (
             Path(learning_status_path) if learning_status_path is not None else None
@@ -507,6 +510,7 @@ class Monitor:
             market_now = active_market(payload, now)
             rejected = 0
             for observation in payload.get("stream_observations", []):
+                self.live_trade_chart.observe(observation)
                 # Independent consumers must not discard valid trade-channel
                 # volume merely because the legacy price sampler rejected an
                 # older cross-channel event timestamp.
@@ -1605,6 +1609,27 @@ def make_handler(monitor):
                     )
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
+            elif route == "/api/live-chart":
+                try:
+                    limit = int(query.get("limit", ["180"])[0])
+                    if not 30 <= limit <= 500:
+                        raise ValueError("Invalid live chart limit")
+                except (ValueError, TypeError):
+                    self.send_error(400, "Use limit 30..500")
+                    return
+                value = monitor.live_trade_chart.snapshot(utcnow(), limit)
+                with monitor.lock:
+                    websocket_status = (
+                        (monitor.state.get("feed_health") or {}).get(
+                            "coinbase_websocket_status"
+                        )
+                    )
+                value["connection_status"] = websocket_status or "UNAVAILABLE"
+                if value["status"] == "NO_RECORDED_TRADES" and websocket_status == "LIVE":
+                    value["status"] = "CONNECTED_IDLE"
+                    value["reason"] = "WebSocket connected; waiting for the next genuine BTC trade"
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
             elif route == "/api/signal-chart":
                 intervals = {"15s": 15, "1m": 60, "3m": 180, "5m": 300, "15m": 900}
                 try:
@@ -1621,21 +1646,50 @@ def make_handler(monitor):
                 except (KeyError, ValueError, TypeError):
                     self.send_error(400, "Use interval 15s/1m/3m/5m/15m and limit 30..500")
                     return
-                value = monitor.journal.signal_chart(
-                    interval_seconds,
-                    limit,
-                    ticker,
-                    candle_fallback=(
-                        monitor.latest_candles
-                        or getattr(monitor.feed, "candle_cache", None)
-                    ),
-                )
+                if interval_seconds == 15:
+                    # Marker/performance history remains journal-backed, while
+                    # genuine sub-minute OHLCV comes only from timestamped
+                    # Coinbase market_trades WebSocket executions.
+                    value = monitor.journal.signal_chart(
+                        60,
+                        limit,
+                        ticker,
+                        candle_fallback=(
+                            monitor.latest_candles
+                            or getattr(monitor.feed, "candle_cache", None)
+                        ),
+                    )
+                    live = monitor.live_trade_chart.snapshot(utcnow(), limit)
+                    value.update(live)
+                    with monitor.lock:
+                        websocket_status = (
+                            (monitor.state.get("feed_health") or {}).get(
+                                "coinbase_websocket_status"
+                            )
+                        )
+                    value["connection_status"] = websocket_status or "UNAVAILABLE"
+                    if value["status"] == "NO_RECORDED_TRADES" and websocket_status == "LIVE":
+                        value["status"] = "CONNECTED_IDLE"
+                        value["reason"] = "WebSocket connected; waiting for the next genuine BTC trade"
+                    else:
+                        value["reason"] = None if value["status"] == "READY" else value.get("reason")
+                else:
+                    value = monitor.journal.signal_chart(
+                        interval_seconds,
+                        limit,
+                        ticker,
+                        candle_fallback=(
+                            monitor.latest_candles
+                            or getattr(monitor.feed, "candle_cache", None)
+                        ),
+                    )
                 with monitor.lock:
                     developing = dict(
                         ((monitor.state.get("model") or {}).get("developing_candle") or {})
                     )
-                value["forming_candle"] = None
-                if developing.get("status") == "DEVELOPING" and value.get("status") == "READY":
+                if interval_seconds != 15:
+                    value["forming_candle"] = None
+                if interval_seconds != 15 and developing.get("status") == "DEVELOPING" and value.get("status") == "READY":
                     try:
                         start = int(developing["start"])
                         bucket = start - start % interval_seconds

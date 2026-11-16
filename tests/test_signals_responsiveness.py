@@ -441,6 +441,24 @@ def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_
         assert wider["forming_candle"]["close"] == 201
         assert all(bar["start"] < bucket for bar in wider["bars"])
         assert wider["latest_bar_start"] == wider["bars"][-1]["start"]
+
+        event = utcnow() - timedelta(seconds=20)
+        assert monitor.live_trade_chart.observe({
+            "source": "Coinbase BTC/USD stream", "kind": "trade",
+            "price": 70123.0, "volume": 0.125, "trade_id": "api-live-1",
+            "event_at": event.isoformat(),
+            "received_at": (event + timedelta(milliseconds=25)).isoformat(),
+            "session_id": "api-test",
+        })
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/live-chart?limit=30",
+            timeout=2,
+        ) as response:
+            live = json.load(response)
+        assert live["status"] == "READY"
+        assert live["interval"] == "15s"
+        assert live["bars"][-1]["volume"] == 0.125
+        assert live["latency"]["event_to_receipt_p50_ms"] == 25.0
     finally:
         server.shutdown()
         server.server_close()

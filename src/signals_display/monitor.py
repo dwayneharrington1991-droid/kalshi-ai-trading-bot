@@ -2622,6 +2622,87 @@ class Journal:
             )
         return len(rows)
 
+    def backfill_contract_summaries(self, limit=20):
+        """Resume bounded derived summaries without scanning prediction blobs.
+
+        Immutable forecasts and openings are never updated. A keyset cursor in
+        ``dashboard_migrations`` keeps every maintenance pass restart-safe and
+        bounded on multi-gigabyte live journals.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Contract summary backfill limit must be 1..100")
+        with self.connect() as db:
+            saved = db.execute(
+                "SELECT value FROM dashboard_migrations WHERE name=?",
+                (CONTRACT_SUMMARY_MIGRATION,),
+            ).fetchone()
+            if saved and saved[0] == "complete":
+                return {"status": "COMPLETE", "processed": 0}
+            try:
+                cursor = json.loads(saved[0]) if saved else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                cursor = {}
+            phase = cursor.get("phase", "predictions")
+            mode, ticker = cursor.get("mode", ""), cursor.get("ticker", "")
+            processed = 0
+            while processed < limit:
+                table = (
+                    "btc_engine_predictions"
+                    if phase == "predictions"
+                    else "btc_engine_opening"
+                )
+                rows = db.execute(
+                    f"""SELECT mode,ticker,MIN(closes_at) AS closes_at
+                        FROM {table}
+                        WHERE mode>? OR (mode=? AND ticker>?)
+                        GROUP BY mode,ticker ORDER BY mode,ticker LIMIT ?""",
+                    (mode, mode, ticker, limit - processed),
+                ).fetchall()
+                for row in rows:
+                    if phase == "predictions":
+                        revisions, latest_at, closes_at = db.execute(
+                            """SELECT COUNT(*),MAX(timestamp),MIN(closes_at)
+                               FROM btc_engine_predictions
+                               WHERE mode=? AND ticker=?""",
+                            (row["mode"], row["ticker"]),
+                        ).fetchone()
+                    else:
+                        revisions, latest_at, closes_at = 0, None, row["closes_at"]
+                    db.execute(
+                        """INSERT OR IGNORE INTO btc_engine_contracts
+                           (mode,ticker,closes_at,revisions,latest_at)
+                           VALUES (?,?,?,?,?)""",
+                        (row["mode"], row["ticker"], closes_at, revisions, latest_at),
+                    )
+                    mode, ticker = row["mode"], row["ticker"]
+                    processed += 1
+                if rows:
+                    break
+                if phase == "predictions":
+                    phase, mode, ticker = "openings", "", ""
+                    continue
+                db.execute(
+                    "INSERT OR REPLACE INTO dashboard_migrations(name,value) VALUES (?,?)",
+                    (CONTRACT_SUMMARY_MIGRATION, "complete"),
+                )
+                return {"status": "COMPLETE", "processed": processed}
+            db.execute(
+                "INSERT OR REPLACE INTO dashboard_migrations(name,value) VALUES (?,?)",
+                (
+                    CONTRACT_SUMMARY_MIGRATION,
+                    json.dumps(
+                        {"phase": phase, "mode": mode, "ticker": ticker},
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            return {
+                "status": "IN_PROGRESS",
+                "processed": processed,
+                "phase": phase,
+                "cursor": {"mode": mode, "ticker": ticker},
+            }
+
     def record_feeds(self, coverage):
         with self.connect() as db:
             for name, feed in coverage.items():

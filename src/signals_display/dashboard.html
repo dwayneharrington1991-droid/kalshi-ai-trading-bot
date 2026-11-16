@@ -212,8 +212,9 @@ function primaryView(s){
   const scalp=!s.stale&&m.actionable===true&&m.recommendation==='SCALP UP'?'SCALP UP':!s.stale&&m.actionable===true&&m.recommendation==='SCALP DOWN'?'SCALP DOWN':'WAIT';
   const openingModel=audit.opening_ensemble_active?'AI ACTIVE':audit.model_id||i.model?'SHADOW / EXPERIMENTAL':'BASELINE / UNAVAILABLE';
   const liveModel=e.model_status||s.settlement_intelligence?.model_status||'EXPERIMENTAL';
-  const minimalConfidence=Number.isFinite(i.up)?Math.max(i.up,Number.isFinite(i.down)?i.down:1-i.up):null;
+  const calibratedOpening=i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE',minimalConfidence=calibratedOpening&&Number.isFinite(i.up)?Math.max(i.up,Number.isFinite(i.down)?i.down:1-i.up):null;
   terminalView(s,i,openingUsable,openingDirection,minimalConfidence);
+  $('minimal-opening-confidence').title=openingUsable?'Calibrated probability assigned to the immutable UP/DOWN opening call.':minimalConfidence!=null?'Larger calibrated outcome probability. The model still says WAIT because neither side crossed the validation-selected directional threshold.':'No calibrated opening probability was available at the immutable cutoff.';
   txt('primary-contract',e.ticker||s.market?.ticker||'Waiting for KXBTC15M');
   txt('primary-time',countdown(s.remaining_seconds));
   txt('primary-opening',openingDirection);

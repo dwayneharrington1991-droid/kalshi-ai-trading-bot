@@ -41,6 +41,26 @@ def test_threshold_is_selected_on_validation_and_reports_test_coverage():
     assert report["promotion_allowed"] is False
 
 
+def test_untouched_test_reports_disjoint_high_confidence_reliability_groups():
+    validation = rows(30, "V")
+    test = rows(8, "T")
+    test_probabilities = [0.59, 0.61, 0.29, 0.79, 0.19, 0.89, 0.09, 0.96]
+    report = selective_report(
+        confident_for(validation), validation, test_probabilities, test
+    )
+    groups = report["test"]["by_calibrated_confidence"]
+    assert set(groups) == {"below_60%", "60%-70%", "70%-80%", "80%-90%", "90%+"}
+    assert sum(group["independent_signals"] for group in groups.values()) == len(test)
+    assert groups["80%-90%"]["independent_signals"] == 2
+    assert groups["90%+"]["independent_signals"] == 2
+    assert groups["90%+"]["accuracy_interval_95"] is not None
+    assert groups["90%+"]["confidence_reliability"]["samples"] == 2
+    assert all(
+        group["selected_on"].startswith("untouched test reporting only")
+        for group in groups.values()
+    )
+
+
 def test_future_test_labels_cannot_change_selected_threshold():
     validation = rows(30, "V")
     test = rows(30, "T")

@@ -168,7 +168,7 @@ class RuntimeMeter:
         # payloads, authentication headers, file contents or arbitrary URLs.
         if component not in {
             "public_rest", "account_sync", "settlement", "prediction",
-            "journal_indexes",
+            "journal_indexes", "candle_persistence",
         }:
             return
         if not isinstance(error_type, str) or not error_type.isidentifier():

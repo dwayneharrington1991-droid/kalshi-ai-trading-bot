@@ -141,11 +141,12 @@ def snapshot(market: dict, series: dict, *, received_at: str):
             supported = True
             calculation_evidence = "EXACT_KALSHI_RULE_TEXT_MATCH"
         increment = _increment(market)
+        price_increment = str(increment) if increment is not None else None
         evidence = {
             "ticker": ticker, "strike": str(strike), "strike_type": market.get("strike_type"),
             "rules_primary": primary.strip(), "rules_secondary": secondary.strip(),
             "settlement_sources": sources, "settlement_spec": spec,
-            "price_increment": str(increment) if increment is not None else None,
+            "price_increment": price_increment,
         }
         fingerprint = hashlib.sha256(
             json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
@@ -155,7 +156,7 @@ def snapshot(market: dict, series: dict, *, received_at: str):
             equality_wins_yes=operator in {">=", "<="},
             settlement_source=str(sources[0]["name"]).strip(),
             rules_primary=primary.strip(), rules_secondary=secondary.strip(),
-            price_increment=evidence["price_increment"], opens_at=str(opens), closes_at=str(closes),
+            price_increment=price_increment, opens_at=str(opens), closes_at=str(closes),
             metadata_received_at=received_at, rule_fingerprint=fingerprint,
             rule_status="STRUCTURED_SETTLEMENT_RULE_VERIFIED" if supported else "SETTLEMENT_CALCULATION_UNVERIFIED",
             averaging_method=method if supported else None,

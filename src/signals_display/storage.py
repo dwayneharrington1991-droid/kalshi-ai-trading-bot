@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite3
 import threading
 
-_locks = {}
+_locks: dict[str, threading.RLock] = {}
 _registry = threading.Lock()
 
 

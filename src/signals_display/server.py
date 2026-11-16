@@ -55,6 +55,25 @@ OPENING_PRELOAD_SECONDS = 120
 OPENING_INPUT_GRACE_SECONDS = 120
 
 
+def process_prediction_frame(monitor, feed, collected):
+    """Process one latest-value frame and isolate recoverable enrichment faults.
+
+    Returning the exception type to worker telemetry keeps the live thread
+    running without exposing provider payloads or exception messages.
+    """
+    base, started, completed, duration = collected
+    try:
+        if isinstance(base, Exception):
+            monitor.tick(collected)
+        else:
+            enriched = feed.enriched(base, utcnow())
+            monitor.tick((enriched, started, completed, duration))
+    except Exception as exc:
+        monitor.runtime_meter.error("prediction", type(exc).__name__)
+        return exc
+    return None
+
+
 class Monitor:
     def __init__(
         self,
@@ -386,7 +405,15 @@ class Monitor:
         observed = received_at or utcnow()
         with self.candle_lock:
             self.latest_candles = candles
-            self.journal.record_candles(candles, observed)
+            try:
+                self.journal.record_candles(candles, observed)
+            except Exception as exc:
+                # Disk pressure or a transient SQLite writer conflict must not
+                # kill the collector and freeze every live panel.  The exact
+                # provider candles remain available to the chart fallback,
+                # while health diagnostics explicitly report persistence loss.
+                self.runtime_meter.error("candle_persistence", type(exc).__name__)
+                return False
         return True
 
     def tick(self, collected=None):
@@ -2191,15 +2218,12 @@ def main():
                         stop.wait(0.01)
                         continue
                     source_key = key
-                    base, started, completed, duration = previous
                     monitor.worker_event("prediction", "started")
-                    if isinstance(base, Exception):
-                        monitor.tick(previous)
-                    else:
-                        now = utcnow()
-                        enriched = feed.enriched(base, now)
-                        monitor.tick((enriched, started, completed, duration))
-                    monitor.worker_event("prediction", "completed")
+                    # One malformed enrichment frame must not permanently stop
+                    # this thread. The next loop processes the newest mailbox
+                    # value; the failed cycle remains explicitly non-actionable.
+                    failure = process_prediction_frame(monitor, feed, previous)
+                    monitor.worker_event("prediction", "completed", failure)
                     last_processed = monotonic()
                 else:
                     monitor.worker_event("prediction", "started")

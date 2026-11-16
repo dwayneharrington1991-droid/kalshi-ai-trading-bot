@@ -12,7 +12,13 @@ import pytest
 
 from src.signals_display.monitor import Journal, PublicFeed, analyze, utcnow
 from src.signals_display.runtime import CachedReport, LatestPayload, RuntimeMeter
-from src.signals_display.server import Monitor, StartupStatus, make_handler, make_startup_handler
+from src.signals_display.server import (
+    Monitor,
+    StartupStatus,
+    make_handler,
+    make_startup_handler,
+    process_prediction_frame,
+)
 from tests.test_signals_display import NOW
 from tests.test_signals_monitor import frame
 
@@ -517,6 +523,60 @@ def test_ready_preload_reaches_chart_before_prediction_worker_runs(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_candle_persistence_failure_keeps_live_chart_and_reports_error(tmp_path, monkeypatch):
+    """A full disk must not kill the collector or erase its verified preload."""
+    journal = Journal(tmp_path / "j.db")
+    monitor = Monitor(None, journal)
+    payload = frame()
+    payload["btc_candles"] = {
+        "source": "Coinbase BTC-USD public one-minute candles",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+        "candles": [{
+            "start": int(NOW.timestamp()) - 60,
+            "open": 100.0, "high": 102.0, "low": 99.0,
+            "close": 101.0, "volume": 2.0,
+        }],
+    }
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError("simulated disk pressure")
+
+    monkeypatch.setattr(journal, "record_candles", disk_full)
+    assert monitor.accept_candle_batch(payload, NOW) is False
+    assert monitor.latest_candles is payload["btc_candles"]
+    assert monitor.runtime_meter.failures()["candle_persistence"]["error_type"] == "OSError"
+
+    chart = journal.signal_chart(
+        60, limit=30, candle_fallback=monitor.latest_candles
+    )
+    assert chart["status"] == "READY"
+    assert chart["fallback_kind"] == "LIVE_VERIFIED_PRELOAD"
+    assert len(chart["bars"]) == 1
+
+
+def test_prediction_enrichment_failure_isolated_and_next_frame_runs(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "j.db"))
+
+    class Feed:
+        fail = True
+
+        def enriched(self, payload, _now):
+            if self.fail:
+                raise ValueError("malformed optional stream frame")
+            return payload
+
+    feed = Feed()
+    collected = (frame(), NOW, NOW, 1.0)
+    failure = process_prediction_frame(monitor, feed, collected)
+    assert isinstance(failure, ValueError)
+    assert monitor.runtime_meter.failures()["prediction"]["error_type"] == "ValueError"
+
+    feed.fail = False
+    assert process_prediction_frame(monitor, feed, collected) is None
+    assert monitor.state_version == 1
 
 
 def test_history_pages_are_indexed_bounded_and_do_not_run_research(tmp_path, monkeypatch):

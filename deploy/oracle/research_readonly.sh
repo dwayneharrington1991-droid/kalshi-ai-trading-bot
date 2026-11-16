@@ -28,17 +28,66 @@ argv_value() {
   return 0
 }
 
+listener_pid() {
+  local listing
+  listing=$(sudo -n ss -H -ltnp "sport = :$1" 2>/dev/null || ss -H -ltnp "sport = :$1" 2>/dev/null || true)
+  sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listing" | sort -u | head -1
+}
+
+# Journal path of a running signals process, resolved against its working dir.
+journal_of() {
+  local pid=$1 path
+  path=$(argv_value "$pid" --journal)
+  [[ -n $path ]] || return 0
+  [[ $path == /* ]] || path="$(readlink -f "/proc/$pid/cwd")/$path"
+  [[ -f $path ]] && readlink -f "$path"
+  return 0
+}
+
 [[ $(id -un) == opc ]] || block "must run as opc"
 [[ -x $PYTHON ]] || block "Python interpreter missing: $PYTHON"
-listing=$(sudo -n ss -H -ltnp "sport = :$PORT" 2>/dev/null || ss -H -ltnp "sport = :$PORT" 2>/dev/null || true)
-pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listing" | sort -u | head -1)
+pid=$(listener_pid "$PORT")
 [[ -n $pid ]] || block "no process is listening on preview port $PORT"
-journal=$(argv_value "$pid" --journal)
 artifact=$(argv_value "$pid" --opening-model-artifact)
-[[ -n $journal && -f $journal ]] || block "could not identify the preview journal from the running process"
 install -d -m 0700 "$OUT_DIR"
 
-say "preview pid=$pid journal=$journal"
+# Every running signals bot's journal is a candidate source of genuinely
+# recorded frozen openings. Each is opened read-only only to count eligible
+# openings; the largest is researched. Nothing is written to any journal.
+declare -a journals=()
+for port in 8768 8765 8767; do
+  other=$(listener_pid "$port")
+  [[ -n $other ]] || continue
+  found=$(journal_of "$other")
+  if [[ -n $found && " ${journals[*]} " != *" $found "* ]]; then
+    journals+=("$found")
+    say "port $port journal=$found"
+  fi
+done
+(( ${#journals[@]} > 0 )) || block "could not identify any signals journal from the running processes"
+journal=$(PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 "$PYTHON" -P -c '
+import json, sqlite3, sys
+from contextlib import closing
+from pathlib import Path
+from src.signals_display.opening_models import dataset_coverage
+best, counts = None, {}
+for path in sys.argv[1:]:
+    try:
+        with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            coverage = dataset_coverage(db)
+        counts[path] = {"official_settled": coverage["official_settled_contracts"],
+                        "eligible_frozen_openings": coverage["eligible_frozen_openings"],
+                        "top_exclusions": dict(sorted(coverage["exclusion_reasons"].items(), key=lambda kv: -kv[1])[:4])}
+        if best is None or coverage["eligible_frozen_openings"] > counts[best]["eligible_frozen_openings"]:
+            best = path
+    except (sqlite3.Error, OSError, KeyError, ValueError) as exc:
+        counts[path] = {"error": type(exc).__name__}
+print(json.dumps(counts, indent=1), file=sys.stderr)
+print(best or "")
+' "${journals[@]}" 2> >(tee "$OUT_DIR/journal_coverage.json" >&2))
+[[ -n $journal ]] || block "no readable journal with opening records"
+say "researching the journal with the most eligible frozen openings: $journal"
+say "preview pid=$pid"
 say "opening artifact=${artifact:-NONE (statistical fallback only)}"
 PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 "$PYTHON" -P -c '
 import hashlib, json, sys

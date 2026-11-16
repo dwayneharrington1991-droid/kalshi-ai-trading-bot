@@ -117,6 +117,8 @@ def test_terminal_behaviour_in_a_real_browser(tmp_path):
     visible = set(out["up"]["visible"])
     assert visible <= {"", "H1", "minimal-opening-call", "minimal-opening-confidence",
                        "term-call-qualifier", "term-confidence-qualifier",
-                       "primary-contract", "primary-time"} | {
+                       "primary-contract", "primary-time", "score-correct", "score-wrong",
+                       "score-accuracy", "score-sample", "score-title", "score-acc", "score-line",
+                       "I"} | {
         v for v in visible if v.startswith(("green", "red", "amber", "term-qual"))
     }

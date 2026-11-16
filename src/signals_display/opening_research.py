@@ -80,9 +80,9 @@ def load(db, asof=None):
             "SELECT ticker,up,payload FROM btc_engine_opening WHERE mode='PUBLIC MARKET DATA'"
         )
     }
-    has_predictions = db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='predictions'"
-    ).fetchone()
+    tables = {name for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    has_predictions = "predictions" in tables
+    has_snapshots = "opening_quote_snapshots" in tables
     for row in rows:
         up, payload = recorded.get(row["ticker"], (None, None))
         try:
@@ -100,8 +100,33 @@ def load(db, asof=None):
             "regime_rising": 1.0 if regime.startswith("rising") else 0.0,
             "regime_falling": 1.0 if regime.startswith("falling") else 0.0,
         }
-        row["quote"] = _quote_at(db, row) if has_predictions else None
+        row["quote"] = (_snapshot_quote_at(db, row) if has_snapshots else None) or (
+            _quote_at(db, row) if has_predictions else None
+        )
     return rows
+
+
+ASSUMED_FEE_MULTIPLIER = 1.0  # Kalshi standard taker schedule; labelled when used
+
+
+def _snapshot_quote_at(db, row):
+    """First recorded opening quote at or after the call (opening_quote_snapshots)."""
+    called = timestamp(row["timestamp"])
+    found = db.execute(
+        """SELECT observed_at,up_bid,up_ask,down_ask,fee_multiplier FROM opening_quote_snapshots
+           WHERE ticker=? AND mode='PUBLIC MARKET DATA'
+             AND julianday(observed_at)>=julianday(?) AND julianday(observed_at)<=julianday(?)
+           ORDER BY observed_at LIMIT 1""",
+        (row["ticker"], called.isoformat(), (called + timedelta(seconds=QUOTE_WINDOW_SECONDS)).isoformat()),
+    ).fetchone()
+    if not found:
+        return None
+    at, up_bid, up_ask, down_ask, multiplier = found
+    assumed = type(multiplier) not in (int, float) or not math.isfinite(multiplier)
+    mid = (up_bid + up_ask) / 2 if type(up_bid) in (int, float) and 0 <= up_bid <= up_ask else None
+    return {"observed_at": at, "up_ask": up_ask, "down_ask": down_ask, "up_mid": mid,
+            "fee_multiplier": ASSUMED_FEE_MULTIPLIER if assumed else multiplier,
+            "fee_multiplier_assumed": assumed, "source": "opening_quote_snapshots"}
 
 
 def _quote_at(db, row):
@@ -117,14 +142,17 @@ def _quote_at(db, row):
         (row["ticker"], called.isoformat(), latest.isoformat()),
     ).fetchall()
     for at, stale, up_bid, up_ask, down_ask, multiplier in found:
-        values = (up_ask, down_ask, multiplier)
-        if stale or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        if stale or any(type(v) not in (int, float) or not math.isfinite(v) for v in (up_ask, down_ask)):
             continue
         if not (0 < up_ask < 1 and 0 < down_ask < 1):
             continue
+        # Older compact evidence did not keep the fee schedule; the standard
+        # multiplier is then assumed and labelled, never silently treated as free.
+        assumed = type(multiplier) not in (int, float) or not math.isfinite(multiplier)
         mid = (up_bid + up_ask) / 2 if type(up_bid) in (int, float) and 0 <= up_bid <= up_ask else None
-        return {"observed_at": at, "up_ask": up_ask, "down_ask": down_ask,
-                "fee_multiplier": multiplier, "up_mid": mid}
+        return {"observed_at": at, "up_ask": up_ask, "down_ask": down_ask, "up_mid": mid,
+                "fee_multiplier": ASSUMED_FEE_MULTIPLIER if assumed else multiplier,
+                "fee_multiplier_assumed": assumed, "source": "predictions"}
     return None
 
 
@@ -346,10 +374,45 @@ def research(rows, progress=None):
                 rigor._log_losses([reference[r["ticker"]] for r in common], [r["outcome"] for r in common]),
             )
     report["incremental_value_vs_compact"] = ablation
+    # Multiple testing: Holm step-down across every candidate compared with the
+    # statistical baseline and, separately, with the existing bot's recorded
+    # live openings on the same holdout contracts.
+    live = sources.get("recorded_live_opening", {})
+    vs_live = {}
+    for name in MODELS:
+        common = [r for r in holdout if r["ticker"] in predictions.get(name, {}) and r["ticker"] in live]
+        if common:
+            vs_live[name] = rigor.paired_superiority_test(
+                rigor._log_losses([predictions[name][r["ticker"]] for r in common], [r["outcome"] for r in common]),
+                rigor._log_losses([live[r["ticker"]] for r in common], [r["outcome"] for r in common]),
+            )
+    report["holdout_log_loss_vs_existing_bot"] = vs_live
+    report["multiple_testing"] = {
+        "method": "Holm step-down, family-wise alpha 0.05",
+        "vs_baseline": holm({n: e["holdout_log_loss_vs_baseline"]["p_value"] for n, e in comparison.items()
+                             if n in MODELS and "holdout_log_loss_vs_baseline" in e}),
+        "vs_existing_bot": holm({n: t["p_value"] for n, t in vs_live.items()}),
+    }
+    report["quote_coverage"] = {
+        "contracts_with_quote": sum(1 for r in rows if r.get("quote")),
+        "from_opening_quote_snapshots": sum(1 for r in rows if (r.get("quote") or {}).get("source") == "opening_quote_snapshots"),
+        "from_prediction_evidence": sum(1 for r in rows if (r.get("quote") or {}).get("source") == "predictions"),
+        "fee_multiplier_assumed": sum(1 for r in rows if (r.get("quote") or {}).get("fee_multiplier_assumed")),
+    }
     report["holdout_detectable_accuracy_margin"] = 1.96 * math.sqrt(0.25 / len(holdout)) if holdout else None
     report["status"] = "RESEARCH_COMPLETE"
     report["note"] = "Out-of-sample = walk-forward predictions on contracts unseen by training/calibration. Thresholds chosen on development only; holdout scored once. Not a profitability guarantee."
     return report
+
+
+def holm(p_values, alpha=0.05):
+    """Holm step-down adjusted p-values and rejections for a family of tests."""
+    ordered = sorted(p_values.items(), key=lambda item: item[1])
+    m, running, result = len(ordered), 0.0, {}
+    for rank, (name, p) in enumerate(ordered):
+        running = max(running, min(1.0, (m - rank) * p))
+        result[name] = {"p_value": p, "holm_adjusted_p": running, "significant": running <= alpha}
+    return result
 
 
 def _count(values):

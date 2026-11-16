@@ -208,6 +208,10 @@ while True:
         assert "initial" in engine, "prediction engine has no opening record"
         assert (state.get("decision_intelligence") or {}).get("execution_capability") is False, "execution capability not disabled"
         assert "id=\"minimal-opening-call\"" in page and "function terminalView(" in page, "terminal page missing"
+        assert "id=\"primary-time\"" in page and "function syncContractClock(" in page, "countdown missing"
+        assert "id=\"ai-scoreboard\"" in page, "performance counter missing"
+        board = get("/api/opening-scoreboard")
+        assert board.get("status") in {"READY", "CALCULATING"}, "performance counter endpoint unavailable"
         break
     except Exception as exc:
         if time.time() > deadline:
@@ -219,7 +223,8 @@ print(json.dumps({
     "opening_ticker": opening.get("ticker"),
     "opening_direction": opening.get("direction"),
     "opening_confidence_status": (opening.get("confidence") or {}).get("status"),
-    "terminal": "AI OPENING CALL + AI CONFIDENCE",
+    "terminal": "AI OPENING CALL + AI CONFIDENCE + TIME LEFT + AI PERFORMANCE",
+    "verified_scoreboard": (board.get("scoreboard") or {}).get("verified_calls"),
     "execution_capability": False,
 }, sort_keys=True))
 ' "$target"); then

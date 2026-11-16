@@ -107,6 +107,8 @@ class Monitor:
         # transient journal lock from turning a truthful 1439/1440 snapshot
         # into 0/1440. Nothing in this cache may be updated after its opening.
         self.preopening_histories = {}
+        # Kraken order-flow observations received at or before each opening.
+        self.preopening_flow = {}
         self.candle_lock = threading.Lock()
         from .signal_chart import LiveTradeCandles
 
@@ -245,6 +247,9 @@ class Monitor:
         self.quick_learning_report = CachedReport(
             self.journal.quick_learning_summary, interval=30, name="quick-learning-summary"
         )
+        self.opening_scoreboard_report = CachedReport(
+            self.journal.verified_opening_scoreboard, interval=30, name="opening-scoreboard"
+        )
         self.scheduled_learning = None
         self.scheduled_scalp_learning = None
         if model_registry is not None:
@@ -377,6 +382,9 @@ class Monitor:
             self.engine_report.invalidate()
             self.research_report.invalidate()
             self.edge_report.invalidate()
+            scoreboard = getattr(self, "opening_scoreboard_report", None)
+            if scoreboard is not None:
+                scoreboard.invalidate()
             # Force the displayed official-label count to refresh immediately
             # after a new result instead of retaining the prior 60-second cache.
             self.readiness_at = None
@@ -481,6 +489,41 @@ class Monitor:
                     retained[ticker] = deepcopy(raw)
         self.preopening_histories = dict(list(retained.items())[-12:])
 
+    def remember_preopening_flow(self, payload, now):
+        """Keep the newest pre-open Kraken order-flow item per upcoming contract.
+
+        Only observations received at or before the opening are retained, so a
+        delayed opening forecast can still use genuinely as-of-opening flow.
+        Bounded and in memory: after a restart these features stay unavailable.
+        """
+        flow = ((payload or {}).get("coverage", {}).get("Kraken public order flow", {}) or {}).get("data") or {}
+        retained = {}
+        for market in (payload or {}).get("markets", []):
+            try:
+                ticker = market["ticker"]
+                opened = timestamp(market["opens_at"])
+                closes = timestamp(market["closes_at"])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            prior = dict(self.preopening_flow.get(ticker) or {})
+            if now >= closes:
+                continue
+            if now <= opened + timedelta(seconds=5):
+                for key in ("spot", "perpetual", "spot_book"):
+                    item = flow.get(key) or {}
+                    try:
+                        observed = timestamp(item["observed_at"])
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        continue
+                    if item.get("status") != "LIVE" or observed > opened or observed > now:
+                        continue
+                    previous = prior.get(key)
+                    if previous is None or timestamp(previous["observed_at"]) < observed:
+                        prior[key] = deepcopy(item)
+            if prior:
+                retained[ticker] = prior
+        self.preopening_flow = dict(list(retained.items())[-12:])
+
     def tick(self, collected=None):
         tick_started = perf_counter()
         phases = {}
@@ -526,6 +569,12 @@ class Monitor:
             # threshold metadata or model generation arrives later.
             mode = payload.get("mode", "PUBLIC MARKET DATA")
             self.remember_preopening_histories(payload, now)
+            self.remember_preopening_flow(payload, now)
+            if market_now:
+                try:
+                    self.journal.record_opening_quote(market_now, mode, now)
+                except sqlite3.OperationalError as exc:
+                    self.runtime_meter.error("opening_quote_storage", type(exc).__name__)
             for discovered in payload.get("markets", []):
                 try:
                     opened = timestamp(discovered["opens_at"])
@@ -911,6 +960,7 @@ class Monitor:
                                 opened, candles=frozen, primary_source=primary
                             ),
                             "primary_source": primary,
+                            "order_flow": self.preopening_flow.get(m["ticker"]),
                             "advanced_features": self.advanced.summarize(
                                 opened,
                                 candles=frozen,
@@ -1899,6 +1949,17 @@ def make_handler(monitor):
                 }
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
+            elif route == "/api/opening-scoreboard":
+                report = monitor.opening_scoreboard_report.get()
+                body = json.dumps(
+                    {
+                        "status": report["status"],
+                        "scoreboard": report["value"],
+                        "generated_at": report["generated_at"],
+                    },
+                    allow_nan=False,
+                ).encode()
+                content_type = "application/json"
             elif route == "/api/learning-summary":
                 report = monitor.quick_learning_report.get()
                 body = json.dumps(
@@ -2491,6 +2552,7 @@ def main():
         monitor.scalp_paper_report.close()
         monitor.edge_report.close()
         monitor.quick_learning_report.close()
+        monitor.opening_scoreboard_report.close()
         if monitor.scheduled_learning:
             monitor.scheduled_learning.close()
         if monitor.scheduled_scalp_learning:

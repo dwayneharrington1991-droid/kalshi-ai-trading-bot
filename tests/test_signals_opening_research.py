@@ -164,3 +164,33 @@ def test_readonly_research_command_and_script_are_valid_and_change_nothing(tmp_p
     assert "install_preview_8768" not in bootstrap and "8765" not in bootstrap
     assert ps.count("__FINAL_SHA__") == 1 and ps.count("{") == ps.count("}")
     assert "| Tee-Object -Variable captured | Out-Host" in ps  # progress stays visible
+
+
+def test_holm_adjustment_controls_family_wise_error():
+    result = research.holm({"a": 0.01, "b": 0.02, "c": 0.04})
+    assert result["a"]["holm_adjusted_p"] == pytest.approx(0.03)
+    assert result["b"]["holm_adjusted_p"] == pytest.approx(0.04)
+    assert result["c"]["holm_adjusted_p"] == pytest.approx(0.04)
+    assert all(item["significant"] for item in result.values())
+    assert not research.holm({"a": 0.03, "b": 0.04})["a"]["significant"]
+
+
+def test_opening_quote_snapshots_are_preferred_and_old_fee_gaps_are_labelled(tmp_path):
+    from src.signals_display.monitor import Journal
+
+    called = datetime(2026, 11, 1, 12, 0, 1, tzinfo=timezone.utc)
+    journal = Journal(tmp_path / "j.db")
+    market = {"ticker": "KXBTC15M-Q", "opens_at": called.isoformat(),
+              "observed_at": (called + timedelta(seconds=2)).isoformat(), "fee_multiplier": 1.0,
+              "quotes": {"up": {"bid": 0.5, "ask": 0.53}, "down": {"bid": 0.45, "ask": 0.49}}}
+    assert journal.record_opening_quote(market, "PUBLIC MARKET DATA", called + timedelta(seconds=3))
+    with sqlite3.connect(tmp_path / "j.db") as db:
+        quote = research._snapshot_quote_at(db, {"ticker": "KXBTC15M-Q", "timestamp": called.isoformat()})
+    assert quote["up_ask"] == 0.53 and quote["source"] == "opening_quote_snapshots"
+    assert quote["fee_multiplier_assumed"] is False
+    # Older prediction evidence without a recorded fee multiplier: standard schedule, labelled.
+    _journal(tmp_path / "old.db", called)
+    with sqlite3.connect(tmp_path / "old.db") as db:
+        db.execute("UPDATE predictions SET payload=json_remove(payload,'$.market.fee_multiplier')")
+        old = research._quote_at(db, {"ticker": "KXBTC15M-Q", "timestamp": called.isoformat()})
+    assert old["fee_multiplier"] == research.ASSUMED_FEE_MULTIPLIER and old["fee_multiplier_assumed"] is True

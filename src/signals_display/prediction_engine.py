@@ -1588,6 +1588,36 @@ def opening_forecast(
                 )
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         result["reason"] = str(exc)
+    # The zero-drift distribution is retained as an independently scored
+    # baseline, but it is not a validated directional classifier.  Freezing a
+    # raw probability is useful for later learning; presenting its sign as an
+    # actionable opening call is not.  Historical rows are never rewritten.
+    if (
+        result.get("up") is not None
+        and str(result.get("model", "")).startswith("opening24h-zero-drift")
+    ):
+        prior_guard = result.get("opening_quality_guard", {})
+        weak_evidence = prior_guard.get("status") == "INSUFFICIENT_PREDICTIVE_CONFIDENCE"
+        result["direction"] = "UNCLEAR"
+        if not weak_evidence:
+            result["confidence"] = {
+                "status": "NO VERIFIED EDGE",
+                "reason": (
+                    "The zero-drift opening estimate is an uncalibrated shadow "
+                    "baseline. UP/DOWN is withheld until an opening-only model "
+                    "passes chronological validation and is explicitly configured."
+                ),
+            }
+        result["reason"] += "; uncalibrated fallback retained for scoring, directional call withheld"
+        result["opening_quality_guard"] = {
+            **prior_guard,
+            "status": prior_guard.get("status")
+            if weak_evidence
+            else "WAIT_UNCALIBRATED_FALLBACK",
+            "direction_policy_status": "WAIT_UNCALIBRATED_FALLBACK",
+            "probability_changed": False,
+            "historical_predictions_rewritten": False,
+        }
     shadow = [
         "RSI",
         "MACD",

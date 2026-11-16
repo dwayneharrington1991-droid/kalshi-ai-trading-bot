@@ -41,6 +41,47 @@ def _conditions(features):
     return result or ["OTHER_OR_UNCLASSIFIED"]
 
 
+def _confidence_band(probability):
+    confidence = max(probability, 1 - probability)
+    bands = (
+        (0.50, 0.55),
+        (0.55, 0.60),
+        (0.60, 0.65),
+        (0.65, 0.70),
+        (0.70, 0.75),
+        (0.75, 0.80),
+        (0.80, 0.90),
+        (0.90, 1.01),
+    )
+    for lower, upper in bands:
+        if confidence < upper:
+            return f"{lower:.0%}-{min(upper, 1):.0%}"
+    raise AssertionError("unreachable confidence band")
+
+
+def _group_metrics(records, key):
+    result = {}
+    for name in sorted({str(record[key]) for record in records}):
+        subset = [record for record in records if str(record[key]) == name]
+        directional = [record for record in subset if record["direction"] in {"UP", "DOWN"}]
+        correct = sum(record["correct"] is True for record in directional)
+        result[name] = {
+            "records": len(subset),
+            "directional_calls": len(directional),
+            "wait": len(subset) - len(directional),
+            "correct": correct,
+            "wrong": len(directional) - correct,
+            "directional_accuracy": correct / len(directional) if directional else None,
+            "directional_accuracy_interval_95": wilson_interval(correct, len(directional)),
+            "coverage": len(directional) / len(subset) if subset else None,
+            "probability_metrics": score(
+                [record["probability_up"] for record in subset],
+                [record["official_outcome"] for record in subset],
+            ),
+        }
+    return result
+
+
 def audit(db, asof=None):
     asof = asof or datetime.now(timezone.utc)
     rows = db.execute(
@@ -61,6 +102,8 @@ def audit(db, asof=None):
         WHERE origin='official' GROUP BY ticker HAVING n>1)"""
     ).fetchone()[0]
     calls, probabilities, outcomes = [], [], []
+    baseline_probabilities, baseline_outcomes = [], []
+    records = []
     invalid = Counter()
     failure_conditions = Counter()
     direction_counts = Counter()
@@ -74,7 +117,9 @@ def audit(db, asof=None):
             if cutoff != opened or timestamp(opening["data_cutoff"]) != cutoff:
                 raise ValueError("cutoff")
             frozen = opening["frozen_features"]
-            if timestamp(frozen["max_input_received_at"]) > cutoff:
+            max_input_received = timestamp(frozen["max_input_received_at"])
+            input_cutoff = timestamp(opening["input_data_cutoff"])
+            if max_input_received >= cutoff or input_cutoff >= cutoff:
                 raise ValueError("future_input")
             p = float(raw[4])
             if not math.isfinite(p) or not 0 <= p <= 1 or raw[7] not in (0, 1):
@@ -86,11 +131,57 @@ def audit(db, asof=None):
         direction_counts[direction] += 1
         probabilities.append(p)
         outcomes.append(int(raw[7]))
+        baseline = opening.get("baseline_probability_up")
+        if type(baseline) in (int, float) and math.isfinite(baseline) and 0 <= baseline <= 1:
+            baseline_probabilities.append(float(baseline))
+            baseline_outcomes.append(int(raw[7]))
+        values = frozen.get("values") or {}
+        active = opening.get("feature_usage", {}).get("active_probability_inputs") or []
+        available = [name for name, value in values.items() if value is not None]
+        correct = None
         if direction in {"UP", "DOWN"}:
             correct = (direction == "UP") == bool(raw[7])
             calls.append(correct)
             if not correct:
-                failure_conditions.update(_conditions(frozen.get("values") or {}))
+                failure_conditions.update(_conditions(values))
+        records.append(
+            {
+                "ticker": raw[0],
+                "opens_at": opened.isoformat(),
+                "generated_at": generated.isoformat(),
+                "opening_delay_seconds": (generated - opened).total_seconds(),
+                "data_cutoff": cutoff.isoformat(),
+                "input_data_cutoff": input_cutoff.isoformat(),
+                "max_input_received_at": max_input_received.isoformat(),
+                "closes_at": closed.isoformat(),
+                "official_outcome_observed_at": observed.isoformat(),
+                "model": opening.get("model", "UNRECORDED"),
+                "model_selection_status": (opening.get("model_selection") or {}).get("status"),
+                "direction": direction,
+                "probability_up": p,
+                "confidence_band": _confidence_band(p),
+                "confidence": opening.get("confidence"),
+                "estimated_edge": opening.get("estimated_edge"),
+                "threshold": opening.get("threshold"),
+                "reference_price": opening.get("reference_price"),
+                "reference_source": opening.get("reference_source"),
+                "historical_candle_status": (opening.get("data_quality") or {}).get("status"),
+                "closed_history_bars": (opening.get("data_quality") or {}).get(
+                    "closed_history_bars"
+                ),
+                "frozen_feature_version": frozen.get("version"),
+                "available_feature_count": len(available),
+                "active_probability_inputs": active,
+                "available_shadow_feature_count": len(
+                    opening.get("feature_usage", {}).get("available_shadow_features") or []
+                ),
+                "official_outcome": int(raw[7]),
+                "correct": correct,
+                "scoring_rule": "UP is correct iff official outcome=1; DOWN iff outcome=0; WAIT is not directional",
+                "preopening_inputs_verified": True,
+                "failure_conditions": _conditions(values) if correct is False else [],
+            }
+        )
     correct = sum(calls)
     directional = len(calls)
     coverage = dataset_coverage(db, asof)
@@ -106,7 +197,13 @@ def audit(db, asof=None):
         "directional_accuracy": correct / directional if directional else None,
         "directional_accuracy_interval_95": wilson_interval(correct, directional),
         "probability_metrics": score(probabilities, outcomes),
+        "saved_statistical_baseline_metrics": score(
+            baseline_probabilities, baseline_outcomes
+        ),
         "directions": dict(sorted(direction_counts.items())),
+        "by_model": _group_metrics(records, "model"),
+        "by_confidence_band": _group_metrics(records, "confidence_band"),
+        "records": records,
         "incorrect_call_conditions": dict(failure_conditions.most_common()),
         "invalid_or_unscored": dict(sorted(invalid.items())),
         "duplicate_opening_tickers": duplicate_openings,

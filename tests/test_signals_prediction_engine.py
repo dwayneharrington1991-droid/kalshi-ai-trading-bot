@@ -546,9 +546,9 @@ def test_opening_panel_reports_supported_price_and_uncalibrated_quality_without_
     opening = engine.opening_forecast(
         m, h, points(), NOW + timedelta(seconds=2), reference_source="Mock Coinbase spot"
     )
-    assert opening["direction"] in ("UP", "DOWN", "UNCLEAR")
+    assert opening["direction"] == "UNCLEAR"
     assert opening["up"] + opening["down"] == pytest.approx(1)
-    assert opening["confidence"]["status"] == "UNCALIBRATED"
+    assert opening["confidence"]["status"] == "NO VERIFIED EDGE"
     assert opening["data_quality"]["closed_history_bars"] == 1440
     assert opening["reference_source"] == "Mock Coinbase spot"
     assert opening["settlement_price_estimate"]["mean"] == pytest.approx(

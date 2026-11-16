@@ -63,6 +63,24 @@ def test_opening_fallback_explains_model_and_feature_role_not_constant_probabili
     assert result["up"] == pytest.approx(
         0.5 * (1 + math.erf(result["probability_inputs"]["z_score"] / math.sqrt(2)))
     )
+    assert result["direction"] == "UNCLEAR"
+    assert result["confidence"]["status"] == "NO VERIFIED EDGE"
+    assert result["opening_quality_guard"]["status"] == "WAIT_UNCALIBRATED_FALLBACK"
+    assert engine.recorded_opening_direction(result) == "UNCLEAR"
+
+
+def test_unvalidated_fallback_wait_does_not_hide_legacy_directional_results():
+    current = opening()
+    assert current["direction"] == "UNCLEAR"
+    # Historical rows without an explicit saved WAIT retain their original
+    # probability-derived scoring.  This prevents the new policy from erasing
+    # or reclassifying prior losses.
+    legacy = {
+        "model": "opening24h-zero-drift-final-average-v1",
+        "up": 0.7,
+        "direction": "UP",
+    }
+    assert engine.recorded_opening_direction(legacy) == "UP"
 
 
 def test_frozen_features_exclude_future_reference_and_microstructure_context():
@@ -396,6 +414,26 @@ def test_read_only_opening_audit_scores_immutable_official_records(tmp_path):
     assert report["duplicate_opening_tickers"] == 0
     assert report["duplicate_official_outcome_tickers"] == 0
     assert report["integrity"]["future_inputs_accepted"] == 0
+    assert len(report["records"]) == 1
+    forensic = report["records"][0]
+    assert forensic["ticker"] == result["ticker"]
+    assert forensic["model"] == "opening24h-zero-drift-final-average-v1"
+    assert forensic["direction"] == "UNCLEAR"
+    assert forensic["correct"] is None
+    assert forensic["closed_history_bars"] == 1440
+    assert forensic["preopening_inputs_verified"] is True
+    assert forensic["max_input_received_at"] < forensic["opens_at"]
+    assert report["by_model"][forensic["model"]]["wait"] == 1
+    assert report["saved_statistical_baseline_metrics"]["samples"] == 1
+
+
+def test_forensic_confidence_bands_are_fixed_before_outcomes():
+    from src.signals_display.opening_accuracy_audit import _confidence_band
+
+    assert _confidence_band(0.50) == "50%-55%"
+    assert _confidence_band(0.79) == "75%-80%"
+    assert _confidence_band(0.85) == "80%-90%"
+    assert _confidence_band(0.95) == "90%-100%"
 
 
 def test_selected_candidate_keeps_independent_baseline_for_future_training(tmp_path):

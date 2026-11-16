@@ -144,11 +144,12 @@ def test_opening_quotes_are_recorded_append_only_inside_the_window(tmp_path):
     assert not journal.record_opening_quote(_market(NOW + timedelta(seconds=3)), mode, NOW + timedelta(seconds=4))  # duplicate
     assert not journal.record_opening_quote(_market(NOW + timedelta(seconds=200)), mode, NOW + timedelta(seconds=201))  # late
     assert not journal.record_opening_quote(_market(NOW + timedelta(seconds=5)), mode, NOW + timedelta(seconds=30))  # stale
-    assert not journal.record_opening_quote(_market(NOW - timedelta(seconds=1)), mode, NOW)  # before open
+    assert not journal.record_opening_quote(_market(NOW - timedelta(seconds=61)), mode, NOW - timedelta(seconds=60))  # too early
+    assert journal.record_opening_quote(_market(NOW - timedelta(seconds=30)), mode, NOW - timedelta(seconds=29))  # pre-open book
     assert not journal.record_opening_quote(_market(NOW + timedelta(seconds=6), up_ask=0), mode, NOW + timedelta(seconds=6))
     with sqlite3.connect(tmp_path / "journal.db") as db:
         rows = db.execute("SELECT seconds_from_open,up_ask,down_ask,fee_multiplier,fee_type FROM opening_quote_snapshots").fetchall()
-        assert rows == [(3.0, 0.52, 0.5, 1.0, "quadratic")]
+        assert sorted(rows) == [(-30.0, 0.52, 0.5, 1.0, "quadratic"), (3.0, 0.52, 0.5, 1.0, "quadratic")]
         with pytest.raises(sqlite3.DatabaseError):
             db.execute("UPDATE opening_quote_snapshots SET up_ask=0.1")
         with pytest.raises(sqlite3.DatabaseError):
@@ -177,3 +178,33 @@ def test_preopening_flow_cache_keeps_only_flow_received_by_the_opening():
     Monitor.remember_preopening_flow(holder, payload(NOW + timedelta(seconds=1)), NOW + timedelta(seconds=2))
     kept = holder.preopening_flow["KXBTC15M-Q"]["spot"]["observed_at"]
     assert kept == (NOW - timedelta(seconds=2)).isoformat()
+
+
+def test_ema_and_volume_acceleration_at_opening_use_pre_open_bars_only():
+    from tests.test_signals_prediction_engine import history
+    values = opening()["frozen_features"]["values"]
+    data = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=1))
+    bars = sorted((b for b in data["candles"] if int(b["start"]) + 60 <= NOW.timestamp()),
+                  key=lambda b: int(b["start"]))[-1440:]
+    closes = [float(b["close"]) for b in bars]
+
+    def ema(period):
+        value, alpha = closes[0], 2 / (period + 1)
+        for x in closes:
+            value += alpha * (x - value)
+        return value
+
+    assert values["opening_ema9_distance"] == pytest.approx(closes[-1] / ema(9) - 1)
+    assert values["opening_ema9_21_gap"] == pytest.approx(ema(9) / ema(21) - 1)
+    assert values["opening_ema200_distance"] == pytest.approx(closes[-1] / ema(200) - 1)
+    recent = sum(float(b["volume"]) for b in bars[-5:])
+    prior = sum(float(b["volume"]) for b in bars[-10:-5])
+    assert values["opening_volume_acceleration"] == pytest.approx(recent / prior - 1)
+
+
+def test_feature_vocabulary_only_appends_new_names():
+    from src.signals_display.features import FEATURES, OPENING_TREND_FEATURES
+    assert FEATURES[-len(OPENING_TREND_FEATURES):] == OPENING_TREND_FEATURES
+    assert FEATURES[:13] == ("distance_scaled", "remaining_fraction", "return_1m", "return_3m", "return_5m",
+                             "return_15m", "return_30m", "return_60m", "acceleration", "body_fraction",
+                             "upper_wick", "lower_wick", "range_fraction")

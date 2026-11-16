@@ -570,11 +570,14 @@ class Monitor:
             mode = payload.get("mode", "PUBLIC MARKET DATA")
             self.remember_preopening_histories(payload, now)
             self.remember_preopening_flow(payload, now)
-            if market_now:
+            # Every listed market: the next contract's pre-open book and the new
+            # contract's first two minutes (the recorder enforces the window).
+            for listed in payload.get("markets", []) or ([market_now] if market_now else []):
                 try:
-                    self.journal.record_opening_quote(market_now, mode, now)
+                    self.journal.record_opening_quote(listed, mode, now)
                 except sqlite3.OperationalError as exc:
                     self.runtime_meter.error("opening_quote_storage", type(exc).__name__)
+                    break
             for discovered in payload.get("markets", []):
                 try:
                     opened = timestamp(discovered["opens_at"])

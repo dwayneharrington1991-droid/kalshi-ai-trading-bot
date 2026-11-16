@@ -358,6 +358,24 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     )
     old_volume = mean(float(b["volume"]) for b in bars[-21:-1])
     values["relative_volume"] = float(latest["volume"]) / old_volume if old_volume else None
+    # EMA distances (9/21/50/200 on closed pre-open 1-minute closes) and volume
+    # acceleration. Each EMA needs four periods of history to settle; shorter
+    # history leaves the feature unavailable rather than guessed.
+    def settled_ema(period):
+        return ema(closes, period)[-1] if len(closes) >= 4 * period else None
+
+    ema9, ema21, ema50, ema200 = (settled_ema(p) for p in (9, 21, 50, 200))
+    values.update(
+        opening_ema9_distance=close / ema9 - 1 if ema9 else None,
+        opening_ema9_21_gap=ema9 / ema21 - 1 if ema9 and ema21 else None,
+        opening_ema50_distance=close / ema50 - 1 if ema50 else None,
+        opening_ema200_distance=close / ema200 - 1 if ema200 else None,
+    )
+    recent_volume = sum(float(b["volume"]) for b in bars[-5:])
+    prior_volume = sum(float(b["volume"]) for b in bars[-10:-5])
+    values["opening_volume_acceleration"] = (
+        recent_volume / prior_volume - 1 if len(bars) >= 10 and prior_volume > 0 else None
+    )
     # Same candle definitions as features.extract, from closed pre-open bars only.
     true_ranges = [
         max(

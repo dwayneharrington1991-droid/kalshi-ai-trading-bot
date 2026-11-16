@@ -3020,6 +3020,7 @@ class Journal:
         }
 
     OPENING_QUOTE_WINDOW_SECONDS = 120
+    OPENING_PREOPEN_QUOTE_SECONDS = 60
 
     def record_opening_quote(self, market, mode, now):
         """Append one executable Kalshi quote observed early in a contract.
@@ -3034,7 +3035,9 @@ class Journal:
             opened = timestamp(market["opens_at"])
             observed = timestamp(market["observed_at"])
             seconds = (observed - opened).total_seconds()
-            if not 0 <= seconds <= self.OPENING_QUOTE_WINDOW_SECONDS:
+            # From 60 s before the opening (the next contract is already listed)
+            # through two minutes after it.
+            if not -self.OPENING_PREOPEN_QUOTE_SECONDS <= seconds <= self.OPENING_QUOTE_WINDOW_SECONDS:
                 return False
             if not 0 <= (now - observed).total_seconds() <= 5:
                 return False

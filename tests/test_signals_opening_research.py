@@ -3,6 +3,7 @@
 All rows here are SYNTHETIC; nothing says anything about live accuracy.
 """
 import hashlib
+import math
 import json
 import sqlite3
 import subprocess
@@ -53,8 +54,8 @@ def test_threshold_table_counts_calls_at_each_confidence_level():
     probabilities = [0.50, 0.51, 0.53, 0.56, 0.38, 0.72]
     rows = [_row(1) for _ in probabilities]
     table = research.threshold_table(probabilities, rows)
-    assert list(table) == ["0.50", "0.52", "0.55", "0.60", "0.65", "0.70"]
-    assert [table[k]["calls"] for k in table] == [5, 4, 3, 2, 1, 1]
+    assert list(table) == ["0.50", "0.52", "0.55", "0.60", "0.65", "0.70", "0.75", "0.80", "0.85", "0.90"]
+    assert [table[k]["calls"] for k in table] == [5, 4, 3, 2, 1, 1, 0, 0, 0, 0]
     assert table["0.50"]["coverage"] == pytest.approx(5 / 6)
 
 
@@ -194,3 +195,128 @@ def test_opening_quote_snapshots_are_preferred_and_old_fee_gaps_are_labelled(tmp
         db.execute("UPDATE predictions SET payload=json_remove(payload,'$.market.fee_multiplier')")
         old = research._quote_at(db, {"ticker": "KXBTC15M-Q", "timestamp": called.isoformat()})
     assert old["fee_multiplier"] == research.ASSUMED_FEE_MULTIPLIER and old["fee_multiplier_assumed"] is True
+
+
+def test_research_preprocess_keeps_research_only_features():
+    rows = [{"features": {"regime_rising": float(i % 2), "return_5m": i * 0.001}} for i in range(20)]
+    prep = research._preprocess(rows, ("return_5m", "regime_rising", "missing_feature"))
+    assert prep["names"] == ["return_5m", "regime_rising"]
+
+
+def test_preopen_market_price_uses_only_quotes_received_by_the_call(tmp_path):
+    from src.signals_display.monitor import Journal
+
+    opened = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc)
+    journal = Journal(tmp_path / "j.db")
+    def book(seconds, bid, ask):
+        observed = opened + timedelta(seconds=seconds)
+        market = {"ticker": "KXBTC15M-P", "opens_at": opened.isoformat(), "observed_at": observed.isoformat(),
+                  "quotes": {"up": {"bid": bid, "ask": ask}, "down": {"bid": 1 - ask, "ask": 1 - bid + 0.01}}}
+        assert journal.record_opening_quote(market, "PUBLIC MARKET DATA", observed + timedelta(seconds=1))
+    book(-20, 0.44, 0.48)
+    book(-5, 0.50, 0.54)   # latest at or before the call
+    book(+3, 0.70, 0.74)   # after the call: never used
+    with sqlite3.connect(tmp_path / "j.db") as db:
+        mid = research._preopen_mid(db, {"ticker": "KXBTC15M-P", "timestamp": opened.isoformat()})
+    assert mid == pytest.approx(0.52)
+
+
+def test_intracontract_rows_carry_same_time_quotes_and_are_researched_per_bucket():
+    rows = []
+    for r in synthetic.opening_rows(240, seed=91, signal=0.6):
+        r.update(executable_quotes={"up": {"ask": 0.55}, "down": {"ask": 0.47}}, fee_multiplier=None,
+                 market=0.53)
+        rows.append(r)
+    class DB:  # learning.dataset stand-in
+        pass
+    original = research.learning.dataset
+    research.learning.dataset = lambda db, asof: rows
+    try:
+        buckets = research.live_rows(DB())
+    finally:
+        research.learning.dataset = original
+    assert list(buckets) == [">10m"]
+    quote = buckets[">10m"][0]["quote"]
+    assert quote["up_ask"] == 0.55 and quote["fee_multiplier_assumed"] is True
+    report = research.intracontract_research(buckets)
+    assert report[">10m"]["status"] in {"RESEARCH_COMPLETE", "INSUFFICIENT_OUT_OF_SAMPLE_CONTRACTS"}
+    assert "immutable opening prediction" in report[">10m"]["scope"]
+    assert report[">10m"]["promotion_allowed"] is False
+
+
+def _retro_journal(path, *, late_bar=False, verified=True):
+    opened = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+    t0 = int(opened.timestamp())
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE forecast_outcomes (ticker TEXT,origin TEXT,observed_at TEXT,outcome INTEGER)")
+        db.execute("CREATE TABLE predictions (id INTEGER PRIMARY KEY, ticker TEXT, mode TEXT, timestamp TEXT, payload TEXT)")
+        db.execute("CREATE TABLE btc_candles (source TEXT,start INTEGER,payload TEXT,first_received_at TEXT)")
+        for ticker, offset, outcome in (("KXBTC15M-R1", 0, 1), ("KXBTC15M-R2", 900, 0)):
+            o = opened + timedelta(seconds=offset)
+            market = {"opens_at": o.isoformat(), "closes_at": (o + timedelta(minutes=15)).isoformat(),
+                      "strike": 100000.0, "mapping_verified": verified, "comparison_operator": ">=",
+                      "averaging_rule_verified": True}
+            db.execute("INSERT INTO predictions (ticker,mode,timestamp,payload) VALUES (?,?,?,?)",
+                       (ticker, "PUBLIC MARKET DATA", (o + timedelta(seconds=5)).isoformat(), json.dumps({"market": market})))
+            db.execute("INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+                       (ticker, "official", (o + timedelta(minutes=16)).isoformat(), outcome))
+        import math as _m
+        for i, start in enumerate(range(t0 - 86580, t0 + 900, 60)):
+            price = 100000 + 30 * _m.sin(i / 17) + i * 0.01
+            bar = {"start": start, "open": price, "high": price + 6 + (i % 5), "low": price - 6, "close": price + 2 * _m.sin(i),
+                   "volume": 1 + i % 13}
+            received = datetime.fromtimestamp(start + 62, timezone.utc)
+            if late_bar and start == t0 - 120:
+                received = opened + timedelta(seconds=30)  # arrived after the opening
+            db.execute("INSERT INTO btc_candles VALUES (?,?,?,?)",
+                       ("Coinbase BTC/USD", start, json.dumps(bar), received.isoformat()))
+    return opened
+
+
+def test_retrospective_rows_use_only_candles_received_by_the_opening(tmp_path):
+    opened = _retro_journal(tmp_path / "ok.db")
+    with sqlite3.connect(tmp_path / "ok.db") as db:
+        rows, info = research.retrospective_rows(db, exclude_tickers={"KXBTC15M-R2"})
+    assert info["status"] == "RECONSTRUCTED" and [r["ticker"] for r in rows] == ["KXBTC15M-R1"]
+    row = rows[0]
+    assert row["timestamp"] == opened.isoformat() and row["outcome"] == 1
+    assert row["recorded_model"] == "RETROSPECTIVE_RECONSTRUCTION" and row["recorded_up"] is None
+    assert 0 < row["baseline"] < 1
+    for name in ("return_15m", "rsi_14", "candle_body_range_ratio", "opening_ema50_distance"):
+        assert row["features"][name] is not None, name
+    # A bar that arrived after the opening is never used: the reconstruction
+    # falls back to the last complete window received before the opening.
+    _retro_journal(tmp_path / "late.db", late_bar=True)
+    with sqlite3.connect(tmp_path / "late.db") as db:
+        late_rows, _ = research.retrospective_rows(db, exclude_tickers={"KXBTC15M-R2"})
+        t0 = int(opened.timestamp())
+        closes = {start: json.loads(payload)["close"] for start, payload in db.execute(
+            "SELECT start,payload FROM btc_candles WHERE start IN (?,?,?)", (t0 - 240, t0 - 180, t0 - 120))}
+    assert len(late_rows) == 1
+    expected = math.log(closes[t0 - 180] / closes[t0 - 240])
+    assert late_rows[0]["features"]["return_1m"] == pytest.approx(expected)
+    assert late_rows[0]["features"]["return_1m"] != pytest.approx(math.log(closes[t0 - 120] / closes[t0 - 180]))
+
+
+def test_retrospective_rows_skip_unverified_settlement_rules(tmp_path):
+    _retro_journal(tmp_path / "unverified.db", verified=False)
+    with sqlite3.connect(tmp_path / "unverified.db") as db:
+        rows, info = research.retrospective_rows(db, exclude_tickers=set())
+    assert rows == [] and info["skipped"] == {"UNVERIFIED_SETTLEMENT_RULES": 2}
+
+
+def test_threshold_table_reports_up_down_wait_through_ninety_percent():
+    probabilities = [0.95, 0.88, 0.30, 0.52, 0.50]
+    table = research.threshold_table(probabilities, [_row(1) for _ in probabilities])
+    assert list(table)[-1] == "0.90"
+    assert (table["0.90"]["calls"], table["0.90"]["up_calls"], table["0.90"]["wait"]) == (1, 1, 4)
+    assert (table["0.70"]["up_calls"], table["0.70"]["down_calls"], table["0.70"]["wait"]) == (2, 1, 2)
+
+
+def test_condition_report_is_descriptive_with_intervals():
+    rows = _augment(synthetic.opening_rows(240, seed=95, signal=0.8))
+    report = research.condition_report(rows)
+    assert set(report["return_15m"]) == {"low", "mid", "high"}
+    assert report["return_15m"]["low"]["contracts"] == 80
+    assert len(report["return_15m"]["high"]["up_rate_wilson_95"]) == 2
+    assert "Exploratory" in report["note"]

@@ -134,6 +134,6 @@ say "running read-only opening research (low priority; can take several minutes)
 cd "$OUT_DIR"
 PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 nice -n 15 timeout 3h \
   "$PYTHON" -P -m src.signals_display.opening_research \
-  --journal "$journal" --output "$OUT_DIR/opening_research.report.json"
+  --journal "$journal" --output "$OUT_DIR/opening_research.report.json" --intracontract --retrospective
 say "REPORT_DIR=$OUT_DIR"
 printf 'RESEARCH_COMPLETE journal_unchanged=READ_ONLY services_unchanged=YES trading=DISABLED\n'

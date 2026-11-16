@@ -13,6 +13,7 @@ readonly PORT=8768
 readonly MIN_FREE_BYTES=$((10 * 1024 * 1024 * 1024))
 readonly STATE_ROOT=/home/opc/.kalshi-deploy/preview-8768
 readonly LOG_PATH="$OLD_ROOT/logs/preview-8768-${TARGET:0:7}.log"
+readonly OPENING_ARTIFACT=${PREVIEW_OPENING_MODEL_ARTIFACT:-}
 
 old_pid=
 new_pid=
@@ -143,6 +144,18 @@ trap rollback_on_error ERR INT TERM
 [[ -z $(git -C "$NEW_ROOT" status --porcelain) ]] || fail "staged checkout is dirty"
 git -C "$NEW_ROOT" cat-file -e "$TARGET^{commit}"
 "$PYTHON" -c 'import httpx, cryptography; from websockets.sync.client import connect'
+if [[ -n $OPENING_ARTIFACT ]]; then
+  [[ $OPENING_ARTIFACT == "$STATE_ROOT"/models/* ]] || fail "opening artifact must be in preview deployment state"
+  [[ -f $OPENING_ARTIFACT && ! -L $OPENING_ARTIFACT ]] || fail "opening artifact missing or unsafe"
+  [[ $(stat -c %U "$OPENING_ARTIFACT") == $(id -un) ]] || fail "opening artifact owner mismatch"
+  PYTHONPATH="$NEW_ROOT" PYTHONNOUSERSITE=1 "$PYTHON" - "$OPENING_ARTIFACT" <<'PY'
+import sys
+from src.signals_display.opening_models import load_artifact
+artifact, reason = load_artifact(sys.argv[1])
+if artifact is None:
+    raise SystemExit("opening artifact rejected: " + reason)
+PY
+fi
 
 free_bytes=$(df -B1 --output=avail "$JOURNAL" | tail -1 | tr -d ' ')
 [[ $free_bytes =~ ^[0-9]+$ ]] || fail "could not measure free storage"
@@ -180,6 +193,9 @@ raise SystemExit(0 if value.get("status")=="HEALTHY" and value.get("build_commit
 PY
 then
   has_arg_pair --journal "$JOURNAL" || fail "target process does not use absolute preserved journal"
+  if [[ -n $OPENING_ARTIFACT ]]; then
+    has_arg_pair --opening-model-artifact "$OPENING_ARTIFACT" || fail "target process does not use requested opening artifact"
+  fi
   [[ " ${old_argv[*]} " == *" -P "* ]] || fail "target process does not use Python safe-path mode"
   process_has_environment "$old_pid" "PYTHONPATH=$NEW_ROOT" || fail "target process is not loading repaired code"
   printf 'PREVIEW_ALREADY_DEPLOYED commit=%s pid=%s journal=%s\n' "$TARGET" "$old_pid" "$JOURNAL"
@@ -203,6 +219,8 @@ for arg in "${old_argv[@]:1}"; do
   (( seen_module )) || continue
   case "$arg" in
     --host|--port|--journal|--build-commit) skip=1 ;;
+    --opening-model-artifact)
+      if [[ -n $OPENING_ARTIFACT ]]; then skip=1; else new_args+=("$arg"); fi ;;
     --disable-scheduled-learning) ;;
     --account-readonly|--private-dashboard) fail "account/private flags are not allowed on preview switch" ;;
     *) new_args+=("$arg") ;;
@@ -211,6 +229,9 @@ done
 (( seen_module )) || fail "could not reconstruct module launch"
 new_args+=(--host "$HOST" --port "$PORT" --journal "$JOURNAL" \
   --build-commit "$TARGET" --disable-scheduled-learning)
+if [[ -n $OPENING_ARTIFACT ]]; then
+  new_args+=(--opening-model-artifact "$OPENING_ARTIFACT")
+fi
 
 kill -TERM "$old_pid"
 wait_stopped "$old_pid" || fail "preview did not stop gracefully within 30 seconds"
@@ -273,9 +294,21 @@ PY
 [[ $(listener_pid "$PORT") == "$new_pid" ]] || fail "new process does not exclusively own port 8768"
 [[ $(readlink -f "/proc/$new_pid/cwd") == "$OLD_ROOT" ]] || fail "new cwd changed"
 tr '\0' '\n' <"/proc/$new_pid/environ" | grep -Fx "PYTHONPATH=$NEW_ROOT" >/dev/null || fail "new code path identity missing"
+if [[ -n $OPENING_ARTIFACT ]]; then
+  mapfile -d '' -t running_argv <"/proc/$new_pid/cmdline"
+  found_artifact=0
+  for ((i=0; i<${#running_argv[@]}-1; i++)); do
+    if [[ ${running_argv[i]} == --opening-model-artifact && ${running_argv[i+1]} == "$OPENING_ARTIFACT" ]]; then
+      found_artifact=1
+      break
+    fi
+  done
+  (( found_artifact )) || fail "running process opening artifact identity mismatch"
+fi
 
 switched=0
 trap - ERR INT TERM
 printf 'PREVIEW_DEPLOY_SUCCESS commit=%s pid=%s journal=%s rollback=%s/rollback.sh\n' \
   "$TARGET" "$new_pid" "$JOURNAL" "$STATE_ROOT"
 printf 'AUTOMATED_TRADING=DISABLED scheduled_learning=DISABLED ports_8765_8767=UNCHANGED\n'
+printf 'OPENING_ARTIFACT=%s\n' "${OPENING_ARTIFACT:-SHADOW_FALLBACK_ONLY}"

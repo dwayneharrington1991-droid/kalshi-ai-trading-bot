@@ -677,6 +677,11 @@ def test_preview_8768_switch_is_narrow_idempotent_and_rollback_guarded():
     assert "PREVIEW_ALREADY_DEPLOYED" in source
     assert "process_has_environment" in source and "PYTHONPATH=$NEW_ROOT" in source
     assert 'new_args=(-P)' in source and "--disable-scheduled-learning" in source
+    assert "PREVIEW_OPENING_MODEL_ARTIFACT" in source
+    assert '"$STATE_ROOT"/models/*' in source
+    assert "opening artifact rejected" in source
+    assert 'new_args+=(--opening-model-artifact "$OPENING_ARTIFACT")' in source
+    assert "running process opening artifact identity mismatch" in source
     assert "kill -TERM \"$old_pid\"" in source
     assert "wait_stopped" in source and "db_open_pids" in source
     assert "start_old_in_memory" in source and "rollback_on_error" in source

@@ -311,4 +311,13 @@ trap - ERR INT TERM
 printf 'PREVIEW_DEPLOY_SUCCESS commit=%s pid=%s journal=%s rollback=%s/rollback.sh\n' \
   "$TARGET" "$new_pid" "$JOURNAL" "$STATE_ROOT"
 printf 'AUTOMATED_TRADING=DISABLED scheduled_learning=DISABLED ports_8765_8767=UNCHANGED\n'
-printf 'OPENING_ARTIFACT=%s\n' "${OPENING_ARTIFACT:-SHADOW_FALLBACK_ONLY}"
+running_artifact=
+mapfile -d '' -t final_argv <"/proc/$new_pid/cmdline"
+for ((i=0; i<${#final_argv[@]}-1; i++)); do
+  if [[ ${final_argv[i]} == --opening-model-artifact ]]; then
+    running_artifact=${final_argv[i+1]}
+  fi
+done
+# Report the artifact the running process actually loaded (it may have been
+# carried through from the previous process rather than requested explicitly).
+printf 'OPENING_ARTIFACT=%s\n' "${running_artifact:-NONE_SHADOW_FALLBACK_ONLY}"

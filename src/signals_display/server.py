@@ -409,8 +409,8 @@ class Monitor:
         if not isinstance(candles, dict) or not candles.get("candles"):
             return False
         observed = received_at or utcnow()
+        persisted = True
         with self.candle_lock:
-            self.latest_candles = candles
             try:
                 self.journal.record_candles(candles, observed)
             except Exception as exc:
@@ -419,8 +419,26 @@ class Monitor:
                 # provider candles remain available to the chart fallback,
                 # while health diagnostics explicitly report persistence loss.
                 self.runtime_meter.error("candle_persistence", type(exc).__name__)
-                return False
-        return True
+                persisted = False
+            try:
+                # The provider batch receipt defines its rolling window. This
+                # also keeps deterministic replay histories anchored to their
+                # original clock instead of the machine's current wall clock.
+                recovery_cutoff = candles.get("received_at") or observed
+                candles = self.journal.recover_recorded_candles(candles, recovery_cutoff)
+                payload["btc_candles"] = candles
+            except Exception as exc:
+                # A read lock/corrupt row never licenses a guessed candle. Keep
+                # the provider batch and expose the recovery failure.
+                diagnostics = dict(candles.get("diagnostics") or {})
+                diagnostics["journal_recovery"] = {
+                    "status": "UNAVAILABLE", "error_type": type(exc).__name__
+                }
+                candles = {**candles, "diagnostics": diagnostics}
+                payload["btc_candles"] = candles
+                self.runtime_meter.error("candle_recovery", type(exc).__name__)
+            self.latest_candles = candles
+        return persisted
 
     def remember_preopening_histories(self, payload, now):
         """Retain bounded, pre-open-only candle receipts for rollover."""

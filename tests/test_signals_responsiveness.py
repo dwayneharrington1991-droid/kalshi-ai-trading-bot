@@ -1,5 +1,5 @@
 """Bounded history and live HTTP responsiveness during blocked background jobs."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -524,6 +524,73 @@ def test_ready_preload_reaches_chart_before_prediction_worker_runs(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_collector_recovers_exact_gap_from_receipt_proven_journal_without_lookahead(
+    tmp_path,
+):
+    """Regression: live Coinbase APIs returned 1439/1440 for one old minute."""
+    journal = Journal(tmp_path / "gap.db")
+    monitor = Monitor(None, journal)
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    first = cutoff - 86400
+    missing = first + 317 * 60
+    recovered = {
+        "start": missing, "open": 90.0, "high": 92.0, "low": 89.0,
+        "close": 91.0, "volume": 4.0,
+    }
+    with journal.connect() as db:
+        db.execute(
+            "INSERT INTO btc_candles VALUES (?,?,?,?)",
+            (
+                "Coinbase Exchange BTC-USD one-minute gap fill", missing,
+                json.dumps(recovered), (NOW - timedelta(hours=1)).isoformat(),
+            ),
+        )
+        # A second gap exists only as a post-cutoff receipt and must not leak in.
+        future_start = first + 318 * 60
+        future = {**recovered, "start": future_start, "close": 999.0}
+        db.execute(
+            "INSERT INTO btc_candles VALUES (?,?,?,?)",
+            (
+                "Coinbase future test row", future_start, json.dumps(future),
+                (NOW + timedelta(seconds=1)).isoformat(),
+            ),
+        )
+
+    payload = frame()
+    payload["btc_candles"] = {
+        "source": "Coinbase BTC-USD public one-minute candles",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "INCOMPLETE", "missing_bars": 2},
+        "candles": [
+            {
+                "start": stamp, "open": 100.0, "high": 102.0, "low": 99.0,
+                "close": 101.0, "volume": 2.0,
+            }
+            for stamp in range(first, cutoff, 60)
+            if stamp not in {missing, future_start}
+        ],
+    }
+
+    assert monitor.accept_candle_batch(payload, NOW) is True
+    history = payload["btc_candles"]
+    assert len(history["candles"]) == 1439
+    assert history["diagnostics"]["missing_intervals"] == [
+        datetime.fromtimestamp(future_start, timezone.utc).isoformat()
+    ]
+    assert history["diagnostics"]["journal_recovery"]["bars"] == 1
+    assert next(bar for bar in history["candles"] if bar["start"] == missing) == recovered
+    assert all(bar["start"] != future_start for bar in history["candles"])
+
+    # Once the second row's genuine receipt is within the allowed cutoff, the
+    # same bounded recovery becomes complete without changing old records.
+    later = NOW + timedelta(seconds=2)
+    completed = journal.recover_recorded_candles(history, later)
+    assert completed["diagnostics"]["status"] == "READY"
+    assert completed["diagnostics"]["missing_bars"] == 0
+    assert len(completed["candles"]) == 1440
+    assert "error" not in completed
 
 
 def test_candle_persistence_failure_keeps_live_chart_and_reports_error(tmp_path, monkeypatch):

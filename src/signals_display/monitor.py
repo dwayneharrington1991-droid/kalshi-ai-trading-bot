@@ -1574,6 +1574,111 @@ class Journal:
 
         self._last_candle_batch = batch
 
+    def recover_recorded_candles(self, data, as_of):
+        """Fill exact gaps from previously receipt-proven Coinbase candles.
+
+        The public candle APIs occasionally omit an interval that an earlier
+        response already delivered.  Those immutable rows are authoritative
+        provider observations, not interpolations.  Only rows first received
+        by ``as_of`` are eligible, so this method cannot introduce post-cutoff
+        information into an opening snapshot.
+        """
+        if not isinstance(data, dict):
+            return data
+        as_of = as_of.astimezone(UTC) if isinstance(as_of, datetime) else timestamp(as_of)
+        cutoff = int(as_of.timestamp()) // CANDLE_SECONDS * CANDLE_SECONDS
+        expected = list(range(cutoff - 86400, cutoff, CANDLE_SECONDS))
+        expected_set = set(expected)
+        merged = {}
+        duplicates = set()
+        for raw in data.get("candles", []):
+            try:
+                start = int(raw["start"])
+                if start not in expected_set or start % CANDLE_SECONDS:
+                    continue
+                if start in merged:
+                    duplicates.add(start)
+                    continue
+                # Validate numeric OHLCV before allowing a bar into a model
+                # history.  Preserve the provider payload without rewriting it.
+                for key in ("open", "high", "low", "close", "volume"):
+                    number(float(raw[key]), 0, 1e15)
+                if float(raw["low"]) > float(raw["high"]):
+                    continue
+                merged[start] = dict(raw)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+
+        missing = expected_set - set(merged)
+        recovered_sources = {}
+        recovered = 0
+        if missing:
+            placeholders = ",".join("?" for _ in missing)
+            with self.read() as db:
+                rows = db.execute(
+                    f"""SELECT source,start,payload,first_received_at
+                        FROM btc_candles
+                        WHERE start IN ({placeholders})
+                          AND source LIKE 'Coinbase%'
+                          AND julianday(first_received_at)<=julianday(?)
+                        ORDER BY start,first_received_at,source""",
+                    (*sorted(missing), as_of.isoformat()),
+                ).fetchall()
+            for row in rows:
+                start = int(row["start"])
+                if start in merged:
+                    continue
+                try:
+                    bar = json.loads(row["payload"])
+                    if int(bar["start"]) != start:
+                        continue
+                    for key in ("open", "high", "low", "close", "volume"):
+                        number(float(bar[key]), 0, 1e15)
+                    if float(bar["low"]) > float(bar["high"]):
+                        continue
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                merged[start] = bar
+                recovered += 1
+                recovered_sources[row["source"]] = recovered_sources.get(row["source"], 0) + 1
+
+        remaining = [start for start in expected if start not in merged]
+        diagnostics = dict(data.get("diagnostics") or {})
+        diagnostics.update(
+            status="READY" if not remaining else "INCOMPLETE",
+            retained_bars=len(merged),
+            missing_bars=len(remaining),
+            missing_intervals=[
+                datetime.fromtimestamp(start, UTC).isoformat() for start in remaining[:20]
+            ],
+            journal_recovery={
+                "status": "RECOVERED" if recovered else "NO_ELIGIBLE_RECORDED_GAPS",
+                "bars": recovered,
+                "sources": recovered_sources,
+                "cutoff": as_of.isoformat(),
+                "rule": "first_received_at must be at or before cutoff",
+            },
+            duplicate_intervals=max(
+                int(diagnostics.get("duplicate_intervals") or 0), len(duplicates)
+            ),
+            reason=(
+                None if not remaining else
+                f"Historical providers and receipt-proven journal still missing {len(remaining)}/1440 exact UTC minutes"
+            ),
+        )
+        result = {
+            **data,
+            "candles": [merged[start] for start in expected if start in merged],
+            "diagnostics": diagnostics,
+        }
+        if remaining:
+            result["error"] = (
+                f"MISSING_CANDLES: {len(remaining)}/1440 UTC intervals unavailable after authoritative recovery"
+            )
+        else:
+            result.pop("error", None)
+        return result
+
     def record_ai_signal_markers(self, state):
         """Append new non-repainting signals; never mutate prior markers."""
         from .signal_chart import marker_is_chronological, markers_from_state

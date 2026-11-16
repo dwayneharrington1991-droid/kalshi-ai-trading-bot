@@ -51,9 +51,9 @@ BRANCH=claude/accuracy-research
 REPO=/home/opc/kalshi-ai-trading-bot
 NEW=/home/opc/kalshi-preview-repair-${SHA:0:7}
 [[ $(id -un) == opc ]] || { echo "BLOCKED: must run as opc" >&2; exit 1; }
-git -C "$REPO" fetch --quiet --no-tags origin "$BRANCH" || { echo "BLOCKED: Oracle checkout could not fetch $BRANCH from GitHub; nothing changed" >&2; exit 1; }
+git -C "$REPO" fetch --quiet --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || { echo "BLOCKED: Oracle checkout could not fetch $BRANCH from GitHub; nothing changed" >&2; exit 1; }
 git -C "$REPO" cat-file -e "$SHA^{commit}" 2>/dev/null || { echo "BLOCKED: commit $SHA was not fetched from $BRANCH; nothing changed" >&2; exit 1; }
-git -C "$REPO" merge-base --is-ancestor "$SHA" FETCH_HEAD || { echo "BLOCKED: $SHA is not on $BRANCH" >&2; exit 1; }
+git -C "$REPO" merge-base --is-ancestor "$SHA" "refs/remotes/origin/$BRANCH" || { echo "BLOCKED: $SHA is not on $BRANCH" >&2; exit 1; }
 if [[ -e $NEW ]]; then
   [[ $(git -C "$NEW" rev-parse HEAD) == "$SHA" && -z $(git -C "$NEW" status --porcelain) ]] || { echo "BLOCKED: $NEW exists and is not a clean checkout of $SHA; nothing changed" >&2; exit 1; }
 else

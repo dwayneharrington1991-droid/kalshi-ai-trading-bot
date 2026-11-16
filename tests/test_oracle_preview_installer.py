@@ -84,7 +84,8 @@ def test_powershell_command_targets_only_preview_and_verifies_commit():
     ps = _powershell()
     bootstrap = _bootstrap()
     assert "127.0.0.1:8768" in ps and "8765" not in bootstrap and "8767" not in bootstrap
-    assert 'merge-base --is-ancestor "$SHA" FETCH_HEAD' in bootstrap
+    assert '"+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"' in bootstrap
+    assert 'merge-base --is-ancestor "$SHA" "refs/remotes/origin/$BRANCH"' in bootstrap
     assert 'exec bash "$NEW/deploy/oracle/install_preview_8768.sh" "$SHA"' in bootstrap
     assert "$health.build_commit -ne $Sha" in ps
     assert "ExitOnForwardFailure=yes" in ps

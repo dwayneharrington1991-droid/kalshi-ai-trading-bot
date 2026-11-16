@@ -898,8 +898,11 @@ class Monitor:
                                 and self.artifact.get("model", {}).get("kind") == "ensemble"
                             ),
                             "opening_candidate_status": self.opening_artifact_status,
+                            # The fallback quality guard judges the fallback on
+                            # its own probability-implied record only.
                             "opening_forward_accuracy": self.readiness.get(
-                                "opening_forward_accuracy", {}
+                                "opening_fallback_forward_accuracy",
+                                self.readiness.get("opening_forward_accuracy", {}),
                             ),
                         },
                         frozen_context={

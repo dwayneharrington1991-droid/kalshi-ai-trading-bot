@@ -2692,6 +2692,40 @@ class Journal:
             if opening_directional else None,
             "policy": "Past official outcomes only; current/future outcomes never enter a frozen opening",
         }
+        # Evidence for the statistical-fallback quality guard. It must judge the
+        # fallback on its own record only (never on a candidate model's calls),
+        # and it must keep accumulating after the guard fires. Saved directions
+        # become UNCLEAR once suppressed, so scoring them would freeze the guard
+        # on stale evidence forever. The immutable recorded probability still
+        # implies a direction, which is the fallback's genuine forecast.
+        from .prediction_engine import direction_label
+
+        def fallback_record(row):
+            try:
+                value = json.loads(row["payload"]) if row["payload"] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {}
+            model = str(value.get("model") or "opening24h-zero-drift-final-average-v1")
+            return model.startswith("opening24h-zero-drift")
+
+        fallback_directional = [
+            row for row in opening_rows
+            if fallback_record(row) and direction_label(row["up"]) in {"UP", "DOWN"}
+        ]
+        fallback_correct = sum(
+            (direction_label(row["up"]) == "UP") == bool(row["outcome"])
+            for row in fallback_directional
+        )
+        fallback_accuracy = {
+            "directional_samples": len(fallback_directional),
+            "correct": fallback_correct,
+            "accuracy": fallback_correct / len(fallback_directional)
+            if fallback_directional else None,
+            "accuracy_interval": wilson(fallback_correct, len(fallback_directional))
+            if fallback_directional else None,
+            "scope": "Statistical fallback openings only; probability-implied direction, including openings whose displayed call was withheld",
+            "policy": "Past official outcomes only; current/future outcomes never enter a frozen opening",
+        }
         return {
             "official_contracts": count,
             "official_featured_contracts": opening_coverage["eligible_frozen_openings"],
@@ -2710,6 +2744,7 @@ class Journal:
             },
             "multi_asset_opening_learning": multi_asset,
             "opening_forward_accuracy": opening_accuracy,
+            "opening_fallback_forward_accuracy": fallback_accuracy,
             "opening_training_coverage": opening_coverage,
             "reason": (
                 f"{count} official outcomes recorded; "

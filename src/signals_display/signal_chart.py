@@ -12,6 +12,10 @@ from .model import timestamp
 
 SUPPORTED_INTERVALS = {60: "1m", 180: "3m", 300: "5m", 900: "15m"}
 MAX_CHART_BARS = 500
+MAX_CLOCK_SKEW_SECONDS = 0.25
+# Coinbase BTC-USD normally trades every few seconds; a minute with no
+# accepted trade means the trade feed is not delivering fresh data.
+LIVE_TRADE_STALE_SECONDS = 60
 
 
 class LiveTradeCandles:
@@ -47,7 +51,9 @@ class LiveTradeCandles:
             event = timestamp(observation["event_at"])
             received = timestamp(observation["received_at"])
             delay = (received - event).total_seconds()
-            if not 0 <= delay <= 5:
+            # Exchange event stamps and local NTP receipts can disagree by a few
+            # milliseconds; a receipt materially before its event is rejected.
+            if not -MAX_CLOCK_SKEW_SECONDS <= delay <= 5:
                 raise ValueError("trade event/receipt timing")
             price = float(observation["price"])
             volume = float(observation["volume"])
@@ -144,8 +150,15 @@ class LiveTradeCandles:
             if last_received_at is not None
             else None
         )
+        stale = age is not None and age > LIVE_TRADE_STALE_SECONDS
         return {
-            "status": "READY" if closed else "WARMING_UP" if forming else "NO_RECORDED_TRADES",
+            "status": "STALE" if stale else "READY" if closed else "WARMING_UP" if forming else "NO_RECORDED_TRADES",
+            "stale": stale,
+            "stale_after_seconds": LIVE_TRADE_STALE_SECONDS,
+            "reason": (
+                f"No accepted Coinbase trade for {age:.0f}s; bars are last-known, not live"
+                if stale else None
+            ),
             "interval": "15s",
             "interval_seconds": 15,
             "bars": closed[-max(30, min(MAX_CHART_BARS, int(limit))):],

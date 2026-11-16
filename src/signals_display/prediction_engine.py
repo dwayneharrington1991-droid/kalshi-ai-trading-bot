@@ -358,6 +358,51 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     )
     old_volume = mean(float(b["volume"]) for b in bars[-21:-1])
     values["relative_volume"] = float(latest["volume"]) / old_volume if old_volume else None
+    # EMA distances (9/21/50/200 on closed pre-open 1-minute closes) and volume
+    # acceleration. Each EMA needs four periods of history to settle; shorter
+    # history leaves the feature unavailable rather than guessed.
+    def settled_ema(period):
+        return ema(closes, period)[-1] if len(closes) >= 4 * period else None
+
+    ema9, ema21, ema50, ema200 = (settled_ema(p) for p in (9, 21, 50, 200))
+    values.update(
+        opening_ema9_distance=close / ema9 - 1 if ema9 else None,
+        opening_ema9_21_gap=ema9 / ema21 - 1 if ema9 and ema21 else None,
+        opening_ema50_distance=close / ema50 - 1 if ema50 else None,
+        opening_ema200_distance=close / ema200 - 1 if ema200 else None,
+    )
+    recent_volume = sum(float(b["volume"]) for b in bars[-5:])
+    prior_volume = sum(float(b["volume"]) for b in bars[-10:-5])
+    values["opening_volume_acceleration"] = (
+        recent_volume / prior_volume - 1 if len(bars) >= 10 and prior_volume > 0 else None
+    )
+    # Same candle definitions as features.extract, from closed pre-open bars only.
+    true_ranges = [
+        max(
+            float(cur["high"]) - float(cur["low"]),
+            abs(float(cur["high"]) - float(prev["close"])),
+            abs(float(cur["low"]) - float(prev["close"])),
+        )
+        for prev, cur in zip(bars, bars[1:])
+    ]
+    prior_ranges = true_ranges[-21:-1]
+    range_mean = sum(prior_ranges) / 20 if len(prior_ranges) == 20 else None
+    range_std = (
+        math.sqrt(sum((r - range_mean) ** 2 for r in prior_ranges) / 20)
+        if range_mean is not None else None
+    )
+    atr_zscore = (
+        (true_ranges[-1] - range_mean) / range_std
+        if true_ranges and range_std and range_std > 0 else None
+    )
+    values.update(
+        candle_body_range_ratio=abs(close - o) / span,
+        candle_close_range_position=(close - low) / span,
+        candle_volume_weighted_move=(close / o - 1) * (float(latest["volume"]) / old_volume)
+        if old_volume else None,
+        candle_atr_zscore_20=atr_zscore,
+        candle_unusual_expansion=int(atr_zscore > 1.5) if atr_zscore is not None else None,
+    )
     intervals = [(b[0] - a[0]).total_seconds() for a, b in zip(points, points[1:])]
     observed_span = (points[-1][0] - points[0][0]).total_seconds()
     if observed_span >= 55 and intervals and all(0 < v <= 5 for v in intervals):
@@ -368,6 +413,7 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     receipts = [timestamp(history["received_at"]), points[-1][0]]
     optional_status = "UNAVAILABLE: no frozen microstructure context"
     optional_receipts = {}
+    excluded = {}
     if frozen_context:
         try:
             context_cutoff = timestamp(frozen_context["cutoff"])
@@ -378,68 +424,141 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
                 and timestamp(frozen_context["max_input_received_at"]) > opened
             ):
                 raise ValueError("POST_OPENING_CONTEXT_INPUT_EXCLUDED")
-            optional_values = {}
-            feature_receipts = {}
-            sources = frozen_context.get("sources", {})
-            primary = sources.get(frozen_context.get("primary_source"), {})
+        except (KeyError, ValueError, TypeError, AttributeError):
+            optional_status = "POST_OPENING_OR_UNVERIFIABLE_CONTEXT_EXCLUDED"
+            frozen_context = None
+    if frozen_context:
+        optional_values = {}
+        feature_receipts = {}
+        sources = frozen_context.get("sources", {})
+        primary = sources.get(frozen_context.get("primary_source"), {})
 
-            def receipt_for(name, raw):
-                receipt = timestamp(raw)
-                if receipt > context_cutoff or receipt > opened:
-                    raise ValueError("POST_OPENING_SOURCE_RECEIPT_EXCLUDED")
-                feature_receipts[name] = {"received_at": receipt.isoformat()}
-                return receipt
+        def receipt_for(name, raw):
+            receipt = timestamp(raw)
+            if receipt > context_cutoff or receipt > opened:
+                raise ValueError("POST_OPENING_SOURCE_RECEIPT_EXCLUDED")
+            feature_receipts[name] = {"received_at": receipt.isoformat()}
+            return receipt
 
-            for name, value in frozen_context.get("candidate_features", {}).items():
-                if name in values and value is not None and name.startswith("micro_"):
-                    window_label = name.split("_", 2)[1]
-                    window = primary.get("windows", {}).get(window_label, {})
-                    if window.get("status") == "READY" and window.get("last_received_at"):
-                        receipt_for(name, window["last_received_at"])
-                        optional_values[name] = number(value, -1e15, 1e15)
-            spot = sources.get("Kraken BTC/USD stream", {})
-            if spot.get("status") == "LIVE":
-                window = spot.get("windows", {}).get("5s", {})
-                if window.get("status") == "READY":
-                    imbalance = window.get("features", {}).get("depth_imbalance")
-                    if imbalance is not None and window.get("last_received_at"):
-                        receipt_for("spot_depth_imbalance", window["last_received_at"])
-                        optional_values["spot_depth_imbalance"] = number(imbalance, -1, 1)
-            perpetual = sources.get("Kraken futures stream", {})
-            if (
-                perpetual.get("status") == "LIVE"
-                and perpetual.get("latest_price") is not None
-                and perpetual.get("data_age_seconds") is not None
-            ):
-                age = number(perpetual["data_age_seconds"], 0, 5)
-                receipt_for(
-                    "derivatives_basis", (context_cutoff - timedelta(seconds=age)).isoformat()
-                )
-                optional_values["derivatives_basis"] = (
-                    number(perpetual["latest_price"], 0.000001, 1e12) / points[-1][1] - 1
-                )
-            advanced = frozen_context.get("advanced_features", {})
-            if advanced:
-                if timestamp(advanced["cutoff"]) > opened:
-                    raise ValueError("POST_OPENING_ADVANCED_CONTEXT_EXCLUDED")
-                for name, value in advanced.get("candidate_features", {}).items():
-                    if name not in values or not name.startswith("advanced_") or value is None:
-                        continue
+        def admit(name, compute):
+            # Each optional value must prove its own pre-opening receipt. One
+            # late or malformed value is excluded alone; it never discards the
+            # other receipt-proven values.
+            try:
+                value = compute()
+            except (KeyError, ValueError, TypeError, AttributeError) as exc:
+                feature_receipts.pop(name, None)
+                reason = str(exc) if str(exc).isupper() else type(exc).__name__
+                excluded[reason] = excluded.get(reason, 0) + 1
+                return
+            if value is not None:
+                optional_values[name] = value
+
+        for name, value in frozen_context.get("candidate_features", {}).items():
+            if name in values and value is not None and name.startswith("micro_"):
+                window = primary.get("windows", {}).get(name.split("_", 2)[1], {})
+                if window.get("status") == "READY" and window.get("last_received_at"):
+                    admit(name, lambda name=name, value=value, window=window: (
+                        receipt_for(name, window["last_received_at"]),
+                        number(value, -1e15, 1e15),
+                    )[1])
+        spot = sources.get("Kraken BTC/USD stream", {})
+        window = spot.get("windows", {}).get("5s", {}) if spot.get("status") == "LIVE" else {}
+        imbalance = window.get("features", {}).get("depth_imbalance") if window.get("status") == "READY" else None
+        if imbalance is not None and window.get("last_received_at"):
+            admit("spot_depth_imbalance", lambda: (
+                receipt_for("spot_depth_imbalance", window["last_received_at"]),
+                number(imbalance, -1, 1),
+            )[1])
+        perpetual = sources.get("Kraken futures stream", {})
+        if (
+            perpetual.get("status") == "LIVE"
+            and perpetual.get("latest_price") is not None
+            and perpetual.get("data_age_seconds") is not None
+        ):
+            admit("derivatives_basis", lambda: (
+                receipt_for("derivatives_basis", (
+                    context_cutoff - timedelta(seconds=number(perpetual["data_age_seconds"], 0, 5))
+                ).isoformat()),
+                number(perpetual["latest_price"], 0.000001, 1e12) / points[-1][1] - 1,
+            )[1])
+        advanced = frozen_context.get("advanced_features", {})
+        advanced_ok = bool(advanced)
+        if advanced_ok:
+            try:
+                advanced_ok = timestamp(advanced["cutoff"]) <= opened
+            except (KeyError, ValueError, TypeError, AttributeError):
+                advanced_ok = False
+            if not advanced_ok:
+                excluded["POST_OPENING_ADVANCED_CONTEXT_EXCLUDED"] = 1
+        if advanced_ok:
+            for name, value in advanced.get("candidate_features", {}).items():
+                if name not in values or not name.startswith("advanced_") or value is None:
+                    continue
+
+                def advanced_value(name=name, value=value):
                     proof = advanced.get("candidate_feature_sources", {}).get(name, {})
                     receipt_for(name, proof["received_at"])
                     if proof.get("event_at") and timestamp(proof["event_at"]) > opened:
                         raise ValueError("POST_OPENING_ADVANCED_EVENT_EXCLUDED")
-                    optional_values[name] = number(value, -1e15, 1e15)
-            values.update(optional_values)
-            receipts.extend(timestamp(item["received_at"]) for item in feature_receipts.values())
-            optional_receipts["microstructure"] = {
-                "cutoff": context_cutoff.isoformat(),
-                "features": feature_receipts,
-                "cutoff_note": "Analysis boundary, not an observation receipt timestamp",
-            }
-            optional_status = "AS_OF_OPENING_CONTEXT: actual used source receipts recorded; analysis cutoff never refreshes an observation"
-        except (KeyError, ValueError, TypeError, AttributeError):
-            optional_status = "POST_OPENING_OR_UNVERIFIABLE_CONTEXT_EXCLUDED"
+                    return number(value, -1e15, 1e15)
+
+                admit(name, advanced_value)
+        # Kraken public order flow observed at or before the opening (at most
+        # 5 s old): same definitions as the live feature extractor.
+        flow = frozen_context.get("order_flow") or {}
+
+        def flow_item(key):
+            item = flow.get(key) or {}
+            if item.get("status") != "LIVE":
+                return None
+            observed = timestamp(item["observed_at"])
+            if observed > opened:
+                raise ValueError("POST_OPENING_ORDER_FLOW_EXCLUDED")
+            if (opened - observed).total_seconds() > 5:
+                raise ValueError("STALE_PRE_OPENING_ORDER_FLOW_EXCLUDED")
+            return item
+
+        for venue, feature in (("spot", "spot_cvd_delta_fraction"), ("perpetual", "perpetual_cvd_delta_fraction")):
+            def cvd(venue=venue, feature=feature):
+                item = flow_item(venue)
+                if item is None:
+                    return None
+                receipt_for(feature, item["observed_at"])
+                absorption = item.get("passive_sell_absorption_candidate")
+                if type(absorption) is bool:
+                    optional_values[venue + "_absorption_candidate"] = int(absorption)
+                dem = item.get("delta_efficiency_3m") or {}
+                if dem.get("status") == "LIVE" and dem.get("delta_efficiency") is not None:
+                    optional_values[venue + "_delta_efficiency_3m"] = number(dem["delta_efficiency"], -1e15, 1e15)
+                return number(item["delta_fraction_60s"], -1, 1)
+
+            admit(feature, cvd)
+
+        def book():
+            item = flow_item("spot_book")
+            if item is None:
+                return None
+            receipt_for("spot_book_dominance", item["observed_at"])
+            ratio = number(item["bid_ask_ratio"], 0, 1e12)
+            if item.get("order_book_imbalance_top3") is not None:
+                optional_values["spot_book_imbalance_top3"] = number(item["order_book_imbalance_top3"], -1, 1)
+            if item.get("micro_price_deviation") is not None:
+                optional_values["spot_micro_price_deviation"] = number(item["micro_price_deviation"], -1, 1)
+            return (ratio - 1) / (ratio + 1)
+
+        admit("spot_book_dominance", book)
+        values.update({k: v for k, v in optional_values.items() if k in values})
+        receipts.extend(timestamp(item["received_at"]) for item in feature_receipts.values())
+        optional_receipts["microstructure"] = {
+            "cutoff": context_cutoff.isoformat(),
+            "features": feature_receipts,
+            "cutoff_note": "Analysis boundary, not an observation receipt timestamp",
+        }
+        optional_status = (
+            "AS_OF_OPENING_CONTEXT: actual used source receipts recorded; analysis cutoff never refreshes an observation"
+            + ("; individually excluded: " + ", ".join(f"{k}={v}" for k, v in sorted(excluded.items())) if excluded else "")
+        )
     values = {
         name: (float(value) if type(value) in (float, int) and math.isfinite(value) else None)
         for name, value in values.items()

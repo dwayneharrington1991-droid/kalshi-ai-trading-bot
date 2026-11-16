@@ -50,6 +50,15 @@ OPENING_CANDLE_FEATURES = tuple(
     "opening_short_long_return_divergence",
 )
 
+# Past-only trend/volume features frozen at the opening (closed 1-minute bars).
+OPENING_TREND_FEATURES = (
+    "opening_ema9_distance",
+    "opening_ema9_21_gap",
+    "opening_ema50_distance",
+    "opening_ema200_distance",
+    "opening_volume_acceleration",
+)
+
 FEATURES = (
     (
         "distance_scaled",
@@ -126,6 +135,7 @@ FEATURES = (
     + FLOW_FEATURES
     + ADAPTIVE_MOMENTUM_FEATURES
     + OPENING_CANDLE_FEATURES
+    + OPENING_TREND_FEATURES
 )
 
 

@@ -1522,6 +1522,19 @@ class Journal:
                 CREATE TRIGGER IF NOT EXISTS opening_input_snapshots_no_delete
                     BEFORE DELETE ON opening_input_snapshots BEGIN
                     SELECT RAISE(ABORT,'Opening input snapshots are immutable'); END;
+                CREATE TABLE IF NOT EXISTS opening_quote_snapshots (
+                    mode TEXT NOT NULL,ticker TEXT NOT NULL,observed_at TEXT NOT NULL,
+                    opens_at TEXT NOT NULL,seconds_from_open REAL NOT NULL,
+                    up_bid REAL,up_ask REAL,down_bid REAL,down_ask REAL,
+                    up_ask_size REAL,down_ask_size REAL,fee_multiplier REAL,fee_type TEXT,
+                    quote_event_time TEXT,payload TEXT NOT NULL,
+                    PRIMARY KEY(mode,ticker,observed_at));
+                CREATE TRIGGER IF NOT EXISTS opening_quote_snapshots_no_update
+                    BEFORE UPDATE ON opening_quote_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Opening quote snapshots are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS opening_quote_snapshots_no_delete
+                    BEFORE DELETE ON opening_quote_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Opening quote snapshots are immutable'); END;
                 CREATE TABLE IF NOT EXISTS learning_contract_reviews (
                     ticker TEXT NOT NULL,origin TEXT NOT NULL,observed_at TEXT NOT NULL,
                     outcome INTEGER NOT NULL,payload TEXT NOT NULL,
@@ -2070,6 +2083,7 @@ class Journal:
                 key: market.get(key) for key in (
                     "ticker", "opens_at", "closes_at", "strike", "mapping_verified",
                     "comparison_operator", "averaging_rule_verified", "observed_at", "quotes",
+                    "fee_multiplier", "fee_type",
                 ) if market.get(key) is not None
             },
             "reference": {
@@ -2773,6 +2787,40 @@ class Journal:
             if opening_directional else None,
             "policy": "Past official outcomes only; current/future outcomes never enter a frozen opening",
         }
+        # Evidence for the statistical-fallback quality guard. It must judge the
+        # fallback on its own record only (never on a candidate model's calls),
+        # and it must keep accumulating after the guard fires. Saved directions
+        # become UNCLEAR once suppressed, so scoring them would freeze the guard
+        # on stale evidence forever. The immutable recorded probability still
+        # implies a direction, which is the fallback's genuine forecast.
+        from .prediction_engine import direction_label
+
+        def fallback_record(row):
+            try:
+                value = json.loads(row["payload"]) if row["payload"] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {}
+            model = str(value.get("model") or "opening24h-zero-drift-final-average-v1")
+            return model.startswith("opening24h-zero-drift")
+
+        fallback_directional = [
+            row for row in opening_rows
+            if fallback_record(row) and direction_label(row["up"]) in {"UP", "DOWN"}
+        ]
+        fallback_correct = sum(
+            (direction_label(row["up"]) == "UP") == bool(row["outcome"])
+            for row in fallback_directional
+        )
+        fallback_accuracy = {
+            "directional_samples": len(fallback_directional),
+            "correct": fallback_correct,
+            "accuracy": fallback_correct / len(fallback_directional)
+            if fallback_directional else None,
+            "accuracy_interval": wilson(fallback_correct, len(fallback_directional))
+            if fallback_directional else None,
+            "scope": "Statistical fallback openings only; probability-implied direction, including openings whose displayed call was withheld",
+            "policy": "Past official outcomes only; current/future outcomes never enter a frozen opening",
+        }
         return {
             "official_contracts": count,
             "official_featured_contracts": opening_coverage["eligible_frozen_openings"],
@@ -2791,6 +2839,7 @@ class Journal:
             },
             "multi_asset_opening_learning": multi_asset,
             "opening_forward_accuracy": opening_accuracy,
+            "opening_fallback_forward_accuracy": fallback_accuracy,
             "opening_training_coverage": opening_coverage,
             "reason": (
                 f"{count} official outcomes recorded; "
@@ -2799,6 +2848,74 @@ class Journal:
                 "Missing historical features are not reconstructed from later data. "
                 "Minimum count is not evidence of skill."
             ),
+        }
+
+    BLOCKED_CONFIDENCE = {"NO VERIFIED EDGE", "INSUFFICIENT PREDICTIVE CONFIDENCE", "UNCALIBRATED"}
+
+    def verified_opening_scoreboard(self):
+        """Verified live AI performance: immutable opening calls the dashboard
+        actually showed as UP/DOWN, matched with official Kalshi settlements.
+
+        A call counts only when its saved immutable record says UP or DOWN, its
+        confidence status was displayable (not blocked/uncalibrated), and its
+        probability agrees with the side. WAIT/UNCLEAR, unsettled contracts,
+        replay records, duplicates and invalid records are excluded and counted
+        separately. Retrospective research predictions never enter.
+        """
+        with self.read() as db:
+            rows = db.execute(
+                """SELECT b.ticker,b.generated_at,b.up,b.payload,f.outcome
+                FROM btc_engine_opening b
+                LEFT JOIN forecast_outcomes f ON f.ticker=b.ticker AND f.origin='official'
+                WHERE b.mode='PUBLIC MARKET DATA'
+                ORDER BY b.generated_at,b.ticker"""
+            ).fetchall()
+        seen, correct, wrong = set(), 0, 0
+        excluded = {"wait_or_no_call": 0, "unsettled": 0, "invalid": 0, "duplicate": 0}
+        first = last = None
+        for ticker, generated_at, up, payload, outcome in rows:
+            if ticker in seen:
+                excluded["duplicate"] += 1
+                continue
+            seen.add(ticker)
+            try:
+                saved = json.loads(payload) if payload else {}
+            except (TypeError, ValueError):
+                excluded["invalid"] += 1
+                continue
+            direction = saved.get("direction")
+            status = (saved.get("confidence") or {}).get("status")
+            if direction not in {"UP", "DOWN"} or status in self.BLOCKED_CONFIDENCE:
+                excluded["wait_or_no_call"] += 1
+                continue
+            if (
+                type(up) not in (int, float)
+                or not math.isfinite(up)
+                or not 0 <= up <= 1
+                or (direction == "UP") != (up >= 0.5)
+            ):
+                excluded["invalid"] += 1
+                continue
+            if outcome not in (0, 1):
+                excluded["unsettled"] += 1
+                continue
+            if (direction == "UP") == bool(outcome):
+                correct += 1
+            else:
+                wrong += 1
+            first = first or generated_at
+            last = generated_at
+        total = correct + wrong
+        return {
+            "correct": correct,
+            "wrong": wrong,
+            "verified_calls": total,
+            "accuracy": correct / total if total else None,
+            "accuracy_interval_95": wilson(correct, total) if total else None,
+            "excluded": excluded,
+            "first_call_at": first,
+            "last_call_at": last,
+            "scope": "Immutable live opening calls shown as UP/DOWN, matched to official Kalshi settlements only",
         }
 
     def quick_learning_summary(self):
@@ -2901,6 +3018,50 @@ class Journal:
             "source": "Coinbase frozen journal history",
             "received_at": max((r[2] for r in rows), default=opened.isoformat()),
         }
+
+    OPENING_QUOTE_WINDOW_SECONDS = 120
+    OPENING_PREOPEN_QUOTE_SECONDS = 60
+
+    def record_opening_quote(self, market, mode, now):
+        """Append one executable Kalshi quote observed early in a contract.
+
+        Only quotes received during the first two minutes after the opening
+        are kept, with their own receipt/event times and the fee schedule, so
+        later research can price opening calls without guessing. Quotes older
+        than 5 s at receipt, inconsistent books or missing asks are skipped,
+        never zero-filled. Rows are append-only.
+        """
+        try:
+            opened = timestamp(market["opens_at"])
+            observed = timestamp(market["observed_at"])
+            seconds = (observed - opened).total_seconds()
+            # From 60 s before the opening (the next contract is already listed)
+            # through two minutes after it.
+            if not -self.OPENING_PREOPEN_QUOTE_SECONDS <= seconds <= self.OPENING_QUOTE_WINDOW_SECONDS:
+                return False
+            if not 0 <= (now - observed).total_seconds() <= 5:
+                return False
+            quotes = market["quotes"]
+            up, down = quotes["up"], quotes["down"]
+            up_ask, down_ask = float(up["ask"]), float(down["ask"])
+            if not (0 < up_ask < 1 and 0 < down_ask < 1):
+                return False
+            row = (
+                mode, market["ticker"], observed.isoformat(), opened.isoformat(), seconds,
+                up.get("bid"), up_ask, down.get("bid"), down_ask,
+                up.get("ask_size"), down.get("ask_size"),
+                market.get("fee_multiplier"), market.get("fee_type"),
+                market.get("quote_event_time"),
+                json.dumps({"quotes": quotes, "received_at": observed.isoformat(),
+                            "recorded_at": now.isoformat()}, allow_nan=False),
+            )
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return False
+        with self.connect() as db:
+            return db.execute(
+                "INSERT OR IGNORE INTO opening_quote_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                row,
+            ).rowcount == 1
 
     def opening_snapshot(self, ticker, mode):
         with self.read() as db:

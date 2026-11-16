@@ -361,3 +361,20 @@ def test_live_trade_candles_do_not_invent_empty_intervals():
     assert [bar["start"] for bar in snapshot["bars"]] == [
         int(NOW.timestamp()), int(NOW.timestamp()) + 30,
     ]
+
+
+def test_live_trade_candles_tolerate_millisecond_clock_skew_only():
+    chart = LiveTradeCandles()
+    assert chart.observe(_trade("tiny-skew", 1, 100, received_delay=-0.1))
+    assert not chart.observe(_trade("material-skew", 2, 101, received_delay=-0.5))
+
+
+def test_live_trade_candles_report_stale_feed_without_dropping_bars():
+    chart = LiveTradeCandles()
+    chart.observe(_trade("only", 1, 100))
+    fresh = chart.snapshot(NOW + timedelta(seconds=21))
+    assert fresh["status"] == "READY" and fresh["stale"] is False
+    stale = chart.snapshot(NOW + timedelta(seconds=120))
+    assert stale["status"] == "STALE" and stale["stale"] is True
+    assert stale["bars"] == fresh["bars"]
+    assert "not live" in stale["reason"]

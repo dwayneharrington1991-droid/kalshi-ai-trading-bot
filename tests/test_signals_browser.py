@@ -408,7 +408,8 @@ def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_pat
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#engine-up")).to_have_text("60.0%")
             assert page.locator("#engine-down").inner_text() == "40.0%"
-            assert page.locator("#opening-direction").inner_text() in ("UP", "DOWN")
+            assert page.locator("#opening-direction").inner_text() == "WAIT"
+            assert page.locator("#opening-up-prob").inner_text() == "unavailable"
             assert page.locator("#opening-ticker").inner_text() == market()["ticker"]
             assert page.locator("#opening-generated").inner_text() == opening["generated_at"]
             assert page.locator("#opening-cutoff").inner_text() == opening["input_data_cutoff"]
@@ -706,6 +707,10 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
         "opening_delay_seconds": 2,
         "status": "DELAYED",
         "reason": "Frozen inputs; experimental zero-drift baseline.",
+        "confidence": {
+            "status": "NO VERIFIED EDGE",
+            "reason": "Uncalibrated fallback retained for scoring only.",
+        },
         "threshold": 100000,
     }
     state["prediction_engine"] = {
@@ -834,9 +839,9 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             page.route("**/api/scalp-criteria", criteria_route)
             page.route("**/api/scalp-paper-performance", paper_route)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
-            playwright.expect(page.locator("#opening-direction")).to_have_text("INSUFFICIENT PREDICTIVE CONFIDENCE")
-            assert page.locator("#opening-up-prob").inner_text() == "50.0%"
-            assert page.locator("#opening-down-prob").inner_text() == "50.0%"
+            playwright.expect(page.locator("#opening-direction")).to_have_text("WAIT")
+            assert page.locator("#opening-up-prob").inner_text() == "unavailable"
+            assert page.locator("#opening-down-prob").inner_text() == "unavailable"
             assert page.locator("#live-direction").inner_text() == "NEUTRAL"
             assert (
                 paper_requests == []
@@ -845,7 +850,7 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             assert "80 official outcomes" in page.locator("#opening-model-summary").inner_text()
             assert page.evaluate("lastState.prediction_engine.initial.direction") == "DOWN"
             assert page.evaluate("lastState.prediction_engine.initial.up") == 0.49994
-            assert page.locator("#primary-opening-probability").inner_text() == "50.0% UP · 50.0% DOWN"
+            assert page.locator("#primary-opening-probability").inner_text() == "Probability unavailable"
             assert page.locator("#primary-live-probability").inner_text() == "50.0% UP · 50.0% DOWN"
             page.locator("#signal-details-toggle").click()
             order = [page.locator(selector).evaluate("e=>e.getBoundingClientRect().top") for selector in ("#opening-prediction", "#btc-engine", "#scalping-monitor", "#model-market-panel")]
@@ -891,7 +896,7 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             }
             page.evaluate("refresh()")
             playwright.expect(page.locator("#live-direction")).to_have_text("UP")
-            assert page.locator("#opening-direction").inner_text() == "INSUFFICIENT PREDICTIVE CONFIDENCE"
+            assert page.locator("#opening-direction").inner_text() == "WAIT"
             assert state["prediction_engine"]["initial"] == initial
             page.evaluate("expired('Synthetic outage')")
             assert page.locator("#scalp-monitor-data").inner_text() == "STALE"

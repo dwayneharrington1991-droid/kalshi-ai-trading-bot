@@ -1364,6 +1364,7 @@ def opening_forecast(
         threshold_received_at=market.get("metadata_received_at", market.get("observed_at")),
         regime="unavailable",
         model="opening24h-zero-drift-final-average-v1",
+        score_cohort="verified-opening-policy-v2",
         direction_policy=DIRECTION_POLICY,
         model_selection={
             "opening_ensemble_active": False,

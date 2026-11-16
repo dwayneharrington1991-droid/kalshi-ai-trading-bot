@@ -907,6 +907,54 @@ def test_quick_learning_summary_uses_compact_records(tmp_path):
     assert value["official_settlements"] == 1
     assert value["correct_directional_openings"] == 1
     assert value["opening_directional_accuracy"] == 1
+    assert value["current_policy"] == {
+        "cohort": "verified-opening-policy-v2",
+        "settled_openings": 0,
+        "directional_opening_calls": 0,
+        "correct_directional_openings": 0,
+        "incorrect_directional_openings": 0,
+        "wait_openings": 0,
+        "directional_accuracy": None,
+        "accuracy_interval": None,
+        "directional_coverage": None,
+        "historical_rows_rewritten": False,
+    }
+
+
+def test_new_opening_score_cohort_starts_without_rewriting_lifetime_history(tmp_path):
+    journal = Journal(tmp_path / "signals.db")
+    payload = json.dumps(
+        {
+            "up": 0.7,
+            "direction": "UNCLEAR",
+            "score_cohort": "verified-opening-policy-v2",
+            "model": "opening24h-zero-drift-final-average-v1",
+        }
+    )
+    with journal.connect() as db:
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            ("KXBTC15M-NEW", "official", "2026-10-30T20:16:00+00:00", 1),
+        )
+        db.execute(
+            "INSERT INTO btc_engine_opening VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "PUBLIC MARKET DATA",
+                "KXBTC15M-NEW",
+                "2026-10-30T20:00:01+00:00",
+                "2026-10-30T20:00:00+00:00",
+                "2026-10-30T20:15:00+00:00",
+                0.7,
+                "DELAYED",
+                payload,
+            ),
+        )
+    value = journal.quick_learning_summary()
+    assert value["current_policy"]["settled_openings"] == 1
+    assert value["current_policy"]["directional_opening_calls"] == 0
+    assert value["current_policy"]["wait_openings"] == 1
+    assert value["current_policy"]["directional_accuracy"] is None
+    assert value["settled_opening_probability_samples"] == 1
 
 
 def test_storage_health_is_constant_time_and_preserves_database(tmp_path):

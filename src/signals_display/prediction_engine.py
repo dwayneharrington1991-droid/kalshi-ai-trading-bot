@@ -1,5 +1,5 @@
 """Past-only 24h context and forward-recorded contract forecasts, not execution."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import math
 from statistics import mean, pstdev, median
@@ -533,8 +533,18 @@ def context24(data, now):
             if start in bars:
                 raise ValueError("Duplicate candle interval")
             bars[start] = b
-        if sorted(bars) != list(range(cutoff - 86400, cutoff, 60)):
-            raise ValueError(f"Incomplete 24h window: {len(bars)}/1440 closed bars")
+        expected = list(range(cutoff - 86400, cutoff, 60))
+        if sorted(bars) != expected:
+            missing = [stamp for stamp in expected if stamp not in bars]
+            label = ", ".join(
+                datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+                for stamp in missing[:5]
+            )
+            suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+            raise ValueError(
+                f"Incomplete 24h window: {len(bars)}/1440 closed bars; "
+                f"missing UTC intervals: {label or 'unknown'}{suffix}"
+            )
         rows = [bars[t] for t in sorted(bars)]
         closes = [b["close"] for b in rows]
         returns = [b - a for a, b in zip(closes, closes[1:])]

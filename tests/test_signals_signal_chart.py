@@ -284,6 +284,10 @@ def test_dashboard_contains_incremental_chart_without_external_script():
     assert "WAITING / NO LIVE PRICE" in page
     assert "updateLiveChartCandle(state)" in page
     assert 'id="opening-score"' in page
+    assert "const openingUsable=Number.isFinite(i.up)" in page
+    assert "Current LIVE staleness cannot change it" in page
+    assert "openingUsable?'This was the bot’s immutable call" in page
+    assert ":i.neutral_reason||i.reason||'Opening inputs were unavailable" in page
     assert "correct · " in page and " wrong" in page
     assert 'id="learning-cycle"' in page
     assert "s.background_learning" in page

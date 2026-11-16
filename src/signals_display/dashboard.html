@@ -145,7 +145,7 @@ function chart(bars,developing){if(!changed('candles',[bars,developing]))return;
 function decisionView(s){const d=s.trade_decision||{};txt('trade-action','🟡 WAIT');txt('scalp-yesno','NO');txt('simple-entry','Not available');txt('simple-risk','Not available');txt('simple-target','Not available');txt('trade-why',s.stale?'Prices are missing or too old. Wait for a fresh update.':d.reason||'No profitable opportunity has been validated. Keep watching.');txt('simple-exit',d.exit_warning||'No new trade is suggested. Check any trades you already hold below.');txt('scalp-summary','No profitable scalp has been validated.');}
 function primaryView(s){
   const e=s.prediction_engine||{},i=e.initial||{},m=s.scalping_monitor||{},audit=e.opening_diagnostics||{};
-  const openingUsable=!s.stale&&Number.isFinite(i.up)&&i.confidence?.status!=='INSUFFICIENT PREDICTIVE CONFIDENCE';
+  const openingUsable=Number.isFinite(i.up)&&i.confidence?.status!=='INSUFFICIENT PREDICTIVE CONFIDENCE';
   const liveUsable=!s.stale&&Number.isFinite(e.up);
   const openingDirection=openingUsable?(i.direction==='WAIT'?'WAIT':directionLabel(i.up)):'NO VERIFIED EDGE';
   const liveDirection=liveUsable?(e.direction||directionLabel(e.up)):'NO VERIFIED EDGE';
@@ -157,7 +157,7 @@ function primaryView(s){
   txt('primary-opening',openingDirection);
   $('primary-opening').className='forecast-label '+(openingDirection==='UP'?'green':openingDirection==='DOWN'?'red':'amber');
   txt('primary-opening-probability',openingUsable?prob(i.up)+' UP · '+prob(Number.isFinite(i.down)?i.down:1-i.up)+' DOWN':'Probability unavailable');
-  txt('primary-opening-reason',s.stale?'The data is too old, so no opening call is trusted.':openingUsable?'This was the bot’s call when the market opened. It will not change.':plain(i.neutral_reason||i.reason||'Opening inputs were not strong enough.'));
+  txt('primary-opening-reason',openingUsable?'This was the bot’s immutable call at the market opening. Current LIVE staleness cannot change it.':i.neutral_reason||i.reason||'Opening inputs were unavailable at the opening cutoff.');
   txt('primary-opening-model','Model: '+openingModel);
   txt('primary-live',liveDirection);
   $('primary-live').className='forecast-label '+(liveDirection==='UP'?'green':liveDirection==='DOWN'?'red':'amber');

@@ -51,7 +51,6 @@ from .edge_scanner import calculate as calculate_edge_scanner, performance as ed
 from .strategy_paper import evaluate as evaluate_dual_strategy
 from .multi_asset import MarketStrip
 
-OPENING_PRELOAD_SECONDS = 120
 OPENING_INPUT_GRACE_SECONDS = 120
 
 
@@ -463,8 +462,7 @@ class Monitor:
                 try:
                     opened = timestamp(discovered["opens_at"])
                     if not (
-                        opened - timedelta(seconds=OPENING_PRELOAD_SECONDS)
-                        <= now
+                        opened <= now
                         <= opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
                     ):
                         continue
@@ -506,10 +504,6 @@ class Monitor:
                             candidates.append(archived)
                     frozen_history = max(candidates, key=eligible_count) if candidates else {}
                     frozen_points, frozen_source = self.estimator.opening_points(opened)
-                    history_ready = context24(frozen_history, opened).get("status") == "READY"
-                    finalize = (
-                        now >= opened + timedelta(seconds=5) and history_ready
-                    ) or now >= opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
                     self.journal.freeze_opening_snapshot(
                         discovered,
                         mode,
@@ -517,7 +511,7 @@ class Monitor:
                         frozen_points,
                         frozen_source,
                         now,
-                        finalized=finalize,
+                        finalized=True,
                     )
                 except (KeyError, ValueError, TypeError, AttributeError):
                     continue

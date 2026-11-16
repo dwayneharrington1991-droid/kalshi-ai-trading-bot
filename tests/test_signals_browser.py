@@ -1111,6 +1111,45 @@ def test_reliability_diagram_uses_observed_bins_and_clears_unavailable_results(t
         thread.join(timeout=2)
 
 
+def test_stale_live_feed_never_hides_immutable_opening_call(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            page.evaluate("""primaryView({
+                stale: true,
+                remaining_seconds: 300,
+                market: {ticker: 'KXBTC15M-IMMUTABLE'},
+                prediction_engine: {
+                    ticker: 'KXBTC15M-IMMUTABLE',
+                    initial: {
+                        up: 0.62, down: 0.38, direction: 'UP',
+                        confidence: {status: 'CALIBRATED'},
+                        reason: 'immutable opening reason'
+                    }
+                },
+                scalping_monitor: {}
+            })""")
+            assert page.locator("#primary-opening").inner_text() == "UP"
+            assert page.locator("#primary-opening-probability").inner_text() == (
+                "62.0% UP · 38.0% DOWN"
+            )
+            assert "immutable call" in page.locator("#primary-opening-reason").inner_text()
+            assert page.locator("#primary-live").inner_text() == "NO VERIFIED EDGE"
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_browser_loads_deduplicated_market_history_and_verified_summary(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "market-history-browser.db"))
     test_now = utcnow()

@@ -74,8 +74,35 @@ def test_24h_context_tracks_live_rolling_timeframes_and_ignores_future_bars():
         dict(start=int(NOW.timestamp()), open=1, high=1, low=1, close=1, volume=100)
     )
     assert engine.context24(data, NOW) == a
-    data["candles"].pop(500)
+    missing = data["candles"].pop(500)["start"]
+    incomplete = engine.context24(data, NOW)
+    assert incomplete["status"] == "INSUFFICIENT DATA"
+    assert "1439/1440" in incomplete["reason"]
+    assert __import__("datetime").datetime.fromtimestamp(
+        missing, __import__("datetime").timezone.utc
+    ).isoformat() in incomplete["reason"]
+
+
+def test_strict_window_recovers_when_unavailable_minute_rolls_out_without_lookahead():
+    data = history()
+    data["candles"].pop(0)
     assert engine.context24(data, NOW)["status"] == "INSUFFICIENT DATA"
+
+    next_close = int(NOW.timestamp()) // 60 * 60
+    prior = data["candles"][-1]
+    data["candles"].append({
+        "start": next_close,
+        "open": prior["close"],
+        "high": prior["close"] + 2,
+        "low": prior["close"] - 2,
+        "close": prior["close"] + 1,
+        "volume": 1,
+    })
+    later = NOW + timedelta(minutes=1)
+    data["received_at"] = later.isoformat()
+    recovered = engine.context24(data, later)
+    assert recovered["status"] == "READY"
+    assert recovered["last_close"] == next_close + 60
 
 
 def test_opening_forecast_uses_only_preopen_received_data_and_reports_delay():
@@ -170,6 +197,16 @@ def test_persisted_opening_snapshot_excludes_future_receipts_and_survives_time(t
     opened = timestamp(contract["opens_at"])
     before = (opened - timedelta(seconds=1), 100000)
     after = (opened + timedelta(milliseconds=1), 200000)
+    with pytest.raises(ValueError, match="before contract start"):
+        journal.freeze_opening_snapshot(
+            contract, "PUBLIC MARKET DATA", history(), [before],
+            "Coinbase BTC/USD proxy", opened - timedelta(milliseconds=1), finalized=True,
+        )
+    with pytest.raises(ValueError, match="final immutable"):
+        journal.freeze_opening_snapshot(
+            contract, "PUBLIC MARKET DATA", history(), [before],
+            "Coinbase BTC/USD proxy", opened, finalized=False,
+        )
     first = journal.freeze_opening_snapshot(
         contract, "PUBLIC MARKET DATA", history(), [before, after],
         "Coinbase BTC/USD proxy", opened + timedelta(seconds=1), finalized=True,
@@ -250,9 +287,7 @@ def test_monitor_preloads_complete_history_before_rollover_and_keeps_opening_imm
     )
     monitor.tick((before, preopen, preopen, 0))
     snapshot = journal.opening_snapshot(contract["ticker"], "PUBLIC MARKET DATA")
-    assert snapshot is not None
-    assert timestamp(snapshot["captured_at"]) < opened
-    assert engine.context24(snapshot["history"], opened)["status"] == "READY"
+    assert snapshot is None
 
     at_open = deepcopy(before)
     at_open.update(now=opened.isoformat(), clock=opened.isoformat(), stream_observations=[])
@@ -260,6 +295,12 @@ def test_monitor_preloads_complete_history_before_rollover_and_keeps_opening_imm
     at_open["reference"] = {**at_open["reference"], "observed_at": opened.isoformat()}
     clock[0] = opened
     monitor.tick((at_open, opened, opened, 0))
+    snapshot = journal.opening_snapshot(contract["ticker"], "PUBLIC MARKET DATA")
+    assert snapshot is not None
+    assert timestamp(snapshot["captured_at"]) == opened
+    assert timestamp(snapshot["data_cutoff"]) == opened
+    assert snapshot["finalized"] is True
+    assert engine.context24(snapshot["history"], opened)["status"] == "READY"
     original = journal.opening_record(contract["ticker"], "PUBLIC MARKET DATA")
     assert original and original["up"] is not None
     assert timestamp(original["data_cutoff"]) == opened

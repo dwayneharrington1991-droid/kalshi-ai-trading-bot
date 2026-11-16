@@ -34,8 +34,11 @@ CONTRACT_SUMMARY_MIGRATION = "btc_engine_contract_summaries_v1"
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 COINBASE = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 COINBASE_EXCHANGE_CANDLES = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+COINBASE_MARKET_TRADES = "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/ticker"
 CANDLE_WINDOW = 1440
 CANDLE_SECONDS = 60
+TRADE_RECOVERY_LIMIT = 1000
+TRADE_RECOVERY_MAX_MINUTES = 5
 
 
 def utcnow():
@@ -536,6 +539,40 @@ class PublicFeed:
                     "Coinbase Exchange BTC-USD one-minute gap fill", exchange_format=True,
                 ))
                 requests += 1
+
+            # Both Coinbase candle products can omit the same isolated minute.
+            # Recover only from genuine timestamped public trades requested for
+            # that exact closed UTC minute. A response at the provider limit is
+            # rejected as potentially truncated; no OHLCV is interpolated.
+            remaining = [t for t in range(cutoff - 86400, cutoff, CANDLE_SECONDS)
+                         if t not in merged]
+            trade_recovery = []
+            for stamp in remaining[:TRADE_RECOVERY_MAX_MINUTES]:
+                try:
+                    requests += 1
+                    bar = self._candle_from_market_trades(stamp, cutoff)
+                except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                    trade_recovery.append({
+                        "start": stamp,
+                        "status": "UNAVAILABLE",
+                        "reason": type(exc).__name__,
+                    })
+                    continue
+                if bar is None:
+                    trade_recovery.append({
+                        "start": stamp,
+                        "status": "NO_VERIFIED_TRADES",
+                    })
+                    continue
+                add_rows(
+                    [bar],
+                    "Coinbase Advanced Trade public market trades exact-minute recovery",
+                )
+                trade_recovery.append({
+                    "start": stamp,
+                    "status": "RECOVERED_FROM_VERIFIED_TRADES",
+                    "trades": bar["trade_count"],
+                })
             received = utcnow()
             expected = list(range(cutoff - 86400, cutoff, CANDLE_SECONDS))
             remaining = [stamp for stamp in expected if stamp not in merged]
@@ -566,6 +603,7 @@ class PublicFeed:
                     ),
                     "cache_order": cache_order,
                     "response_orders": response_orders,
+                    "trade_recovery": trade_recovery,
                     "source_counts": source_counts,
                     "reason": None if not remaining else
                     f"Historical providers still missing {len(remaining)}/1440 exact UTC minutes",
@@ -588,6 +626,54 @@ class PublicFeed:
                 "diagnostics": dict(self.candle_diagnostics),
             }
         return self.candle_cache
+
+    def _candle_from_market_trades(self, start, cutoff):
+        """Build one closed candle from a complete bounded public trade response."""
+        start = int(start)
+        end = start + CANDLE_SECONDS
+        if start % CANDLE_SECONDS or end > int(cutoff):
+            raise ValueError("Trade recovery requires one aligned closed minute")
+        url = COINBASE_MARKET_TRADES + "?" + urlencode({
+            "start": start,
+            "end": end,
+            "limit": TRADE_RECOVERY_LIMIT,
+        })
+        value = self._read(url)
+        trades = value.get("trades")
+        if not isinstance(trades, list):
+            raise ValueError("Unsupported Coinbase market-trades schema")
+        if len(trades) >= TRADE_RECOVERY_LIMIT:
+            raise ValueError("Market-trades response may be truncated")
+        parsed = []
+        identifiers = set()
+        for raw in trades:
+            identifier = str(raw["trade_id"])
+            if identifier in identifiers:
+                raise ValueError("Duplicate market trade identifier")
+            identifiers.add(identifier)
+            observed = timestamp(raw["time"])
+            if not start <= observed.timestamp() < end:
+                raise ValueError("Market trade outside requested minute")
+            price = number(float(raw["price"]), 0.000001, 1e15)
+            size = number(float(raw["size"]), 0.000000000000001, 1e15)
+            parsed.append((observed, identifier, price, size))
+        if not parsed:
+            return None
+        parsed.sort(key=lambda item: (item[0], item[1]))
+        prices = [item[2] for item in parsed]
+        return {
+            "start": start,
+            "open": prices[0],
+            "high": max(prices),
+            "low": min(prices),
+            "close": prices[-1],
+            "volume": sum(item[3] for item in parsed),
+            "trade_count": len(parsed),
+            "source": (
+                "Coinbase Advanced Trade public market trades "
+                "exact-minute recovery"
+            ),
+        }
 
     def sampled_multi_assets(self, now):
         """Run bounded discovery/history preparation away from the primary BTC poll."""
@@ -2500,8 +2586,12 @@ class Journal:
     def freeze_opening_snapshot(
         self, market, mode, history, reference_points, reference_source, captured_at, finalized
     ):
-        """Persist receipt-proven opening inputs independently from live freshness."""
+        """Persist one receipt-proven snapshot at/after open; never rewrite it."""
         opened = timestamp(market["opens_at"])
+        if captured_at < opened:
+            raise ValueError("Opening snapshot cannot be persisted before contract start")
+        if not finalized:
+            raise ValueError("Only final immutable opening snapshots may be persisted")
         points = [
             [when.isoformat(), price]
             for when, price in reference_points
@@ -2526,18 +2616,20 @@ class Journal:
                 "SELECT finalized,payload FROM opening_input_snapshots WHERE mode=? AND ticker=?",
                 (mode, market["ticker"]),
             ).fetchone()
-            if existing and existing[0]:
+            if existing:
                 return json.loads(existing[1])
             db.execute(
                 """INSERT INTO opening_input_snapshots
-                   (mode,ticker,opens_at,captured_at,finalized,payload) VALUES (?,?,?,?,?,?)
-                   ON CONFLICT(mode,ticker) DO UPDATE SET
-                     captured_at=excluded.captured_at,finalized=excluded.finalized,payload=excluded.payload
-                   WHERE opening_input_snapshots.finalized=0""",
+                   (mode,ticker,opens_at,captured_at,finalized,payload)
+                   VALUES (?,?,?,?,?,?) ON CONFLICT(mode,ticker) DO NOTHING""",
                 (mode, market["ticker"], opened.isoformat(), captured_at.isoformat(),
                  int(bool(finalized)), json.dumps(payload, allow_nan=False)),
             )
-        return payload
+            saved = db.execute(
+                "SELECT payload FROM opening_input_snapshots WHERE mode=? AND ticker=?",
+                (mode, market["ticker"]),
+            ).fetchone()
+        return json.loads(saved[0])
 
     def opening_record(self, ticker, mode, candidate=None, wall_now=None):
         with self.read() if candidate is None else self.connect() as db:

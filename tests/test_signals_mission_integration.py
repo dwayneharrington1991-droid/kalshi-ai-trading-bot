@@ -124,6 +124,65 @@ def test_missing_coinbase_minutes_are_gap_filled_without_interpolation(monkeypat
     assert any("api.exchange.coinbase.com" in url for url in calls)
 
 
+def test_shared_candle_gap_recovers_only_from_exact_timestamped_market_trades(monkeypatch):
+    from src.signals_display import monitor as module
+
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    absent = cutoff - 300
+
+    def get(url, **_kwargs):
+        query = parse_qs(urlsplit(url).query)
+        if url.startswith(module.COINBASE_MARKET_TRADES):
+            assert int(query["start"][0]) == absent
+            assert int(query["end"][0]) == absent + 60
+            return httpx.Response(200, json={"trades": [
+                {"trade_id": "three", "time": __import__("datetime").datetime.fromtimestamp(absent + 50, __import__("datetime").timezone.utc).isoformat(), "price": "101", "size": "0.3"},
+                {"trade_id": "one", "time": __import__("datetime").datetime.fromtimestamp(absent + 5, __import__("datetime").timezone.utc).isoformat(), "price": "100", "size": "0.1"},
+                {"trade_id": "two", "time": __import__("datetime").datetime.fromtimestamp(absent + 30, __import__("datetime").timezone.utc).isoformat(), "price": "99", "size": "0.2"},
+            ]}, request=httpx.Request("GET", url))
+        if "api.exchange.coinbase.com" in url:
+            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+        left, right = int(query["start"][0]), int(query["end"][0])
+        return httpx.Response(200, json={"candles": [
+            dict(start=str(t), open="100", high="102", low="99", close="101", volume="1")
+            for t in range(left, right, 60) if t != absent
+        ]}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    result = PublicFeed(get).candles(NOW)
+    recovered = next(bar for bar in result["candles"] if bar["start"] == absent)
+    assert (recovered["open"], recovered["high"], recovered["low"], recovered["close"]) == (
+        100.0, 101.0, 99.0, 101.0
+    )
+    assert recovered["volume"] == pytest.approx(0.6)
+    assert "market trades" in recovered["source"]
+    assert result["diagnostics"]["status"] == "READY"
+    assert result["diagnostics"]["trade_recovery"] == [{
+        "start": absent,
+        "status": "RECOVERED_FROM_VERIFIED_TRADES",
+        "trades": 3,
+    }]
+
+
+@pytest.mark.parametrize("trades", [
+    [
+        {"trade_id": "duplicate", "time": NOW.isoformat(), "price": "100", "size": "1"},
+        {"trade_id": "duplicate", "time": NOW.isoformat(), "price": "100", "size": "1"},
+    ],
+    [
+        {"trade_id": "future", "time": (NOW + timedelta(minutes=2)).isoformat(), "price": "100", "size": "1"},
+    ],
+])
+def test_trade_recovery_rejects_duplicate_or_out_of_window_receipts(trades):
+    start = int(NOW.timestamp()) // 60 * 60
+
+    def get(url, **_kwargs):
+        return httpx.Response(200, json={"trades": trades}, request=httpx.Request("GET", url))
+
+    with pytest.raises(ValueError):
+        PublicFeed(get)._candle_from_market_trades(start, start + 60)
+
+
 def test_unrecoverable_candle_gap_is_explicitly_incomplete(monkeypatch):
     from src.signals_display import monitor as module
 

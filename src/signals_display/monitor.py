@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 import re
+import shutil
 from pathlib import Path
 import sqlite3
 from time import perf_counter, monotonic
@@ -1832,9 +1833,26 @@ class Journal:
             except OSError:
                 sizes[label + "_bytes"] = 0
         total = sizes["database_bytes"] + sizes["wal_bytes"]
+        try:
+            disk = shutil.disk_usage(path.parent)
+            free_bytes = disk.free
+            used_ratio = disk.used / disk.total if disk.total else 1.0
+        except OSError:
+            disk = None
+            free_bytes = None
+            used_ratio = None
+        critical = (
+            free_bytes is not None
+            and (free_bytes < 5 * 1024**3 or used_ratio >= 0.90)
+        )
         return {
             **sizes, "total_mib": round(total / 1048576, 2),
-            "status": "HIGH_STORAGE_PRESSURE" if total >= 2 * 1024**3 else "NORMAL",
+            "filesystem_total_bytes": disk.total if disk else None,
+            "filesystem_free_bytes": free_bytes,
+            "filesystem_used_percent": round(used_ratio * 100, 2)
+            if used_ratio is not None else None,
+            "status": "CRITICAL_DISK_PRESSURE" if critical else
+            "HIGH_STORAGE_PRESSURE" if total >= 2 * 1024**3 else "NORMAL",
             "note": "Existing history is preserved; new prediction evidence uses bounded compact rows",
         }
 

@@ -3,6 +3,7 @@ from datetime import timedelta
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import sqlite3
 import threading
 from time import perf_counter
 from urllib.request import urlopen
@@ -555,6 +556,46 @@ def test_candle_persistence_failure_keeps_live_chart_and_reports_error(tmp_path,
     assert chart["status"] == "READY"
     assert chart["fallback_kind"] == "LIVE_VERIFIED_PRELOAD"
     assert len(chart["bars"]) == 1
+
+
+def test_opening_sqlite_lock_is_reported_as_wait_without_resetting_live_state(
+    tmp_path, monkeypatch
+):
+    journal = Journal(tmp_path / "locked.db")
+    monitor = Monitor(None, journal)
+    payload = frame()
+
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(journal, "opening_record", locked)
+    monitor.tick((payload, NOW, NOW, 1.0))
+
+    initial = monitor.state["prediction_engine"]["initial"]
+    assert initial["direction"] == "WAIT"
+    assert initial["up"] is None
+    assert initial["status"] == "UNAVAILABLE"
+    assert initial["reason"].startswith("OPENING_STORAGE_UNAVAILABLE")
+    assert monitor.state.get("connection_error") is not True
+    assert monitor.runtime_meter.failures()["opening_storage"]["error_type"] == (
+        "OperationalError"
+    )
+
+
+def test_storage_health_reports_root_pressure_without_scanning_database(
+    tmp_path, monkeypatch
+):
+    journal = Journal(tmp_path / "health.db")
+    usage = __import__("collections").namedtuple("usage", "total used free")
+    monkeypatch.setattr(
+        "src.signals_display.monitor.shutil.disk_usage",
+        lambda _path: usage(100 * 1024**3, 93 * 1024**3, 7 * 1024**3),
+    )
+
+    health = journal.storage_health()
+    assert health["status"] == "CRITICAL_DISK_PRESSURE"
+    assert health["filesystem_used_percent"] == 93.0
+    assert health["filesystem_free_bytes"] == 7 * 1024**3
 
 
 def test_prediction_enrichment_failure_isolated_and_next_frame_runs(tmp_path):

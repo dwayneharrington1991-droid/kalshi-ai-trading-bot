@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from decimal import Decimal
 from pathlib import Path
 import re
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -100,6 +102,11 @@ class Monitor:
         # PublicFeed owns asynchronous refreshes, but request handlers must not
         # depend on its internal cache timing after a release restart.
         self.latest_candles = None
+        # Receipt-proven histories are retained only across the imminent
+        # contract boundary. This prevents an after-open refresh or a
+        # transient journal lock from turning a truthful 1439/1440 snapshot
+        # into 0/1440. Nothing in this cache may be updated after its opening.
+        self.preopening_histories = {}
         self.candle_lock = threading.Lock()
         self.build_commit = build_commit
         self.learning_status_path = (
@@ -415,6 +422,43 @@ class Monitor:
                 return False
         return True
 
+    def remember_preopening_histories(self, payload, now):
+        """Retain bounded, pre-open-only candle receipts for rollover."""
+        raw = payload.get("btc_candles", {}) if isinstance(payload, dict) else {}
+        try:
+            received = timestamp(raw["received_at"])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            received = None
+        retained = {}
+        for market in payload.get("markets", []) if isinstance(payload, dict) else []:
+            try:
+                ticker = market["ticker"]
+                opened = timestamp(market["opens_at"])
+                closes = timestamp(market["closes_at"])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            prior = self.preopening_histories.get(ticker)
+            if prior is not None and now < closes:
+                retained[ticker] = prior
+            if (
+                received is not None
+                and received <= opened
+                and now <= opened
+                and raw.get("candles")
+            ):
+                # PublicFeed replaces rather than mutates history objects, but
+                # a deep copy makes the opening boundary explicit and testable.
+                try:
+                    unchanged = (
+                        prior is not None
+                        and timestamp(prior["received_at"]) == received
+                    )
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    unchanged = False
+                if not unchanged:
+                    retained[ticker] = deepcopy(raw)
+        self.preopening_histories = dict(list(retained.items())[-12:])
+
     def tick(self, collected=None):
         tick_started = perf_counter()
         phases = {}
@@ -458,6 +502,7 @@ class Monitor:
             # independent of live-data freshness and remains usable when
             # threshold metadata or model generation arrives later.
             mode = payload.get("mode", "PUBLIC MARKET DATA")
+            self.remember_preopening_histories(payload, now)
             for discovered in payload.get("markets", []):
                 try:
                     opened = timestamp(discovered["opens_at"])
@@ -475,6 +520,7 @@ class Monitor:
                     candidates = [
                         item for item in (
                             raw_history if eligible else None,
+                            self.preopening_histories.get(discovered["ticker"]),
                             (existing or {}).get("history"),
                         )
                         if isinstance(item, dict)
@@ -513,6 +559,11 @@ class Monitor:
                         now,
                         finalized=True,
                     )
+                except sqlite3.OperationalError as exc:
+                    self.runtime_meter.error(
+                        "opening_snapshot_storage", type(exc).__name__
+                    )
+                    continue
                 except (KeyError, ValueError, TypeError, AttributeError):
                     continue
             primary = None
@@ -756,15 +807,32 @@ class Monitor:
                 "multi_asset_diagnostics", {"status": "UNAVAILABLE"}
             )
             state["market_health"] = diagnose_market(state, now)
-            prior = (
-                self.journal.engine_prior(state["market"]["ticker"], state["mode"])
-                if state.get("market")
-                else None
-            )
+            try:
+                prior = (
+                    self.journal.engine_prior(state["market"]["ticker"], state["mode"])
+                    if state.get("market")
+                    else None
+                )
+            except sqlite3.OperationalError as exc:
+                self.runtime_meter.error("opening_storage", type(exc).__name__)
+                prior = None
             opening = None
             if state.get("market") and self.models_enabled:
                 m = state["market"]
-                opening = self.journal.opening_record(m["ticker"], state["mode"])
+                try:
+                    opening = self.journal.opening_record(m["ticker"], state["mode"])
+                except sqlite3.OperationalError as exc:
+                    self.runtime_meter.error("opening_storage", type(exc).__name__)
+                    opening = {
+                        "status": "UNAVAILABLE",
+                        "direction": "WAIT",
+                        "up": None,
+                        "down": None,
+                        "reason": (
+                            "OPENING_STORAGE_UNAVAILABLE: immutable journal is busy; "
+                            "no opening call will be inferred or rewritten"
+                        ),
+                    }
                 if (
                     opening is None
                     and m.get("strike") is not None
@@ -840,9 +908,22 @@ class Monitor:
                     # opening instant; later observations can never be backfilled.
                     retry_until = opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
                     if candidate.get("up") is not None or generated >= retry_until:
-                        opening = self.journal.opening_record(
-                            m["ticker"], state["mode"], candidate, generated
-                        )
+                        try:
+                            opening = self.journal.opening_record(
+                                m["ticker"], state["mode"], candidate, generated
+                            )
+                        except sqlite3.OperationalError as exc:
+                            self.runtime_meter.error("opening_storage", type(exc).__name__)
+                            opening = {
+                                "status": "UNAVAILABLE",
+                                "direction": "WAIT",
+                                "up": None,
+                                "down": None,
+                                "reason": (
+                                    "OPENING_STORAGE_UNAVAILABLE: immutable journal is busy; "
+                                    "no opening call will be inferred or rewritten"
+                                ),
+                            }
                     else:
                         candidate["status"] = "WARMING UP"
                         candidate["reason"] += (

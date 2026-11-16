@@ -291,6 +291,14 @@ def test_monitor_preloads_complete_history_before_rollover_and_keeps_opening_imm
 
     at_open = deepcopy(before)
     at_open.update(now=opened.isoformat(), clock=opened.isoformat(), stream_observations=[])
+    # A boundary refresh received after opening must not replace the complete
+    # receipt-proven pre-opening payload with zero history.
+    at_open["btc_candles"] = {
+        "source": candles["source"],
+        "received_at": (opened + timedelta(milliseconds=1)).isoformat(),
+        "diagnostics": {"status": "WARMING_UP", "missing_bars": 1440},
+        "candles": [],
+    }
     at_open["markets"][0]["observed_at"] = opened.isoformat()
     at_open["reference"] = {**at_open["reference"], "observed_at": opened.isoformat()}
     clock[0] = opened
@@ -315,6 +323,41 @@ def test_monitor_preloads_complete_history_before_rollover_and_keeps_opening_imm
     later["markets"][0]["observed_at"] = later_time.isoformat()
     monitor.tick((later, later_time, later_time, 0))
     assert journal.opening_record(contract["ticker"], "PUBLIC MARKET DATA") == original
+
+
+def test_incomplete_preopening_receipt_never_resets_to_zero_at_rollover(tmp_path):
+    opened = NOW
+    before_open = opened - timedelta(seconds=1)
+    contract = market()
+    incomplete = history(opened - timedelta(minutes=1), before_open)
+    missing_start = int(opened.timestamp()) - 3600
+    incomplete["candles"] = [
+        bar for bar in incomplete["candles"] if int(bar["start"]) != missing_start
+    ]
+    assert len(incomplete["candles"]) == 1439
+    monitor = Monitor(None, Journal(tmp_path / "rollover.db"))
+    before = frame()
+    before.update(
+        markets=[contract], btc_candles=incomplete,
+        now=before_open.isoformat(), clock=before_open.isoformat(),
+    )
+    monitor.remember_preopening_histories(before, before_open)
+
+    boundary = deepcopy(before)
+    boundary.update(now=opened.isoformat(), clock=opened.isoformat())
+    boundary["btc_candles"] = {
+        "source": incomplete["source"],
+        "received_at": (opened + timedelta(milliseconds=1)).isoformat(),
+        "candles": [],
+    }
+    monitor.remember_preopening_histories(boundary, opened)
+
+    retained = monitor.preopening_histories[contract["ticker"]]
+    assert len(retained["candles"]) == 1439
+    context = engine.context24(retained, opened)
+    assert context["status"] == "INSUFFICIENT DATA"
+    assert "1439/1440" in context["reason"]
+    assert "missing UTC intervals" in context["reason"]
 
 
 def test_recording_revisions_and_official_scoring_do_not_backfill_or_duplicate(tmp_path):

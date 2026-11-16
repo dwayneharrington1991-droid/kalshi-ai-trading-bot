@@ -124,6 +124,79 @@ def test_missing_coinbase_minutes_are_gap_filled_without_interpolation(monkeypat
     assert any("api.exchange.coinbase.com" in url for url in calls)
 
 
+def test_primary_provider_backoff_does_not_block_independent_candle_fallback(monkeypatch):
+    """A 429/backoff on brokerage history must not abort Exchange recovery."""
+    from src.signals_display import monitor as module
+
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    calls = []
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        query = parse_qs(urlsplit(url).query)
+        if "api.exchange.coinbase.com" in url:
+            left = int(__import__("datetime").datetime.fromisoformat(query["start"][0]).timestamp())
+            right = int(__import__("datetime").datetime.fromisoformat(query["end"][0]).timestamp())
+            rows = [
+                [t, "99", "102", "100", "101", "1"]
+                for t in range(left, right, 60)
+            ]
+            return httpx.Response(200, json=rows, request=httpx.Request("GET", url))
+        return httpx.Response(
+            429, headers={"Retry-After": "30"}, json={},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    feed = PublicFeed(get)
+    result = feed.candles(NOW)
+
+    assert result["diagnostics"]["status"] == "READY"
+    assert len(result["candles"]) == 1440
+    assert [bar["start"] for bar in result["candles"]] == list(
+        range(cutoff - 86400, cutoff, 60)
+    )
+    attempts = result["diagnostics"]["provider_attempts"]
+    assert attempts[0]["provider"] == "Coinbase Advanced Trade candles"
+    assert attempts[0]["status"] == "UNAVAILABLE"
+    assert any(
+        item["provider"] == "Coinbase Exchange candles" and item["status"] == "OK"
+        for item in attempts
+    )
+    assert result["diagnostics"]["provider_backoffs"][0]["root_failure"] == "HTTP_STATUS_429"
+    assert result["diagnostics"]["next_retry_at"] is not None
+
+
+def test_all_provider_backoffs_report_retry_without_freezing_rolling_window(monkeypatch):
+    from src.signals_display import monitor as module
+
+    clock = [100.0]
+
+    def unavailable(url, **_kwargs):
+        return httpx.Response(
+            429, headers={"Retry-After": "20"}, json={},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    feed = PublicFeed(unavailable)
+    first = feed.candles(NOW)
+    assert first["diagnostics"]["status"] == "INCOMPLETE"
+    assert first["diagnostics"]["missing_intervals"][0].endswith("+00:00")
+    assert first["diagnostics"]["next_retry_at"] is not None
+    assert len(first["diagnostics"]["provider_backoffs"]) == 3
+
+    # Five seconds later the cache window advances even while all endpoints
+    # remain inside their independent provider cooldowns.
+    clock[0] += 5
+    later = NOW + timedelta(minutes=1)
+    second = feed.candles(later)
+    assert second["diagnostics"]["last_attempt_at"] == later.isoformat()
+    assert second["diagnostics"]["status"] == "INCOMPLETE"
+    assert second["diagnostics"]["next_retry_at"] is not None
+
+
 def test_shared_candle_gap_recovers_only_from_exact_timestamped_market_trades(monkeypatch):
     from src.signals_display import monitor as module
 

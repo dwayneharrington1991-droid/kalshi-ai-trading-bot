@@ -694,10 +694,18 @@ def test_candle_integrity_endpoint_reports_full_window_and_exact_gap(
         monitor.latest_candles["candles"] = [
             bar for bar in monitor.latest_candles["candles"] if bar["start"] != missing
         ]
+        monitor.latest_candles["diagnostics"].update(
+            provider_attempts=[{"provider": "Coinbase Exchange candles", "status": "UNAVAILABLE"}],
+            provider_backoffs=[{"endpoint": "https://example.invalid", "retry_after_seconds": 12}],
+            next_retry_at="2026-10-26T12:16:12+00:00",
+            reason="provider retry pending",
+        )
         with urlopen(url, timeout=2) as response:
             incomplete = json.load(response)
         assert incomplete["status"] == "INCOMPLETE"
         assert incomplete["missing_intervals"] == [missing]
+        assert incomplete["recovery"]["next_retry_at"] == "2026-10-26T12:16:12+00:00"
+        assert incomplete["recovery"]["attempts"][0]["status"] == "UNAVAILABLE"
     finally:
         server.shutdown()
         server.server_close()

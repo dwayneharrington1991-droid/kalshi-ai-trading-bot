@@ -166,6 +166,7 @@ class PublicFeed:
                 self.http_backoff[diagnostic["endpoint"]] = {
                     "until": monotonic() + delay,
                     "attempts": attempts,
+                    "root_failure": diagnostic["failure_reason"],
                 }
                 diagnostic["retry_after_seconds"] = delay
             from email.utils import parsedate_to_datetime
@@ -245,6 +246,26 @@ class PublicFeed:
                     "observed_at": item.get("received_at"),
                 }
         return None
+
+    def retry_status(self, urls=None):
+        """Return bounded provider backoff state without making a request."""
+        endpoints = {url.split("?")[0] for url in urls} if urls else None
+        now_mono = monotonic()
+        values = []
+        for endpoint, retry in self.http_backoff.items():
+            if endpoints is not None and endpoint not in endpoints:
+                continue
+            remaining = max(0.0, float(retry.get("until", 0)) - now_mono)
+            if remaining <= 0:
+                continue
+            values.append({
+                "endpoint": endpoint,
+                "retry_after_seconds": round(remaining, 2),
+                "next_retry_at": (utcnow() + timedelta(seconds=remaining)).isoformat(),
+                "attempts": int(retry.get("attempts", 0)),
+                "root_failure": retry.get("root_failure"),
+            })
+        return sorted(values, key=lambda item: (item["next_retry_at"], item["endpoint"]))
 
     def poll_failure_code(self, exc):
         """Stable credential-free cause for a failed public collection pass."""
@@ -434,6 +455,7 @@ class PublicFeed:
             duplicate_intervals = []
             conflicting_duplicate_intervals = []
             source_counts = {}
+            provider_attempts = []
 
             def add_rows(rows, source, exchange_format=False):
                 starts = []
@@ -498,11 +520,19 @@ class PublicFeed:
                         set(conflicting_duplicate_intervals)
                     ),
                     cache_order=cache_order, source_counts=source_counts,
+                    provider_attempts=[], provider_backoffs=[], next_retry_at=None,
                 )
-                return {**(self.candle_cache or {}), "diagnostics": dict(self.candle_diagnostics)}
+                self.candle_cache = {
+                    **(self.candle_cache or {}),
+                    "candles": [merged[t] for t in sorted(merged)],
+                    "received_at": now.isoformat(),
+                    "diagnostics": dict(self.candle_diagnostics),
+                }
+                self.candle_cache.pop("error", None)
+                return self.candle_cache
             requests = 0
             response_orders = []
-            for left, right in ranges[:5]:
+            for left, right in ranges[:6]:
                 start = left - CANDLE_SECONDS
                 end = min(int(utcnow().timestamp()), right + CANDLE_SECONDS)
                 url = (
@@ -511,10 +541,23 @@ class PublicFeed:
                         {"start": start, "end": end, "granularity": "ONE_MINUTE", "limit": 300}
                     )
                 )
-                response_orders.append(add_rows(
-                    self._read(url)["candles"], "Coinbase Advanced Trade one-minute candles"
-                ))
                 requests += 1
+                try:
+                    response_orders.append(add_rows(
+                        self._read(url)["candles"],
+                        "Coinbase Advanced Trade one-minute candles",
+                    ))
+                    provider_attempts.append({
+                        "provider": "Coinbase Advanced Trade candles",
+                        "range_start": left, "range_end": right, "status": "OK",
+                    })
+                except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                    provider_attempts.append({
+                        "provider": "Coinbase Advanced Trade candles",
+                        "range_start": left, "range_end": right,
+                        "status": "UNAVAILABLE", "error_type": type(exc).__name__,
+                        "reason": str(exc)[:160],
+                    })
 
             # The brokerage history endpoint occasionally omits isolated closed
             # minutes for several seconds. Fill only still-missing intervals
@@ -529,17 +572,30 @@ class PublicFeed:
                     fallback_ranges[-1][1] += CANDLE_SECONDS
                 else:
                     fallback_ranges.append([stamp, stamp + CANDLE_SECONDS])
-            for left, right in fallback_ranges[:5]:
+            for left, right in fallback_ranges[:6]:
                 params = urlencode({
                     "start": datetime.fromtimestamp(left, timezone.utc).isoformat(),
                     "end": datetime.fromtimestamp(right, timezone.utc).isoformat(),
                     "granularity": CANDLE_SECONDS,
                 })
-                response_orders.append(add_rows(
-                    self._read(COINBASE_EXCHANGE_CANDLES + "?" + params),
-                    "Coinbase Exchange BTC-USD one-minute gap fill", exchange_format=True,
-                ))
                 requests += 1
+                try:
+                    response_orders.append(add_rows(
+                        self._read(COINBASE_EXCHANGE_CANDLES + "?" + params),
+                        "Coinbase Exchange BTC-USD one-minute gap fill",
+                        exchange_format=True,
+                    ))
+                    provider_attempts.append({
+                        "provider": "Coinbase Exchange candles",
+                        "range_start": left, "range_end": right, "status": "OK",
+                    })
+                except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                    provider_attempts.append({
+                        "provider": "Coinbase Exchange candles",
+                        "range_start": left, "range_end": right,
+                        "status": "UNAVAILABLE", "error_type": type(exc).__name__,
+                        "reason": str(exc)[:160],
+                    })
 
             # Both Coinbase candle products can omit the same isolated minute.
             # Recover only from genuine timestamped public trades requested for
@@ -553,6 +609,12 @@ class PublicFeed:
                     requests += 1
                     bar = self._candle_from_market_trades(stamp, cutoff)
                 except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                    provider_attempts.append({
+                        "provider": "Coinbase Advanced Trade market trades",
+                        "range_start": stamp, "range_end": stamp + CANDLE_SECONDS,
+                        "status": "UNAVAILABLE", "error_type": type(exc).__name__,
+                        "reason": str(exc)[:160],
+                    })
                     trade_recovery.append({
                         "start": stamp,
                         "status": "UNAVAILABLE",
@@ -560,6 +622,11 @@ class PublicFeed:
                     })
                     continue
                 if bar is None:
+                    provider_attempts.append({
+                        "provider": "Coinbase Advanced Trade market trades",
+                        "range_start": stamp, "range_end": stamp + CANDLE_SECONDS,
+                        "status": "NO_VERIFIED_TRADES",
+                    })
                     trade_recovery.append({
                         "start": stamp,
                         "status": "NO_VERIFIED_TRADES",
@@ -569,6 +636,11 @@ class PublicFeed:
                     [bar],
                     "Coinbase Advanced Trade public market trades exact-minute recovery",
                 )
+                provider_attempts.append({
+                    "provider": "Coinbase Advanced Trade market trades",
+                    "range_start": stamp, "range_end": stamp + CANDLE_SECONDS,
+                    "status": "RECOVERED", "trades": bar["trade_count"],
+                })
                 trade_recovery.append({
                     "start": stamp,
                     "status": "RECOVERED_FROM_VERIFIED_TRADES",
@@ -579,6 +651,11 @@ class PublicFeed:
             remaining = [stamp for stamp in expected if stamp not in merged]
             ordered = [merged[t] for t in expected if t in merged]
             status = "READY" if not remaining else "INCOMPLETE"
+            backoffs = self.retry_status([
+                "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles",
+                COINBASE_EXCHANGE_CANDLES,
+                COINBASE_MARKET_TRADES,
+            ])
             self.candle_cache = {
                 "candles": ordered,
                 "source": "Coinbase BTC-USD public one-minute candles; Exchange endpoint fills verified gaps",
@@ -587,7 +664,7 @@ class PublicFeed:
                     "method": "Initial 24h preload, then exact missing-interval backfill",
                     "requests": requests,
                     "retained_bars": len(merged),
-                    "maximum_requests_per_refresh": 10,
+                    "maximum_requests_per_refresh": 17,
                 },
                 "diagnostics": {
                     "status": status, "last_attempt_at": now.isoformat(),
@@ -605,6 +682,9 @@ class PublicFeed:
                     "cache_order": cache_order,
                     "response_orders": response_orders,
                     "trade_recovery": trade_recovery,
+                    "provider_attempts": provider_attempts,
+                    "provider_backoffs": backoffs,
+                    "next_retry_at": backoffs[0]["next_retry_at"] if backoffs else None,
                     "source_counts": source_counts,
                     "reason": None if not remaining else
                     f"Historical providers still missing {len(remaining)}/1440 exact UTC minutes",

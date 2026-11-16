@@ -138,6 +138,8 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy, m
                 payload["orderbook_fp"]["no_dollars"] = []
             elif missing_side:
                 payload["orderbook_fp"][missing_side + "_dollars"] = []
+        elif url.startswith(module.COINBASE_MARKET_TRADES):
+            payload = {"trades": []}
         elif "/candles?" in url:
             payload = {"candles": []}
         elif url == module.COINBASE:
@@ -148,9 +150,12 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy, m
 
     monkeypatch.setattr(module, "utcnow", lambda: NOW)
     data = PublicFeed(get).poll()
-    assert len(calls) == 10
+    # Empty primary history now exercises bounded independent Exchange and
+    # exact-trade recovery rather than aborting after the first provider.
+    assert len(calls) == 20
     assert any(url.startswith(module.COINBASE_EXCHANGE_CANDLES) for url in calls)
-    assert sum("/candles?" in call for call in calls) == 6
+    assert sum("/candles?" in call for call in calls) == 11
+    assert sum(call.startswith(module.COINBASE_MARKET_TRADES) for call in calls) == 5
     market = data["markets"][0]
     if missing_side == "both":
         assert market["book_diagnostic"].startswith("NO_LIQUIDITY")
@@ -246,12 +251,14 @@ def test_incomplete_startup_candle_preload_retries_after_five_seconds():
 
     feed = PublicFeed(get, multi_venue=False)
     feed.candles(NOW)
-    assert len(calls) == 6
-    assert calls[-1].startswith(module.COINBASE_EXCHANGE_CANDLES)
+    first_attempts = len(calls)
+    assert first_attempts == 16
+    assert any(call.startswith(module.COINBASE_EXCHANGE_CANDLES) for call in calls)
+    assert calls[-1].startswith(module.COINBASE_MARKET_TRADES)
     feed.candles(NOW + timedelta(seconds=4))
-    assert len(calls) == 6
+    assert len(calls) == first_attempts
     feed.candles(NOW + timedelta(seconds=5))
-    assert len(calls) == 12
+    assert len(calls) == first_attempts * 2
 
 
 def test_counterfactual_journal_deduplicates_and_includes_spread_and_fees(tmp_path):

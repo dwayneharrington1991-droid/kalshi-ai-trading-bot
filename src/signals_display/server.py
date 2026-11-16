@@ -1694,6 +1694,7 @@ def make_handler(monitor):
                 expected = list(range(cutoff - 86400, cutoff, 60))
                 missing = [stamp for stamp in expected if stamp not in set(unique)]
                 unexpected = [stamp for stamp in unique if stamp not in set(expected)]
+                diagnostics = source.get("diagnostics", {})
                 body = json.dumps(
                     {
                         "status": "READY"
@@ -1710,7 +1711,13 @@ def make_handler(monitor):
                         "invalid_bars": invalid,
                         "missing_intervals": missing,
                         "unexpected_intervals": unexpected,
-                        "diagnostics": source.get("diagnostics", {}),
+                        "recovery": {
+                            "attempts": diagnostics.get("provider_attempts", []),
+                            "backoffs": diagnostics.get("provider_backoffs", []),
+                            "next_retry_at": diagnostics.get("next_retry_at"),
+                            "reason": diagnostics.get("reason"),
+                        },
+                        "diagnostics": diagnostics,
                         "note": (
                             "Timestamp-only integrity evidence; no prices, credentials, "
                             "account data, or historical rows are exposed."

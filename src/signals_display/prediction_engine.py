@@ -827,6 +827,16 @@ def create(db, *, migrate_contract_summaries=True):
         END;
     """
     )
+    db.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS btc_engine_opening_no_update
+            BEFORE UPDATE ON btc_engine_opening BEGIN
+            SELECT RAISE(ABORT,'Opening predictions are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS btc_engine_opening_no_delete
+            BEFORE DELETE ON btc_engine_opening BEGIN
+            SELECT RAISE(ABORT,'Opening predictions are immutable'); END;
+        """
+    )
     if migrate_contract_summaries:
         backfill_contract_summaries(db)
 

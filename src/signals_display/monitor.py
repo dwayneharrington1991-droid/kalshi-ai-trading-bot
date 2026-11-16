@@ -1516,6 +1516,12 @@ class Journal:
                     mode TEXT NOT NULL,ticker TEXT NOT NULL,opens_at TEXT NOT NULL,
                     captured_at TEXT NOT NULL,finalized INTEGER NOT NULL,payload TEXT NOT NULL,
                     PRIMARY KEY(mode,ticker));
+                CREATE TRIGGER IF NOT EXISTS opening_input_snapshots_no_update
+                    BEFORE UPDATE ON opening_input_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Opening input snapshots are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS opening_input_snapshots_no_delete
+                    BEFORE DELETE ON opening_input_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Opening input snapshots are immutable'); END;
                 CREATE TABLE IF NOT EXISTS learning_contract_reviews (
                     ticker TEXT NOT NULL,origin TEXT NOT NULL,observed_at TEXT NOT NULL,
                     outcome INTEGER NOT NULL,payload TEXT NOT NULL,

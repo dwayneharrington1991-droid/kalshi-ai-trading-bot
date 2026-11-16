@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import timedelta
 import math
+import sqlite3
 import pytest
 from src.signals_display import prediction_engine as engine
 from src.signals_display.market_health import diagnose, selection_summary
@@ -182,6 +183,17 @@ def test_opening_is_immutable_and_survives_restart(tmp_path):
     b = {**opening, "up": 0.99, "generated_at": (NOW + timedelta(seconds=20)).isoformat()}
     assert j.opening_record(m["ticker"], "PUBLIC MARKET DATA", b, NOW + timedelta(seconds=20)) == a
     assert Journal(tmp_path / "j.db").opening_record(m["ticker"], "PUBLIC MARKET DATA") == a
+    with j.connect() as db:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "UPDATE btc_engine_opening SET up=0.99 WHERE mode=? AND ticker=?",
+                ("PUBLIC MARKET DATA", m["ticker"]),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "DELETE FROM btc_engine_opening WHERE mode=? AND ticker=?",
+                ("PUBLIC MARKET DATA", m["ticker"]),
+            )
 
 
 def test_actual_contract_rules_are_required_and_no_opening_data_means_unavailable():
@@ -222,6 +234,17 @@ def test_persisted_opening_snapshot_excludes_future_receipts_and_survives_time(t
         opened + timedelta(minutes=10), finalized=True,
     )
     assert replacement == first
+    with journal.connect() as db:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "UPDATE opening_input_snapshots SET finalized=0 WHERE mode=? AND ticker=?",
+                ("PUBLIC MARKET DATA", contract["ticker"]),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "DELETE FROM opening_input_snapshots WHERE mode=? AND ticker=?",
+                ("PUBLIC MARKET DATA", contract["ticker"]),
+            )
 
 
 def test_one_hundred_consecutive_openings_get_distinct_immutable_snapshots(tmp_path):

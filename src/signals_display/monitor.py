@@ -133,7 +133,7 @@ class PublicFeed:
         if self.client:
             self.client.close()
 
-    def _read(self, url):
+    def _read(self, url, timeout=4):
         started = perf_counter()
         diagnostic = {
             "endpoint": url.split("?")[0],
@@ -148,7 +148,7 @@ class PublicFeed:
                 raise ValueError("PUBLIC_HTTP_BACKOFF: waiting for provider retry interval")
             response = self.get(
                 url,
-                timeout=4,
+                timeout=timeout,
                 follow_redirects=False,
                 headers={"Accept": "application/json", "Cache-Control": "no-cache"},
             )
@@ -555,7 +555,7 @@ class PublicFeed:
                     trade_recovery.append({
                         "start": stamp,
                         "status": "UNAVAILABLE",
-                        "reason": type(exc).__name__,
+                        "reason": type(exc).__name__ + ": " + str(exc)[:160],
                     })
                     continue
                 if bar is None:
@@ -633,12 +633,18 @@ class PublicFeed:
         end = start + CANDLE_SECONDS
         if start % CANDLE_SECONDS or end > int(cutoff):
             raise ValueError("Trade recovery requires one aligned closed minute")
+        # Unlike the candle endpoint, Get Market Trades documents its range
+        # as RFC3339 timestamps. Sending Unix integers makes the service ignore
+        # or reject the historical range, commonly returning current trades
+        # that our exact-minute guard then (correctly) discards.
         url = COINBASE_MARKET_TRADES + "?" + urlencode({
-            "start": start,
-            "end": end,
+            "start": datetime.fromtimestamp(start, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "end": datetime.fromtimestamp(end, timezone.utc).isoformat().replace("+00:00", "Z"),
             "limit": TRADE_RECOVERY_LIMIT,
         })
-        value = self._read(url)
+        # Historical public REST is outside the one-second quote path. Give it
+        # a bounded ten seconds without delaying live contract collection.
+        value = self._read(url, timeout=10)
         trades = value.get("trades")
         if not isinstance(trades, list):
             raise ValueError("Unsupported Coinbase market-trades schema")

@@ -9,8 +9,8 @@ import time
 from urllib.request import urlopen
 
 
-def fetch(path, timeout=5):
-    with urlopen("http://127.0.0.1:8765" + path, timeout=timeout) as response:
+def fetch(path, port, timeout=5):
+    with urlopen(f"http://127.0.0.1:{port}" + path, timeout=timeout) as response:
         return json.load(response)
 
 
@@ -53,8 +53,20 @@ def summarize(samples, target):
         (state.get("prediction_engine") or {}).get("initial") or {}
         for state in rollover_states
     ]
-    if not any(item.get("generated_at") and item.get("ticker") == new_ticker for item in opening):
+    recorded = [
+        item for item in opening
+        if item.get("generated_at") and item.get("ticker") == new_ticker
+    ]
+    if len(recorded) < 2:
         raise ValueError("new contract did not record an immutable opening forecast")
+    immutable_fields = (
+        "ticker", "generated_at", "data_cutoff", "direction", "up", "down", "status"
+    )
+    fingerprints = {
+        tuple(item.get(field) for field in immutable_fields) for item in recorded
+    }
+    if len(fingerprints) != 1:
+        raise ValueError("new contract opening forecast changed after it was recorded")
     if any(
         (state.get("decision_intelligence") or {}).get("execution_capability") is not False
         for state in states
@@ -69,6 +81,7 @@ def summarize(samples, target):
         "quote_timestamps": len(quote_times),
         "chart_latest_intervals": len(chart_starts),
         "opening_forecast_for_new_contract": True,
+        "opening_forecast_immutable": True,
         "settlement_panel_present": all("prediction_engine" in state for state in states),
         "scalp_panel_present": all("scalping_monitor" in state for state in states),
         "automated_trading": "DISABLED",
@@ -78,6 +91,7 @@ def summarize(samples, target):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True)
+    parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--duration", type=int, default=1_200)
     parser.add_argument("--interval", type=int, default=5)
     parser.add_argument("--output", required=True)
@@ -91,10 +105,10 @@ def main():
         try:
             samples.append({
                 "at": datetime.now(timezone.utc).isoformat(),
-                "health": fetch("/healthz"),
-                "ready": fetch("/readyz"),
-                "state": fetch("/api/state?view=main"),
-                "chart": fetch("/api/signal-chart?interval=1m&limit=30"),
+                "health": fetch("/healthz", args.port),
+                "ready": fetch("/readyz", args.port),
+                "state": fetch("/api/state?view=main", args.port),
+                "chart": fetch("/api/signal-chart?interval=1m&limit=30", args.port),
             })
         except Exception as exc:
             failures.append(type(exc).__name__)

@@ -3,16 +3,16 @@ set -Eeuo pipefail
 
 # Dedicated preview-only switch. It never targets systemd, production paths,
 # ports 8765/8767, account credentials, backups, or order APIs.
-readonly TARGET=a739646155cbe36e324e4b5f9c6f58a0cedbc4a8
+readonly TARGET=${PREVIEW_TARGET_COMMIT:-a739646155cbe36e324e4b5f9c6f58a0cedbc4a8}
 readonly OLD_ROOT=/home/opc/kalshi-preview-upgrade
-readonly NEW_ROOT=/home/opc/kalshi-preview-repair-a739646
+readonly NEW_ROOT=${PREVIEW_TARGET_ROOT:-/home/opc/kalshi-preview-repair-a739646}
 readonly JOURNAL=/home/opc/kalshi-preview-upgrade/logs/upgraded-live-8768.db
 readonly PYTHON=/home/opc/kalshi-ai-trading-bot/.venv/bin/python
 readonly HOST=127.0.0.1
 readonly PORT=8768
 readonly MIN_FREE_BYTES=$((10 * 1024 * 1024 * 1024))
 readonly STATE_ROOT=/home/opc/.kalshi-deploy/preview-8768
-readonly LOG_PATH="$OLD_ROOT/logs/preview-8768-a739646.log"
+readonly LOG_PATH="$OLD_ROOT/logs/preview-8768-${TARGET:0:7}.log"
 
 old_pid=
 new_pid=
@@ -134,6 +134,8 @@ rollback_on_error() {
 trap rollback_on_error ERR INT TERM
 
 [[ -x $PYTHON ]] || fail "Python interpreter missing: $PYTHON"
+[[ $TARGET =~ ^[0-9a-f]{40}$ ]] || fail "target must be an exact 40-character commit"
+[[ $NEW_ROOT == /home/opc/kalshi-preview-repair-* ]] || fail "unexpected target root"
 [[ -d $OLD_ROOT && -d $NEW_ROOT ]] || fail "preview checkout missing"
 [[ -f $JOURNAL ]] || fail "existing preview journal missing"
 [[ ! -L $JOURNAL ]] || fail "journal must be a regular non-symlink path"

@@ -202,6 +202,25 @@ function terminalView(s,i,usable,direction,confidence){
   terminalSet(call,termPct(sided),callNote,'Calibrated probability of '+call+' · frozen at open',sided);
 }
 setInterval(()=>{if(terminal.closesAt&&Date.now()>=terminal.closesAt)terminalUnavailable('Contract closed · waiting for the next opening')},1000);
+/* Top TIME LEFT countdown: anchored to the contract's official closes_at and
+   corrected for the browser/server clock offset; ticks every second. */
+const contractClock={closesAt:null,offsetMs:0};
+function contractCountdownText(closesAtMs,nowMs){
+  if(!Number.isFinite(closesAtMs)||!Number.isFinite(nowMs))return '--:--';
+  const left=Math.ceil((closesAtMs-nowMs)/1000);
+  if(left<0||left>900)return '--:--';
+  return String(Math.floor(left/60)).padStart(2,'0')+':'+String(left%60).padStart(2,'0');
+}
+function renderContractClock(){txt('primary-time',contractCountdownText(contractClock.closesAt,Date.now()+contractClock.offsetMs))}
+// Re-render four times a second so the MM:SS value changes within 250 ms of each
+// real second boundary (the text itself changes once per second).
+setInterval(()=>{if(contractClock.closesAt!=null)renderContractClock()},250);
+function syncContractClock(s){
+  const serverNow=Date.parse(s.generated_at||s.now),closes=Date.parse(s.market?.closes_at);
+  if(Number.isFinite(serverNow))contractClock.offsetMs=serverNow-Date.now();
+  if(Number.isFinite(closes))contractClock.closesAt=closes;
+  renderContractClock();
+}
 function primaryView(s){
   const e=s.prediction_engine||{},i=e.initial||{},m=s.scalping_monitor||{},audit=e.opening_diagnostics||{};
   const openingBlocked=['NO VERIFIED EDGE','INSUFFICIENT PREDICTIVE CONFIDENCE','UNCALIBRATED'].includes(i.confidence?.status);
@@ -216,7 +235,7 @@ function primaryView(s){
   terminalView(s,i,openingUsable,openingDirection,minimalConfidence);
   $('minimal-opening-confidence').title=openingUsable?'Calibrated probability assigned to the immutable UP/DOWN opening call.':minimalConfidence!=null?'Larger calibrated outcome probability. The model still says WAIT because neither side crossed the validation-selected directional threshold.':'No calibrated opening probability was available at the immutable cutoff.';
   txt('primary-contract',e.ticker||s.market?.ticker||'Waiting for KXBTC15M');
-  txt('primary-time',countdown(s.remaining_seconds));
+  syncContractClock(s);
   txt('primary-opening',openingDirection);
   $('primary-opening').className='forecast-label '+(openingDirection==='UP'?'green':openingDirection==='DOWN'?'red':'amber');
   const openingProbabilityAvailable=Number.isFinite(i.up),openingThreshold=i.decision_policy?.threshold;
@@ -464,7 +483,7 @@ function scheduleRefresh(delay=0){clearTimeout(refreshTimer);refreshTimer=setTim
 const browserSleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function watchState(){for(;;){if(document.hidden){await browserSleep(1000);continue}const after=Number.isFinite(lastServerVersion)?Math.max(0,lastServerVersion):0;try{const response=await fetch('/api/state-version?after='+after+'&timeout=15',{cache:'no-store',signal:AbortSignal.timeout(20000)});if(!response.ok)throw Error('watch HTTP '+response.status);const notice=await response.json();if(notice.changed&&notice.state_version>lastServerVersion){const wait=Math.max(0,nextLiveRenderAt-performance.now());if(wait)await browserSleep(wait);await refresh();nextLiveRenderAt=performance.now()+500}}catch(error){await browserSleep(500)}}}
 document.addEventListener('visibilitychange',()=>{scheduleRefresh(document.hidden?5000:0);if(!document.hidden){signalChart.lastFetch=0;refreshSignalChart(true)}});
-setInterval(()=>{if(lastState){const elapsed=(Date.now()-lastSuccess)/1000;txt('engine-countdown',countdown((lastState.remaining_seconds??0)-elapsed));txt('opening-countdown',countdown((lastState.remaining_seconds??0)-elapsed));txt('primary-time',countdown((lastState.remaining_seconds??0)-elapsed));if((lastState.remaining_seconds??0)-elapsed<=0)expireEngine()}refreshTiming();if(Date.now()-lastSuccess>5000){txt('freshness','STALE / CONNECTION LOST');txt('direction','UNCLEAR');txt('scalp','WAIT');for(const id of ['prob-up','prob-down','scalp-up','scalp-down'])txt(id,'unavailable');$('plans').replaceChildren();expired('Connection lost; waiting for fresh data.')}},1000);
+setInterval(()=>{if(lastState){const elapsed=(Date.now()-lastSuccess)/1000;txt('engine-countdown',countdown((lastState.remaining_seconds??0)-elapsed));txt('opening-countdown',countdown((lastState.remaining_seconds??0)-elapsed));renderContractClock();if((lastState.remaining_seconds??0)-elapsed<=0)expireEngine()}refreshTiming();if(Date.now()-lastSuccess>5000){txt('freshness','STALE / CONNECTION LOST');txt('direction','UNCLEAR');txt('scalp','WAIT');for(const id of ['prob-up','prob-down','scalp-up','scalp-down'])txt(id,'unavailable');$('plans').replaceChildren();expired('Connection lost; waiting for fresh data.')}},1000);
 $('export').onclick=()=>{if(!latest)return;const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(latest,null,2)],{type:'application/json'}));a.download='signals-loaded-history-page.json';a.click();URL.revokeObjectURL(a.href)};scheduleRefresh();watchState();refreshPerformance();refreshSignalChart();refreshLiveTradeChart();setInterval(refreshPerformance,30000);setInterval(refreshDetails,10000);setInterval(refreshSignalChart,2000);setInterval(refreshLiveTradeChart,500);
 $('load-market-history').onclick=()=>{marketHistoryBeforeClose=null;marketHistoryBeforeTicker=null;marketHistoryCursors=[];refreshMarketHistory()};$('market-history-next').onclick=()=>{if(marketHistoryNext&&!marketHistoryBusy){marketHistoryCursors.push({close:marketHistoryBeforeClose,ticker:marketHistoryBeforeTicker});marketHistoryBeforeClose=marketHistoryNext.close;marketHistoryBeforeTicker=marketHistoryNext.ticker;refreshMarketHistory()}};$('market-history-previous').onclick=()=>{if(marketHistoryCursors.length&&!marketHistoryBusy){const cursor=marketHistoryCursors.pop();marketHistoryBeforeClose=cursor.close;marketHistoryBeforeTicker=cursor.ticker;refreshMarketHistory()}};
 </script></body></html>

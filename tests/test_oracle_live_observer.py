@@ -9,78 +9,129 @@ PATH = Path(__file__).parents[1] / "deploy/oracle/observe_live_rollover.py"
 spec = importlib.util.spec_from_file_location("observer", PATH)
 observer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(observer)
+TARGET = "a" * 40
+CUTOFF = 1762300800
 
 
-def sample(ticker, suffix, *, opening=False):
+def integrity(*, missing=(), duplicate=False):
+    starts = [stamp for stamp in range(CUTOFF - 86400, CUTOFF, 60) if stamp not in missing]
+    if duplicate:
+        starts.append(starts[-1])
     return {
-        "health": {
-            "build_commit": "a" * 40,
-            "signals_only": True,
-            "workers": {"healthy": True},
-        },
-        "ready": {"status": "READY"},
-        "state": {
-            "market": {"ticker": ticker, "observed_at": "2026-11-05T00:00:" + suffix + "Z"},
-            "reference": {"observed_at": "2026-11-05T00:00:" + suffix + "Z"},
-            "prediction_engine": {
-                "initial": {
-                    "ticker": ticker,
-                    "generated_at": "2026-11-05T00:00:" + suffix + "Z",
-                } if opening else {},
-            },
-            "scalping_monitor": {"signal": "WAIT"},
-            "decision_intelligence": {"execution_capability": False},
-        },
-        "chart": {"status": "READY", "latest_bar_start": int(suffix)},
+        "status": "READY" if not missing and not duplicate else "INCOMPLETE",
+        "cutoff": CUTOFF, "interval_seconds": 60, "starts": starts,
+        "bars": len(starts), "unique_bars": len(set(starts)),
+        "duplicate_bars": len(starts) - len(set(starts)), "invalid_bars": 0,
+        "missing_intervals": list(missing), "unexpected_intervals": [],
     }
 
 
-def test_observer_requires_real_rollover_and_new_immutable_opening():
+def sample(ticker, index, *, opening=None, new=False):
+    now = f"2026-11-05T00:{15 if new else 14}:{index:02d}+00:00"
+    market = {
+        "ticker": ticker, "observed_at": now,
+        "opens_at": "2026-11-05T00:15:00+00:00" if new else "2026-11-05T00:00:00+00:00",
+        "closes_at": "2026-11-05T00:30:00+00:00" if new else "2026-11-05T00:15:00+00:00",
+    }
+    return {
+        "at": now,
+        "health": {"status": "HEALTHY", "build_commit": TARGET, "signals_only": True, "workers": {"healthy": True}},
+        "ready": {"status": "READY", "signals_only": True, "contract": ticker, "contract_quotes_fresh": True, "reference_fresh": True},
+        "state": {
+            "now": now, "stale": False, "market": market,
+            "reference": {"observed_at": now},
+            "prediction_engine": {"updated_at": now, "direction": "UP", "initial": opening or {}},
+            "scalping_monitor": {"timestamp": now}, "scalp": "WAIT",
+            "decision_intelligence": {"execution_capability": False},
+            "storage_health": {"status": "NORMAL", "filesystem_free_bytes": 20 * 1024**3},
+        },
+        "chart": {"status": "READY", "bars": [{"start": CUTOFF - 60}], "latest_bar_start": CUTOFF + index * 60},
+        "integrity": integrity(), "request_latency_ms": [1.0, 2.0],
+    }
+
+
+def valid_rows():
     old = "KXBTC15M-OLD"
     new = "KXBTC15M-NEW"
-    first_new = sample(new, "03", opening=True)
-    second_new = sample(new, "04", opening=True)
-    second_new["state"]["prediction_engine"]["initial"] = deepcopy(
-        first_new["state"]["prediction_engine"]["initial"]
-    )
-    result = observer.summarize(
-        [sample(old, "01"), sample(old, "02"), first_new, second_new],
-        "a" * 40,
-    )
-    assert result["status"] == "PASS"
-    assert result["contracts"] == [old, new]
-    assert result["automated_trading"] == "DISABLED"
-    assert result["opening_forecast_immutable"] is True
-
-
-def test_observer_rejects_health_only_without_rollover():
-    with pytest.raises(ValueError, match="no complete"):
-        observer.summarize([sample("KXBTC15M-ONLY", "01")], "a" * 40)
-
-
-def test_observer_rejects_any_execution_capability():
-    rows = [
-        sample("KXBTC15M-OLD", "01"),
-        sample("KXBTC15M-NEW", "02", opening=True),
-        sample("KXBTC15M-NEW", "03", opening=True),
+    opening = {
+        "ticker": new, "generated_at": "2026-11-05T00:15:00+00:00",
+        "data_cutoff": "2026-11-05T00:15:00+00:00",
+        "input_data_cutoff": "2026-11-05T00:14:59+00:00", "direction": "WAIT",
+        "up": None, "down": None, "status": "INSUFFICIENT DATA",
+    }
+    return [
+        sample(old, 1), sample(old, 2), sample(new, 3, opening=deepcopy(opening), new=True),
+        sample(new, 4, opening=deepcopy(opening), new=True),
     ]
-    rows[-1]["state"]["prediction_engine"]["initial"] = deepcopy(
-        rows[-2]["state"]["prediction_engine"]["initial"]
-    )
+
+
+def test_observer_requires_real_rollover_complete_candles_and_immutable_opening():
+    result = observer.summarize(valid_rows(), TARGET)
+    assert result["status"] == "PASS"
+    assert result["contracts"] == ["KXBTC15M-OLD", "KXBTC15M-NEW"]
+    assert result["completed_candle_rollovers"] == 3
+    assert result["candle_integrity"]["bars"] == 1440
+    assert result["opening_forecast_immutable"] is True
+    assert result["automated_trading"] == "DISABLED"
+
+
+def test_observer_rejects_missing_interval_with_exact_utc_reason():
+    rows = valid_rows()
+    missing = CUTOFF - 300
+    rows[-1]["integrity"] = integrity(missing=(missing,))
+    with pytest.raises(ValueError, match="missing UTC intervals=2025-11-04T23:55:00"):
+        observer.summarize(rows, TARGET)
+
+
+def test_observer_rejects_duplicate_future_or_out_of_order_candles():
+    with pytest.raises(ValueError, match="duplicates=1"):
+        observer.validate_candle_integrity(integrity(duplicate=True))
+    future = integrity()
+    future["starts"][-1] = CUTOFF
+    future["unexpected_intervals"] = [CUTOFF]
+    future["missing_intervals"] = [CUTOFF - 60]
+    with pytest.raises(ValueError, match="future=1"):
+        observer.validate_candle_integrity(future)
+    out_of_order = integrity()
+    out_of_order["starts"][-2:] = reversed(out_of_order["starts"][-2:])
+    with pytest.raises(ValueError, match="ordered"):
+        observer.validate_candle_integrity(out_of_order)
+
+
+def test_observer_rejects_health_only_without_contract_rollover():
+    rows = valid_rows()[:2]
+    with pytest.raises(ValueError, match="no complete"):
+        observer.summarize(rows, TARGET)
+
+
+def test_observer_rejects_execution_stale_storage_and_repaint():
+    rows = valid_rows()
     rows[-1]["state"]["decision_intelligence"]["execution_capability"] = True
     with pytest.raises(ValueError, match="execution boundary"):
-        observer.summarize(rows, "a" * 40)
-
-
-def test_observer_rejects_repainted_opening():
-    rows = [
-        sample("KXBTC15M-OLD", "01"),
-        sample("KXBTC15M-NEW", "02", opening=True),
-        sample("KXBTC15M-NEW", "03", opening=True),
-    ]
-    rows[-1]["state"]["prediction_engine"]["initial"]["generated_at"] = (
-        rows[-2]["state"]["prediction_engine"]["initial"]["generated_at"]
-    )
+        observer.summarize(rows, TARGET)
+    rows = valid_rows()
+    rows[-1]["ready"]["reference_fresh"] = False
+    with pytest.raises(ValueError, match="stale"):
+        observer.summarize(rows, TARGET)
+    rows = valid_rows()
+    rows[-1]["state"]["storage_health"]["filesystem_free_bytes"] = 5 * 1024**3
+    with pytest.raises(ValueError, match="10 GiB"):
+        observer.summarize(rows, TARGET)
+    rows = valid_rows()
     rows[-1]["state"]["prediction_engine"]["initial"]["up"] = 0.99
     with pytest.raises(ValueError, match="changed"):
-        observer.summarize(rows, "a" * 40)
+        observer.summarize(rows, TARGET)
+
+
+def test_observer_rejects_post_open_cutoff_and_nonadvancing_live_or_scalp():
+    rows = valid_rows()
+    for row in rows[2:]:
+        row["state"]["prediction_engine"]["initial"]["input_data_cutoff"] = "2026-11-05T00:15:00+00:00"
+    with pytest.raises(ValueError, match="strictly before"):
+        observer.summarize(rows, TARGET)
+    rows = valid_rows()
+    for row in rows[2:]:
+        row["state"]["prediction_engine"]["updated_at"] = "same"
+        row["state"]["scalping_monitor"]["timestamp"] = "same"
+    with pytest.raises(ValueError, match="LIVE"):
+        observer.summarize(rows, TARGET)

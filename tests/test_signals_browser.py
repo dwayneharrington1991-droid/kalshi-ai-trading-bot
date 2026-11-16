@@ -411,7 +411,7 @@ def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_pat
             assert page.locator("#opening-direction").inner_text() in ("UP", "DOWN")
             assert page.locator("#opening-ticker").inner_text() == market()["ticker"]
             assert page.locator("#opening-generated").inner_text() == opening["generated_at"]
-            assert page.locator("#opening-cutoff").inner_text() == NOW.isoformat()
+            assert page.locator("#opening-cutoff").inner_text() == opening["input_data_cutoff"]
             assert page.locator("#opening-prediction").evaluate(
                 "e=>e.getBoundingClientRect().top"
             ) < page.locator("#btc-engine").evaluate("e=>e.getBoundingClientRect().top")

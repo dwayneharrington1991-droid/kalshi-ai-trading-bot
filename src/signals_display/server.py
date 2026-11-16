@@ -1480,6 +1480,7 @@ class Monitor:
         state["scalping_monitor"] = diagnose_scalp(
             state, self.scalp_criteria, account=state["account"], now=health_clock
         )
+        state["storage_health"] = self.journal.storage_health()
         state["dual_strategy"] = evaluate_dual_strategy(
             state, paper_performance=self.journal.strategy_performance(health_clock)
         )
@@ -1653,6 +1654,52 @@ def make_handler(monitor):
                     else None
                 )
                 body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/candle-integrity":
+                source = (
+                    monitor.latest_candles
+                    or getattr(monitor.feed, "candle_cache", None)
+                    or {}
+                )
+                cutoff = int(utcnow().timestamp()) // 60 * 60
+                starts = []
+                invalid = 0
+                for raw in source.get("candles", []):
+                    try:
+                        start = int(raw["start"])
+                        if start % 60:
+                            raise ValueError("unaligned")
+                        starts.append(start)
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        invalid += 1
+                unique = sorted(set(starts))
+                expected = list(range(cutoff - 86400, cutoff, 60))
+                missing = [stamp for stamp in expected if stamp not in set(unique)]
+                unexpected = [stamp for stamp in unique if stamp not in set(expected)]
+                body = json.dumps(
+                    {
+                        "status": "READY"
+                        if not missing and not unexpected and len(starts) == 1440
+                        and len(unique) == 1440 and not invalid
+                        else "INCOMPLETE",
+                        "cutoff": cutoff,
+                        "interval_seconds": 60,
+                        "received_at": source.get("received_at"),
+                        "starts": unique,
+                        "bars": len(starts),
+                        "unique_bars": len(unique),
+                        "duplicate_bars": len(starts) - len(unique),
+                        "invalid_bars": invalid,
+                        "missing_intervals": missing,
+                        "unexpected_intervals": unexpected,
+                        "diagnostics": source.get("diagnostics", {}),
+                        "note": (
+                            "Timestamp-only integrity evidence; no prices, credentials, "
+                            "account data, or historical rows are exposed."
+                        ),
+                    },
+                    allow_nan=False,
+                ).encode()
                 content_type = "application/json"
             elif route == "/api/market-history":
                 try:

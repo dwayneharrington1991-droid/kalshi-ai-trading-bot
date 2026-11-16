@@ -1308,6 +1308,17 @@ def opening_forecast(
 
     opened = timestamp(market["opens_at"])
     closed = timestamp(market["closes_at"])
+    cutoff_candidates = []
+    try:
+        history_received = timestamp(history["received_at"])
+        if history_received < opened:
+            cutoff_candidates.append(history_received)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        pass
+    cutoff_candidates.extend(
+        when for when, _price in reference_points if when < opened
+    )
+    input_cutoff = max(cutoff_candidates) if cutoff_candidates else None
     result = dict(
         ticker=market["ticker"],
         opens_at=market["opens_at"],
@@ -1315,6 +1326,7 @@ def opening_forecast(
         timestamp=generated_at.isoformat(),
         generated_at=generated_at.isoformat(),
         data_cutoff=opened.isoformat(),
+        input_data_cutoff=input_cutoff.isoformat() if input_cutoff else None,
         opening_delay_seconds=max(0, (generated_at - opened).total_seconds()),
         timing_diagnostic={
             "forecast_computation_delay_seconds": max(0, (generated_at - opened).total_seconds()),
@@ -1384,7 +1396,7 @@ def opening_forecast(
             raise ValueError(day["reason"])
         by_time = {}
         for t, raw_price in reference_points:
-            if not opened - timedelta(seconds=65) <= t <= opened:
+            if not opened - timedelta(seconds=65) <= t < opened:
                 continue
             price = number(raw_price, 0.000001, 1e12)
             if t in by_time and by_time[t] != price:

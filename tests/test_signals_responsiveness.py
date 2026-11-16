@@ -598,6 +598,45 @@ def test_storage_health_reports_root_pressure_without_scanning_database(
     assert health["filesystem_free_bytes"] == 7 * 1024**3
 
 
+def test_candle_integrity_endpoint_reports_full_window_and_exact_gap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("src.signals_display.server.utcnow", lambda: NOW)
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    monitor = Monitor(None, Journal(tmp_path / "integrity.db"))
+    monitor.latest_candles = {
+        "source": "Coinbase verified test preload", "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY"},
+        "candles": [
+            {"start": stamp, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+            for stamp in range(cutoff - 86400, cutoff, 60)
+        ],
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/api/candle-integrity"
+        with urlopen(url, timeout=2) as response:
+            complete = json.load(response)
+        assert complete["status"] == "READY"
+        assert complete["bars"] == complete["unique_bars"] == 1440
+        assert complete["starts"] == list(range(cutoff - 86400, cutoff, 60))
+
+        missing = cutoff - 300
+        monitor.latest_candles["candles"] = [
+            bar for bar in monitor.latest_candles["candles"] if bar["start"] != missing
+        ]
+        with urlopen(url, timeout=2) as response:
+            incomplete = json.load(response)
+        assert incomplete["status"] == "INCOMPLETE"
+        assert incomplete["missing_intervals"] == [missing]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_prediction_enrichment_failure_isolated_and_next_frame_runs(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "j.db"))
 

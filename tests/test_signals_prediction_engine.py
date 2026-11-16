@@ -113,6 +113,7 @@ def test_opening_forecast_uses_only_preopen_received_data_and_reports_delay():
         first["status"] == "DELAYED"
         and first["up"] is not None
         and first["data_cutoff"] == NOW.isoformat()
+        and timestamp(first["input_data_cutoff"]) < NOW
     )
     assert first["opening_delay_seconds"] == 3
     later = points() + [(NOW + timedelta(seconds=1), 999999)]
@@ -213,6 +214,7 @@ def test_persisted_opening_snapshot_excludes_future_receipts_and_survives_time(t
     )
     assert first["reference_points"] == [[before[0].isoformat(), before[1]]]
     assert first["data_cutoff"] == opened.isoformat()
+    assert timestamp(first["input_data_cutoff"]) < opened
     much_later = journal.opening_snapshot(contract["ticker"], "PUBLIC MARKET DATA")
     assert much_later == first
     replacement = journal.freeze_opening_snapshot(
@@ -307,11 +309,13 @@ def test_monitor_preloads_complete_history_before_rollover_and_keeps_opening_imm
     assert snapshot is not None
     assert timestamp(snapshot["captured_at"]) == opened
     assert timestamp(snapshot["data_cutoff"]) == opened
+    assert timestamp(snapshot["input_data_cutoff"]) < opened
     assert snapshot["finalized"] is True
     assert engine.context24(snapshot["history"], opened)["status"] == "READY"
     original = journal.opening_record(contract["ticker"], "PUBLIC MARKET DATA")
     assert original and original["up"] is not None
     assert timestamp(original["data_cutoff"]) == opened
+    assert timestamp(original["input_data_cutoff"]) < opened
     assert timestamp(original["history_received_at"]) <= opened
 
     later = deepcopy(at_open)

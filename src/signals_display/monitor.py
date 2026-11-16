@@ -2619,13 +2619,18 @@ class Journal:
         points = [
             [when.isoformat(), price]
             for when, price in reference_points
-            if when <= opened
+            if when < opened
         ]
+        cutoff_candidates = [timestamp(history["received_at"])] if history.get("received_at") else []
+        cutoff_candidates.extend(timestamp(point[0]) for point in points)
+        cutoff_candidates = [value for value in cutoff_candidates if value < opened]
         payload = {
             "ticker": market["ticker"],
             "opens_at": opened.isoformat(),
             "captured_at": captured_at.isoformat(),
             "data_cutoff": opened.isoformat(),
+            "input_data_cutoff": max(cutoff_candidates).isoformat()
+            if cutoff_candidates else None,
             "history": history,
             "reference_points": points,
             "reference_source": reference_source,

@@ -15,10 +15,17 @@ from .scores import horizon, score
 
 
 PROTOCOL = "validation-selected-abstention-forward-test-v1"
-THRESHOLDS = (0.55, 0.60, 0.65, 0.70, 0.75, 0.80)
+THRESHOLDS = (0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
 TARGET_ACCURACY = 0.80
 MIN_VALIDATION_SIGNALS = 15
 COVERAGE_TARGETS = (0.10, 0.25, 0.50, 0.75, 1.0)
+CONFIDENCE_GROUPS = (
+    ("below_60%", 0.50, 0.60),
+    ("60%-70%", 0.60, 0.70),
+    ("70%-80%", 0.70, 0.80),
+    ("80%-90%", 0.80, 0.90),
+    ("90%+", 0.90, 1.0000001),
+)
 
 
 def _direction(probability, threshold):
@@ -78,6 +85,52 @@ def _metrics(probabilities, rows, threshold):
         "actual_realized_results": None,
         "actual_realized_results_reason": "Model holdout outcomes are not manual account fills",
     }
+
+
+def _confidence_group_report(probabilities, rows):
+    """Disjoint untouched-test confidence reliability; never threshold selection."""
+    ordered = sorted(
+        zip(probabilities, rows),
+        key=lambda item: (timestamp(item[1]["timestamp"]), item[1]["ticker"]),
+    )
+    first = {}
+    for probability, row in ordered:
+        if (
+            type(probability) in (int, float)
+            and math.isfinite(probability)
+            and 0 <= probability <= 1
+        ):
+            first.setdefault(row["ticker"], (probability, row))
+    eligible = len({row["ticker"] for row in rows})
+    result = {}
+    for label, lower, upper in CONFIDENCE_GROUPS:
+        selected = [
+            (probability, row)
+            for probability, row in first.values()
+            if lower <= max(probability, 1 - probability) < upper
+        ]
+        confidences = [max(probability, 1 - probability) for probability, _ in selected]
+        correct = [
+            int((probability >= 0.5) == bool(row["outcome"]))
+            for probability, row in selected
+        ]
+        count = len(selected)
+        successes = sum(correct)
+        result[label] = {
+            "independent_signals": count,
+            "eligible_markets": eligible,
+            "market_coverage": count / eligible if eligible else 0,
+            "observed_directional_accuracy": successes / count if count else None,
+            "accuracy_interval_95": wilson(successes, count) if count else None,
+            "mean_predicted_confidence": sum(confidences) / count if count else None,
+            "confidence_reliability": score(confidences, correct),
+            "outcome_probability_metrics": score(
+                [probability for probability, _ in selected],
+                [row["outcome"] for _, row in selected],
+            ),
+            "selected_on": "untouched test reporting only; group did not select model or threshold",
+        }
+    return result
 
 
 def _cost_evidence(signals, slippage=0.01):
@@ -201,6 +254,9 @@ def selective_report(validation_probabilities, validation_rows, test_probabiliti
     threshold = chosen["threshold"]
     test = _metrics(test_probabilities, test_rows, threshold)
     test["by_regime"] = _regime_reports(test_probabilities, test_rows, threshold)
+    test["by_calibrated_confidence"] = _confidence_group_report(
+        test_probabilities, test_rows
+    )
     test["target_observed"] = bool(
         test["independent_signals"] >= MIN_VALIDATION_SIGNALS
         and test["actionable_directional_accuracy"] is not None

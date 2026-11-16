@@ -52,7 +52,7 @@ REPO=/home/opc/kalshi-ai-trading-bot
 NEW=/home/opc/kalshi-preview-repair-${SHA:0:7}
 [[ $(id -un) == opc ]] || { echo "BLOCKED: must run as opc" >&2; exit 1; }
 git -C "$REPO" fetch --quiet --no-tags origin "$BRANCH" || { echo "BLOCKED: Oracle checkout could not fetch $BRANCH from GitHub; nothing changed" >&2; exit 1; }
-git -C "$REPO" cat-file -e "$SHA^{commit}"
+git -C "$REPO" cat-file -e "$SHA^{commit}" 2>/dev/null || { echo "BLOCKED: commit $SHA was not fetched from $BRANCH; nothing changed" >&2; exit 1; }
 git -C "$REPO" merge-base --is-ancestor "$SHA" FETCH_HEAD || { echo "BLOCKED: $SHA is not on $BRANCH" >&2; exit 1; }
 if [[ -e $NEW ]]; then
   [[ $(git -C "$NEW" rev-parse HEAD) == "$SHA" && -z $(git -C "$NEW" status --porcelain) ]] || { echo "BLOCKED: $NEW exists and is not a clean checkout of $SHA; nothing changed" >&2; exit 1; }
@@ -69,8 +69,13 @@ exec bash "$NEW/deploy/oracle/install_preview_8768.sh" "$SHA"
 $bootstrap = $bootstrap.Replace('__SHA__', $Sha) -replace "`r", ''
 $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrap))
 Write-Host "Installing $Sha on Oracle preview 8768 (production 8765 and preview 8767 are not touched)..."
+# Windows PowerShell 5.1 hosts such as the ISE turn native stderr into errors
+# under -ErrorAction Stop; judge the remote result by its exit code only.
+$ErrorActionPreference = 'Continue'
 & ssh.exe @sshBase $Server "echo $encoded | base64 -d | bash"
-if ($LASTEXITCODE -ne 0) { throw "Install failed (exit $LASTEXITCODE). The guarded installer rolled preview 8768 back automatically; 8765 and 8767 were not touched." }
+$remoteExit = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($remoteExit -ne 0) { throw "Install failed (exit $remoteExit). Read the PREVIEW_INSTALL / BLOCKED lines above: a blocked install changed nothing, and a failed switch or post-check restores the previous preview 8768 automatically. Ports 8765 and 8767 are never touched." }
 $listening = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue
 if (-not $listening) {
   $quotedKey = if ($Key) { "-o IdentitiesOnly=yes -i `"$Key`" " } else { '' }

@@ -122,3 +122,52 @@ def test_countdown_accuracy_rollover_refresh_in_a_real_browser(tmp_path):
     assert out["refresh"] in {"07:00", "06:59"}
     # The 1 s interval re-renders from closes_at, not the wrong 30 s snapshot.
     assert out["refresh_after_tick"] in {"06:59", "06:58"}
+
+
+PILL_SCRIPT = r"""
+const { chromium } = require('playwright');
+(async () => {
+  const b = await chromium.launch(); const out = {};
+  for (const [vp, size] of [['desktop', {width: 1440, height: 900}], ['mobile', {width: 390, height: 844}]]) {
+    const p = await b.newPage({viewport: size});
+    await p.route('**/api/**', r => r.abort());
+    await p.goto(process.argv[2]); await p.waitForTimeout(200);
+    out[vp] = await p.evaluate(() => {
+      const now = Date.now(), iso = t => new Date(t).toISOString();
+      syncContractClock({generated_at: iso(now), market: {ticker: 'KXBTC15M-T', closes_at: iso(now + 754e3)}});
+      const cards = () => [...document.querySelectorAll('#minimal-opening .minimal-value')]
+        .map(c => { const r = c.getBoundingClientRect(); return [Math.round(r.top), Math.round(r.left)]; });
+      const pill = document.querySelector('main>div.primary-contract'), time = document.getElementById('primary-time');
+      const box = pill.getBoundingClientRect(), withPill = cards();
+      pill.style.setProperty('display', 'none', 'important');
+      const withoutPill = cards();
+      pill.style.removeProperty('display');
+      return {visible: time.offsetParent !== null && getComputedStyle(pill).display !== 'none',
+              text: time.textContent, pillBottom: box.bottom,
+              firstCardTop: withPill[0][0], cardsUnmoved: JSON.stringify(withPill) === JSON.stringify(withoutPill),
+              hscroll: document.documentElement.scrollWidth > innerWidth};
+    });
+    await p.close();
+  }
+  console.log(JSON.stringify(out)); await b.close();
+})();
+"""
+
+
+def test_top_countdown_is_visible_above_cards_without_moving_them(tmp_path):
+    found = _node_with_playwright()
+    if not found:
+        pytest.skip("Node Playwright is not available")
+    node, env = found
+    script = tmp_path / "pill.js"
+    script.write_text(PILL_SCRIPT)
+    result = subprocess.run([node, str(script), PAGE.as_uri()], capture_output=True,
+                            text=True, timeout=120, env=env)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+    for viewport, view in out.items():
+        assert view["visible"], viewport
+        assert view["text"] in {"12:34", "12:33"}, viewport
+        assert view["pillBottom"] <= view["firstCardTop"], viewport  # at the top, no overlap
+        assert view["cardsUnmoved"], viewport  # the pill takes no layout space
+        assert not view["hscroll"], viewport

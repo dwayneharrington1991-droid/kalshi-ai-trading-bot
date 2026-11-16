@@ -82,6 +82,12 @@ main{position:relative;z-index:1}
 #minimal-opening-confidence{position:relative;font-size:clamp(40px,6vw,70px);font-weight:800;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
 .term-qual{position:relative;display:block;margin-top:clamp(16px,3vh,26px);max-width:36ch;font-size:13px;line-height:1.5;color:var(--t-muted);letter-spacing:.02em}
 @media(max-width:760px){#minimal-opening{grid-template-columns:1fr;align-content:start;min-height:auto;padding-top:12px}#minimal-opening .minimal-value{min-height:auto;padding:30px 18px;border-radius:22px}.term-gauge{width:min(260px,72vw)}}
+/* Visible top countdown pill (TIME LEFT). Pinned above the centred cards so
+   it takes no layout space on desktop; it never moves the two AI cards there. */
+main>div.primary-contract:not(#minimal-opening){display:block!important;position:absolute;top:18px;left:50%;transform:translateX(-50%);z-index:2;margin:0;padding:10px 22px;white-space:nowrap;color:var(--t-muted);font-size:12px;letter-spacing:.18em;background:linear-gradient(160deg,#121a28b3,#070b12cc);border:1px solid #7fd6ff33;border-radius:999px;box-shadow:0 10px 30px #0008,0 1px 0 #ffffff14 inset;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+main>div.primary-contract #primary-contract{color:var(--t-text);font-weight:600;letter-spacing:.04em}
+main>div.primary-contract #primary-time{display:inline-block;min-width:3.6em;margin-left:8px;font-size:20px;font-weight:800;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--t-cyan);text-shadow:0 0 14px #22e4ff66;vertical-align:-2px}
+@media(max-width:760px){main>div.primary-contract:not(#minimal-opening){top:10px;width:calc(100% - 24px);white-space:normal;text-align:center;line-height:1.7;letter-spacing:.1em;border-radius:16px;padding:8px 12px}#minimal-opening{padding-top:72px}}
 @media(prefers-reduced-motion:reduce){body:after,#minimal-opening .minimal-value:after,.term-flip{animation:none!important}.term-arc,#minimal-opening .minimal-value{transition:none!important}}
 @media(prefers-contrast:more){#minimal-opening .minimal-value{background:#000;border-color:#fff}.term-qual{color:#fff}#minimal-opening h1{color:#fff;background:none}}
 </style></head><body><main>

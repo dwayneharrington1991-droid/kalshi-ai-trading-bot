@@ -116,6 +116,7 @@ def test_terminal_behaviour_in_a_real_browser(tmp_path):
         assert (out[stale]["call"], out[stale]["conf"]) == ("WAIT", "—"), stale
     visible = set(out["up"]["visible"])
     assert visible <= {"", "H1", "minimal-opening-call", "minimal-opening-confidence",
-                       "term-call-qualifier", "term-confidence-qualifier"} | {
+                       "term-call-qualifier", "term-confidence-qualifier",
+                       "primary-contract", "primary-time"} | {
         v for v in visible if v.startswith(("green", "red", "amber", "term-qual"))
     }

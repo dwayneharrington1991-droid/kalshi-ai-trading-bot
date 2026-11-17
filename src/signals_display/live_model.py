@@ -204,6 +204,21 @@ class LiveEstimator:
         drained, self.pending_preopen_references = self.pending_preopen_references, []
         return drained
 
+    def peek_preopen_references(self):
+        """Return the pending receipts without acknowledging persistence.
+
+        The server acknowledges this exact prefix only after the journal write
+        succeeds. A transient SQLite error must not turn receipt-proven inputs
+        into an unrecoverable opening after they have already been drained.
+        """
+        return list(self.pending_preopen_references)
+
+    def acknowledge_preopen_references(self, count):
+        """Discard a successfully handled prefix of the pending receipt queue."""
+        if not isinstance(count, int) or count < 0 or count > len(self.pending_preopen_references):
+            raise ValueError("invalid pre-opening receipt acknowledgement")
+        del self.pending_preopen_references[:count]
+
     def opening_points(self, opened):
         """Select one proxy source using receipts at or before opening only."""
         start = opened - timedelta(seconds=65)

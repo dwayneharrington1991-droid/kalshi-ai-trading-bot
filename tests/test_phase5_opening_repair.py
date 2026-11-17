@@ -44,6 +44,35 @@ def test_estimator_buffers_accepted_receipts_and_server_keeps_only_pre_open_ones
     assert kept == [NOW + timedelta(seconds=s) for s in (-70, -30, -1, 0)]
 
 
+def test_preopen_receipts_are_acknowledged_only_after_successful_persistence(tmp_path, monkeypatch):
+    """A transient SQLite failure must leave every receipt queued for retry."""
+    opened = NOW + timedelta(seconds=30)
+    clock = NOW
+    monkeypatch.setattr("src.signals_display.server.utcnow", lambda: clock)
+    journal = Journal(tmp_path / "retry.db")
+    monitor = Monitor(PublicFeed(lambda *_a, **_k: None, multi_venue=False), journal)
+    monitor.estimator.pending_preopen_references = [
+        ("Coinbase BTC/USD proxy", NOW, 100000.0),
+    ]
+    payload = frame()
+    payload.update(mode=MODE, markets=[{**market(), "opens_at": opened.isoformat()}],
+                   stream_observations=[])
+    attempts = []
+
+    def fail_once(ticks, mode, persisted_at):
+        attempts.append(list(ticks))
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("busy")
+        return 1
+
+    monkeypatch.setattr(journal, "record_preopen_references", fail_once)
+    monitor.tick((deepcopy(payload), clock, clock, 0))
+    assert monitor.estimator.peek_preopen_references()  # not lost on failure
+    monitor.tick((deepcopy(payload), clock, clock, 0))
+    assert len(attempts) == 2 and attempts[1][:len(attempts[0])] == attempts[0]
+    assert monitor.estimator.peek_preopen_references() == []
+
+
 def _ticks(offsets, source="Coinbase BTC/USD proxy"):
     return [(source, NOW + timedelta(seconds=o), 100000 + o, NOW) for o in offsets]
 
@@ -244,6 +273,14 @@ def test_emergency_override_is_never_blocked_and_rollback_is_unguarded():
     assert "opening_window_wait" not in rollback
     installer = (ROOT / "deploy/oracle/install_preview_8768.sh").read_text()
     assert "opening_window_wait" not in installer  # restore paths stay unguarded
+
+
+def test_manual_rollback_preserves_previous_python_code_identity():
+    switch = (ROOT / "deploy/oracle/switch_preview_8768.sh").read_text()
+    assert 'old_pythonpath=${entry#PYTHONPATH=}' in switch
+    assert '[[ -n $old_pythonpath ]] || old_pythonpath=$old_cwd' in switch
+    assert "printf 'nohup env PYTHONPATH=%q PYTHONNOUSERSITE=1 ' \"$old_pythonpath\"" in switch
+    assert "write_rollback_command" in switch
 
 
 # ------------------------------------------------------- quote evidence

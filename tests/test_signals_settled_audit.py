@@ -291,3 +291,30 @@ def test_research_reports_seal_baselines_family_gates_and_one_holm_family():
     chosen = comparison["compact_offset"].get("holdout_at_chosen_threshold")
     if chosen and chosen["calls_with_executable_quote"]:
         assert "net_pnl_day_block_bootstrap_95" in chosen and "max_drawdown" in chosen
+
+
+def test_model_versions_are_never_mixed_and_scoreboard_replica_matches_dashboard(tmp_path):
+    from src.signals_display.monitor import Journal
+
+    def build(db):
+        for i in range(10):  # older model: 3 of 10 right
+            _opening(db, i, 0.7, "UP", outcome=int(i < 3))
+        for i in range(10, 36):  # newer model: 18 of 26 right
+            _opening(db, i, 0.7, "UP", outcome=int(i < 28))
+        db.execute("UPDATE btc_engine_opening SET payload=json_set(payload,'$.model','m2') "
+                   "WHERE CAST(substr(ticker,10) AS INTEGER)>=10")
+    path = _db(tmp_path, build)
+    with _ro(path) as db:
+        report = audit.audit(db, ASOF)
+    versions = report["model_versions"]
+    assert (versions["m1"]["correct"], versions["m1"]["displayed_calls"]) == (3, 10)
+    assert (versions["m2"]["correct"], versions["m2"]["displayed_calls"]) == (18, 26)
+    board = report["dashboard_scoreboard_replica"]
+    assert (board["correct"], board["wrong"]) == (21, 15) and board["single_model"] is False
+    assert board["most_recent_26"]["models"] == {"m2": 26}
+    assert (board["most_recent_26"]["correct"], board["most_recent_26"]["wrong"]) == (18, 8)
+    # Identical counts to the dashboard's own counter on the same journal.
+    import shutil
+    shutil.copy(path, tmp_path / "copy.db")  # the Journal may migrate its own copy; never the audited file
+    live = Journal(tmp_path / "copy.db").verified_opening_scoreboard()
+    assert (live["correct"], live["wrong"]) == (board["correct"], board["wrong"])

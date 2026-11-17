@@ -223,6 +223,50 @@ def no_call_reasons(rows):
     }
 
 
+def model_versions(settled):
+    """Per recorded model: never mix versions when judging a model."""
+    out = {}
+    for model in sorted({r["model"] for r in settled}):
+        group = [r for r in settled if r["model"] == model]
+        calls = [r for r in group if displayed(r)]
+        scored = [r for r in group if r["up"] is not None]
+        s = score([r["up"] for r in scored], [r["outcome"] for r in scored]) if scored else {}
+        out[model] = {
+            "first_opening": group[0]["opens_at"].isoformat(),
+            "last_opening": group[-1]["opens_at"].isoformat(),
+            "settled_openings": len(group),
+            "displayed_calls": len(calls),
+            **{k: v for k, v in _calls(calls).items() if k != "calls"},
+            "brier_all_recorded": s.get("brier"),
+            "log_loss_all_recorded": s.get("log_loss"),
+            "ece_all_recorded": s.get("expected_calibration_error"),
+            "thresholds_seen": _count(str(r["threshold"]) for r in group),
+        }
+    return out
+
+
+def dashboard_scoreboard(rows):
+    """Exact replica of Journal.verified_opening_scoreboard's counting rules
+    (displayed UP/DOWN, calibrated status, consistent probability, official
+    settlement), so the dashboard counter can be reconciled record by record."""
+    calls = [r for r in rows if r["outcome"] is not None and displayed(r)]
+    out = {**_calls(calls),
+           "first_call_opens_at": calls[0]["opens_at"].isoformat() if calls else None,
+           "last_call_opens_at": calls[-1]["opens_at"].isoformat() if calls else None,
+           "by_model": {m: _calls([r for r in calls if r["model"] == m])
+                        for m in sorted({r["model"] for r in calls})},
+           "single_model": len({r["model"] for r in calls}) <= 1}
+    for window in (26, 50, 100):
+        recent = calls[-window:]
+        if recent:
+            out[f"most_recent_{window}"] = {
+                **_calls(recent),
+                "from": recent[0]["opens_at"].isoformat(),
+                "models": _count(r["model"] for r in recent),
+            }
+    return out
+
+
 def integrity_checks(db, rows, asof):
     """Adversarial re-checks of the audit's own inputs. Any non-zero count is a
     reason to distrust the affected rows; none are silently repaired."""
@@ -629,6 +673,8 @@ def audit(db, asof=None):
         "integrity_checks": integrity_checks(db, rows, asof),
         "quote_snapshot_coverage": quote_snapshot_coverage(db, rows),
         "daily_breakdown": daily_breakdown(rows),
+        "model_versions": model_versions(settled),
+        "dashboard_scoreboard_replica": dashboard_scoreboard(rows),
         "sealed_holdout": seal,
         "all_settled": {
             "displayed_accuracy": displayed_accuracy(settled),
@@ -686,6 +732,18 @@ def summary_lines(report):
     lines.append(f"PNL priced={p['priced_calls']} excluded={p['excluded_no_executable_ask']} "
                  f"mean={fmt(p.get('mean_net_pnl_per_contract'))} total={fmt(p.get('total_net_pnl'))} "
                  f"boot95={p.get('day_block_bootstrap_95')} breakeven={fmt(p.get('break_even_hit_rate'))}")
+    board = report.get("dashboard_scoreboard_replica") or {}
+    if board:
+        lines.append(f"SCOREBOARD_REPLICA {board['correct']}-{board['wrong']} acc={fmt(board['accuracy'])} "
+                     f"wilson95={board['accuracy_wilson_95']} single_model={board['single_model']} "
+                     f"from={board['first_call_opens_at']} to={board['last_call_opens_at']}")
+        recent = board.get("most_recent_26")
+        if recent:
+            lines.append(f"  most_recent_26 {recent['correct']}-{recent['wrong']} from={recent['from']} models={recent['models']}")
+    for model, v in (report.get("model_versions") or {}).items():
+        lines.append(f"  model {model}: {v['first_opening'][:16]}..{v['last_opening'][:16]} settled={v['settled_openings']} "
+                     f"calls={v['displayed_calls']} acc={fmt(v['accuracy'])} wilson95={v['accuracy_wilson_95']} "
+                     f"brier={fmt(v['brier_all_recorded'])}")
     q = report.get("quote_snapshot_coverage") or {}
     lines.append(f"QUOTES table={q.get('table_present')} rows={q.get('rows')} preopen_rows={q.get('rows_at_or_before_open')} "
                  f"first={q.get('first_observed_at')} settled_with_preopen={q.get('settled_openings_with_preopen_quote')}")

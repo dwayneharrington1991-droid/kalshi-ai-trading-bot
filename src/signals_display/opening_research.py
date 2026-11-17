@@ -76,7 +76,31 @@ MODELS = {
     "compact_plus_trend": dict(features=rigor.COMPACT_FEATURES + TREND, offset=True),
     "compact_plus_preopen_market": dict(features=rigor.COMPACT_FEATURES + ("kalshi_preopen_mid_logit",), offset=True),
     "boosted_stumps": dict(features=rigor.COMPACT_FEATURES + TECHNICALS, boost=True),
+    # Phase 4 pre-registered candidate: does momentum/trend act differently in
+    # rising vs falling volatility regimes? Interactions are products of frozen
+    # as-of-opening values only.
+    "compact_regime_interactions": dict(features=rigor.COMPACT_FEATURES + (
+        "regime_rising", "regime_falling", "ix_return_15m_x_rising", "ix_return_15m_x_falling",
+        "ix_ema9_21_gap_x_rising", "ix_ema9_21_gap_x_falling"), offset=True),
 }
+INTERACTIONS = {
+    "ix_return_15m_x_rising": ("return_15m", "regime_rising"),
+    "ix_return_15m_x_falling": ("return_15m", "regime_falling"),
+    "ix_ema9_21_gap_x_rising": ("opening_ema9_21_gap", "regime_rising"),
+    "ix_ema9_21_gap_x_falling": ("opening_ema9_21_gap", "regime_falling"),
+}
+
+
+def add_interactions(rows):
+    """Products of two frozen opening values; missing if either input is missing."""
+    for row in rows:
+        f = row["features"]
+        for name, (a, b) in INTERACTIONS.items():
+            x, y = f.get(a), f.get(b)
+            f[name] = (float(x) * float(y)
+                       if type(x) in (int, float) and type(y) in (int, float)
+                       and math.isfinite(x) and math.isfinite(y) else None)
+    return rows
 
 
 # --------------------------------------------------------------------- loading
@@ -480,8 +504,58 @@ def condition_report(rows):
     return report
 
 
-def research(rows, progress=None, checkpoint=None):
-    rows = opening_models._validate_rows(rows)
+def _mcnemar(candidate_right, current_right):
+    """Exact two-sided McNemar test on paired right/wrong outcomes."""
+    cand_only = sum(x and not y for x, y in zip(candidate_right, current_right))
+    curr_only = sum(y and not x for x, y in zip(candidate_right, current_right))
+    n = cand_only + curr_only
+    if not n:
+        return {"candidate_only_right": 0, "current_only_right": 0, "p_value": 1.0}
+    tail = sum(math.comb(n, i) for i in range(0, min(cand_only, curr_only) + 1)) / 2 ** n
+    return {"candidate_only_right": cand_only, "current_only_right": curr_only, "p_value": min(1.0, 2 * tail),
+            "test": "exact two-sided McNemar on discordant contracts"}
+
+
+def current_model_comparison(holdout, predictions, current_model):
+    """Candidates versus the RUNNING model on the same sealed-holdout contracts.
+
+    Only openings the live engine recorded as made by ``current_model`` are
+    used, so no other model version is mixed in. Two views:
+    * same contracts: each candidate's direction on exactly the contracts the
+      running model displayed as UP/DOWN (paired McNemar test);
+    * matched coverage: each candidate may choose its own k most confident
+      contracts, k = the running model's number of displayed calls, so a
+      candidate cannot look better simply by calling fewer contracts.
+    """
+    mine = [r for r in holdout if r.get("recorded_model") == current_model
+            and type(r.get("recorded_up")) in (int, float)]
+    called = [r for r in mine if r.get("recorded_direction") in {"UP", "DOWN"}
+              and r.get("recorded_confidence_status") in DISPLAYABLE_RECORDED_CONFIDENCE]
+    out = {"current_model_label": current_model, "holdout_openings_by_current_model": len(mine),
+           "current_model_displayed_calls": len(called)}
+    if not called:
+        out["status"] = "NO_CURRENT_MODEL_CALLS_IN_HOLDOUT"
+        return out
+    current_right = [(r["recorded_direction"] == "UP") == bool(r["outcome"]) for r in called]
+    out["current_model"] = {**call_metrics([(r["recorded_up"], r) for r in called]),
+                            "coverage": len(called) / len(mine)}
+    out["candidates"] = {}
+    for name, by_ticker in predictions.items():
+        if not all(r["ticker"] in by_ticker for r in mine):
+            continue
+        same = [(by_ticker[r["ticker"]], r) for r in called]
+        candidate_right = [(p >= 0.5) == bool(r["outcome"]) for p, r in same]
+        ranked = sorted(mine, key=lambda r: -abs(by_ticker[r["ticker"]] - 0.5))[:len(called)]
+        out["candidates"][name] = {
+            "same_contracts": {**call_metrics(same), "paired_vs_current": _mcnemar(candidate_right, current_right)},
+            "matched_coverage": call_metrics([(by_ticker[r["ticker"]], r) for r in ranked]),
+        }
+    out["status"] = "MEASURED"
+    return out
+
+
+def research(rows, progress=None, checkpoint=None, current_model=None):
+    rows = add_interactions(opening_models._validate_rows(rows))
     report = {
         "format": REPORT_FORMAT,
         "role": "SHADOW_RESEARCH_ONLY",
@@ -632,6 +706,8 @@ def research(rows, progress=None, checkpoint=None):
                 rigor._log_losses([market[r["ticker"]] for r in common], [r["outcome"] for r in common]),
             )
     report["holdout_log_loss_vs_kalshi_preopen_mid"] = vs_market
+    if current_model:
+        report["versus_running_model"] = current_model_comparison(holdout, predictions, current_model)
     # One family across every candidate x reference pair (plan section 4.4).
     family = {}
     for ref, tests in (("statistical_baseline", {n: e["holdout_log_loss_vs_baseline"] for n, e in comparison.items()
@@ -899,6 +975,16 @@ def summary_text(report):
             f"threshold={entry.get('threshold_chosen_on_development')} calls={chosen.get('calls')} "
             f"acc={chosen.get('accuracy')} net/contract={chosen.get('mean_net_pnl_per_contract')}"
         )
+    versus = report.get("versus_running_model") or {}
+    if versus.get("status") == "MEASURED":
+        cur = versus["current_model"]
+        lines.append(f"RUNNING MODEL holdout calls={cur['calls']} acc={cur['accuracy']} wilson95={cur['accuracy_wilson_95']} coverage={cur['coverage']:.3f}")
+        for name, entry in versus["candidates"].items():
+            same, matched = entry["same_contracts"], entry["matched_coverage"]
+            lines.append(f"  {name:32s} same-contracts acc={same['accuracy']} McNemar p={same['paired_vs_current']['p_value']:.3f} "
+                         f"| matched-coverage acc={matched['accuracy']} net/contract={matched['mean_net_pnl_per_contract']}")
+    elif versus:
+        lines.append(f"RUNNING MODEL comparison: {versus.get('status')} (openings by it in holdout: {versus.get('holdout_openings_by_current_model')})")
     for bucket, sub in (report.get("intracontract") or {}).items():
         lines.append(f"[intracontract {bucket}] {sub.get('status')} contracts={sub.get('eligible_opening_contracts')}")
         for name, entry in (sub.get("model_comparison") or {}).items():
@@ -927,6 +1013,9 @@ def main():
                         help="Write only Report A (the settled audit of displayed calls)")
     parser.add_argument("--asof", help="ISO-8601 cutoff; only labels observed by then are used. "
                         "Pin it to resume a run on exactly the same data.")
+    parser.add_argument("--current-model",
+                        help="Recorded model label of the running model, e.g. opening-candidate/<model_id>; "
+                             "candidates are compared with it on the same holdout contracts")
     parser.add_argument("--checkpoint-dir", type=Path,
                         help="Research-output directory for resumable fold checkpoints")
     args = parser.parse_args()
@@ -975,7 +1064,7 @@ def main():
             phase("load_frozen_openings", t)
             print(f"Loaded {len(rows)} eligible frozen openings (read-only)", flush=True)
             t = time.monotonic()
-            report = research(rows, progress=progress, checkpoint=checkpoint)
+            report = research(rows, progress=progress, checkpoint=checkpoint, current_model=args.current_model)
             report.update(asof=asof.isoformat(), authoritative_dataset_coverage=coverage,
                           optional_section_errors={}, optional_sections_pending=[
                               name for name, wanted in (("retrospective", args.retrospective),

@@ -182,11 +182,17 @@ if [[ -n $artifact && -f $artifact ]]; then
     --output "$OUT_DIR/model_diagnostics.json" | tee -a "$OUT_DIR/summary_reports_A_B.txt" \
     || say "model diagnostics unavailable; continuing"
 fi
+current_model=""
+if [[ -n $artifact && -f $artifact ]]; then
+  current_model=$(PYTHONNOUSERSITE=1 "$PYTHON" -P -c 'import json,sys; m=json.load(open(sys.argv[1])).get("model_id"); print("opening-candidate/" + m if m else "")' "$artifact" 2>/dev/null || true)
+fi
+say "running model label for same-contract comparison: ${current_model:-NONE}"
 say "Report B: offline model research (resumable; limit $RESEARCH_TIMEOUT; rerun the same command to continue)"
 set +e
 PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 nice -n 15 timeout "$RESEARCH_TIMEOUT" \
   "$PYTHON" -P -m src.signals_display.opening_research --journal "$journal" --asof "$asof" \
   --checkpoint-dir "$RUN_ROOT/checkpoints" --output "$OUT_DIR/opening_research.report.json" \
+  ${current_model:+--current-model "$current_model"} \
   --intracontract --retrospective | tee -a "$OUT_DIR/summary_reports_A_B.txt"
 status=${PIPESTATUS[0]}
 set -e

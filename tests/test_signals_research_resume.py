@@ -242,6 +242,7 @@ def test_model_diagnostics_verify_components_inputs_and_contributions(trained):
     for row in rows:
         row["recorded_up"] = opening_models.predict(artifact["model"], row["features"],
                                                     baseline_probability=row["baseline"])
+        row["recorded_model"] = "opening-candidate/test-ensemble"
         row["features"].pop("body_fraction", None)  # an input that is never present at opening
     report = diag.diagnose(artifact, rows)
     assert report["status"] == "DIAGNOSED"
@@ -256,20 +257,43 @@ def test_model_diagnostics_verify_components_inputs_and_contributions(trained):
     # recorded_up was computed before body_fraction was removed, so the
     # reproduction check must report mismatches rather than pass silently.
     rep = report["reproduction"]
-    assert rep["openings_after_artifact_available"] == 40
-    assert rep["exactly_reproduced_within_1e_6"] < 40 and rep["max_abs_difference"] > 1e-6
+    assert rep["openings_made_by_this_artifact"] == 400
+    assert rep["exactly_reproduced_within_1e_6"] < 400 and rep["max_abs_difference"] > 1e-6
+    assert rep["mismatches"] and rep["mismatches"][0]["difference"] == rep["max_abs_difference"]
 
 
 def test_model_diagnostics_reproduce_recorded_probabilities_exactly(trained):
     artifact, rows = trained
     rows = [dict(r, features=dict(r["features"])) for r in rows]
-    for row in rows:
-        row["recorded_up"] = opening_models.predict(artifact["model"], row["features"],
-                                                    baseline_probability=row["baseline"])
+    for i, row in enumerate(rows):
+        made_by_artifact = i >= 360
+        row["recorded_model"] = ("opening-candidate/test-ensemble" if made_by_artifact
+                                 else "opening24h-zero-drift-final-average-v1")
+        # Fallback openings carry a different (baseline) probability.
+        row["recorded_up"] = (opening_models.predict(artifact["model"], row["features"],
+                                                     baseline_probability=row["baseline"])
+                              if made_by_artifact else row["baseline"])
     report = diag.diagnose(artifact, rows)
-    assert report["reproduction"]["openings_after_artifact_available"] == 40
-    assert report["reproduction"]["exactly_reproduced_within_1e_6"] == 40
+    rep = report["reproduction"]
+    assert rep["openings_made_by_this_artifact"] == 40
+    assert rep["exactly_reproduced_within_1e_6"] == 40 and rep["mismatches"] == []
+    assert rep["openings_made_by_other_models"] == {"opening24h-zero-drift-final-average-v1": 360}
     oos = report["out_of_sample_for_this_artifact"]
     # Row 360 opened one minute before row 359's label arrived (the label
     # cutoff), so only rows 361-399 are out-of-sample for this artifact.
     assert oos["contracts"] == 39 and "artifact_better_log_loss" in oos
+
+
+def test_regression_fallback_openings_are_not_reported_as_reproduction_failures(trained):
+    """Phase 3 compared every opening after available_at, so openings made by
+    the statistical fallback looked like ensemble reproduction failures."""
+    artifact, rows = trained
+    rows = [dict(r, features=dict(r["features"])) for r in rows[360:]]
+    for row in rows:
+        row["recorded_model"] = "opening24h-zero-drift-final-average-v1"
+        row["recorded_up"] = row["baseline"]
+    tampered = dict(rows[0], recorded_model="opening-candidate/test-ensemble", recorded_up=0.99)
+    report = diag.diagnose(artifact, rows[1:] + [tampered])
+    rep = report["reproduction"]
+    assert rep["openings_made_by_this_artifact"] == 1
+    assert [m["ticker"] for m in rep["mismatches"]] == [tampered["ticker"]]  # real defects still caught

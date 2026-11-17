@@ -151,24 +151,36 @@ def diagnose(artifact, rows):
             drop[f"{index}:{member.get('kind')}"] = sum(moved) / len(moved)
         report["component_drop_sensitivity"] = drop
 
-    # Reproduction of recorded live probabilities from frozen inputs.
-    available = artifact.get("available_at")
-    checked = []
+    # Reproduction of recorded live probabilities from frozen inputs. Only an
+    # opening the live engine labelled as made by THIS artifact can be expected
+    # to reproduce; openings made by the statistical fallback (e.g. while a
+    # restarted process had not yet re-loaded the artifact) or by another
+    # artifact are counted separately instead of being reported as failures.
+    expected_model = "opening-candidate/" + str(artifact.get("model_id"))
+    checked, other_models, mismatches = [], {}, []
     for row, p in zip(rows, ensemble):
         recorded = row.get("recorded_up")
         if type(recorded) not in (int, float):
             continue
-        try:
-            after = available is None or timestamp(row["opens_at"]) >= timestamp(available)
-        except (TypeError, ValueError, AttributeError):
-            after = False
-        if after:
-            checked.append(abs(recorded - p))
+        made_by = row.get("recorded_model") or "UNRECORDED"
+        if made_by != expected_model:
+            other_models[made_by] = other_models.get(made_by, 0) + 1
+            continue
+        difference = abs(recorded - p)
+        checked.append(difference)
+        if difference > 1e-6:
+            mismatches.append({"ticker": row["ticker"], "opens_at": row.get("opens_at"),
+                               "recorded_up": recorded, "recomputed_up": p, "difference": difference})
     report["reproduction"] = {
-        "openings_after_artifact_available": len(checked),
+        "expected_recorded_model": expected_model,
+        "openings_made_by_this_artifact": len(checked),
         "exactly_reproduced_within_1e_6": sum(d <= 1e-6 for d in checked),
         "max_abs_difference": max(checked) if checked else None,
-        "reading": "Differences mean the live call was made by another model/version or a different input path.",
+        "mismatches": sorted(mismatches, key=lambda m: -m["difference"])[:20],
+        "openings_made_by_other_models": other_models,
+        "reading": ("A mismatch on an opening made by this artifact means the stored frozen inputs or "
+                    "baseline do not reproduce the live call: a real defect to investigate. Openings "
+                    "made by other models are not expected to reproduce."),
     }
 
     # Out-of-sample for this artifact: openings after its label cutoff.
@@ -223,7 +235,10 @@ def summary_lines(report):
         lines.append(f"  component drop sensitivity={ {k: round(v, 4) for k, v in report['component_drop_sensitivity'].items()} }")
     rep = report.get("reproduction") or {}
     if rep:
-        lines.append(f"  reproduction {rep['exactly_reproduced_within_1e_6']}/{rep['openings_after_artifact_available']} max_diff={rep['max_abs_difference']}")
+        lines.append(f"  reproduction {rep['exactly_reproduced_within_1e_6']}/{rep['openings_made_by_this_artifact']} "
+                     f"max_diff={rep['max_abs_difference']} other_models={rep['openings_made_by_other_models']}")
+        for m in rep["mismatches"][:5]:
+            lines.append(f"    mismatch {m['ticker']} recorded={m['recorded_up']:.4f} recomputed={m['recomputed_up']:.4f}")
     oos = report.get("out_of_sample_for_this_artifact") or {}
     if oos.get("contracts", 0) >= 2:
         lines.append(f"  OOS n={oos['contracts']} artifact brier={oos['artifact']['brier']:.4f} baseline brier={oos['statistical_baseline']['brier']:.4f} "

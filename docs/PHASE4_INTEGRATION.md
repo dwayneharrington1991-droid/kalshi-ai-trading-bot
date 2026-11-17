@@ -46,3 +46,19 @@ or artifacts. No result in this branch was measured on real Oracle data.
   loaders drop any contract joined to more than one official row.
 - **No silent version pooling.** The 0.55 threshold challenge also runs per
   recorded model; a pooled result is labelled `MIXED_MODEL_VERSIONS_REFERENCE_ONLY`.
+
+## Codex safety review incorporated (`8dbd321`, fast-forward)
+
+See `docs/CODEX_PHASE4_INTEGRATION_REVIEW.md`. In summary:
+- Report B and artifact diagnostics are pinned to port 8768's journal.
+- The running-model comparison uses the canonical display rule.
+- Holm correction is applied across the paired McNemar tests.
+- No holdout threshold tables or regime slices: development only.
+- Candidate availability is decided on development rows only.
+- Any invalid official row quarantines its ticker.
+- SSH and SCP use strict host-key verification.
+
+Added on top: per-candidate incremental-feature coverage on development rows
+(`candidate_incremental_coverage_development`). A family kept active by one
+always-present input, such as a regime indicator, is labelled `PARTIAL_FAMILY`
+instead of being silently relabelled.

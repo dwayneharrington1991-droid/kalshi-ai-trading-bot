@@ -665,6 +665,25 @@ def research(rows, progress=None, checkpoint=None, current_model=None):
     report["inactive_research_candidates"] = {
         name: "INSUFFICIENT_INCREMENTAL_FEATURE_COVERAGE" for name in sorted(inactive)
     }
+    # Transparency: one always-present input (e.g. a regime indicator) keeps
+    # a candidate active even if the rest of its family is missing, so every
+    # candidate's incremental coverage on DEVELOPMENT rows is reported and a
+    # partially covered family is labelled rather than silently relabelled.
+    candidate_coverage = {}
+    for name, incremental in MODEL_INCREMENTAL_FEATURES.items():
+        shares = {
+            feature: (sum(type(r["features"].get(feature)) in (int, float)
+                          and math.isfinite(r["features"][feature]) for r in coverage_rows)
+                      / len(coverage_rows)) if coverage_rows else 0.0
+            for feature in incremental
+        }
+        sparse = sorted(f for f, share in shares.items() if share < 0.5)
+        candidate_coverage[name] = {
+            "status": "INACTIVE" if name in inactive else "PARTIAL_FAMILY" if sparse else "FULL",
+            "sparse_incremental_features": sparse,
+            "incremental_features": len(incremental),
+        }
+    report["candidate_incremental_coverage_development"] = candidate_coverage
     report["walk_forward_folds"] = folds
     oos = [r for r in rows if all(r["ticker"] in predictions[name] for name in ("compact_offset",))]
     report["out_of_sample_contracts"] = len(oos)

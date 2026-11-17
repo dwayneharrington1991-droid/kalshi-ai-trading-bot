@@ -154,3 +154,18 @@ def test_research_tools_cannot_overwrite_or_activate_the_model(tmp_path):
     assert hashlib.sha256(artifact.read_bytes()).hexdigest() == before
     report = research.research([])
     assert report["activation_allowed"] is False and report["promotion_allowed"] is False
+
+
+def test_partially_covered_candidate_family_is_labelled_not_silently_relabelled():
+    from src.signals_display import rigorous_synthetic as synthetic
+    from tests.test_signals_opening_research import _augment
+
+    rows = _augment(synthetic.opening_rows(300, seed=606, signal=0.4))
+    for r in rows:  # trend inputs absent; regime indicators always present
+        for name in research.TREND:
+            r["features"].pop(name, None)
+    report = research.research(rows)
+    coverage = report["candidate_incremental_coverage_development"]["momentum_trend_volatility"]
+    assert coverage["status"] == "PARTIAL_FAMILY"
+    assert set(research.TREND) <= set(coverage["sparse_incremental_features"])
+    assert "momentum_trend_volatility" not in report["inactive_research_candidates"]

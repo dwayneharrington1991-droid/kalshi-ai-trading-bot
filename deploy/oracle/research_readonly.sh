@@ -143,10 +143,11 @@ except Exception as exc:
 print(json.dumps(summary, indent=1, default=str))
 ' "$artifact" | tee "$OUT_DIR/running_model.json"
 
-say "running read-only opening research (low priority; can take several minutes)"
+say "running Report A (settled audit of displayed calls), then Report B (offline model research); low priority, can take several minutes"
 cd "$OUT_DIR"
 PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 nice -n 15 timeout 3h \
   "$PYTHON" -P -m src.signals_display.opening_research \
-  --journal "$journal" --output "$OUT_DIR/opening_research.report.json" --intracontract --retrospective
+  --journal "$journal" --output "$OUT_DIR/opening_research.report.json" --intracontract --retrospective \
+  | tee "$OUT_DIR/summary_reports_A_B.txt"
 say "REPORT_DIR=$OUT_DIR"
 printf 'RESEARCH_COMPLETE journal_unchanged=READ_ONLY services_unchanged=YES trading=DISABLED\n'

@@ -23,7 +23,9 @@ import math
 from pathlib import Path
 import sqlite3
 
-from . import learning, opening_models, rigorous_evaluation as rigor
+import hashlib
+
+from . import learning, opening_models, rigorous_evaluation as rigor, settled_audit
 from .calibration import fit_platt
 from .model import timestamp
 from .scores import score, wilson_interval
@@ -39,8 +41,9 @@ WALK_BLOCK = 30
 MAX_FOLDS = 20
 MAX_TRAIN_ROWS = 2000
 RESEARCH_LAMBDA_GRID = (3.0, 30.0, 300.0)
-DEVELOPMENT_FRACTION = 0.7
+SEALED_HOLDOUT_FRACTION = 0.20  # docs/RESEARCH_PLAN_SETTLED_ACCURACY.md section 4.1
 MIN_DEVELOPMENT_CALLS = 30
+MIN_FAMILY_CONTRACTS = 300  # plan section 5: below this a family is INSUFFICIENT_HISTORY
 
 TECHNICALS = ("rsi_14", "macd_scaled", "ema_gap", "vwap_deviation", "bollinger_z", "volatility_24h")
 CANDLES = ("upper_wick", "lower_wick", "range_fraction", "candle_body_range_ratio",
@@ -260,17 +263,28 @@ def _fit(train, validation, spec):
     return lambda row: learning.sigmoid(platt["slope"] * learning.logit(raw(row)) + platt["intercept"])
 
 
-def walk_forward(rows, start=WALK_START, block=WALK_BLOCK, progress=None):
+def walk_forward(rows, start=WALK_START, block=WALK_BLOCK, progress=None, seal=None):
     """Expanding chronological folds. Every prediction is for a contract whose
     label was unavailable to training and calibration (purged by label time).
     Fold size grows with the journal so at most MAX_FOLDS refits run; the
-    training window is bounded to the most recent MAX_TRAIN_ROWS contracts."""
+    training window is bounded to the most recent MAX_TRAIN_ROWS contracts.
+
+    With ``seal`` (an index), folds run only on the development rows before
+    it. Every model is then fitted ONCE on development rows and frozen, and
+    that frozen model scores the whole sealed holdout. No holdout label ever
+    enters training, calibration, hyperparameter or threshold selection."""
     rows = opening_models._validate_rows(rows)
-    block = max(block, math.ceil(max(0, len(rows) - start) / MAX_FOLDS))
+    limit = len(rows) if seal is None else seal
+    block = max(block, math.ceil(max(0, limit - start) / MAX_FOLDS))
     predictions = {name: {} for name in MODELS}
     folds = 0
-    for end in range(start, len(rows), block):
-        past, test = rows[max(0, end - MAX_TRAIN_ROWS):end], rows[end: end + block]
+    ends = list(range(start, limit, block))
+    if seal is not None and seal < len(rows):
+        ends.append(seal)
+    for end in ends:
+        sealed_fold = seal is not None and end == seal
+        stop = len(rows) if sealed_fold else min(end + block, limit)
+        past, test = rows[max(0, end - MAX_TRAIN_ROWS):end], rows[end:stop]
         split = int(len(past) * 0.8)
         train, validation, test = opening_models._purge(past[:split], past[split:], test)
         if len(train) < 50 or len(validation) < 15 or not test:
@@ -279,7 +293,8 @@ def walk_forward(rows, start=WALK_START, block=WALK_BLOCK, progress=None):
             continue
         folds += 1
         if progress:
-            progress(f"fold {folds}: train<= {end} contracts, testing {len(test)}")
+            label = "SEALED HOLDOUT (frozen development model)" if sealed_fold else f"fold {folds}"
+            progress(f"{label}: train<= {end} contracts, testing {len(test)}")
         for name, spec in MODELS.items():
             try:
                 predict = _fit(train, validation, spec)
@@ -308,7 +323,7 @@ def call_metrics(pairs):
     """pairs: (probability_up, row) for the called contracts."""
     n = len(pairs)
     correct = sum((p >= 0.5) == bool(r["outcome"]) for p, r in pairs)
-    pnl, expected = [], []
+    pnl, expected, priced = [], [], []
     for p, r in pairs:
         side = "up" if p >= 0.5 else "down"
         cost = _cost(r, side)
@@ -317,6 +332,7 @@ def call_metrics(pairs):
         won = r["outcome"] == (1 if side == "up" else 0)
         pnl.append((1.0 if won else 0.0) - cost)
         expected.append(max(p, 1 - p) - cost)
+        priced.append({"day": str(r.get("opens_at") or r.get("timestamp"))[:10], "pnl": pnl[-1]})
     mean = sum(pnl) / len(pnl) if pnl else None
     half = (1.96 * math.sqrt(sum((x - mean) ** 2 for x in pnl) / (len(pnl) - 1) / len(pnl))
             if len(pnl) > 1 else None)
@@ -335,7 +351,18 @@ def call_metrics(pairs):
         "net_pnl_95": [mean - half, mean + half] if half is not None else None,
         "total_net_pnl_one_contract_each": sum(pnl) if pnl else None,
         "mean_model_expected_value": sum(expected) / len(expected) if expected else None,
+        "net_pnl_day_block_bootstrap_95": day_block_bootstrap(priced) if priced else None,
+        "max_drawdown": _max_drawdown(pnl) if pnl else None,
     }
+
+
+def _max_drawdown(pnl):
+    total = peak = worst = 0.0
+    for x in pnl:
+        total += x
+        peak = max(peak, total)
+        worst = max(worst, peak - total)
+    return worst
 
 
 def threshold_table(probabilities, rows):
@@ -471,7 +498,18 @@ def research(rows, progress=None):
         group: {name: sum(r["features"].get(name) is not None for r in rows) / len(rows) if rows else 0 for name in names}
         for group, names in FEATURE_GROUPS.items()
     }
-    predictions, folds = walk_forward(rows, progress=progress)
+    report["feature_family_history"] = feature_family_history(rows)
+    seal = len(rows) - int(round(len(rows) * SEALED_HOLDOUT_FRACTION))
+    sealed_tickers = [r["ticker"] for r in rows[seal:]]
+    report["sealed_holdout"] = {
+        "method": f"last {SEALED_HOLDOUT_FRACTION:.0%} of eligible contracts by opening time; models frozen on development rows",
+        "seal_index": seal,
+        "holdout_contracts": len(sealed_tickers),
+        "holdout_starts_at": rows[seal]["opens_at"] if seal < len(rows) else None,
+        "holdout_ticker_sha256": hashlib.sha256("\n".join(sealed_tickers).encode()).hexdigest(),
+        "tuning_on_holdout": False,
+    }
+    predictions, folds = walk_forward(rows, progress=progress, seal=seal)
     report["walk_forward_folds"] = folds
     oos = [r for r in rows if all(r["ticker"] in predictions[name] for name in ("compact_offset",))]
     report["out_of_sample_contracts"] = len(oos)
@@ -479,15 +517,24 @@ def research(rows, progress=None):
         report["status"] = "INSUFFICIENT_OUT_OF_SAMPLE_CONTRACTS"
         report["reason"] = f"Need roughly {WALK_START + 2 * MIN_DEVELOPMENT_CALLS}+ eligible frozen openings for a walk-forward comparison"
         return report
+    history = [(timestamp(r["label_available_at"]), r["outcome"]) for r in rows]
+    as_audit = [{"ticker": r["ticker"], "opens_at": timestamp(r["opens_at"])} for r in oos]
     sources = {
         "opening_statistical_baseline": {r["ticker"]: r["baseline"] for r in oos},
+        "baseline_expanding_up_rate": settled_audit.expanding_base_rate(as_audit, history),
+        "baseline_persistence_last_settled": settled_audit.persistence(as_audit, history),
         "recorded_live_opening": {r["ticker"]: r["recorded_up"] for r in oos if type(r.get("recorded_up")) in (int, float)},
         "kalshi_market_mid_at_call": {r["ticker"]: r["quote"]["up_mid"] for r in oos if r.get("quote") and r["quote"].get("up_mid") is not None},
         "kalshi_preopen_mid_as_of_call": {r["ticker"]: r["kalshi_preopen_mid"] for r in oos if r.get("kalshi_preopen_mid") is not None},
         **predictions,
     }
-    split = int(len(oos) * DEVELOPMENT_FRACTION)
-    development, holdout = oos[:split], oos[split:]
+    sealed = set(sealed_tickers)
+    development = [r for r in oos if r["ticker"] not in sealed]
+    holdout = [r for r in oos if r["ticker"] in sealed]
+    if not development or not holdout:
+        report["status"] = "INSUFFICIENT_OUT_OF_SAMPLE_CONTRACTS"
+        report["reason"] = "Sealed holdout or development period has no out-of-sample predictions"
+        return report
     comparison = {}
     for name, by_ticker in sources.items():
         dev = [r for r in development if r["ticker"] in by_ticker]
@@ -532,6 +579,14 @@ def research(rows, progress=None):
                 rigor._log_losses([predictions[name][r["ticker"]] for r in common], [r["outcome"] for r in common]),
                 rigor._log_losses([reference[r["ticker"]] for r in common], [r["outcome"] for r in common]),
             )
+    family_of = {"compact_plus_technicals": "technicals_ema_rsi_macd_vwap_bollinger",
+                 "compact_plus_flow": "order_book_flow_cvd", "compact_plus_candles": "candles",
+                 "compact_plus_trend": "trend_ema_volume_acceleration",
+                 "compact_plus_preopen_market": "kalshi_preopen_market"}
+    for name, test in ablation.items():
+        status = report["feature_family_history"].get(family_of.get(name), {}).get("status", "EVALUABLE")
+        test["family_history_status"] = status
+        test["interpretable"] = status == "EVALUABLE"
     report["incremental_value_vs_compact"] = ablation
     # Multiple testing: Holm step-down across every candidate compared with the
     # statistical baseline and, separately, with the existing bot's recorded
@@ -546,11 +601,27 @@ def research(rows, progress=None):
                 rigor._log_losses([live[r["ticker"]] for r in common], [r["outcome"] for r in common]),
             )
     report["holdout_log_loss_vs_existing_bot"] = vs_live
+    market = sources.get("kalshi_preopen_mid_as_of_call", {})
+    vs_market = {}
+    for name in MODELS:
+        common = [r for r in holdout if r["ticker"] in predictions.get(name, {}) and r["ticker"] in market]
+        if len(common) >= 2:
+            vs_market[name] = rigor.paired_superiority_test(
+                rigor._log_losses([predictions[name][r["ticker"]] for r in common], [r["outcome"] for r in common]),
+                rigor._log_losses([market[r["ticker"]] for r in common], [r["outcome"] for r in common]),
+            )
+    report["holdout_log_loss_vs_kalshi_preopen_mid"] = vs_market
+    # One family across every candidate x reference pair (plan section 4.4).
+    family = {}
+    for ref, tests in (("statistical_baseline", {n: e["holdout_log_loss_vs_baseline"] for n, e in comparison.items()
+                                                 if n in MODELS and "holdout_log_loss_vs_baseline" in e}),
+                       ("existing_bot", vs_live), ("kalshi_preopen_mid", vs_market)):
+        for name, test in tests.items():
+            family[f"{name} vs {ref}"] = test["p_value"]
     report["multiple_testing"] = {
-        "method": "Holm step-down, family-wise alpha 0.05",
-        "vs_baseline": holm({n: e["holdout_log_loss_vs_baseline"]["p_value"] for n, e in comparison.items()
-                             if n in MODELS and "holdout_log_loss_vs_baseline" in e}),
-        "vs_existing_bot": holm({n: t["p_value"] for n, t in vs_live.items()}),
+        "method": "Holm step-down over every candidate x reference pair, family-wise alpha 0.05",
+        "family_size": len(family),
+        "results": holm(family),
     }
     report["quote_coverage"] = {
         "contracts_with_quote": sum(1 for r in rows if r.get("quote")),
@@ -562,6 +633,27 @@ def research(rows, progress=None):
     report["status"] = "RESEARCH_COMPLETE"
     report["note"] = "Out-of-sample = walk-forward predictions on contracts unseen by training/calibration. Thresholds chosen on development only; holdout scored once. Not a profitability guarantee."
     return report
+
+
+def feature_family_history(rows):
+    """Plan section 5: a family is judged only where enough contracts carry it."""
+    out = {}
+    for group, names in FEATURE_GROUPS.items():
+        carrying = [r for r in rows
+                    if sum(r["features"].get(n) is not None for n in names) * 2 >= len(names)]
+        out[group] = {
+            "contracts_with_family": len(carrying),
+            "first_available": carrying[0]["opens_at"] if carrying else None,
+            "minimum_required": MIN_FAMILY_CONTRACTS,
+            "status": "EVALUABLE" if len(carrying) >= MIN_FAMILY_CONTRACTS else "INSUFFICIENT_HISTORY",
+        }
+    return out
+
+
+def day_block_bootstrap(priced, replicates=None, seed=None):
+    from .settled_audit import BOOTSTRAP_REPLICATES, BOOTSTRAP_SEED, day_block_bootstrap as boot
+
+    return boot(priced, replicates or BOOTSTRAP_REPLICATES, seed or BOOTSTRAP_SEED)
 
 
 def holm(p_values, alpha=0.05):
@@ -800,11 +892,28 @@ def main():
                         help="Also evaluate live intracontract predictions per time-remaining bucket")
     parser.add_argument("--retrospective", action="store_true",
                         help="Also evaluate candle-only RETROSPECTIVE openings for settled contracts without frozen records")
+    parser.add_argument("--audit-only", action="store_true",
+                        help="Write only Report A (the settled audit of displayed calls)")
     args = parser.parse_args()
     try:
         rigor._refuse_foreign_file(args.output, REPORT_FORMAT)
         with closing(sqlite3.connect(args.journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             coverage = opening_models.dataset_coverage(db)
+            # Report A first: the verified historical audit of displayed calls,
+            # written and printed before any experimental model research runs.
+            audit = settled_audit.audit(db)
+            audit["authoritative_dataset_coverage"] = coverage
+            audit_path = args.output.with_name("report_A_settled_audit.json")
+            rigor._refuse_foreign_file(audit_path, settled_audit.AUDIT_FORMAT)
+            from .model_registry import atomic_json as _write
+
+            _write(audit_path, audit)
+            print("REPORT_A_BEGIN", flush=True)
+            for line in settled_audit.summary_lines(audit):
+                print(line, flush=True)
+            print("REPORT_A_END", flush=True)
+            if args.audit_only:
+                return
             rows = load(db)
             section_errors = {}
             buckets = None
@@ -841,7 +950,9 @@ def main():
         from .model_registry import atomic_json
 
         atomic_json(args.output, report)
+        print("REPORT_B_BEGIN")
         print(summary_text(report))
+        print("REPORT_B_END")
     except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
         parser.error(str(exc))
 

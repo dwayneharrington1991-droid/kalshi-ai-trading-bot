@@ -3,7 +3,7 @@
 One pasted command measures the real opening model on the real preview
 journal without changing anything on the server:
 
-1. Fetches `claude/accuracy-research`, verifies the exact commit, and extracts
+1. Fetches `claude/research-plan-readonly`, verifies the exact commit, and extracts
    it into a temporary directory with `git archive` (no service checkout is
    touched).
 2. Runs `deploy/oracle/research_readonly.sh`, which reports the model the live
@@ -35,7 +35,7 @@ if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) { throw 'OpenSSH c
 $bootstrap = @'
 set -Eeuo pipefail
 SHA=__SHA__
-BRANCH=claude/accuracy-research
+BRANCH=claude/research-plan-readonly
 REPO=/home/opc/kalshi-ai-trading-bot
 [[ $(id -un) == opc ]] || { echo "BLOCKED: must run as opc" >&2; exit 1; }
 git -C "$REPO" fetch --quiet --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || { echo "BLOCKED: could not fetch $BRANCH; nothing changed" >&2; exit 1; }

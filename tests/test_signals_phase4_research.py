@@ -68,6 +68,19 @@ def test_running_model_comparison_reports_absence_instead_of_mixing_versions():
     assert report["holdout_openings_by_current_model"] == 0
 
 
+def test_running_model_comparison_uses_canonical_displayed_call_validation():
+    rows = _rows()
+    mine = [row for row in rows if row["recorded_model"] == CURRENT]
+    mine[0]["recorded_direction"] = "DOWN" if mine[0]["recorded_up"] >= 0.5 else "UP"
+    mine[1]["recorded_up"] = float("nan")
+    predictions = {"candidate": {row["ticker"]: 0.7 for row in rows}}
+    report = research.current_model_comparison(rows, predictions, CURRENT)
+    expected = sum(research._displayable_recorded_call(row) for row in mine)
+    assert report["current_model_displayed_calls"] == expected
+    assert report["current_model"]["calls"] == expected
+    assert "paired_mcnemar_multiple_testing" in report
+
+
 def test_research_compares_candidates_with_running_model_on_sealed_holdout_only():
     rows = _augment(synthetic.opening_rows(420, seed=505, signal=0.6))
     for i, r in enumerate(rows):
@@ -82,3 +95,7 @@ def test_research_compares_candidates_with_running_model_on_sealed_holdout_only(
     assert "momentum_trend_volatility" in versus["candidates"]
     family = report["multiple_testing"]["results"]
     assert any(k.startswith("momentum_trend_volatility vs") for k in family)
+    for comparison in report["model_comparison"].values():
+        assert "threshold_table_holdout" not in comparison
+        assert "development_threshold_table" in comparison
+        assert "holdout_by_regime" not in comparison

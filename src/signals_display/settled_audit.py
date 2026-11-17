@@ -89,7 +89,8 @@ def official_outcomes(db):
         evidence.setdefault(ticker, []).append((observed, outcome))
     for ticker, items in evidence.items():
         valid = {(observed, outcome) for observed, outcome in items if outcome in (0, 1)}
-        if len({outcome for _observed, outcome in valid}) != 1:
+        has_invalid = any(outcome not in (0, 1) for _observed, outcome in items)
+        if has_invalid or len({outcome for _observed, outcome in valid}) != 1:
             quarantined.add(ticker)
             continue
         outcomes[ticker] = min(valid, key=lambda item: _receipt_order(item[0]))
@@ -355,6 +356,7 @@ def integrity_checks(db, rows, asof):
     disagreements = 0
     duplicate_official_rows = 0
     conflicting_official_tickers = 0
+    invalid_official_rows = 0
     origins = {}
     if "forecast_outcomes" in tables:
         labels = {}
@@ -365,8 +367,10 @@ def integrity_checks(db, rows, asof):
             if origin == "official":
                 official_by_ticker.setdefault(ticker, []).append(outcome)
         duplicate_official_rows = sum(max(0, len(values) - 1) for values in official_by_ticker.values())
+        invalid_official_rows = sum(value not in (0, 1) for values in official_by_ticker.values() for value in values)
         conflicting_official_tickers = sum(
-            len({value for value in values if value in (0, 1)}) != 1
+            any(value not in (0, 1) for value in values)
+            or len({value for value in values if value in (0, 1)}) != 1
             for values in official_by_ticker.values()
         )
         disagreements = sum(
@@ -387,6 +391,7 @@ def integrity_checks(db, rows, asof):
         "multiple_tickers_same_open": {"count": len(same_open), "examples": dict(list(same_open.items())[:5])},
         "outcome_origins": origins,
         "duplicate_official_outcome_rows": duplicate_official_rows,
+        "invalid_official_outcome_rows": invalid_official_rows,
         "conflicting_or_invalid_official_outcome_tickers": conflicting_official_tickers,
         "official_vs_other_origin_disagreements": disagreements,
         "sample_size": {

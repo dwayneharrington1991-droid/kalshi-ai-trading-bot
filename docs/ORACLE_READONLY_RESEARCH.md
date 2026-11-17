@@ -34,7 +34,7 @@ if (-not $Key) {
     Where-Object { ($_.Name -like '*oracle*' -or $_.Name -like 'ssh-key-*.key') -and $_.Extension -notin '.pub', '.ppk' } |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 }
-$sshBase = @('-o', 'StrictHostKeyChecking=accept-new', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=8')
+$sshBase = @('-o', 'StrictHostKeyChecking=yes', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=8')
 if ($Key) { $sshBase += @('-o', 'IdentitiesOnly=yes', '-i', $Key); Write-Host "Using SSH key: $Key" }
 if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) { throw 'OpenSSH client (ssh.exe) is not installed.' }
 $bootstrap = @'
@@ -62,7 +62,7 @@ $reportDir = ($captured | Where-Object { $_ -like 'RESEARCH: REPORT_DIR=*' } | S
 if ($reportDir) {
   $local = Join-Path $env:USERPROFILE 'kalshi-research'
   New-Item -ItemType Directory -Force -Path $local | Out-Null
-  $scpBase = @('-o', 'StrictHostKeyChecking=accept-new')
+  $scpBase = @('-o', 'StrictHostKeyChecking=yes')
   if ($Key) { $scpBase += @('-o', 'IdentitiesOnly=yes', '-i', $Key) }
   $ErrorActionPreference = 'Continue'
   & scp.exe @scpBase -r "${Server}:$reportDir" $local

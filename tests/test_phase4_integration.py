@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from src.signals_display import opening_research as research
+from src.signals_display import artifact_diagnostics as diagnostics
 from src.signals_display import settled_audit as audit
 from tests.test_signals_settled_audit import ASOF, _db, _opening, _ro
 
@@ -59,6 +60,22 @@ def test_earliest_receipt_is_kept_for_identical_repeated_settlements(tmp_path):
     assert outcomes["KXBTC15M-0000"][0] == "2026-10-01T00:15:30Z"  # earlier than 00:16:00+00:00
 
 
+def test_invalid_official_row_quarantines_ticker_instead_of_being_ignored(tmp_path):
+    def build(db):
+        _opening(db, 0, 0.7, "UP", outcome=1)
+        db.execute("CREATE TABLE fo2 AS SELECT * FROM forecast_outcomes")
+        db.execute("DROP TABLE forecast_outcomes")
+        db.execute("ALTER TABLE fo2 RENAME TO forecast_outcomes")
+        db.execute("INSERT INTO forecast_outcomes VALUES ('KXBTC15M-0000','official',?,2)",
+                   (ASOF.isoformat(),))
+    with _ro(_db(tmp_path, build)) as db:
+        outcomes, quarantined = audit.official_outcomes(db)
+        report = audit.audit(db, ASOF)
+    assert not outcomes and quarantined == {"KXBTC15M-0000"}
+    assert report["integrity_checks"]["invalid_official_outcome_rows"] == 1
+    assert report["journal_audit"]["verified_settled_openings"] == 0
+
+
 def test_threshold_challenge_never_pools_model_versions_silently(tmp_path):
     def build(db):
         for i in range(60):
@@ -91,6 +108,35 @@ def test_candidate_family_is_six_and_includes_momentum_trend_volatility():
     features = research.MODELS["momentum_trend_volatility"]["features"]
     assert set(research.TREND) <= set(features)
     assert set(research.INTERACTIONS) <= set(features)
+
+
+def test_artifact_report_counts_four_components_and_exact_87_input_union(monkeypatch):
+    names = [f"feature_{i}" for i in range(87)]
+    components = [
+        {"kind": kind, "feature_set": f"set-{i}",
+         "preprocessor": {"names": names[i::4]}}
+        for i, kind in enumerate(("logistic", "ridge", "opening_gradient_boosting", "volatility_baseline"))
+    ]
+    artifact = {"model_id": "m87", "model": {"kind": "opening_ensemble",
+                "components": components, "mixture_weights": [0.25] * 4},
+                "available_at": "2026-01-01T00:00:00+00:00",
+                "labels_available_through": "2025-12-31T00:00:00+00:00"}
+    row = {"ticker": "T", "features": {name: 1.0 for name in names}, "baseline": 0.5,
+           "recorded_up": 0.6, "recorded_model": "opening-candidate/m87", "outcome": 1,
+           "opens_at": "2026-01-01T00:15:00+00:00"}
+    monkeypatch.setattr(diagnostics, "_predict", lambda model, row, features=None: 0.6)
+    report = diagnostics.diagnose(artifact, [row])
+    assert report["component_count"] == report["active_components"] == 4
+    assert report["input_feature_count"] == 87
+    assert report["requested_87_inputs_matches_artifact"] is True
+
+
+def test_runner_pins_report_b_and_artifact_diagnostics_to_port_8768_journal():
+    script = (ROOT / "deploy/oracle/research_readonly.sh").read_text()
+    assert 'preview_journal=$(journal_of "$pid")' in script
+    assert "journal=$preview_journal" in script
+    assert "largest historical journal (Report A only if different)" in script
+    assert 'systemctl' not in script and 'kill ' not in script
 
 
 def test_research_tools_cannot_overwrite_or_activate_the_model(tmp_path):

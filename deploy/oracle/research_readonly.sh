@@ -54,6 +54,8 @@ journal_of() {
 pid=$(listener_pid "$PORT")
 [[ -n $pid ]] || block "no process is listening on preview port $PORT"
 artifact=$(argv_value "$pid" --opening-model-artifact)
+preview_journal=$(journal_of "$pid")
+[[ -n $preview_journal ]] || block "could not identify the port $PORT journal"
 install -d -m 0700 "$RUN_ROOT" "$RUN_ROOT/checkpoints" "$OUT_DIR"
 
 # Every running signals bot's journal is a candidate source of genuinely
@@ -72,7 +74,7 @@ for port in 8768 8765 8767; do
   fi
 done
 (( ${#journals[@]} > 0 )) || block "could not identify any signals journal from the running processes"
-journal=$(PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 "$PYTHON" -P -c '
+largest_journal=$(PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 "$PYTHON" -P -c '
 import json, sqlite3, sys
 from contextlib import closing
 from pathlib import Path
@@ -92,8 +94,14 @@ for path in sys.argv[1:]:
 print(json.dumps(counts, indent=1), file=sys.stderr)
 print(best or "")
 ' "${journals[@]}" 2> >(tee "$OUT_DIR/journal_coverage.json" >&2))
-[[ -n $journal ]] || block "no readable journal with opening records"
-say "researching the journal with the most eligible frozen openings: $journal"
+[[ -n $largest_journal ]] || block "no readable journal with opening records"
+# Model diagnostics and Report B must use the same journal as the running
+# preview artifact.  A larger production/legacy journal may be useful for its
+# own Report A, but pairing it with the 8768 model would mix deployments.
+journal=$preview_journal
+[[ -r $journal ]] || block "port $PORT journal is not readable: $journal"
+say "researching the verified port $PORT journal: $journal"
+say "largest historical journal (Report A only if different): $largest_journal"
 say "preview pid=$pid"
 say "opening artifact=${artifact:-NONE (statistical fallback only)}"
 PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 "$PYTHON" -P -c '

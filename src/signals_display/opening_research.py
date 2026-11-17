@@ -85,6 +85,10 @@ MODELS = {
 }
 PREREGISTERED_CANDIDATE_LIMIT = 6
 assert len(MODELS) <= PREREGISTERED_CANDIDATE_LIMIT, "pre-registered candidate family exceeded"
+MODEL_INCREMENTAL_FEATURES = {
+    name: tuple(feature for feature in spec["features"] if feature not in rigor.COMPACT_FEATURES)
+    for name, spec in MODELS.items()
+}
 INTERACTIONS = {
     "ix_return_15m_x_rising": ("return_15m", "regime_rising"),
     "ix_return_15m_x_falling": ("return_15m", "regime_falling"),
@@ -525,6 +529,20 @@ def _mcnemar(candidate_right, current_right):
             "test": "exact two-sided McNemar on discordant contracts"}
 
 
+def _displayable_recorded_call(row):
+    """Canonical immutable-call rule shared by scoring and paired research."""
+    probability = row.get("recorded_up")
+    direction = row.get("recorded_direction")
+    return (
+        direction in {"UP", "DOWN"}
+        and row.get("recorded_confidence_status") in DISPLAYABLE_RECORDED_CONFIDENCE
+        and type(probability) in (int, float)
+        and math.isfinite(probability)
+        and 0 <= probability <= 1
+        and (direction == "UP") == (probability >= 0.5)
+    )
+
+
 def current_model_comparison(holdout, predictions, current_model):
     """Candidates versus the RUNNING model on the same sealed-holdout contracts.
 
@@ -537,9 +555,9 @@ def current_model_comparison(holdout, predictions, current_model):
       candidate cannot look better simply by calling fewer contracts.
     """
     mine = [r for r in holdout if r.get("recorded_model") == current_model
-            and type(r.get("recorded_up")) in (int, float)]
-    called = [r for r in mine if r.get("recorded_direction") in {"UP", "DOWN"}
-              and r.get("recorded_confidence_status") in DISPLAYABLE_RECORDED_CONFIDENCE]
+            and type(r.get("recorded_up")) in (int, float)
+            and math.isfinite(r["recorded_up"]) and 0 <= r["recorded_up"] <= 1]
+    called = [r for r in mine if _displayable_recorded_call(r)]
     out = {"current_model_label": current_model, "holdout_openings_by_current_model": len(mine),
            "current_model_displayed_calls": len(called)}
     if not called:
@@ -559,6 +577,14 @@ def current_model_comparison(holdout, predictions, current_model):
             "same_contracts": {**call_metrics(same), "paired_vs_current": _mcnemar(candidate_right, current_right)},
             "matched_coverage": call_metrics([(by_ticker[r["ticker"]], r) for r in ranked]),
         }
+    paired = {
+        name: entry["same_contracts"]["paired_vs_current"]["p_value"]
+        for name, entry in out["candidates"].items()
+    }
+    out["paired_mcnemar_multiple_testing"] = {
+        "method": "Holm step-down across every candidate paired with the running model",
+        "results": holm(paired),
+    }
     out["status"] = "MEASURED"
     return out
 
@@ -622,6 +648,23 @@ def research(rows, progress=None, checkpoint=None, current_model=None):
         "tuning_on_holdout": False,
     }
     predictions, folds = walk_forward(rows, progress=progress, seal=seal, checkpoint=checkpoint)
+    coverage_rows = rows[:seal]  # candidate availability is decided without inspecting the sealed period
+    inactive = set()
+    for name, incremental in MODEL_INCREMENTAL_FEATURES.items():
+        if incremental and (
+            not coverage_rows
+            or not any(
+                sum(type(r["features"].get(feature)) in (int, float)
+                    and math.isfinite(r["features"][feature]) for r in coverage_rows)
+                >= len(coverage_rows) / 2
+                for feature in incremental
+            )
+        ):
+            inactive.add(name)
+            predictions[name] = {}
+    report["inactive_research_candidates"] = {
+        name: "INSUFFICIENT_INCREMENTAL_FEATURE_COVERAGE" for name in sorted(inactive)
+    }
     report["walk_forward_folds"] = folds
     oos = [r for r in rows if all(r["ticker"] in predictions[name] for name in ("compact_offset",))]
     report["out_of_sample_contracts"] = len(oos)
@@ -659,15 +702,19 @@ def research(rows, progress=None, checkpoint=None, current_model=None):
             "development_contracts": len(dev),
             "holdout_contracts": len(hold),
             "holdout_probabilistic": {k: score(hold_p, [r["outcome"] for r in hold])[k] for k in ("brier", "log_loss", "accuracy")},
-            "threshold_table_holdout": threshold_table(hold_p, hold),
+            "development_threshold_table": threshold_table([by_ticker[r["ticker"]] for r in dev], dev),
             "threshold_chosen_on_development": chosen,
         }
         if chosen is not None:
             picked = [(p, r) for p, r in zip(hold_p, hold) if max(p, 1 - p) >= chosen]
             entry["holdout_at_chosen_threshold"] = call_metrics(picked)
-            entry["holdout_by_regime"] = {
-                regime: call_metrics([(p, r) for p, r in picked if r.get("regime") == regime])
-                for regime in sorted({r.get("regime") for r in hold})
+            development_picked = [
+                (by_ticker[r["ticker"]], r) for r in dev
+                if max(by_ticker[r["ticker"]], 1 - by_ticker[r["ticker"]]) >= chosen
+            ]
+            entry["development_by_regime_at_chosen_threshold"] = {
+                regime: call_metrics([(p, r) for p, r in development_picked if r.get("regime") == regime])
+                for regime in sorted({r.get("regime") for r in dev})
             }
         base = [
             r for r in hold

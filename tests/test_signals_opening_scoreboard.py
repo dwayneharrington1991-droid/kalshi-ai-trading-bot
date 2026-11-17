@@ -36,10 +36,11 @@ def test_scoreboard_counts_only_verified_displayed_calls(tmp_path):
     _opening(journal, 6, up=0.40, direction="UP", outcome=1)       # side contradicts probability: invalid
     _opening(journal, 7, up=0.9, direction="UP", outcome=1, payload_override="{broken")  # invalid JSON
     _opening(journal, 8, up=0.9, direction="UP", outcome=1, mode="REPLAY / SIMULATED")  # not live
+    _opening(journal, 9, up=0.9, direction="UP", confidence={"status": "MADE_UP"}, outcome=1)
     board = journal.verified_opening_scoreboard()
     assert (board["correct"], board["wrong"], board["verified_calls"]) == (2, 1, 3)
     assert abs(board["accuracy"] - 2 / 3) < 1e-12
-    assert board["excluded"] == {"wait_or_no_call": 2, "unsettled": 1, "invalid": 2, "duplicate": 0}
+    assert board["excluded"] == {"wait_or_no_call": 3, "unsettled": 1, "invalid": 2, "duplicate": 0}
     lo, hi = board["accuracy_interval_95"]
     assert lo < 2 / 3 < hi
 

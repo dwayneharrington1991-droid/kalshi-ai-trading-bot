@@ -67,14 +67,14 @@ FEATURE_GROUPS = {
     "trend_ema_volume_acceleration": TREND,
     "kalshi_preopen_market": ("kalshi_preopen_mid_logit",),
 }
+# Six pre-registered fitted candidates.  Regime slices and Kalshi prices are
+# references/conditions, not extra candidates added after results are visible.
 MODELS = {
     "compact_offset": dict(features=rigor.COMPACT_FEATURES, offset=True),
     "compact_plus_technicals": dict(features=rigor.COMPACT_FEATURES + TECHNICALS, offset=True),
     "compact_plus_flow": dict(features=rigor.COMPACT_FEATURES + FLOW, offset=True),
     "compact_plus_candles": dict(features=rigor.COMPACT_FEATURES + CANDLES, offset=True),
-    "regime_aware_compact": dict(features=rigor.COMPACT_FEATURES + ("regime_rising", "regime_falling"), offset=True),
     "compact_plus_trend": dict(features=rigor.COMPACT_FEATURES + TREND, offset=True),
-    "compact_plus_preopen_market": dict(features=rigor.COMPACT_FEATURES + ("kalshi_preopen_mid_logit",), offset=True),
     "boosted_stumps": dict(features=rigor.COMPACT_FEATURES + TECHNICALS, boost=True),
 }
 
@@ -491,10 +491,13 @@ def research(rows, progress=None, checkpoint=None):
         "eligible_opening_contracts": len(rows),
         "costs": {"slippage_per_contract": SLIPPAGE, "fees": "Kalshi taker fee formula", "quote": f"first non-stale executable ask within {QUOTE_WINDOW_SECONDS}s after the opening call"},
     }
-    recorded = [r for r in rows if type(r.get("recorded_up")) in (int, float)]
+    numeric_recorded = [r for r in rows if type(r.get("recorded_up")) in (int, float)]
+    recorded = [r for r in numeric_recorded if math.isfinite(r["recorded_up"])
+                and 0 <= r["recorded_up"] <= 1]
     confidences = sorted(abs(r["recorded_up"] - 0.5) for r in recorded)
     report["recorded_live_openings"] = {
         "contracts": len(recorded),
+        "invalid_probability_records": len(numeric_recorded) - len(recorded),
         "by_model": _count(r["recorded_model"] for r in recorded),
         "decision_thresholds_seen": _count(str(r["recorded_threshold"]) for r in recorded),
         "confidence_status_seen": _count(str(r["recorded_confidence_status"]) for r in recorded),
@@ -507,8 +510,13 @@ def research(rows, progress=None, checkpoint=None):
         "threshold_table": threshold_table([r["recorded_up"] for r in recorded], recorded),
     }
     report["conditions_exploratory"] = condition_report(rows)
-    failures = [r for r in recorded if r.get("recorded_direction") in {"UP", "DOWN"}
-                and (r["recorded_direction"] == "UP") != bool(r["outcome"])]
+    failures = [
+        r for r in recorded
+        if r.get("recorded_direction") in {"UP", "DOWN"}
+        and r.get("recorded_confidence_status") in DISPLAYABLE_RECORDED_CONFIDENCE
+        and (r["recorded_direction"] == "UP") == (r["recorded_up"] >= 0.5)
+        and (r["recorded_direction"] == "UP") != bool(r["outcome"])
+    ]
     report["recorded_live_openings"]["failed_calls"] = [
         {"ticker": r["ticker"], "direction": r["recorded_direction"],
          "confidence": max(r["recorded_up"], 1 - r["recorded_up"]), "regime": r.get("regime"),
@@ -592,8 +600,8 @@ def research(rows, progress=None, checkpoint=None):
     report["model_comparison"] = comparison
     ablation = {}
     reference = predictions.get("compact_offset", {})
-    for name in ("compact_plus_technicals", "compact_plus_flow", "compact_plus_candles", "regime_aware_compact",
-                 "compact_plus_trend", "compact_plus_preopen_market"):
+    for name in ("compact_plus_technicals", "compact_plus_flow", "compact_plus_candles",
+                 "compact_plus_trend"):
         common = [r for r in oos if r["ticker"] in reference and r["ticker"] in predictions.get(name, {})]
         if common:
             ablation[name] = rigor.paired_superiority_test(
@@ -602,8 +610,7 @@ def research(rows, progress=None, checkpoint=None):
             )
     family_of = {"compact_plus_technicals": "technicals_ema_rsi_macd_vwap_bollinger",
                  "compact_plus_flow": "order_book_flow_cvd", "compact_plus_candles": "candles",
-                 "compact_plus_trend": "trend_ema_volume_acceleration",
-                 "compact_plus_preopen_market": "kalshi_preopen_market"}
+                 "compact_plus_trend": "trend_ema_volume_acceleration"}
     for name, test in ablation.items():
         status = report["feature_family_history"].get(family_of.get(name), {}).get("status", "EVALUABLE")
         test["family_history_status"] = status

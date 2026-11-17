@@ -68,6 +68,7 @@ def diagnose(artifact, rows):
         "component_count": len(parts),
         "active_components": sum(weight > 0 for weight, _ in parts),
         "input_feature_count": len(union),
+        "requested_87_inputs_matches_artifact": len(union) == 87,
         "rows_examined": len(rows),
     }
     if not rows:
@@ -153,7 +154,7 @@ def diagnose(artifact, rows):
 
     # Reproduction of recorded live probabilities from frozen inputs.
     available = artifact.get("available_at")
-    checked = []
+    checked, matching_model, other_model, missing_model = [], [], [], 0
     for row, p in zip(rows, ensemble):
         recorded = row.get("recorded_up")
         if type(recorded) not in (int, float):
@@ -163,12 +164,38 @@ def diagnose(artifact, rows):
         except (TypeError, ValueError, AttributeError):
             after = False
         if after:
-            checked.append(abs(recorded - p))
+            difference = abs(recorded - p)
+            checked.append(difference)
+            recorded_model = row.get("recorded_model")
+            if not recorded_model or recorded_model == "UNRECORDED":
+                missing_model += 1
+            elif recorded_model == artifact.get("model_id") or recorded_model.endswith(
+                "/" + str(artifact.get("model_id"))
+            ):
+                matching_model.append(difference)
+            else:
+                other_model.append(difference)
     report["reproduction"] = {
         "openings_after_artifact_available": len(checked),
         "exactly_reproduced_within_1e_6": sum(d <= 1e-6 for d in checked),
         "max_abs_difference": max(checked) if checked else None,
-        "reading": "Differences mean the live call was made by another model/version or a different input path.",
+        "matching_model_id_openings": len(matching_model),
+        "matching_model_id_exactly_reproduced": sum(d <= 1e-6 for d in matching_model),
+        "matching_model_id_max_abs_difference": max(matching_model) if matching_model else None,
+        "different_model_id_openings": len(other_model),
+        "missing_recorded_model_id": missing_model,
+        "status": (
+            "NO_MATCHING_MODEL_COHORT"
+            if not matching_model
+            else "REPRODUCED"
+            if all(d <= 1e-6 for d in matching_model)
+            else "MATCHING_MODEL_INPUT_PATH_MISMATCH"
+        ),
+        "reading": (
+            "Only openings explicitly attributed to this artifact can test reproducibility. "
+            "Differences inside that cohort indicate a feature/input-path or artifact mismatch; "
+            "calls from another model version are reported separately."
+        ),
     }
 
     # Out-of-sample for this artifact: openings after its label cutoff.

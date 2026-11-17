@@ -414,6 +414,9 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     optional_status = "UNAVAILABLE: no frozen microstructure context"
     optional_receipts = {}
     excluded = {}
+    # Diagnostic metadata only (Phase 5): why each attempted optional input is
+    # or is not in the frozen vector. It never changes a value or probability.
+    feature_status = {}
     if frozen_context:
         try:
             context_cutoff = timestamp(frozen_context["cutoff"])
@@ -450,9 +453,13 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
                 feature_receipts.pop(name, None)
                 reason = str(exc) if str(exc).isupper() else type(exc).__name__
                 excluded[reason] = excluded.get(reason, 0) + 1
+                feature_status[name] = "EXCLUDED:" + reason
                 return
             if value is not None:
                 optional_values[name] = value
+                feature_status[name] = "PRESENT"
+            else:
+                feature_status[name] = "ABSENT_SOURCE_NOT_LIVE_OR_EMPTY"
 
         for name, value in frozen_context.get("candidate_features", {}).items():
             if name in values and value is not None and name.startswith("micro_"):
@@ -581,6 +588,8 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
         },
         "closed_history_bars": day["closed_bars"],
         "optional_context_status": optional_status,
+        "optional_context_available": bool(frozen_context),
+        "optional_feature_status": feature_status,
         "target_metadata_received_at": market.get(
             "metadata_received_at", market.get("observed_at")
         ),

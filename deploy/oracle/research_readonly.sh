@@ -12,7 +12,7 @@ readonly PYTHON=/home/opc/kalshi-ai-trading-bot/.venv/bin/python
 # One persistent run folder: its manifest pins the as-of time so a rerun
 # resumes on exactly the same data, and its checkpoints keep completed folds.
 # Everything written lives under /home/opc/kalshi-research only.
-readonly RUN_ROOT=${RESEARCH_RUN_ROOT:-/home/opc/kalshi-research/phase3-run}
+readonly RUN_ROOT=${RESEARCH_RUN_ROOT:-/home/opc/kalshi-research/phase4-run}
 readonly OUT_DIR=$RUN_ROOT/reports-$(date -u +%Y%m%dT%H%M%SZ)
 readonly RESEARCH_TIMEOUT=${RESEARCH_TIMEOUT:-6h}
 readonly PORT=8768
@@ -60,12 +60,14 @@ install -d -m 0700 "$RUN_ROOT" "$RUN_ROOT/checkpoints" "$OUT_DIR"
 # recorded frozen openings. Each is opened read-only only to count eligible
 # openings; the largest is researched. Nothing is written to any journal.
 declare -a journals=()
+declare -A journal_port=()
 for port in 8768 8765 8767; do
   other=$(listener_pid "$port")
   [[ -n $other ]] || continue
   found=$(journal_of "$other")
   if [[ -n $found && " ${journals[*]} " != *" $found "* ]]; then
     journals+=("$found")
+    journal_port["$found"]=$port
     say "port $port journal=$found"
   fi
 done
@@ -173,9 +175,21 @@ say "run $asof (manifest $manifest; checkpoints $RUN_ROOT/checkpoints)"
 asof=${asof#* }
 run_py() { PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 nice -n 15 "$PYTHON" -P "$@"; }
 cd "$OUT_DIR"
-say "Report A: settled audit of displayed calls"
+say "Report A: settled audit of displayed calls (port ${journal_port[$journal]} journal)"
 run_py -m src.signals_display.opening_research --journal "$journal" --asof "$asof" \
   --output "$OUT_DIR/opening_research.report.json" --audit-only | tee "$OUT_DIR/summary_reports_A_B.txt"
+# Report A per running service: the dashboard counter on each port counts
+# that port's own journal, so each is audited separately and labelled.
+for each in "${journals[@]}"; do
+  [[ $each == "$journal" ]] && continue
+  port_dir="$OUT_DIR/port-${journal_port[$each]}"
+  install -d -m 0700 "$port_dir"
+  say "Report A for port ${journal_port[$each]} journal (dashboard reconciliation)"
+  run_py -m src.signals_display.opening_research --journal "$each" --asof "$asof" \
+    --output "$port_dir/opening_research.report.json" --audit-only \
+    | sed "s/^/[port ${journal_port[$each]}] /" | tee -a "$OUT_DIR/summary_reports_A_B.txt" \
+    || say "Report A for port ${journal_port[$each]} unavailable; continuing"
+done
 if [[ -n $artifact && -f $artifact ]]; then
   say "Model diagnostics: deployed artifact components, inputs and contributions (artifact read only)"
   run_py -m src.signals_display.artifact_diagnostics --journal "$journal" --artifact "$artifact" --asof "$asof" \

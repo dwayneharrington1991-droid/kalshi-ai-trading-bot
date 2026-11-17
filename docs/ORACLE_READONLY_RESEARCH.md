@@ -17,7 +17,7 @@ journal without changing anything on the server:
 No process is stopped, started or signalled; journals, artifacts, registries
 and ports 8765/8767/8768 are not modified; trading stays disabled.
 
-Resumable: the run folder `/home/opc/kalshi-research/phase3-run` pins the
+Resumable: the run folder `/home/opc/kalshi-research/phase4-run` pins the
 as-of time in `manifest.json` and keeps completed folds in `checkpoints/`.
 If the time limit is reached, rerun the same command; finished work is reused.
 Delete that folder (research output only) to start a fresh run on newer data.

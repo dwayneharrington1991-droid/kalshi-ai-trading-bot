@@ -279,7 +279,7 @@ def test_inner_cv_preprocessor_is_fit_on_each_past_only_fold(monkeypatch):
             "use_baseline_offset": use_offset,
         }
 
-    monkeypatch.setattr(research.rigor, "fit_logistic", fake_fit)
+    monkeypatch.setattr(research.fast, "fit_logistic", fake_fit)
     research._fit(rows[:80], rows[80:], {"features": ("return_5m",), "offset": True})
     assert seen_means[0] == pytest.approx(9.5)
     assert seen_means[-1] == pytest.approx(39.5)  # final model uses all training rows

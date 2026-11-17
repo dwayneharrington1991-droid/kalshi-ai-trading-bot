@@ -16,16 +16,18 @@ model, artifact, registry, journal, live prediction or dashboard, and the
 report cannot be loaded as a forecast artifact.
 """
 import argparse
+import bisect
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
 import sqlite3
+import time
 
 import hashlib
 
-from . import learning, opening_models, rigorous_evaluation as rigor, settled_audit
+from . import learning, opening_models, research_fast as fast, rigorous_evaluation as rigor, settled_audit
 from .calibration import fit_platt
 from .model import timestamp
 from .scores import score, wilson_interval
@@ -253,17 +255,17 @@ def _fit(train, validation, spec):
                 fold_prep = _preprocess(fit_rows, names)
                 if not fold_prep["names"]:
                     continue
-                m = rigor.fit_logistic(fit_rows, fold_prep, l2, use_offset=spec["offset"])
+                m = fast.fit_logistic(fit_rows, fold_prep, l2, use_offset=spec["offset"])
                 losses += rigor._log_losses([rigor.raw_probability(m, r) for r in held], [r["outcome"] for r in held])
             if losses and (best is None or sum(losses) / len(losses) < best[0]):
                 best = (sum(losses) / len(losses), l2)
-        model = rigor.fit_logistic(train, prep, best[1] if best else 10.0, use_offset=spec["offset"])
+        model = fast.fit_logistic(train, prep, best[1] if best else 10.0, use_offset=spec["offset"])
         raw = lambda row: rigor.raw_probability(model, row)
     platt = fit_platt([raw(r) for r in validation], [r["outcome"] for r in validation])
     return lambda row: learning.sigmoid(platt["slope"] * learning.logit(raw(row)) + platt["intercept"])
 
 
-def walk_forward(rows, start=WALK_START, block=WALK_BLOCK, progress=None, seal=None):
+def walk_forward(rows, start=WALK_START, block=WALK_BLOCK, progress=None, seal=None, checkpoint=None):
     """Expanding chronological folds. Every prediction is for a contract whose
     label was unavailable to training and calibration (purged by label time).
     Fold size grows with the journal so at most MAX_FOLDS refits run; the
@@ -272,7 +274,11 @@ def walk_forward(rows, start=WALK_START, block=WALK_BLOCK, progress=None, seal=N
     With ``seal`` (an index), folds run only on the development rows before
     it. Every model is then fitted ONCE on development rows and frozen, and
     that frozen model scores the whole sealed holdout. No holdout label ever
-    enters training, calibration, hyperparameter or threshold selection."""
+    enters training, calibration, hyperparameter or threshold selection.
+
+    With ``checkpoint`` (research_fast.Checkpoints), each (fold, model) result
+    is stored under a hash of its exact inputs and reused on a resumed run;
+    the fold boundaries, purging and fitting are unchanged."""
     rows = opening_models._validate_rows(rows)
     limit = len(rows) if seal is None else seal
     block = max(block, math.ceil(max(0, limit - start) / MAX_FOLDS))
@@ -295,13 +301,28 @@ def walk_forward(rows, start=WALK_START, block=WALK_BLOCK, progress=None, seal=N
         if progress:
             label = "SEALED HOLDOUT (frozen development model)" if sealed_fold else f"fold {folds}"
             progress(f"{label}: train<= {end} contracts, testing {len(test)}")
+        started = time.monotonic()
+        reused = 0
         for name, spec in MODELS.items():
+            key = checkpoint.key(name, spec, train, validation, test) if checkpoint else None
+            saved = checkpoint.get(key) if checkpoint else None
+            if saved is not None:
+                reused += 1
+                predictions[name].update(saved.get("predictions") or {})
+                continue
             try:
                 predict = _fit(train, validation, spec)
-            except (ValueError, ZeroDivisionError):
+            except (ValueError, ZeroDivisionError) as exc:
+                if checkpoint:
+                    checkpoint.put(key, name, failed=type(exc).__name__)
                 continue
-            for row in test:
-                predictions[name][row["ticker"]] = predict(row)
+            fold_predictions = {row["ticker"]: predict(row) for row in test}
+            predictions[name].update(fold_predictions)
+            if checkpoint:
+                checkpoint.put(key, name, predictions=fold_predictions)
+        if progress:
+            progress(f"  fold {folds} done in {time.monotonic() - started:.1f}s "
+                     f"({reused}/{len(MODELS)} models reused from checkpoint)")
     return predictions, folds
 
 
@@ -459,7 +480,7 @@ def condition_report(rows):
     return report
 
 
-def research(rows, progress=None):
+def research(rows, progress=None, checkpoint=None):
     rows = opening_models._validate_rows(rows)
     report = {
         "format": REPORT_FORMAT,
@@ -509,7 +530,7 @@ def research(rows, progress=None):
         "holdout_ticker_sha256": hashlib.sha256("\n".join(sealed_tickers).encode()).hexdigest(),
         "tuning_on_holdout": False,
     }
-    predictions, folds = walk_forward(rows, progress=progress, seal=seal)
+    predictions, folds = walk_forward(rows, progress=progress, seal=seal, checkpoint=checkpoint)
     report["walk_forward_folds"] = folds
     oos = [r for r in rows if all(r["ticker"] in predictions[name] for name in ("compact_offset",))]
     report["out_of_sample_contracts"] = len(oos)
@@ -708,7 +729,7 @@ def _candle_values(bars):
     return values
 
 
-def retrospective_rows(db, exclude_tickers, limit=RETROSPECTIVE_LIMIT):
+def retrospective_rows(db, exclude_tickers, limit=RETROSPECTIVE_LIMIT, asof=None):
     """RETROSPECTIVE candle-only opening rows for settled contracts that have no
     eligible frozen opening record. Never mixed with the live record.
 
@@ -723,9 +744,11 @@ def retrospective_rows(db, exclude_tickers, limit=RETROSPECTIVE_LIMIT):
     tables = {name for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if not {"forecast_outcomes", "predictions", "btc_candles"} <= tables:
         return [], {"status": "UNAVAILABLE", "reason": "journal lacks outcomes, predictions or candles"}
+    asof = asof or datetime.now(timezone.utc)
     outcomes = db.execute(
         """SELECT ticker,observed_at,outcome FROM forecast_outcomes WHERE origin='official'
-           ORDER BY observed_at DESC LIMIT ?""", (limit * 2,)
+             AND julianday(observed_at)<=julianday(?)
+           ORDER BY observed_at DESC LIMIT ?""", (asof.isoformat(), limit * 2)
     ).fetchall()
     contracts, skipped = [], {}
     for ticker, observed_at, outcome in outcomes:
@@ -768,10 +791,14 @@ def retrospective_rows(db, exclude_tickers, limit=RETROSPECTIVE_LIMIT):
         if prior is None or stamp < prior[1]:
             candles[start] = (bar, stamp)
     rows = []
+    # Sorted starts + bisect select exactly the bars the former full scan did:
+    # cutoff - 86520 <= start <= cutoff - 60, received by the opening.
+    starts = sorted(candles)
     for ticker, opened, closed, strike, observed_at, outcome in contracts:
         cutoff = opened.timestamp()
-        bars = [bar for start, (bar, received) in candles.items()
-                if cutoff - 86520 <= start and start + 60 <= cutoff and received <= opened]
+        low = bisect.bisect_left(starts, cutoff - 86520)
+        high = bisect.bisect_right(starts, cutoff - 60)
+        bars = [candles[start][0] for start in starts[low:high] if candles[start][1] <= opened]
         if not bars:
             skipped["NO_PRE_OPEN_CANDLES"] = skipped.get("NO_PRE_OPEN_CANDLES", 0) + 1
             continue
@@ -839,13 +866,13 @@ def live_rows(db, asof=None):
     return buckets
 
 
-def intracontract_research(buckets, progress=None):
+def intracontract_research(buckets, progress=None, checkpoint=None):
     """Walk-forward research per time-remaining bucket; shadow only."""
     report = {}
     for bucket, rows in sorted(buckets.items()):
         if progress:
             progress(f"intracontract bucket {bucket}: {len(rows)} contracts")
-        result = research(rows, progress=progress)
+        result = research(rows, progress=progress, checkpoint=checkpoint)
         result["scope"] = (
             f"Live intracontract predictions with {bucket} remaining; separate from the "
             "immutable opening prediction and never shown as an opening call"
@@ -884,6 +911,10 @@ def summary_text(report):
     return "\n".join(lines)
 
 
+def _stamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--journal", type=Path, required=True)
@@ -894,65 +925,116 @@ def main():
                         help="Also evaluate candle-only RETROSPECTIVE openings for settled contracts without frozen records")
     parser.add_argument("--audit-only", action="store_true",
                         help="Write only Report A (the settled audit of displayed calls)")
+    parser.add_argument("--asof", help="ISO-8601 cutoff; only labels observed by then are used. "
+                        "Pin it to resume a run on exactly the same data.")
+    parser.add_argument("--checkpoint-dir", type=Path,
+                        help="Research-output directory for resumable fold checkpoints")
     args = parser.parse_args()
+    started = time.monotonic()
+    phase_times = {}
+
+    def progress(message):
+        print(f"RESEARCH_PROGRESS {_stamp()} +{time.monotonic() - started:.0f}s {message}", flush=True)
+
+    def phase(name, since):
+        phase_times[name] = round(time.monotonic() - since, 1)
+        progress(f"PHASE {name} finished in {phase_times[name]}s")
+
     try:
+        asof = timestamp(args.asof) if args.asof else datetime.now(timezone.utc)
+        if asof.tzinfo is None:
+            raise ValueError("--asof must include a timezone")
+        checkpoint = fast.Checkpoints(args.checkpoint_dir) if args.checkpoint_dir else None
         rigor._refuse_foreign_file(args.output, REPORT_FORMAT)
+        from .model_registry import atomic_json
+
+        progress(f"as-of {asof.isoformat()}; numpy solver={'yes' if fast.numpy_available() else 'NO (pure Python fallback)'}; "
+                 f"checkpoints={args.checkpoint_dir or 'disabled'}")
         with closing(sqlite3.connect(args.journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-            coverage = opening_models.dataset_coverage(db)
+            t = time.monotonic()
+            coverage = opening_models.dataset_coverage(db, asof)
             # Report A first: the verified historical audit of displayed calls,
             # written and printed before any experimental model research runs.
-            audit = settled_audit.audit(db)
+            audit = settled_audit.audit(db, asof)
             audit["authoritative_dataset_coverage"] = coverage
             audit_path = args.output.with_name("report_A_settled_audit.json")
             rigor._refuse_foreign_file(audit_path, settled_audit.AUDIT_FORMAT)
-            from .model_registry import atomic_json as _write
-
-            _write(audit_path, audit)
+            atomic_json(audit_path, audit)
             print("REPORT_A_BEGIN", flush=True)
             for line in settled_audit.summary_lines(audit):
                 print(line, flush=True)
             print("REPORT_A_END", flush=True)
+            phase("report_A", t)
             if args.audit_only:
                 return
-            rows = load(db)
-            section_errors = {}
-            buckets = None
-            if args.intracontract:
-                try:
-                    buckets = live_rows(db)
-                except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
-                    section_errors["intracontract"] = type(exc).__name__ + ": " + str(exc)[:200]
-            retro, retro_info = [], None
-            if args.retrospective:
-                try:
-                    retro, retro_info = retrospective_rows(db, {r["ticker"] for r in rows})
-                except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
-                    section_errors["retrospective"] = type(exc).__name__ + ": " + str(exc)[:200]
-            if args.retrospective:
-                has_snapshots = db.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='opening_quote_snapshots'"
-                ).fetchone()
-                for row in retro:  # executable quotes after the opening, for costs only
-                    row["quote"] = (_snapshot_quote_at(db, row) if has_snapshots else None) or _quote_at(db, row)
-        if section_errors:
-            print(f"Optional research sections unavailable: {section_errors}", flush=True)
-        progress = lambda m: print("RESEARCH_PROGRESS " + m, flush=True)
-        print(f"Loaded {len(rows)} eligible frozen openings (read-only)", flush=True)
-        report = research(rows, progress=progress)
-        report["optional_section_errors"] = section_errors
-        report["authoritative_dataset_coverage"] = coverage
-        if args.retrospective:
-            print(f"Retrospective candle-only reconstruction: {retro_info}", flush=True)
-            report["retrospective_candle_only"] = {"reconstruction": retro_info, **research(retro, progress=progress)}
-        if buckets is not None:
-            print("Loaded intracontract rows: " + ", ".join(f"{k}={len(v)}" for k, v in sorted(buckets.items())), flush=True)
-            report["intracontract"] = intracontract_research(buckets, progress=progress)
-        from .model_registry import atomic_json
 
-        atomic_json(args.output, report)
-        print("REPORT_B_BEGIN")
-        print(summary_text(report))
-        print("REPORT_B_END")
+            # Core Report B: frozen openings only. Written before any optional
+            # section is even loaded, so a later interruption cannot lose it.
+            t = time.monotonic()
+            rows = load(db, asof)
+            phase("load_frozen_openings", t)
+            print(f"Loaded {len(rows)} eligible frozen openings (read-only)", flush=True)
+            t = time.monotonic()
+            report = research(rows, progress=progress, checkpoint=checkpoint)
+            report.update(asof=asof.isoformat(), authoritative_dataset_coverage=coverage,
+                          optional_section_errors={}, optional_sections_pending=[
+                              name for name, wanted in (("retrospective", args.retrospective),
+                                                        ("intracontract", args.intracontract)) if wanted],
+                          phase_seconds=phase_times)
+            phase("report_B_core", t)
+            atomic_json(args.output, report)
+            print("REPORT_B_BEGIN", flush=True)
+            print(summary_text(report), flush=True)
+            print("REPORT_B_END", flush=True)
+            exclude = {r["ticker"] for r in rows}
+            del rows
+
+            if args.retrospective:
+                t = time.monotonic()
+                try:
+                    retro, retro_info = retrospective_rows(db, exclude, asof=asof)
+                    has_snapshots = db.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='opening_quote_snapshots'"
+                    ).fetchone()
+                    for row in retro:  # executable quotes after the opening, for costs only
+                        row["quote"] = (_snapshot_quote_at(db, row) if has_snapshots else None) or _quote_at(db, row)
+                    phase("load_retrospective", t)
+                    print(f"Retrospective candle-only reconstruction: {retro_info}", flush=True)
+                    t = time.monotonic()
+                    report["retrospective_candle_only"] = {
+                        "reconstruction": retro_info,
+                        **research(retro, progress=progress, checkpoint=checkpoint)}
+                    phase("research_retrospective", t)
+                    del retro
+                except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+                    report["optional_section_errors"]["retrospective"] = type(exc).__name__ + ": " + str(exc)[:200]
+                report["optional_sections_pending"].remove("retrospective")
+                atomic_json(args.output, report)
+
+            if args.intracontract:
+                t = time.monotonic()
+                try:
+                    buckets = live_rows(db, asof)
+                    phase("load_intracontract", t)
+                    print("Loaded intracontract rows: " + ", ".join(
+                        f"{k}={len(v)}" for k, v in sorted(buckets.items())), flush=True)
+                    t = time.monotonic()
+                    report["intracontract"] = intracontract_research(buckets, progress=progress, checkpoint=checkpoint)
+                    phase("research_intracontract", t)
+                    del buckets
+                except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+                    report["optional_section_errors"]["intracontract"] = type(exc).__name__ + ": " + str(exc)[:200]
+                report["optional_sections_pending"].remove("intracontract")
+                atomic_json(args.output, report)
+        if report["optional_section_errors"]:
+            print(f"Optional research sections unavailable: {report['optional_section_errors']}", flush=True)
+        if checkpoint:
+            report["checkpoints"] = {"reused_fold_models": checkpoint.hits, "computed_fold_models": checkpoint.misses}
+            atomic_json(args.output, report)
+        print("REPORT_B_OPTIONAL_BEGIN", flush=True)
+        print(summary_text({**report, "model_comparison": {}}), flush=True)
+        print("REPORT_B_OPTIONAL_END", flush=True)
+        progress(f"ALL PHASES COMPLETE {phase_times}")
     except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
         parser.error(str(exc))
 

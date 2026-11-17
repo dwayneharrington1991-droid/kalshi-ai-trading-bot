@@ -9,7 +9,12 @@ set -Eeuo pipefail
 
 readonly CODE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 readonly PYTHON=/home/opc/kalshi-ai-trading-bot/.venv/bin/python
-readonly OUT_DIR=/home/opc/kalshi-research/$(date -u +%Y%m%dT%H%M%SZ)
+# One persistent run folder: its manifest pins the as-of time so a rerun
+# resumes on exactly the same data, and its checkpoints keep completed folds.
+# Everything written lives under /home/opc/kalshi-research only.
+readonly RUN_ROOT=${RESEARCH_RUN_ROOT:-/home/opc/kalshi-research/phase3-run}
+readonly OUT_DIR=$RUN_ROOT/reports-$(date -u +%Y%m%dT%H%M%SZ)
+readonly RESEARCH_TIMEOUT=${RESEARCH_TIMEOUT:-6h}
 readonly PORT=8768
 
 say() { printf 'RESEARCH: %s\n' "$*"; }
@@ -49,7 +54,7 @@ journal_of() {
 pid=$(listener_pid "$PORT")
 [[ -n $pid ]] || block "no process is listening on preview port $PORT"
 artifact=$(argv_value "$pid" --opening-model-artifact)
-install -d -m 0700 "$OUT_DIR"
+install -d -m 0700 "$RUN_ROOT" "$RUN_ROOT/checkpoints" "$OUT_DIR"
 
 # Every running signals bot's journal is a candidate source of genuinely
 # recorded frozen openings. Each is opened read-only only to count eligible
@@ -143,11 +148,53 @@ except Exception as exc:
 print(json.dumps(summary, indent=1, default=str))
 ' "$artifact" | tee "$OUT_DIR/running_model.json"
 
-say "running Report A (settled audit of displayed calls), then Report B (offline model research); low priority, can take several minutes"
+manifest=$RUN_ROOT/manifest.json
+asof=$(PYTHONNOUSERSITE=1 "$PYTHON" -P - "$manifest" "$journal" <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+path, journal = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except (OSError, ValueError):
+    data = {}
+if data.get("journal") != journal or not data.get("asof"):
+    data = {"journal": journal, "asof": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat()}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(data, handle, indent=1)
+    os.replace(tmp, path)
+    print("NEW " + data["asof"])
+else:
+    print("RESUME " + data["asof"])
+PY
+)
+say "run $asof (manifest $manifest; checkpoints $RUN_ROOT/checkpoints)"
+asof=${asof#* }
+run_py() { PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 nice -n 15 "$PYTHON" -P "$@"; }
 cd "$OUT_DIR"
-PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 nice -n 15 timeout 3h \
-  "$PYTHON" -P -m src.signals_display.opening_research \
-  --journal "$journal" --output "$OUT_DIR/opening_research.report.json" --intracontract --retrospective \
-  | tee "$OUT_DIR/summary_reports_A_B.txt"
+say "Report A: settled audit of displayed calls"
+run_py -m src.signals_display.opening_research --journal "$journal" --asof "$asof" \
+  --output "$OUT_DIR/opening_research.report.json" --audit-only | tee "$OUT_DIR/summary_reports_A_B.txt"
+if [[ -n $artifact && -f $artifact ]]; then
+  say "Model diagnostics: deployed artifact components, inputs and contributions (artifact read only)"
+  run_py -m src.signals_display.artifact_diagnostics --journal "$journal" --artifact "$artifact" --asof "$asof" \
+    --output "$OUT_DIR/model_diagnostics.json" | tee -a "$OUT_DIR/summary_reports_A_B.txt" \
+    || say "model diagnostics unavailable; continuing"
+fi
+say "Report B: offline model research (resumable; limit $RESEARCH_TIMEOUT; rerun the same command to continue)"
+set +e
+PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 nice -n 15 timeout "$RESEARCH_TIMEOUT" \
+  "$PYTHON" -P -m src.signals_display.opening_research --journal "$journal" --asof "$asof" \
+  --checkpoint-dir "$RUN_ROOT/checkpoints" --output "$OUT_DIR/opening_research.report.json" \
+  --intracontract --retrospective | tee -a "$OUT_DIR/summary_reports_A_B.txt"
+status=${PIPESTATUS[0]}
+set -e
+if (( status == 124 )); then
+  say "REPORT_DIR=$OUT_DIR"
+  printf 'RESEARCH_INCOMPLETE time limit reached; completed folds are checkpointed. Rerun the same command to resume. journal_unchanged=READ_ONLY services_unchanged=YES trading=DISABLED\n'
+  exit 124
+fi
+(( status == 0 )) || block "research exited with status $status (completed folds are checkpointed)"
 say "REPORT_DIR=$OUT_DIR"
 printf 'RESEARCH_COMPLETE journal_unchanged=READ_ONLY services_unchanged=YES trading=DISABLED\n'

@@ -3,7 +3,7 @@
 One pasted command measures the real opening model on the real preview
 journal without changing anything on the server:
 
-1. Fetches `claude/research-plan-readonly`, verifies the exact commit, and extracts
+1. Fetches `claude/research-phase3-resumable`, verifies the exact commit, and extracts
    it into a temporary directory with `git archive` (no service checkout is
    touched).
 2. Runs `deploy/oracle/research_readonly.sh`, which reports the model the live
@@ -16,6 +16,11 @@ journal without changing anything on the server:
 
 No process is stopped, started or signalled; journals, artifacts, registries
 and ports 8765/8767/8768 are not modified; trading stays disabled.
+
+Resumable: the run folder `/home/opc/kalshi-research/phase3-run` pins the
+as-of time in `manifest.json` and keeps completed folds in `checkpoints/`.
+If the time limit is reached, rerun the same command; finished work is reused.
+Delete that folder (research output only) to start a fresh run on newer data.
 
 ```powershell
 & {
@@ -35,7 +40,7 @@ if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) { throw 'OpenSSH c
 $bootstrap = @'
 set -Eeuo pipefail
 SHA=__SHA__
-BRANCH=claude/research-plan-readonly
+BRANCH=claude/research-phase3-resumable
 REPO=/home/opc/kalshi-ai-trading-bot
 [[ $(id -un) == opc ]] || { echo "BLOCKED: must run as opc" >&2; exit 1; }
 git -C "$REPO" fetch --quiet --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || { echo "BLOCKED: could not fetch $BRANCH; nothing changed" >&2; exit 1; }
@@ -53,7 +58,6 @@ $ErrorActionPreference = 'Continue'
 & ssh.exe @sshBase $Server "echo $encoded | base64 -d | bash" | Tee-Object -Variable captured | Out-Host
 $remoteExit = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
-if ($remoteExit -ne 0) { throw "Research did not complete (exit $remoteExit). Nothing on the server was changed." }
 $reportDir = ($captured | Where-Object { $_ -like 'RESEARCH: REPORT_DIR=*' } | Select-Object -Last 1) -replace '^RESEARCH: REPORT_DIR=', ''
 if ($reportDir) {
   $local = Join-Path $env:USERPROFILE 'kalshi-research'
@@ -65,5 +69,8 @@ if ($reportDir) {
   $ErrorActionPreference = 'Stop'
   Write-Host "Report copied to $local\$(Split-Path $reportDir -Leaf)"
 }
+if ($remoteExit -eq 124) { Write-Host 'Time limit reached. Completed work is saved on the server: run this same command again to resume.' -ForegroundColor Yellow }
+elseif ($remoteExit -ne 0) { throw "Research did not complete (exit $remoteExit). Nothing on the server was changed." }
+else { Write-Host 'Reports A and B complete.' -ForegroundColor Green }
 }
 ```

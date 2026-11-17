@@ -143,6 +143,86 @@ def displayed(row):
 # ------------------------------------------------------------------- audit
 
 
+def quote_snapshot_coverage(db, rows):
+    """Why a market-price comparison may be impossible: is there any pre-open
+    Kalshi quote at all, and when did recording start?"""
+    if "opening_quote_snapshots" not in _tables(db):
+        return {"table_present": False,
+                "reading": "This journal predates pre-open Kalshi quote capture; no market comparison is possible from it."}
+    total, tickers, first, last, preopen, preopen_two_sided, modes = db.execute(
+        """SELECT COUNT(*),COUNT(DISTINCT ticker),MIN(observed_at),MAX(observed_at),
+                  SUM(seconds_from_open<=0),
+                  SUM(seconds_from_open<=0 AND up_bid IS NOT NULL AND up_ask IS NOT NULL),
+                  GROUP_CONCAT(DISTINCT mode)
+           FROM opening_quote_snapshots"""
+    ).fetchone()
+    settled = {r["ticker"] for r in rows if r["outcome"] is not None}
+    settled_with_preopen = 0
+    if settled:
+        for (ticker,) in db.execute(
+            "SELECT DISTINCT ticker FROM opening_quote_snapshots WHERE seconds_from_open<=0 AND mode=?", (MODE,)
+        ):
+            settled_with_preopen += ticker in settled
+    first_opening = rows[0]["opens_at"].isoformat() if rows else None
+    return {
+        "table_present": True, "rows": total, "distinct_tickers": tickers,
+        "first_observed_at": first, "last_observed_at": last,
+        "rows_at_or_before_open": preopen or 0,
+        "two_sided_rows_at_or_before_open": preopen_two_sided or 0,
+        "modes": modes, "settled_openings_with_preopen_quote": settled_with_preopen,
+        "first_recorded_opening": first_opening,
+        "reading": (
+            "No quote was recorded at or before any opening; only post-open quotes exist."
+            if total and not preopen else
+            "Quote capture began after the settled history; coverage grows from first_observed_at."
+            if total else "Table exists but is empty."
+        ),
+    }
+
+
+def daily_breakdown(rows):
+    """Per-UTC-day counts that show when displayed calls stopped or started."""
+    days = {}
+    for r in rows:
+        day = days.setdefault(r["opens_at"].date().isoformat(), {
+            "openings": 0, "settled": 0, "displayed_calls": 0, "correct": 0,
+            "models": {}, "confidence_status": {}, "directions": {}})
+        day["openings"] += 1
+        day["settled"] += r["outcome"] is not None
+        if r["outcome"] is not None and displayed(r):
+            day["displayed_calls"] += 1
+            day["correct"] += (r["direction"] == "UP") == bool(r["outcome"])
+        for key, value in (("models", r["model"]), ("confidence_status", str(r["confidence_status"])),
+                           ("directions", str(r["direction"]))):
+            day[key][value] = day[key].get(value, 0) + 1
+    return dict(sorted(days.items()))
+
+
+def no_call_reasons(rows):
+    """Why settled openings were not displayed calls, one reason each."""
+    reasons = {}
+    for r in rows:
+        if displayed(r):
+            continue
+        if r["up"] is None:
+            reason = "NO_PROBABILITY_RECORDED"
+        elif r["direction"] not in {"UP", "DOWN"}:
+            reason = f"DIRECTION_{r['direction']}"
+        elif r["confidence_status"] not in DISPLAYABLE_CONFIDENCE:
+            reason = f"CONFIDENCE_{r['confidence_status']}"
+        else:
+            reason = "DIRECTION_CONTRADICTS_PROBABILITY"
+        reasons[reason] = reasons.get(reason, 0) + 1
+    confidences = sorted(max(r["up"], 1 - r["up"]) for r in rows if r["up"] is not None)
+    return {
+        "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+        "max_confidence": confidences[-1] if confidences else None,
+        "median_confidence": confidences[len(confidences) // 2] if confidences else None,
+        "thresholds_seen": _count(str(r["threshold"]) for r in rows),
+        "models_seen": _count(r["model"] for r in rows),
+    }
+
+
 def integrity_checks(db, rows, asof):
     """Adversarial re-checks of the audit's own inputs. Any non-zero count is a
     reason to distrust the affected rows; none are silently repaired."""
@@ -547,6 +627,8 @@ def audit(db, asof=None):
         "activation_allowed": False,
         "journal_audit": journal_audit(db, rows, problems, asof),
         "integrity_checks": integrity_checks(db, rows, asof),
+        "quote_snapshot_coverage": quote_snapshot_coverage(db, rows),
+        "daily_breakdown": daily_breakdown(rows),
         "sealed_holdout": seal,
         "all_settled": {
             "displayed_accuracy": displayed_accuracy(settled),
@@ -555,10 +637,12 @@ def audit(db, asof=None):
             "hypothetical_pnl": hypothetical_pnl(db, [r for r in settled if displayed(r)]),
         },
         "development": {
+            "no_call_reasons": no_call_reasons(development),
             "displayed_accuracy": displayed_accuracy(development),
             "calibration": calibration(development),
         },
         "holdout": {
+            "no_call_reasons": no_call_reasons(holdout),
             "displayed_accuracy": displayed_accuracy(holdout),
             "calibration": calibration(holdout),
             "versus_market": versus_market(holdout, history),
@@ -602,6 +686,11 @@ def summary_lines(report):
     lines.append(f"PNL priced={p['priced_calls']} excluded={p['excluded_no_executable_ask']} "
                  f"mean={fmt(p.get('mean_net_pnl_per_contract'))} total={fmt(p.get('total_net_pnl'))} "
                  f"boot95={p.get('day_block_bootstrap_95')} breakeven={fmt(p.get('break_even_hit_rate'))}")
+    q = report.get("quote_snapshot_coverage") or {}
+    lines.append(f"QUOTES table={q.get('table_present')} rows={q.get('rows')} preopen_rows={q.get('rows_at_or_before_open')} "
+                 f"first={q.get('first_observed_at')} settled_with_preopen={q.get('settled_openings_with_preopen_quote')}")
+    lines.append(f"HOLDOUT_NO_CALL {report['holdout']['no_call_reasons']['reasons']} "
+                 f"models={report['holdout']['no_call_reasons']['models_seen']}")
     h = report["holdout"]["displayed_accuracy"]
     lines.append(f"SEALED_HOLDOUT n={report['sealed_holdout']['holdout_contracts']} from={report['sealed_holdout']['holdout_starts_at']} "
                  f"calls={h['displayed_calls']} accuracy={fmt(h['accuracy'])} wilson95={h['accuracy_wilson_95']}")

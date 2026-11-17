@@ -73,6 +73,58 @@ def test_recorded_metrics_score_only_actual_displayed_directional_calls():
     assert metrics["invalid_direction_records"] == 1
 
 
+def test_research_rejects_invalid_probabilities_and_failure_list_matches_displayed_calls(monkeypatch):
+    rows = _augment(synthetic.opening_rows(120, seed=109))
+    rows[0].update(recorded_up=float("nan"), recorded_direction="UP",
+                   recorded_confidence_status="CALIBRATED")
+    rows[1].update(recorded_up=1.2, recorded_direction="UP",
+                   recorded_confidence_status="CALIBRATED")
+    rows[2].update(recorded_up=0.9, recorded_direction="UP",
+                   recorded_confidence_status="NO VERIFIED EDGE", outcome=0)
+    report = research.research(rows)
+    live = report["recorded_live_openings"]
+    assert live["invalid_probability_records"] == 2
+    assert all(item["ticker"] != rows[2]["ticker"] for item in live["failed_calls"])
+    assert live["all_recorded_probability_scores"]["samples"] == 118
+
+
+def test_intelligence_inventory_separates_defined_observed_and_model_active_features():
+    rows = _augment(synthetic.opening_rows(120, seed=110))
+    inventory = research.intelligence_inventory(rows)
+    assert inventory["defined_feature_vocabulary"] > 87
+    assert inventory["requested_87_feature_assumption_matches_code"] is False
+    assert inventory["families"]["compact_price_momentum"]["features_observed_at_least_once"] > 0
+    assert inventory["families"]["classic_technicals"]["status"] == "DEFINED_BUT_NOT_OBSERVED"
+    assert inventory["research_candidates"]["compact_plus_technicals"]["incremental_family_active"] is False
+    assert inventory["research_candidates"]["compact_plus_flow"]["incremental_family_active"] is True
+    assert inventory["runtime_artifact_feature_weights"] == "NOT_VERIFIABLE_FROM_HISTORICAL_ROWS"
+
+
+def test_sparse_feature_family_is_not_mislabeled_as_an_ablation(monkeypatch):
+    rows = _augment(synthetic.opening_rows(260, seed=111, signal=0.4))
+
+    def fake_walk(ordered, **_kwargs):
+        eligible = ordered[research.WALK_START:]
+        return {
+            name: {row["ticker"]: row["baseline"] for row in eligible}
+            for name in research.MODELS
+        }, 1
+
+    monkeypatch.setattr(research, "walk_forward", fake_walk)
+    report = research.research(rows)
+    assert report["inactive_research_candidates"]["compact_plus_technicals"] == (
+        "INSUFFICIENT_INCREMENTAL_FEATURE_COVERAGE"
+    )
+    assert "compact_plus_technicals" not in report["model_comparison"]
+    assert "compact_plus_technicals" not in report["incremental_value_vs_compact"]
+
+
+def test_research_candidate_family_is_pre_registered_and_bounded():
+    assert len(research.MODELS) <= 6
+    assert "compact_plus_preopen_market" not in research.MODELS
+    assert "kalshi_preopen_mid_as_of_call" not in research.MODELS
+
+
 def _journal(path, called_at):
     with sqlite3.connect(path) as db:
         db.execute("CREATE TABLE predictions (id INTEGER PRIMARY KEY, ticker TEXT, mode TEXT, timestamp TEXT, payload TEXT)")

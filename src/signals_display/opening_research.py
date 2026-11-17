@@ -62,15 +62,22 @@ FEATURE_GROUPS = {
     "trend_ema_volume_acceleration": TREND,
     "kalshi_preopen_market": ("kalshi_preopen_mid_logit",),
 }
+# Six pre-registered candidates, matching the research plan's family limit.
+# Market price and regime remain named baselines/conditions rather than extra
+# fitted candidates; adding them as models would silently expand the multiple-
+# testing family after seeing results.
 MODELS = {
     "compact_offset": dict(features=rigor.COMPACT_FEATURES, offset=True),
     "compact_plus_technicals": dict(features=rigor.COMPACT_FEATURES + TECHNICALS, offset=True),
     "compact_plus_flow": dict(features=rigor.COMPACT_FEATURES + FLOW, offset=True),
     "compact_plus_candles": dict(features=rigor.COMPACT_FEATURES + CANDLES, offset=True),
-    "regime_aware_compact": dict(features=rigor.COMPACT_FEATURES + ("regime_rising", "regime_falling"), offset=True),
     "compact_plus_trend": dict(features=rigor.COMPACT_FEATURES + TREND, offset=True),
-    "compact_plus_preopen_market": dict(features=rigor.COMPACT_FEATURES + ("kalshi_preopen_mid_logit",), offset=True),
     "boosted_stumps": dict(features=rigor.COMPACT_FEATURES + TECHNICALS, boost=True),
+}
+
+MODEL_INCREMENTAL_FEATURES = {
+    name: tuple(feature for feature in spec["features"] if feature not in rigor.COMPACT_FEATURES)
+    for name, spec in MODELS.items()
 }
 
 
@@ -386,6 +393,79 @@ def recorded_decision_metrics(rows):
     return {**call_metrics(pairs), "wait_or_withheld": waits, "invalid_direction_records": invalid}
 
 
+def intelligence_inventory(rows):
+    """Separate code vocabulary, observed inputs and research-model inputs.
+
+    A feature being defined in ``FEATURES`` does not mean that a frozen opening
+    contained it, that a preprocessor retained it, or that a fitted coefficient
+    was non-zero. This report prevents the dashboard/research language from
+    treating those four states as equivalent.
+    """
+    from .features import FEATURES, OPENING_CANDLE_FEATURES, OPENING_TREND_FEATURES
+
+    def available(row, name):
+        value = row.get("features", {}).get(name)
+        return type(value) in (int, float) and math.isfinite(value)
+
+    families = {
+        "compact_price_momentum": tuple(rigor.COMPACT_FEATURES),
+        "classic_technicals": TECHNICALS,
+        "order_flow_cvd_book": FLOW + ("spot_depth_imbalance",),
+        "multi_hour_candlestick": tuple(OPENING_CANDLE_FEATURES),
+        "opening_trend_volume": tuple(OPENING_TREND_FEATURES),
+        "microstructure_windows": tuple(name for name in FEATURES if name.startswith("micro_")),
+        "advanced_indicators_and_flow": tuple(name for name in FEATURES if name.startswith("advanced_")),
+        "adaptive_momentum": tuple(name for name in FEATURES if name.startswith("adaptive_")),
+    }
+    family_report = {}
+    for family, names in families.items():
+        counts = {
+            name: sum(available(row, name) for row in rows)
+            for name in names
+        }
+        available_names = [name for name, count in counts.items() if count]
+        half = [name for name, count in counts.items() if count >= len(rows) / 2] if rows else []
+        family_report[family] = {
+            "defined_features": len(names),
+            "features_observed_at_least_once": len(available_names),
+            "features_eligible_for_half_coverage_preprocessor": len(half),
+            "contracts_with_any_feature": sum(
+                any(available(row, name) for name in names)
+                for row in rows
+            ),
+            "minimum_feature_observations": min(counts.values()) if counts else 0,
+            "maximum_feature_observations": max(counts.values()) if counts else 0,
+            "status": "OBSERVED" if available_names else "DEFINED_BUT_NOT_OBSERVED",
+        }
+    candidates = {}
+    for name, spec in MODELS.items():
+        incremental = MODEL_INCREMENTAL_FEATURES[name]
+        retained = [
+            feature for feature in incremental
+            if rows and sum(available(row, feature) for row in rows)
+            >= len(rows) / 2
+        ]
+        candidates[name] = {
+            "algorithm": "gradient_boosted_stumps" if spec.get("boost") else "logistic_offset",
+            "configured_features": len(spec["features"]),
+            "incremental_features": list(incremental),
+            "incremental_features_with_half_coverage": retained,
+            "incremental_family_active": not incremental or bool(retained),
+        }
+    return {
+        "defined_feature_vocabulary": len(FEATURES),
+        "requested_87_feature_assumption_matches_code": len(FEATURES) == 87,
+        "warning": (
+            f"Current code defines {len(FEATURES)} candidate names, not 87. "
+            "Only receipt-proven values retained by a fold-local preprocessor can influence a fitted model."
+        ),
+        "eligible_frozen_openings": len(rows),
+        "families": family_report,
+        "research_candidates": candidates,
+        "runtime_artifact_feature_weights": "NOT_VERIFIABLE_FROM_HISTORICAL_ROWS",
+    }
+
+
 def _choose_threshold(probabilities, rows):
     """Development-only choice: best mean net P&L with enough priced calls."""
     best = None
@@ -443,10 +523,15 @@ def research(rows, progress=None):
         "eligible_opening_contracts": len(rows),
         "costs": {"slippage_per_contract": SLIPPAGE, "fees": "Kalshi taker fee formula", "quote": f"first non-stale executable ask within {QUOTE_WINDOW_SECONDS}s after the opening call"},
     }
-    recorded = [r for r in rows if type(r.get("recorded_up")) in (int, float)]
+    numeric_recorded = [r for r in rows if type(r.get("recorded_up")) in (int, float)]
+    recorded = [
+        r for r in numeric_recorded
+        if math.isfinite(r["recorded_up"]) and 0 <= r["recorded_up"] <= 1
+    ]
     confidences = sorted(abs(r["recorded_up"] - 0.5) for r in recorded)
     report["recorded_live_openings"] = {
         "contracts": len(recorded),
+        "invalid_probability_records": len(numeric_recorded) - len(recorded),
         "by_model": _count(r["recorded_model"] for r in recorded),
         "decision_thresholds_seen": _count(str(r["recorded_threshold"]) for r in recorded),
         "confidence_status_seen": _count(str(r["recorded_confidence_status"]) for r in recorded),
@@ -455,12 +540,24 @@ def research(rows, progress=None):
         "share_at_or_above_55": sum(c >= 0.05 for c in confidences) / len(confidences) if confidences else None,
         "saved_calls": _count(str(r["recorded_direction"]) for r in recorded),
         "actual_displayed_decisions": recorded_decision_metrics(recorded),
+        "all_recorded_probability_scores": (
+            score([r["recorded_up"] for r in recorded], [r["outcome"] for r in recorded])
+            if recorded else {}
+        ),
+        "confidence_bands": rigor.confidence_band_report(
+            [r["recorded_up"] for r in recorded], recorded
+        ),
         "threshold_table_scope": "Counterfactual probability cutoffs; not historical displayed calls",
         "threshold_table": threshold_table([r["recorded_up"] for r in recorded], recorded),
     }
     report["conditions_exploratory"] = condition_report(rows)
-    failures = [r for r in recorded if r.get("recorded_direction") in {"UP", "DOWN"}
-                and (r["recorded_direction"] == "UP") != bool(r["outcome"])]
+    failures = [
+        r for r in recorded
+        if r.get("recorded_direction") in {"UP", "DOWN"}
+        and r.get("recorded_confidence_status") in DISPLAYABLE_RECORDED_CONFIDENCE
+        and (r["recorded_direction"] == "UP") == (r["recorded_up"] >= 0.5)
+        and (r["recorded_direction"] == "UP") != bool(r["outcome"])
+    ]
     report["recorded_live_openings"]["failed_calls"] = [
         {"ticker": r["ticker"], "direction": r["recorded_direction"],
          "confidence": max(r["recorded_up"], 1 - r["recorded_up"]), "regime": r.get("regime"),
@@ -471,7 +568,22 @@ def research(rows, progress=None):
         group: {name: sum(r["features"].get(name) is not None for r in rows) / len(rows) if rows else 0 for name in names}
         for group, names in FEATURE_GROUPS.items()
     }
+    report["ai_intelligence_inventory"] = intelligence_inventory(rows)
     predictions, folds = walk_forward(rows, progress=progress)
+    inactive_candidates = {
+        name
+        for name, evidence in report["ai_intelligence_inventory"]["research_candidates"].items()
+        if not evidence["incremental_family_active"]
+    }
+    # A sparse family can otherwise silently collapse to the compact model and
+    # be reported as evidence for indicators it never used. Preserve the base,
+    # but withhold mislabeled family comparisons until inputs have coverage.
+    for name in inactive_candidates:
+        predictions[name] = {}
+    report["inactive_research_candidates"] = {
+        name: "INSUFFICIENT_INCREMENTAL_FEATURE_COVERAGE"
+        for name in sorted(inactive_candidates)
+    }
     report["walk_forward_folds"] = folds
     oos = [r for r in rows if all(r["ticker"] in predictions[name] for name in ("compact_offset",))]
     report["out_of_sample_contracts"] = len(oos)
@@ -524,8 +636,8 @@ def research(rows, progress=None):
     report["model_comparison"] = comparison
     ablation = {}
     reference = predictions.get("compact_offset", {})
-    for name in ("compact_plus_technicals", "compact_plus_flow", "compact_plus_candles", "regime_aware_compact",
-                 "compact_plus_trend", "compact_plus_preopen_market"):
+    for name in ("compact_plus_technicals", "compact_plus_flow", "compact_plus_candles",
+                 "compact_plus_trend"):
         common = [r for r in oos if r["ticker"] in reference and r["ticker"] in predictions.get(name, {})]
         if common:
             ablation[name] = rigor.paired_superiority_test(

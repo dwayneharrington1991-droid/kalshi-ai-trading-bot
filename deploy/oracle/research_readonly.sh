@@ -112,6 +112,19 @@ if path:
         test_baseline=(report.get("test") or {}).get("opening_statistical_baseline", {}),
         selective_test_at_threshold=selective.get("test"),
     )
+    # The inputs the trained model actually uses: the component preprocessors.
+    model = data.get("model") or {}
+    components = model.get("components") or [model]
+    used = sorted({name for part in components
+                   for name in ((part.get("preprocessor") or {}).get("names") or [])})
+    summary["model_input_features"] = used
+    summary["model_input_feature_count"] = len(used)
+    summary["model_components"] = [
+        {"kind": part.get("kind"), "feature_set": part.get("feature_set"),
+         "features": len((part.get("preprocessor") or {}).get("names") or [])}
+        for part in components
+    ]
+    summary["mixture_weights"] = model.get("mixture_weights")
     for key in ("test_selected", "test_baseline"):
         summary[key] = {k: summary[key].get(k) for k in ("samples", "accuracy", "brier", "log_loss")}
     test = summary.get("selective_test_at_threshold") or {}

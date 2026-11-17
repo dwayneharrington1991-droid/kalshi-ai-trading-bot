@@ -227,8 +227,9 @@ def test_intracontract_rows_carry_same_time_quotes_and_are_researched_per_bucket
         r.update(executable_quotes={"up": {"ask": 0.55}, "down": {"ask": 0.47}}, fee_multiplier=None,
                  market=0.53)
         rows.append(r)
-    class DB:  # learning.dataset stand-in
-        pass
+    class DB:  # learning.dataset stand-in with a predictions table present
+        def execute(self, _sql):
+            return [("predictions",)]
     original = research.learning.dataset
     research.learning.dataset = lambda db, asof: rows
     try:
@@ -320,3 +321,20 @@ def test_condition_report_is_descriptive_with_intervals():
     assert report["return_15m"]["low"]["contracts"] == 80
     assert len(report["return_15m"]["high"]["up_rate_wilson_95"]) == 2
     assert "Exploratory" in report["note"]
+
+
+def test_optional_sections_never_abort_the_opening_research(tmp_path):
+    journal = tmp_path / "minimal.db"
+    with sqlite3.connect(journal) as db:  # no predictions / candles tables
+        db.execute("CREATE TABLE forecast_outcomes (ticker TEXT,origin TEXT,observed_at TEXT,outcome INTEGER)")
+        db.execute("CREATE TABLE btc_engine_opening (mode TEXT,ticker TEXT,generated_at TEXT,cutoff TEXT,"
+                   "closes_at TEXT,up REAL,status TEXT,payload TEXT)")
+    output = tmp_path / "report.json"
+    result = subprocess.run(
+        [sys.executable, "-m", "src.signals_display.opening_research", "--journal", str(journal),
+         "--output", str(output), "--intracontract", "--retrospective"],
+        cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text())
+    assert report["intracontract"] == {}
+    assert report["retrospective_candle_only"]["reconstruction"]["status"] == "UNAVAILABLE"

@@ -665,6 +665,9 @@ def live_rows(db, asof=None):
     """
     from .scores import horizon
 
+    tables = {name for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "predictions" not in tables:
+        return {}
     buckets = {}
     for row in learning.dataset(db, asof or datetime.now(timezone.utc)):
         quotes = row.get("executable_quotes") or {}
@@ -741,19 +744,31 @@ def main():
         rigor._refuse_foreign_file(args.output, REPORT_FORMAT)
         with closing(sqlite3.connect(args.journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             rows = load(db)
-            buckets = live_rows(db) if args.intracontract else None
-            retro, retro_info = (
-                retrospective_rows(db, {r["ticker"] for r in rows}) if args.retrospective else ([], None)
-            )
+            section_errors = {}
+            buckets = None
+            if args.intracontract:
+                try:
+                    buckets = live_rows(db)
+                except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+                    section_errors["intracontract"] = type(exc).__name__ + ": " + str(exc)[:200]
+            retro, retro_info = [], None
+            if args.retrospective:
+                try:
+                    retro, retro_info = retrospective_rows(db, {r["ticker"] for r in rows})
+                except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+                    section_errors["retrospective"] = type(exc).__name__ + ": " + str(exc)[:200]
             if args.retrospective:
                 has_snapshots = db.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='opening_quote_snapshots'"
                 ).fetchone()
                 for row in retro:  # executable quotes after the opening, for costs only
                     row["quote"] = (_snapshot_quote_at(db, row) if has_snapshots else None) or _quote_at(db, row)
+        if section_errors:
+            print(f"Optional research sections unavailable: {section_errors}", flush=True)
         progress = lambda m: print("RESEARCH_PROGRESS " + m, flush=True)
         print(f"Loaded {len(rows)} eligible frozen openings (read-only)", flush=True)
         report = research(rows, progress=progress)
+        report["optional_section_errors"] = section_errors
         if args.retrospective:
             print(f"Retrospective candle-only reconstruction: {retro_info}", flush=True)
             report["retrospective_candle_only"] = {"reconstruction": retro_info, **research(retro, progress=progress)}

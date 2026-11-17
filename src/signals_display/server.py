@@ -496,9 +496,15 @@ class Monitor:
         delayed opening forecast can still use genuinely as-of-opening flow.
         Bounded and in memory: after a restart these features stay unavailable.
         """
-        flow = ((payload or {}).get("coverage", {}).get("Kraken public order flow", {}) or {}).get("data") or {}
+        coverage = (payload or {}).get("coverage") or {}
+        entry = coverage.get("Kraken public order flow") if isinstance(coverage, dict) else None
+        flow = (entry.get("data") if isinstance(entry, dict) else None) or {}
+        if not isinstance(flow, dict):
+            flow = {}
         retained = {}
-        for market in (payload or {}).get("markets", []):
+        for market in (payload or {}).get("markets", []) or []:
+            if not isinstance(market, dict):
+                continue
             try:
                 ticker = market["ticker"]
                 opened = timestamp(market["opens_at"])
@@ -510,7 +516,9 @@ class Monitor:
                 continue
             if now <= opened + timedelta(seconds=5):
                 for key in ("spot", "perpetual", "spot_book"):
-                    item = flow.get(key) or {}
+                    item = flow.get(key)
+                    if not isinstance(item, dict):
+                        continue
                     try:
                         observed = timestamp(item["observed_at"])
                     except (KeyError, ValueError, TypeError, AttributeError):
@@ -569,14 +577,19 @@ class Monitor:
             # threshold metadata or model generation arrives later.
             mode = payload.get("mode", "PUBLIC MARKET DATA")
             self.remember_preopening_histories(payload, now)
-            self.remember_preopening_flow(payload, now)
+            # Optional evidence capture. A failure here is recorded but must never
+            # turn the tick into a market-data failure (stale state -> /readyz 503).
+            try:
+                self.remember_preopening_flow(payload, now)
+            except Exception as exc:
+                self.runtime_meter.error("preopening_flow_capture", type(exc).__name__)
             # Every listed market: the next contract's pre-open book and the new
             # contract's first two minutes (the recorder enforces the window).
             for listed in payload.get("markets", []) or ([market_now] if market_now else []):
                 try:
                     self.journal.record_opening_quote(listed, mode, now)
-                except sqlite3.OperationalError as exc:
-                    self.runtime_meter.error("opening_quote_storage", type(exc).__name__)
+                except Exception as exc:
+                    self.runtime_meter.error("opening_quote_capture", type(exc).__name__)
                     break
             for discovered in payload.get("markets", []):
                 try:
@@ -892,125 +905,139 @@ class Monitor:
                 self.runtime_meter.error("opening_storage", type(exc).__name__)
                 prior = None
             opening = None
-            if state.get("market") and self.models_enabled:
-                m = state["market"]
-                try:
-                    opening = self.journal.opening_record(m["ticker"], state["mode"])
-                except sqlite3.OperationalError as exc:
-                    self.runtime_meter.error("opening_storage", type(exc).__name__)
-                    opening = {
-                        "status": "UNAVAILABLE",
-                        "direction": "WAIT",
-                        "up": None,
-                        "down": None,
-                        "reason": (
-                            "OPENING_STORAGE_UNAVAILABLE: immutable journal is busy; "
-                            "no opening call will be inferred or rewritten"
-                        ),
-                    }
-                if (
-                    opening is None
-                    and m.get("strike") is not None
-                    and m.get("mapping_verified")
-                    and m.get("averaging_rule_verified")
-                    and m.get("comparison_operator") == ">="
-                ):
-                    opened = timestamp(m["opens_at"])
-                    snapshot = self.journal.opening_snapshot(m["ticker"], state["mode"])
-                    if snapshot:
-                        frozen = snapshot.get("history", {})
-                        frozen_points = [
-                            (timestamp(point[0]), point[1])
-                            for point in snapshot.get("reference_points", [])
-                        ]
-                        frozen_source = snapshot.get("reference_source")
-                    else:
-                        raw_history = payload.get("btc_candles", {})
-                        try:
-                            eligible = timestamp(raw_history["received_at"]) <= opened
-                        except (KeyError, ValueError, TypeError, AttributeError):
-                            eligible = False
-                        frozen = raw_history if eligible else self.journal.opening_inputs(opened)
-                        frozen_points, frozen_source = self.estimator.opening_points(opened)
-                    generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
-                    candidate = opening_forecast(
-                        m,
-                        frozen,
-                        frozen_points,
-                        generated,
-                        reference_source=frozen_source,
-                        audit_context={
-                            "official_contracts": self.readiness.get("official_contracts"),
-                            "minimum_contracts": self.readiness.get("minimum_contracts", 170),
-                            "artifact_status": self.opening_artifact_status,
-                            "live_model": self.artifact.get("model", {}).get("kind")
-                            if self.artifact
-                            else "experimental statistical fallback",
-                            "live_ensemble_active": bool(
-                                self.artifact
-                                and self.artifact.get("model", {}).get("kind") == "ensemble"
+            try:
+                if state.get("market") and self.models_enabled:
+                    m = state["market"]
+                    try:
+                        opening = self.journal.opening_record(m["ticker"], state["mode"])
+                    except sqlite3.OperationalError as exc:
+                        self.runtime_meter.error("opening_storage", type(exc).__name__)
+                        opening = {
+                            "status": "UNAVAILABLE",
+                            "direction": "WAIT",
+                            "up": None,
+                            "down": None,
+                            "reason": (
+                                "OPENING_STORAGE_UNAVAILABLE: immutable journal is busy; "
+                                "no opening call will be inferred or rewritten"
                             ),
-                            "opening_candidate_status": self.opening_artifact_status,
-                            # The fallback quality guard judges the fallback on
-                            # its own probability-implied record only.
-                            "opening_forward_accuracy": self.readiness.get(
-                                "opening_fallback_forward_accuracy",
-                                self.readiness.get("opening_forward_accuracy", {}),
-                            ),
-                        },
-                        frozen_context={
-                            **self.intelligence.summarize(
-                                opened, candles=frozen, primary_source=primary
-                            ),
-                            "primary_source": primary,
-                            "order_flow": self.preopening_flow.get(m["ticker"]),
-                            "advanced_features": self.advanced.summarize(
-                                opened,
-                                candles=frozen,
-                                primary_source=primary,
-                                threshold=m["strike"],
-                            ),
-                        },
-                        candidate_artifact=self.opening_artifact,
-                    )
-                    if state["mode"] == "PUBLIC MARKET DATA":
-                        generated = utcnow()
-                        candidate["timestamp"] = candidate["generated_at"] = generated.isoformat()
-                        candidate["opening_delay_seconds"] = max(
-                            0, (generated - opened).total_seconds()
-                        )
-                        if candidate.get("up") is not None:
-                            candidate["status"] = "DELAYED" if generated > opened else "ON_TIME"
-                    candidate["closes_at"] = m["closes_at"]
-                    # Keep retrying briefly when asynchronous history/reference
-                    # delivery straddles rollover. Inputs remain cut off at the
-                    # opening instant; later observations can never be backfilled.
-                    retry_until = opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
-                    if candidate.get("up") is not None or generated >= retry_until:
-                        try:
-                            opening = self.journal.opening_record(
-                                m["ticker"], state["mode"], candidate, generated
-                            )
-                        except sqlite3.OperationalError as exc:
-                            self.runtime_meter.error("opening_storage", type(exc).__name__)
-                            opening = {
-                                "status": "UNAVAILABLE",
-                                "direction": "WAIT",
-                                "up": None,
-                                "down": None,
-                                "reason": (
-                                    "OPENING_STORAGE_UNAVAILABLE: immutable journal is busy; "
-                                    "no opening call will be inferred or rewritten"
+                        }
+                    if (
+                        opening is None
+                        and m.get("strike") is not None
+                        and m.get("mapping_verified")
+                        and m.get("averaging_rule_verified")
+                        and m.get("comparison_operator") == ">="
+                    ):
+                        opened = timestamp(m["opens_at"])
+                        snapshot = self.journal.opening_snapshot(m["ticker"], state["mode"])
+                        if snapshot:
+                            frozen = snapshot.get("history", {})
+                            frozen_points = [
+                                (timestamp(point[0]), point[1])
+                                for point in snapshot.get("reference_points", [])
+                            ]
+                            frozen_source = snapshot.get("reference_source")
+                        else:
+                            raw_history = payload.get("btc_candles", {})
+                            try:
+                                eligible = timestamp(raw_history["received_at"]) <= opened
+                            except (KeyError, ValueError, TypeError, AttributeError):
+                                eligible = False
+                            frozen = raw_history if eligible else self.journal.opening_inputs(opened)
+                            frozen_points, frozen_source = self.estimator.opening_points(opened)
+                        generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+                        candidate = opening_forecast(
+                            m,
+                            frozen,
+                            frozen_points,
+                            generated,
+                            reference_source=frozen_source,
+                            audit_context={
+                                "official_contracts": self.readiness.get("official_contracts"),
+                                "minimum_contracts": self.readiness.get("minimum_contracts", 170),
+                                "artifact_status": self.opening_artifact_status,
+                                "live_model": self.artifact.get("model", {}).get("kind")
+                                if self.artifact
+                                else "experimental statistical fallback",
+                                "live_ensemble_active": bool(
+                                    self.artifact
+                                    and self.artifact.get("model", {}).get("kind") == "ensemble"
                                 ),
-                            }
-                    else:
-                        candidate["status"] = "WARMING UP"
-                        candidate["reason"] += (
-                            "; retrying receipt-proven pre-opening inputs while the bounded "
-                            f"{OPENING_INPUT_GRACE_SECONDS}-second rollover window remains open"
+                                "opening_candidate_status": self.opening_artifact_status,
+                                # The fallback quality guard judges the fallback on
+                                # its own probability-implied record only.
+                                "opening_forward_accuracy": self.readiness.get(
+                                    "opening_fallback_forward_accuracy",
+                                    self.readiness.get("opening_forward_accuracy", {}),
+                                ),
+                            },
+                            frozen_context={
+                                **self.intelligence.summarize(
+                                    opened, candles=frozen, primary_source=primary
+                                ),
+                                "primary_source": primary,
+                                "order_flow": self.preopening_flow.get(m["ticker"]),
+                                "advanced_features": self.advanced.summarize(
+                                    opened,
+                                    candles=frozen,
+                                    primary_source=primary,
+                                    threshold=m["strike"],
+                                ),
+                            },
+                            candidate_artifact=self.opening_artifact,
                         )
-                        candidate["retry_until"] = retry_until.isoformat()
-                        opening = candidate
+                        if state["mode"] == "PUBLIC MARKET DATA":
+                            generated = utcnow()
+                            candidate["timestamp"] = candidate["generated_at"] = generated.isoformat()
+                            candidate["opening_delay_seconds"] = max(
+                                0, (generated - opened).total_seconds()
+                            )
+                            if candidate.get("up") is not None:
+                                candidate["status"] = "DELAYED" if generated > opened else "ON_TIME"
+                        candidate["closes_at"] = m["closes_at"]
+                        # Keep retrying briefly when asynchronous history/reference
+                        # delivery straddles rollover. Inputs remain cut off at the
+                        # opening instant; later observations can never be backfilled.
+                        retry_until = opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
+                        if candidate.get("up") is not None or generated >= retry_until:
+                            try:
+                                opening = self.journal.opening_record(
+                                    m["ticker"], state["mode"], candidate, generated
+                                )
+                            except sqlite3.OperationalError as exc:
+                                self.runtime_meter.error("opening_storage", type(exc).__name__)
+                                opening = {
+                                    "status": "UNAVAILABLE",
+                                    "direction": "WAIT",
+                                    "up": None,
+                                    "down": None,
+                                    "reason": (
+                                        "OPENING_STORAGE_UNAVAILABLE: immutable journal is busy; "
+                                        "no opening call will be inferred or rewritten"
+                                    ),
+                                }
+                        else:
+                            candidate["status"] = "WARMING UP"
+                            candidate["reason"] += (
+                                "; retrying receipt-proven pre-opening inputs while the bounded "
+                                f"{OPENING_INPUT_GRACE_SECONDS}-second rollover window remains open"
+                            )
+                            candidate["retry_until"] = retry_until.isoformat()
+                            opening = candidate
+            except Exception as exc:
+                # The immutable opening is optional for market readiness. An
+                # unexpected error is recorded and the opening is shown as
+                # unavailable (WAIT, no confidence) instead of failing every tick
+                # for the whole contract, which made the state stale (/readyz 503).
+                self.runtime_meter.error("opening_generation", type(exc).__name__)
+                opening = {
+                    "status": "UNAVAILABLE",
+                    "up": None,
+                    "direction": "WAIT",
+                    "reason": "OPENING_GENERATION_ERROR: " + type(exc).__name__
+                    + "; no opening call is shown and no probability is invented",
+                }
             state["prediction_engine"] = engine_view(
                 state, prior, opening, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
             )

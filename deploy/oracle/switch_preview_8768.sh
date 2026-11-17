@@ -14,6 +14,7 @@ readonly MIN_FREE_BYTES=$((10 * 1024 * 1024 * 1024))
 readonly STATE_ROOT=/home/opc/.kalshi-deploy/preview-8768
 readonly LOG_PATH="$OLD_ROOT/logs/preview-8768-${TARGET:0:7}.log"
 readonly OPENING_ARTIFACT=${PREVIEW_OPENING_MODEL_ARTIFACT:-}
+readonly READY_TIMEOUT=${PREVIEW_READY_TIMEOUT_SECONDS:-600}
 
 old_pid=
 new_pid=
@@ -77,6 +78,54 @@ process_has_environment() {
   tr '\0' '\n' <"/proc/$pid/environ" | grep -Fx -- "$expected" >/dev/null
 }
 
+readiness_report() {
+  # Prints one line per endpoint and exits 0 only when every condition holds.
+  "$PYTHON" - "$1" "${PREVIEW_PROBE_PORT:-8768}" <<'PY'
+import json, sys
+from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, build_opener
+opener = build_opener(ProxyHandler({}))
+target, port = sys.argv[1], sys.argv[2]
+results, failures = {}, []
+for path in ("/healthz", "/readyz", "/api/candle-integrity", "/api/state?view=main"):
+    try:
+        with opener.open(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
+            results[path] = (response.status, json.load(response))
+    except HTTPError as exc:
+        try:
+            body = json.load(exc)
+        except Exception:
+            body = {}
+        results[path] = (exc.code, body)
+    except (URLError, OSError, ValueError) as exc:
+        results[path] = (None, {"error": type(exc).__name__})
+for path, (code, body) in results.items():
+    if path != "/api/state?view=main":
+        print(f"{path} HTTP {code} " + json.dumps(body, sort_keys=True, default=str)[:600])
+h = results["/healthz"][1]; r = results["/readyz"][1]
+c = results["/api/candle-integrity"][1]; s = results["/api/state?view=main"][1]
+def check(ok, reason):
+    if not ok:
+        failures.append(reason)
+check(results["/healthz"][0] == 200 and h.get("status")=="HEALTHY" and h.get("build_commit")==target, "healthz not HEALTHY for target build")
+check(h.get("signals_only") is True and (h.get("workers") or {}).get("healthy") is True, "workers unhealthy or not signals-only")
+check(results["/readyz"][0] == 200 and r.get("status")=="READY" and r.get("signals_only") is True, "readyz not READY")
+check(r.get("contract_quotes_fresh") is True and r.get("reference_fresh") is True, "contract quotes or reference not fresh")
+if c.get("status") == "READY":
+    check(c.get("bars")==1440 and c.get("unique_bars")==1440 and not c.get("missing_intervals") and not c.get("duplicate_bars"), "candle integrity inconsistent")
+else:
+    opening = (s.get("prediction_engine") or {}).get("initial") or {}
+    check(c.get("status")=="INCOMPLETE" and bool(c.get("missing_intervals")) and opening.get("up") is None
+          and opening.get("direction") in {"WAIT", "UNCLEAR"}, "candle window incomplete without a withheld opening")
+check(results["/api/candle-integrity"][0] == 200 and results["/api/state?view=main"][0] == 200, "candle-integrity or state endpoint not HTTP 200")
+check((s.get("decision_intelligence") or {}).get("execution_capability") is False, "execution capability not disabled")
+print("READINESS " + ("PASS" if not failures else "FAIL: " + "; ".join(failures)))
+print(json.dumps({"health": h.get("status"), "ready": r.get("status"), "candles": c.get("status"),
+                  "missing": c.get("missing_intervals"), "signals_only": True}, sort_keys=True, default=str))
+sys.exit(1 if failures else 0)
+PY
+}
+
 write_rollback_command() {
   local rollback="$STATE_ROOT/rollback.sh" arg
   install -d -m 0700 "$STATE_ROOT"
@@ -136,6 +185,7 @@ trap rollback_on_error ERR INT TERM
 
 [[ -x $PYTHON ]] || fail "Python interpreter missing: $PYTHON"
 [[ $TARGET =~ ^[0-9a-f]{40}$ ]] || fail "target must be an exact 40-character commit"
+[[ $READY_TIMEOUT =~ ^[0-9]+$ ]] && (( READY_TIMEOUT >= 60 && READY_TIMEOUT <= 1800 )) || fail "readiness timeout must be 60..1800 seconds"
 [[ $NEW_ROOT == /home/opc/kalshi-preview-repair-* ]] || fail "unexpected target root"
 [[ -d $OLD_ROOT && -d $NEW_ROOT ]] || fail "preview checkout missing"
 [[ -f $JOURNAL ]] || fail "existing preview journal missing"
@@ -244,50 +294,28 @@ nohup env PYTHONPATH="$NEW_ROOT" PYTHONNOUSERSITE=1 \
   "$PYTHON" "${new_args[@]}" >"$LOG_PATH" 2>&1 &
 new_pid=$!
 
-for _ in {1..180}; do
-  kill -0 "$new_pid" 2>/dev/null || fail "repaired preview exited during startup"
-  if "$PYTHON" - "$TARGET" <<'PY' >/dev/null 2>&1
-import json, sys
-from urllib.request import ProxyHandler, build_opener
-opener=build_opener(ProxyHandler({}))
-def get(path):
-    with opener.open("http://127.0.0.1:8768"+path, timeout=3) as r:
-        assert r.status == 200
-        return json.load(r)
-h=get("/healthz"); r=get("/readyz"); c=get("/api/candle-integrity"); s=get("/api/state?view=main")
-assert h.get("status")=="HEALTHY" and h.get("build_commit")==sys.argv[1]
-assert h.get("signals_only") is True and (h.get("workers") or {}).get("healthy") is True
-assert r.get("status")=="READY" and r.get("signals_only") is True
-assert r.get("contract_quotes_fresh") is True and r.get("reference_fresh") is True
-assert c.get("status") in {"READY", "INCOMPLETE"}
-if c.get("status") == "READY":
-    assert c.get("bars")==1440 and c.get("unique_bars")==1440
-    assert not c.get("missing_intervals") and not c.get("duplicate_bars")
-else:
-    assert c.get("missing_intervals")
-    opening=(s.get("prediction_engine") or {}).get("initial") or {}
-    assert opening.get("up") is None and opening.get("direction") in {"WAIT", "UNCLEAR"}
-assert (s.get("decision_intelligence") or {}).get("execution_capability") is False
-PY
-  then break; fi
-  sleep 1
+# Readiness: every original condition is still required. The wait is bounded
+# by wall-clock time (a large preserved journal can make startup slow), and
+# each failing endpoint is reported with its HTTP status and body.
+ready_deadline=$((SECONDS + READY_TIMEOUT))
+next_progress=$((SECONDS + 30))
+while (( SECONDS < ready_deadline )); do
+  kill -0 "$new_pid" 2>/dev/null || { tail -n 60 "$LOG_PATH" >&2 || true; fail "repaired preview exited during startup"; }
+  if readiness_report "$TARGET" >/dev/null 2>&1; then break; fi
+  if (( SECONDS >= next_progress )); then
+    printf 'PREVIEW_READINESS_PROGRESS elapsed=%ss\n' "$((READY_TIMEOUT - (ready_deadline - SECONDS)))" >&2
+    readiness_report "$TARGET" >&2 || true
+    next_progress=$((SECONDS + 30))
+  fi
+  sleep 2
 done
 
 # Final checks are repeated outside the loop so timeout is a hard failure.
-"$PYTHON" - "$TARGET" <<'PY'
-import json, sys
-from urllib.request import ProxyHandler, build_opener
-opener=build_opener(ProxyHandler({}))
-def get(path):
-    with opener.open("http://127.0.0.1:8768"+path, timeout=5) as r: return json.load(r)
-h,r,c,s=get("/healthz"),get("/readyz"),get("/api/candle-integrity"),get("/api/state?view=main")
-assert h.get("status")=="HEALTHY" and h.get("build_commit")==sys.argv[1]
-assert h.get("signals_only") is True and (h.get("workers") or {}).get("healthy") is True
-assert r.get("status")=="READY" and r.get("signals_only") is True
-assert c.get("status")=="READY" or (c.get("missing_intervals") and ((s.get("prediction_engine") or {}).get("initial") or {}).get("up") is None)
-assert (s.get("decision_intelligence") or {}).get("execution_capability") is False
-print(json.dumps({"health":h.get("status"),"ready":r.get("status"),"candles":c.get("status"),"missing":c.get("missing_intervals"),"signals_only":True},sort_keys=True))
-PY
+if ! readiness_report "$TARGET"; then
+  printf 'PREVIEW_READINESS_TIMEOUT after %ss; last 60 lines of %s:\n' "$READY_TIMEOUT" "$LOG_PATH" >&2
+  tail -n 60 "$LOG_PATH" >&2 || true
+  fail "repaired preview did not become healthy and ready"
+fi
 
 [[ $(listener_pid 8765 2>/dev/null || true) == "$pid_8765" ]] || fail "port 8765 listener changed"
 [[ $(listener_pid 8767 2>/dev/null || true) == "$pid_8767" ]] || fail "port 8767 listener changed"

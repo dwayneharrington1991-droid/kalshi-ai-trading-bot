@@ -58,6 +58,135 @@ OPENING_INPUT_GRACE_SECONDS = 120
 CANDLE_CACHE_STALE_SECONDS = 150
 
 
+def candle_integrity_report(source, observed_at):
+    """Describe one published candle snapshot against its own immutable cutoff.
+
+    Collector and HTTP workers run independently. Grading the previous
+    collector snapshot against the request's newer wall-clock minute creates a
+    false 1439/1440 gap at minute rollover. ``window_cutoff`` is the exact
+    window the collector asked providers to fill; older payloads derive it
+    from their receipt timestamp for compatibility.
+
+    Status precedence (most severe first):
+      INVALID    - the snapshot's own timestamps are impossible (a cutoff later
+                   than the request clock or than its receipt, a receipt in the
+                   future, or a window more than 24 h old). Never deployable.
+      STALE      - no receipt timestamp, or the cutoff is older than 120 s, or
+                   the receipt is older than the 150 s opening freshness limit.
+                   A stale collector is never deployable, complete or not.
+      INCOMPLETE - fresh, but a bar is missing, duplicated, unaligned,
+                   out of order, or outside the window.
+      READY      - fresh, exactly 1,440 unique, ordered, aligned bars.
+    """
+    source = source if isinstance(source, dict) else {}
+    wall_cutoff = int(observed_at.timestamp()) // 60 * 60
+    try:
+        received = timestamp(source["received_at"])
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        received = None
+    try:
+        snapshot_cutoff = int(source.get("window_cutoff"))
+        cutoff_source = "collector_window_cutoff"
+    except (TypeError, ValueError, OverflowError):
+        cutoff_source = "received_at_compatibility_fallback"
+        snapshot_cutoff = (
+            int(received.timestamp()) // 60 * 60 if received is not None else wall_cutoff
+        )
+    receipt_age = (
+        (observed_at - received).total_seconds() if received is not None else None
+    )
+    invalid_reasons = []
+    if snapshot_cutoff % 60:
+        invalid_reasons.append("window_cutoff is not minute-aligned")
+    if snapshot_cutoff > wall_cutoff:
+        invalid_reasons.append("window_cutoff is later than the request clock")
+    elif wall_cutoff - snapshot_cutoff > 86400:
+        invalid_reasons.append("window_cutoff is more than 24 h old")
+    if received is not None:
+        # Clock skew allowance between collector and HTTP worker threads is
+        # zero in-process; allow 5 s for monotonic/wall adjustments only.
+        if receipt_age < -5:
+            invalid_reasons.append("received_at is in the future")
+        if snapshot_cutoff > int(received.timestamp()) // 60 * 60:
+            # A window ending after its own receipt would claim bars that had
+            # not closed when the data arrived (future-data leakage).
+            invalid_reasons.append("window_cutoff is later than its receipt")
+    cutoff_valid = not invalid_reasons
+    starts, invalid = [], 0
+    for raw in source.get("candles", []):
+        try:
+            start = int(raw["start"])
+            if start % 60:
+                raise ValueError("unaligned")
+            starts.append(start)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            invalid += 1
+    unique = sorted(set(starts))
+    # Measured on the provider order before any sorting, so a reordered
+    # publication is visible instead of being silently repaired.
+    out_of_order = starts != sorted(starts)
+    expected = list(range(snapshot_cutoff - 86400, snapshot_cutoff, 60))
+    expected_set = set(expected)
+    unique_set = set(unique)
+    missing = [stamp for stamp in expected if stamp not in unique_set]
+    unexpected = [stamp for stamp in unique if stamp not in expected_set]
+    age = wall_cutoff - snapshot_cutoff if cutoff_valid else None
+    stale_reasons = []
+    if cutoff_valid:
+        if received is None:
+            stale_reasons.append("no receipt timestamp")
+        elif receipt_age > CANDLE_CACHE_STALE_SECONDS:
+            stale_reasons.append(
+                f"receipt {receipt_age:.0f}s old > {CANDLE_CACHE_STALE_SECONDS}s"
+            )
+        if age > OPENING_INPUT_GRACE_SECONDS:
+            stale_reasons.append(f"cutoff {age}s old > {OPENING_INPUT_GRACE_SECONDS}s")
+    structurally_ready = bool(
+        cutoff_valid and not missing and not unexpected and len(starts) == 1440
+        and len(unique) == 1440 and not invalid and not out_of_order
+    )
+    status = (
+        "INVALID" if not cutoff_valid
+        else "STALE" if stale_reasons
+        else "READY" if structurally_ready
+        else "INCOMPLETE"
+    )
+    diagnostics = source.get("diagnostics", {})
+    return {
+        "status": status,
+        "invalid_reasons": invalid_reasons,
+        "stale_reasons": stale_reasons,
+        "cutoff": snapshot_cutoff,
+        "wall_clock_cutoff": wall_cutoff,
+        "snapshot_age_seconds": age,
+        "cache_age_seconds": round(receipt_age, 3) if receipt_age is not None else None,
+        "stale_after_seconds": CANDLE_CACHE_STALE_SECONDS,
+        "cutoff_source": cutoff_source,
+        "interval_seconds": 60,
+        "received_at": source.get("received_at"),
+        "starts": unique,
+        "bars": len(starts),
+        "unique_bars": len(unique),
+        "duplicate_bars": len(starts) - len(unique),
+        "invalid_bars": invalid,
+        "out_of_order": out_of_order,
+        "missing_intervals": missing,
+        "unexpected_intervals": unexpected,
+        "recovery": {
+            "attempts": diagnostics.get("provider_attempts", []),
+            "backoffs": diagnostics.get("provider_backoffs", []),
+            "next_retry_at": diagnostics.get("next_retry_at"),
+            "reason": diagnostics.get("reason"),
+        },
+        "diagnostics": diagnostics,
+        "note": (
+            "Timestamp-only integrity evidence for the collector's published "
+            "snapshot; no prices, credentials, account data, or historical rows "
+            "are exposed."
+        ),
+    }
+
+
 def process_prediction_frame(monitor, feed, collected):
     """Process one latest-value frame and isolate recoverable enrichment faults.
 
@@ -1814,73 +1943,16 @@ def make_handler(monitor):
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/api/candle-integrity":
-                source = (
-                    monitor.latest_candles
-                    or getattr(monitor.feed, "candle_cache", None)
-                    or {}
-                )
-                # Judge the cached window against the cache's OWN cutoff: the last
-                # minute boundary at or before it was received. Using the request
-                # clock instead made the newest just-closed minute look "missing"
-                # (and the oldest "unexpected") whenever a minute boundary passed
-                # between collector refreshes. A cache older than the opening
-                # model's 150 s freshness limit is reported STALE, never READY.
-                wall = utcnow()
-                try:
-                    received = timestamp(source["received_at"])
-                except (KeyError, TypeError, ValueError, AttributeError):
-                    received = None
-                anchor = min(wall, received) if received is not None else wall
-                cutoff = int(anchor.timestamp()) // 60 * 60
-                age = (wall - received).total_seconds() if received is not None else None
-                stale = age is None or not 0 <= age <= CANDLE_CACHE_STALE_SECONDS
-                starts = []
-                invalid = 0
-                for raw in source.get("candles", []):
-                    try:
-                        start = int(raw["start"])
-                        if start % 60:
-                            raise ValueError("unaligned")
-                        starts.append(start)
-                    except (KeyError, TypeError, ValueError, OverflowError):
-                        invalid += 1
-                unique = sorted(set(starts))
-                expected = list(range(cutoff - 86400, cutoff, 60))
-                missing = [stamp for stamp in expected if stamp not in set(unique)]
-                unexpected = [stamp for stamp in unique if stamp not in set(expected)]
-                diagnostics = source.get("diagnostics", {})
+                # Copy one atomic publication. Never combine bars from one
+                # collector cycle with diagnostics from another.
+                with monitor.candle_lock:
+                    source = deepcopy(
+                        monitor.latest_candles
+                        or getattr(monitor.feed, "candle_cache", None)
+                        or {}
+                    )
                 body = json.dumps(
-                    {
-                        "status": "STALE" if stale else "READY"
-                        if not missing and not unexpected and len(starts) == 1440
-                        and len(unique) == 1440 and not invalid
-                        else "INCOMPLETE",
-                        "cutoff": cutoff,
-                        "wall_clock_cutoff": int(wall.timestamp()) // 60 * 60,
-                        "cache_age_seconds": round(age, 3) if age is not None else None,
-                        "stale_after_seconds": CANDLE_CACHE_STALE_SECONDS,
-                        "interval_seconds": 60,
-                        "received_at": source.get("received_at"),
-                        "starts": unique,
-                        "bars": len(starts),
-                        "unique_bars": len(unique),
-                        "duplicate_bars": len(starts) - len(unique),
-                        "invalid_bars": invalid,
-                        "missing_intervals": missing,
-                        "unexpected_intervals": unexpected,
-                        "recovery": {
-                            "attempts": diagnostics.get("provider_attempts", []),
-                            "backoffs": diagnostics.get("provider_backoffs", []),
-                            "next_retry_at": diagnostics.get("next_retry_at"),
-                            "reason": diagnostics.get("reason"),
-                        },
-                        "diagnostics": diagnostics,
-                        "note": (
-                            "Timestamp-only integrity evidence; no prices, credentials, "
-                            "account data, or historical rows are exposed."
-                        ),
-                    },
-                    allow_nan=False,
+                    candle_integrity_report(source, utcnow()), allow_nan=False
                 ).encode()
                 content_type = "application/json"
             elif route == "/api/market-history":

@@ -169,6 +169,72 @@ def test_switch_readiness_probe_passes_a_genuinely_ready_service_and_reports_sta
     assert starting.returncode != 0 and "LOADING_JOURNAL" in starting.stdout
 
 
+def test_switch_accepts_later_live_gap_when_frozen_opening_has_independent_complete_history():
+    _Server.responses = {
+        "/healthz": (200, {"status": "HEALTHY", "build_commit": "abc", "signals_only": True,
+                           "workers": {"healthy": True}}),
+        "/readyz": (200, {"status": "READY", "signals_only": True,
+                           "contract_quotes_fresh": True, "reference_fresh": True}),
+        "/api/candle-integrity": (200, {"status": "INCOMPLETE", "bars": 1439,
+                                         "unique_bars": 1439,
+                                         "missing_intervals": [1794887760]}),
+        "/api/state?view=main": (200, {
+            "prediction_engine": {
+                "ticker": "KXBTC15M-TEST",
+                "initial": {
+                    "ticker": "KXBTC15M-TEST", "direction": "UP", "up": 0.7,
+                    "opens_at": "2026-11-17T03:45:00+00:00",
+                    "data_cutoff": "2026-11-17T03:45:00+00:00",
+                    "history_last_close": 1794887100,
+                    "data_quality": {"closed_history_bars": 1440},
+                    # Integration: receipt-time provenance is required as well.
+                    "frozen_features": {"closed_history_bars": 1440,
+                                        "max_input_received_at": "2026-11-17T03:44:59+00:00"},
+                },
+            },
+            "decision_intelligence": {"execution_capability": False},
+        }),
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        script = _probe_source() + f'\nPYTHON={sys.executable}\nPREVIEW_PROBE_PORT={server.server_address[1]}\nreadiness_report abc\n'
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    finally:
+        server.shutdown()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "READINESS PASS" in result.stdout
+
+
+def test_switch_rejects_directional_opening_without_complete_frozen_evidence():
+    _Server.responses = {
+        "/healthz": (200, {"status": "HEALTHY", "build_commit": "abc", "signals_only": True,
+                           "workers": {"healthy": True}}),
+        "/readyz": (200, {"status": "READY", "signals_only": True,
+                           "contract_quotes_fresh": True, "reference_fresh": True}),
+        "/api/candle-integrity": (200, {"status": "INCOMPLETE", "bars": 1439,
+                                         "unique_bars": 1439, "missing_intervals": [1]}),
+        "/api/state?view=main": (200, {
+            "prediction_engine": {"ticker": "KXBTC15M-TEST", "initial": {
+                "ticker": "KXBTC15M-TEST", "direction": "DOWN", "up": 0.2,
+                "data_cutoff": "2026-11-17T04:00:00+00:00",
+                "history_last_close": 1794888000,
+                "data_quality": {"closed_history_bars": 1439},
+            }},
+            "decision_intelligence": {"execution_capability": False},
+        }),
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        script = _probe_source() + f'\nPYTHON={sys.executable}\nPREVIEW_PROBE_PORT={server.server_address[1]}\nreadiness_report abc\n'
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    finally:
+        server.shutdown()
+    assert result.returncode != 0
+    assert "independently verified frozen opening" in result.stdout
+
+
 def test_core_market_data_failure_still_makes_the_service_not_ready(tmp_path):
     class FailingFeed:
         def poll(self):
@@ -296,3 +362,42 @@ def test_candle_integrity_uses_the_cache_cutoff_across_minute_boundaries(tmp_pat
     # A cache older than 150 s is STALE, never READY.
     monitor.latest_candles["candles"].append({"start": gap, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1})
     assert _integrity(monitor, received + timedelta(seconds=200))["status"] == "STALE"
+
+
+# --- Integration coverage: unified frozen-opening validation ---------------
+
+
+def _engine_responses(candles, initial, engine_ticker):
+    responses = _responses(candles, initial)
+    responses["/api/state?view=main"][1]["prediction_engine"]["ticker"] = engine_ticker
+    return responses
+
+
+def test_complete_frozen_opening_from_a_previous_contract_fails():
+    complete = frozen_opening()
+    result = _probe(_engine_responses(GAP, complete, "KXBTC15M-NEXT"))
+    assert result.returncode != 0 and "independently verified frozen opening" in result.stdout
+    assert _probe(_engine_responses(GAP, complete, complete["ticker"])).returncode == 0
+
+
+def test_frozen_opening_whose_history_runs_past_its_cutoff_fails():
+    leaked = json.loads(json.dumps(frozen_opening()))
+    opened = datetime.fromisoformat(leaked["opens_at"]).timestamp()
+    leaked["history_last_close"] = opened + 60  # history ends after the opening
+    assert _probe(_responses(GAP, leaked)).returncode != 0
+    missing = json.loads(json.dumps(frozen_opening()))
+    missing.pop("history_last_close")
+    assert _probe(_responses(GAP, missing)).returncode != 0
+
+
+def test_codex_withheld_rule_is_tightened_wait_with_probability_needs_provenance():
+    # Codex accepted any WAIT; a WAIT that still carries a probability is
+    # displayed as a percentage and so must prove complete provenance.
+    result = _probe(_responses(GAP, {"direction": "WAIT", "up": 0.58}))
+    assert result.returncode != 0
+
+
+def test_invalid_candle_snapshot_never_passes_readiness():
+    invalid = dict(GAP, status="INVALID")
+    assert _probe(_responses(invalid, {"up": None, "direction": "WAIT"})).returncode != 0
+    assert _probe(_responses(dict(GAP, status="STALE"), {"up": None, "direction": "WAIT"})).returncode != 0

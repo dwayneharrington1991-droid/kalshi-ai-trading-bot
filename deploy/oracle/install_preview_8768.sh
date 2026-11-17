@@ -107,6 +107,12 @@ main() {
   [[ -z $(git -C "$new_root" status --porcelain) ]] || block "staged checkout is dirty"
   [[ -x $python ]] || block "Python interpreter missing: $python"
 
+  # Exclusive preview-8768 lock for the whole install/verify/rollback sequence
+  # (inherited from the deploy orchestrator; a concurrent installer is rejected).
+  # shellcheck source=deploy/oracle/preview_deploy_lock.sh
+  source "$script_dir/preview_deploy_lock.sh"
+  preview_deploy_lock || block "another preview 8768 deployment holds the lock"
+
   local pid_8765 pid_8767 old_pid
   pid_8765=$(listener_pid 8765 2>/dev/null || true)
   pid_8767=$(listener_pid 8767 2>/dev/null || true)
@@ -162,7 +168,7 @@ main() {
     (
       cd "$old_cwd"
       nohup env -i "${old_env[@]}" "${old_argv[@]}" \
-        >"$old_cwd/logs/preview-8768-install-rollback.log" 2>&1 &
+        >"$old_cwd/logs/preview-8768-install-rollback.log" 2>&1 </dev/null 9>&- &
     ) || true
     if wait_preview_healthy "$python" 120; then
       printf 'PREVIEW_INSTALL_ROLLED_BACK: previous preview process is healthy\n' >&2

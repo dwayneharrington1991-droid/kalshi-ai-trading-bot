@@ -276,10 +276,15 @@ def test_emergency_override_is_never_blocked_and_rollback_is_unguarded():
 
 
 def test_manual_rollback_preserves_previous_python_code_identity():
+    """Codex cf61cac intent, kept under the full-environment rollback (Phase 5
+    blocker 2): the previous PYTHONPATH is preserved exactly, and a legacy
+    launch without one is pinned to the verified old release root. Behaviour
+    is exercised in test_phase5_deploy_orchestrator."""
     switch = (ROOT / "deploy/oracle/switch_preview_8768.sh").read_text()
     assert 'old_pythonpath=${entry#PYTHONPATH=}' in switch
     assert '[[ -n $old_pythonpath ]] || old_pythonpath=$old_cwd' in switch
-    assert "printf 'nohup env PYTHONPATH=%q PYTHONNOUSERSITE=1 ' \"$old_pythonpath\"" in switch
+    assert "(( has_pythonpath )) || printf 'PYTHONPATH=%s\\0' \"$old_pythonpath\"" in switch
+    assert 'env -i "${environment[@]}" "${argv[@]}"' in switch
     assert "write_rollback_command" in switch
 
 

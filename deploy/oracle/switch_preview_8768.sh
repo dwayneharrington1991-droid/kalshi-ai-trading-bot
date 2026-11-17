@@ -26,6 +26,11 @@ declare -a old_env=()
 
 fail() { printf 'PREVIEW_DEPLOY_BLOCKED: %s\n' "$*" >&2; return 1; }
 
+# Exclusive preview-8768 deployment lock (inherited when run by the installer
+# or the deploy orchestrator; an independent concurrent switch is rejected).
+# shellcheck source=deploy/oracle/preview_deploy_lock.sh
+source "$(dirname "${BASH_SOURCE[0]}")/preview_deploy_lock.sh"
+
 listener_pid() {
   local port=$1 output pids
   output=$(sudo -n ss -H -ltnp "sport = :$port") || return 1
@@ -167,26 +172,51 @@ PY
 }
 
 write_rollback_command() {
-  local rollback="$STATE_ROOT/rollback.sh" arg
+  # Persist the COMPLETE previous launch identity for a manual rollback:
+  # argv, working directory and the full environment (which can hold
+  # secrets), each NUL-separated and readable only by this user. The
+  # environment is never printed or logged; rollback.sh restores it with
+  # env -i so nothing from the invoking shell leaks in.
+  local rollback="$STATE_ROOT/rollback.sh" entry has_pythonpath=0
   install -d -m 0700 "$STATE_ROOT"
-  {
-    printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ncd %q\n' "$old_cwd"
-    # Python safe-path mode (-P) deliberately excludes the working directory.
-    # Preserve the old process's code identity explicitly or the manual
-    # rollback could import the repaired tree, an installed package, or fail.
-    printf 'nohup env PYTHONPATH=%q PYTHONNOUSERSITE=1 ' "$old_pythonpath"
-    for arg in "${old_argv[@]}"; do printf '%q ' "$arg"; done
-    printf '> %q 2>&1 &\n' "$OLD_ROOT/logs/preview-8768-rollback.log"
-    printf 'echo "rollback_pid=$!"\n'
-  } >"$rollback.next"
+  (
+    umask 077
+    printf '%s\0' "${old_argv[@]}" >"$STATE_ROOT/rollback.argv.next"
+    printf '%s' "$old_cwd" >"$STATE_ROOT/rollback.cwd.next"
+    {
+      for entry in "${old_env[@]}"; do
+        [[ $entry == PYTHONPATH=* ]] && has_pythonpath=1
+        printf '%s\0' "$entry"
+      done
+      # Legacy launches without PYTHONPATH: python -P excludes the cwd, so pin
+      # the verified old release root as the import root (previous code identity).
+      (( has_pythonpath )) || printf 'PYTHONPATH=%s\0' "$old_pythonpath"
+    } >"$STATE_ROOT/rollback.env.next"
+    cat >"$rollback.next" <<'ROLLBACK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+mapfile -d '' -t environment <"$here/rollback.env"
+mapfile -d '' -t argv <"$here/rollback.argv"
+cd "$(cat "$here/rollback.cwd")"
+nohup env -i "${environment[@]}" "${argv[@]}" >"$here/rollback.log" 2>&1 </dev/null 9>&- &
+echo "rollback_pid=$!"
+ROLLBACK
+  )
+  chmod 0600 "$STATE_ROOT/rollback.argv.next" "$STATE_ROOT/rollback.cwd.next" "$STATE_ROOT/rollback.env.next"
   chmod 0700 "$rollback.next"
+  mv -f "$STATE_ROOT/rollback.argv.next" "$STATE_ROOT/rollback.argv"
+  mv -f "$STATE_ROOT/rollback.cwd.next" "$STATE_ROOT/rollback.cwd"
+  mv -f "$STATE_ROOT/rollback.env.next" "$STATE_ROOT/rollback.env"
   mv -f "$rollback.next" "$rollback"
 }
 
 start_old_in_memory() {
   cd "$old_cwd"
+  # stdin detached and the deployment-lock fd 9 closed: the restored
+  # preview must never hold the lock or the caller's terminal/SSH pipes.
   nohup env -i "${old_env[@]}" "${old_argv[@]}" \
-    >"$OLD_ROOT/logs/preview-8768-rollback.log" 2>&1 &
+    >"$OLD_ROOT/logs/preview-8768-rollback.log" 2>&1 </dev/null 9>&- &
   local rollback_pid=$!
   for _ in {1..120}; do
     if "$PYTHON" - "$TARGET" <<'PY' >/dev/null 2>&1
@@ -258,6 +288,7 @@ free_bytes=$(df -B1 --output=avail "$JOURNAL" | tail -1 | tr -d ' ')
 pid_8765=$(listener_pid 8765 2>/dev/null || true)
 pid_8767=$(listener_pid 8767 2>/dev/null || true)
 
+preview_deploy_lock || exit 1
 old_pid=$(listener_pid "$PORT") || fail "exactly one process must listen on 127.0.0.1:$PORT"
 [[ -r /proc/$old_pid/cmdline && -r /proc/$old_pid/environ ]] || fail "cannot inspect preview process"
 mapfile -d '' -t old_argv <"/proc/$old_pid/cmdline"
@@ -349,8 +380,10 @@ wait_port_free || fail "port 8768 remained occupied after graceful stop"
 switched=1
 
 cd "$OLD_ROOT"
+# stdin detached and fd 9 closed: the new preview must never inherit the
+# deployment lock (it would block every later deploy) or the SSH pipes.
 nohup env PYTHONPATH="$NEW_ROOT" PYTHONNOUSERSITE=1 \
-  "$PYTHON" "${new_args[@]}" >"$LOG_PATH" 2>&1 &
+  "$PYTHON" "${new_args[@]}" >"$LOG_PATH" 2>&1 </dev/null 9>&- &
 new_pid=$!
 
 # Readiness: every original condition is still required. The wait is bounded

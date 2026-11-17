@@ -12,8 +12,9 @@ survives SSH disconnects. It is generated from
 2. Paste the command below into Windows PowerShell. It prints a job ID right
    away (`resume with: -ResumeJobId <id>`).
 3. You can close the window or lose Wi-Fi at any point: the deployment keeps
-   running on Oracle. To check it again, paste the same command with
-   `-ResumeJobId <id>` added after the last `param` default, or run:
+   running on Oracle. To check it again, paste the same command and add
+   ` -ResumeJobId <id>` right after its final closing `}`. This never starts
+   a second deployment. Or run:
    `ssh opc@129.146.120.195 bash /home/opc/kalshi-preview-repair-f8b2480/deploy/oracle/deploy_job_8768.sh status <id>`
 4. The final line is one of: `SUCCESS`, `DEPLOY FAILED` (previous build still
    healthy), `DEPLOY ROLLED BACK`, `DEPLOY BLOCKED`, or `MANUAL RECOVERY

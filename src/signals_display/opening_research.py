@@ -67,22 +67,24 @@ FEATURE_GROUPS = {
     "trend_ema_volume_acceleration": TREND,
     "kalshi_preopen_market": ("kalshi_preopen_mid_logit",),
 }
+# Six pre-registered fitted candidates.  Regime slices and Kalshi prices are
+# references/conditions, not extra candidates added after results are visible.
 MODELS = {
     "compact_offset": dict(features=rigor.COMPACT_FEATURES, offset=True),
     "compact_plus_technicals": dict(features=rigor.COMPACT_FEATURES + TECHNICALS, offset=True),
     "compact_plus_flow": dict(features=rigor.COMPACT_FEATURES + FLOW, offset=True),
     "compact_plus_candles": dict(features=rigor.COMPACT_FEATURES + CANDLES, offset=True),
-    "regime_aware_compact": dict(features=rigor.COMPACT_FEATURES + ("regime_rising", "regime_falling"), offset=True),
-    "compact_plus_trend": dict(features=rigor.COMPACT_FEATURES + TREND, offset=True),
-    "compact_plus_preopen_market": dict(features=rigor.COMPACT_FEATURES + ("kalshi_preopen_mid_logit",), offset=True),
-    "boosted_stumps": dict(features=rigor.COMPACT_FEATURES + TECHNICALS, boost=True),
-    # Phase 4 pre-registered candidate: does momentum/trend act differently in
-    # rising vs falling volatility regimes? Interactions are products of frozen
+    # Integrated Phase 4 slot (Claude + Codex): the trend family together
+    # with volatility-regime interactions in ONE pre-registered candidate, so
+    # the family stays at six. Interactions are products of frozen
     # as-of-opening values only.
-    "compact_regime_interactions": dict(features=rigor.COMPACT_FEATURES + (
+    "momentum_trend_volatility": dict(features=rigor.COMPACT_FEATURES + TREND + (
         "regime_rising", "regime_falling", "ix_return_15m_x_rising", "ix_return_15m_x_falling",
         "ix_ema9_21_gap_x_rising", "ix_ema9_21_gap_x_falling"), offset=True),
+    "boosted_stumps": dict(features=rigor.COMPACT_FEATURES + TECHNICALS, boost=True),
 }
+PREREGISTERED_CANDIDATE_LIMIT = 6
+assert len(MODELS) <= PREREGISTERED_CANDIDATE_LIMIT, "pre-registered candidate family exceeded"
 INTERACTIONS = {
     "ix_return_15m_x_rising": ("return_15m", "regime_rising"),
     "ix_return_15m_x_falling": ("return_15m", "regime_falling"),
@@ -111,6 +113,13 @@ def load(db, asof=None):
     executable quote at or after that call (costs only, never a feature)."""
     asof = asof or datetime.now(timezone.utc)
     rows = opening_models.dataset(db, asof)
+    # Defensive quarantine (matches settled_audit.official_outcomes): a ticker
+    # joined to more than one official row is dropped, never trained or
+    # scored twice and never given whichever label SQLite returned.
+    counts = {}
+    for row in rows:
+        counts[row["ticker"]] = counts.get(row["ticker"], 0) + 1
+    rows = [row for row in rows if counts[row["ticker"]] == 1]
     recorded = {
         ticker: (up, payload)
         for ticker, up, payload in db.execute(
@@ -565,10 +574,13 @@ def research(rows, progress=None, checkpoint=None, current_model=None):
         "eligible_opening_contracts": len(rows),
         "costs": {"slippage_per_contract": SLIPPAGE, "fees": "Kalshi taker fee formula", "quote": f"first non-stale executable ask within {QUOTE_WINDOW_SECONDS}s after the opening call"},
     }
-    recorded = [r for r in rows if type(r.get("recorded_up")) in (int, float)]
+    numeric_recorded = [r for r in rows if type(r.get("recorded_up")) in (int, float)]
+    recorded = [r for r in numeric_recorded if math.isfinite(r["recorded_up"])
+                and 0 <= r["recorded_up"] <= 1]
     confidences = sorted(abs(r["recorded_up"] - 0.5) for r in recorded)
     report["recorded_live_openings"] = {
         "contracts": len(recorded),
+        "invalid_probability_records": len(numeric_recorded) - len(recorded),
         "by_model": _count(r["recorded_model"] for r in recorded),
         "decision_thresholds_seen": _count(str(r["recorded_threshold"]) for r in recorded),
         "confidence_status_seen": _count(str(r["recorded_confidence_status"]) for r in recorded),
@@ -581,8 +593,13 @@ def research(rows, progress=None, checkpoint=None, current_model=None):
         "threshold_table": threshold_table([r["recorded_up"] for r in recorded], recorded),
     }
     report["conditions_exploratory"] = condition_report(rows)
-    failures = [r for r in recorded if r.get("recorded_direction") in {"UP", "DOWN"}
-                and (r["recorded_direction"] == "UP") != bool(r["outcome"])]
+    failures = [
+        r for r in recorded
+        if r.get("recorded_direction") in {"UP", "DOWN"}
+        and r.get("recorded_confidence_status") in DISPLAYABLE_RECORDED_CONFIDENCE
+        and (r["recorded_direction"] == "UP") == (r["recorded_up"] >= 0.5)
+        and (r["recorded_direction"] == "UP") != bool(r["outcome"])
+    ]
     report["recorded_live_openings"]["failed_calls"] = [
         {"ticker": r["ticker"], "direction": r["recorded_direction"],
          "confidence": max(r["recorded_up"], 1 - r["recorded_up"]), "regime": r.get("regime"),
@@ -666,8 +683,8 @@ def research(rows, progress=None, checkpoint=None, current_model=None):
     report["model_comparison"] = comparison
     ablation = {}
     reference = predictions.get("compact_offset", {})
-    for name in ("compact_plus_technicals", "compact_plus_flow", "compact_plus_candles", "regime_aware_compact",
-                 "compact_plus_trend", "compact_plus_preopen_market"):
+    for name in ("compact_plus_technicals", "compact_plus_flow", "compact_plus_candles",
+                 "momentum_trend_volatility"):
         common = [r for r in oos if r["ticker"] in reference and r["ticker"] in predictions.get(name, {})]
         if common:
             ablation[name] = rigor.paired_superiority_test(
@@ -676,8 +693,7 @@ def research(rows, progress=None, checkpoint=None, current_model=None):
             )
     family_of = {"compact_plus_technicals": "technicals_ema_rsi_macd_vwap_bollinger",
                  "compact_plus_flow": "order_book_flow_cvd", "compact_plus_candles": "candles",
-                 "compact_plus_trend": "trend_ema_volume_acceleration",
-                 "compact_plus_preopen_market": "kalshi_preopen_market"}
+                 "momentum_trend_volatility": "trend_ema_volume_acceleration"}
     for name, test in ablation.items():
         status = report["feature_family_history"].get(family_of.get(name), {}).get("status", "EVALUABLE")
         test["family_history_status"] = status
@@ -827,7 +843,11 @@ def retrospective_rows(db, exclude_tickers, limit=RETROSPECTIVE_LIMIT, asof=None
            ORDER BY observed_at DESC LIMIT ?""", (asof.isoformat(), limit * 2)
     ).fetchall()
     contracts, skipped = [], {}
+    repeated = {t for t, n in _count(t for t, _o, _y in outcomes).items() if n > 1}
     for ticker, observed_at, outcome in outcomes:
+        if ticker in repeated:
+            skipped["REPEATED_OFFICIAL_OUTCOME"] = skipped.get("REPEATED_OFFICIAL_OUTCOME", 0) + 1
+            continue
         if ticker in exclude_tickers or outcome not in (0, 1):
             continue
         meta = db.execute(

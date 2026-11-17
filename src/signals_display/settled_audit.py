@@ -32,6 +32,8 @@ CONFIDENCE_BANDS = ((0.50, 0.55), (0.55, 0.60), (0.60, 0.65), (0.65, 0.70),
                     (0.70, 0.80), (0.80, 0.90), (0.90, 1.0000001))
 DISPLAYABLE_CONFIDENCE = {"CALIBRATED", "EXPERIMENTAL CALIBRATED CANDIDATE"}
 HIGH_CONFIDENCE_CLAIM = {"min_confidence": 0.80, "min_calls": 100, "min_wilson_lower": 0.80}
+PHASE4_FIXED_THRESHOLD = 0.55
+PHASE4_THRESHOLD_CHALLENGERS = (0.50, 0.52, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80)
 BOOTSTRAP_REPLICATES = 2000
 BOOTSTRAP_SEED = 20261117
 
@@ -63,19 +65,62 @@ def preopen_mid(db, ticker, opened):
     return (bid + ask) / 2
 
 
+def _receipt_order(observed):
+    try:
+        return (0, timestamp(observed).timestamp(), "")
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        return (1, 0.0, str(observed))
+
+
+def official_outcomes(db):
+    """One trusted official label per ticker, plus the quarantined tickers.
+
+    (Codex Phase 4) Conflicting or invalid official rows are quarantined
+    instead of trusting whichever row SQLite returns last. Identical repeats
+    keep the EARLIEST receipt so chronology is never improved by a later
+    copy. Every consumer (scoring, baselines) uses this single reader.
+    """
+    outcomes, quarantined, evidence = {}, set(), {}
+    if "forecast_outcomes" not in _tables(db):
+        return outcomes, quarantined
+    for ticker, observed, outcome in db.execute(
+        "SELECT ticker,observed_at,outcome FROM forecast_outcomes WHERE origin='official'"
+    ):
+        evidence.setdefault(ticker, []).append((observed, outcome))
+    for ticker, items in evidence.items():
+        valid = {(observed, outcome) for observed, outcome in items if outcome in (0, 1)}
+        if len({outcome for _observed, outcome in valid}) != 1:
+            quarantined.add(ticker)
+            continue
+        outcomes[ticker] = min(valid, key=lambda item: _receipt_order(item[0]))
+    return outcomes, quarantined
+
+
+def official_history(db, asof):
+    """(receipt time, outcome) of trusted official labels known by ``asof``;
+    the baselines use this, so quarantined settlements never enter them."""
+    history = []
+    for observed, outcome in official_outcomes(db)[0].values():
+        try:
+            t = timestamp(observed)
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            continue
+        if t <= asof:
+            history.append((t, outcome))
+    return sorted(history)
+
+
 def load_openings(db, asof):
     """Every recorded opening with its official outcome (or why it has none)."""
     tables = _tables(db)
     if "btc_engine_opening" not in tables:
         return [], {"btc_engine_opening": "TABLE_MISSING"}
-    outcomes = {}
-    if "forecast_outcomes" in tables:
-        for ticker, observed, outcome in db.execute(
-            "SELECT ticker,observed_at,outcome FROM forecast_outcomes WHERE origin='official'"
-        ):
-            outcomes[ticker] = (observed, outcome)
+    outcomes, quarantined = official_outcomes(db)
+    problems = {}
+    if quarantined:
+        problems["CONFLICTING_OR_INVALID_OFFICIAL_OUTCOME"] = len(quarantined)
     has_quotes = "opening_quote_snapshots" in tables
-    rows, problems = [], {}
+    rows = []
     for ticker, generated, cutoff, closes, up, payload in db.execute(
         "SELECT ticker,generated_at,cutoff,closes_at,up,payload FROM btc_engine_opening WHERE mode=?",
         (MODE,),
@@ -110,6 +155,8 @@ def load_openings(db, asof):
             "confidence_status": (saved.get("confidence") or {}).get("status"),
             "threshold": (saved.get("decision_policy") or {}).get("threshold"),
             "model": saved.get("model") or "UNRECORDED",
+            "regime": saved.get("regime") or "unavailable",
+            "settlement_quarantined": ticker in quarantined,
             "feature_version": frozen.get("version"),
             "max_input_received_at": frozen.get("max_input_received_at"),
             "history_last_close": saved.get("history_last_close"),
@@ -255,7 +302,11 @@ def dashboard_scoreboard(rows):
            "last_call_opens_at": calls[-1]["opens_at"].isoformat() if calls else None,
            "by_model": {m: _calls([r for r in calls if r["model"] == m])
                         for m in sorted({r["model"] for r in calls})},
-           "single_model": len({r["model"] for r in calls}) <= 1}
+           "single_model": len({r["model"] for r in calls}) <= 1,
+           # The live counter takes whichever duplicate official row SQLite
+           # returns first; quarantined settlements are excluded here instead.
+           "displayed_calls_excluded_for_conflicting_settlement": sum(
+               r.get("settlement_quarantined", False) and displayed(r) for r in rows)}
     for window in (26, 50, 100):
         recent = calls[-window:]
         if recent:
@@ -302,12 +353,22 @@ def integrity_checks(db, rows, asof):
     same_open = {k.isoformat(): v for k, v in by_open.items() if len(v) > 1}
     duplicate_tickers = len(rows) - len({r["ticker"] for r in rows})
     disagreements = 0
+    duplicate_official_rows = 0
+    conflicting_official_tickers = 0
     origins = {}
     if "forecast_outcomes" in tables:
         labels = {}
+        official_by_ticker = {}
         for ticker, origin, outcome in db.execute("SELECT ticker,origin,outcome FROM forecast_outcomes"):
             origins[origin] = origins.get(origin, 0) + 1
             labels.setdefault(ticker, {})[origin] = outcome
+            if origin == "official":
+                official_by_ticker.setdefault(ticker, []).append(outcome)
+        duplicate_official_rows = sum(max(0, len(values) - 1) for values in official_by_ticker.values())
+        conflicting_official_tickers = sum(
+            len({value for value in values if value in (0, 1)}) != 1
+            for values in official_by_ticker.values()
+        )
         disagreements = sum(
             1 for v in labels.values()
             if "official" in v and any(o != v["official"] for k, o in v.items() if k != "official" and o in (0, 1))
@@ -325,6 +386,8 @@ def integrity_checks(db, rows, asof):
         "duplicate_ticker_rows": duplicate_tickers,
         "multiple_tickers_same_open": {"count": len(same_open), "examples": dict(list(same_open.items())[:5])},
         "outcome_origins": origins,
+        "duplicate_official_outcome_rows": duplicate_official_rows,
+        "conflicting_or_invalid_official_outcome_tickers": conflicting_official_tickers,
         "official_vs_other_origin_disagreements": disagreements,
         "sample_size": {
             "settled": n, "displayed_calls": calls,
@@ -439,6 +502,77 @@ def displayed_accuracy(settled):
                                 and lower is not None and lower >= claim["min_wilson_lower"]),
     }
     return out
+
+
+def _threshold_metrics(rows, threshold):
+    """Counterfactual symmetric threshold over immutable probabilities.
+
+    This never rewrites the historical displayed direction.  It answers the
+    narrower research question: what would the *same frozen probabilities*
+    have done under a predeclared abstention cutoff?
+    """
+    eligible = [r for r in rows if r["up"] is not None]
+    called = [r for r in eligible if max(r["up"], 1 - r["up"]) >= threshold]
+    correct = sum((r["up"] >= 0.5) == bool(r["outcome"]) for r in called)
+    probabilities = [r["up"] for r in called]
+    outcomes = [r["outcome"] for r in called]
+    probabilistic = score(probabilities, outcomes) if called else None
+    return {
+        "threshold": threshold,
+        "eligible_probabilities": len(eligible),
+        "calls": len(called),
+        "wait": len(eligible) - len(called),
+        "coverage": len(called) / len(eligible) if eligible else None,
+        "correct": correct,
+        "wrong": len(called) - correct,
+        "accuracy": correct / len(called) if called else None,
+        "accuracy_wilson_95": wilson_interval(correct, len(called)),
+        "brier_on_called": probabilistic["brier"] if probabilistic else None,
+        "log_loss_on_called": probabilistic["log_loss"] if probabilistic else None,
+        "ece_on_called": probabilistic["expected_calibration_error"] if probabilistic else None,
+    }
+
+
+def threshold_challenge(settled):
+    """Pooled challenge (reference) plus one per recorded model version."""
+    pooled = _threshold_challenge(settled)
+    models = sorted({r["model"] for r in settled})
+    pooled["model_scope"] = "SINGLE_MODEL" if len(models) <= 1 else "MIXED_MODEL_VERSIONS_REFERENCE_ONLY"
+    pooled["by_model"] = {m: _threshold_challenge([r for r in settled if r["model"] == m]) for m in models}
+    return pooled
+
+
+def _threshold_challenge(settled):
+    """Challenge 0.55 without tuning on the chronological sealed holdout.
+
+    Alternative thresholds and regime slices are development-only exploratory
+    diagnostics.  The holdout is opened only for the already-declared 0.55
+    policy, preventing this report from choosing a threshold on final data.
+    """
+    development, holdout, seal = sealed_split(settled)
+    alternatives = {
+        f"{threshold:.2f}": _threshold_metrics(development, threshold)
+        for threshold in PHASE4_THRESHOLD_CHALLENGERS
+    }
+    regimes = {}
+    for regime in sorted({str(r.get("regime") or "unavailable") for r in development}):
+        group = [r for r in development if str(r.get("regime") or "unavailable") == regime]
+        regimes[regime] = _threshold_metrics(group, PHASE4_FIXED_THRESHOLD)
+    return {
+        "role": "COUNTERFACTUAL_SHADOW_RESEARCH_ONLY",
+        "historical_displayed_calls_unchanged": True,
+        "fixed_policy": PHASE4_FIXED_THRESHOLD,
+        "sealed_split": seal,
+        "development_alternatives": alternatives,
+        "fixed_policy_on_sealed_holdout": _threshold_metrics(holdout, PHASE4_FIXED_THRESHOLD),
+        "development_regime_slices_at_fixed_policy": regimes,
+        "selection_allowed": False,
+        "note": (
+            "Only the predeclared 0.55 threshold is evaluated on the sealed holdout. "
+            "Alternative thresholds and regime slices are exploratory development evidence, "
+            "not authorization to change production."
+        ),
+    }
 
 
 def confidence_bands(rows):
@@ -652,17 +786,7 @@ def audit(db, asof=None):
     asof = asof or datetime.now(timezone.utc)
     rows, problems = load_openings(db, asof)
     settled = [r for r in rows if r["outcome"] is not None]
-    history = []
-    if "forecast_outcomes" in _tables(db):
-        for observed, outcome in db.execute(
-            "SELECT observed_at,outcome FROM forecast_outcomes WHERE origin='official'"
-        ):
-            try:
-                t = timestamp(observed)
-            except (TypeError, ValueError, AttributeError, OverflowError):
-                continue
-            if t <= asof:
-                history.append((t, outcome))
+    history = official_history(db, asof)
     development, holdout, seal = sealed_split(settled)
     report = {
         "format": AUDIT_FORMAT,
@@ -694,6 +818,7 @@ def audit(db, asof=None):
             "versus_market": versus_market(holdout, history),
             "hypothetical_pnl": hypothetical_pnl(db, [r for r in holdout if displayed(r)]),
         },
+        "phase4_threshold_challenge": threshold_challenge(settled),
         "note": (
             "The recorded AI probabilities were fixed before settlement, so the full "
             "record is already out-of-sample for the live model. The sealed holdout "
@@ -744,6 +869,17 @@ def summary_lines(report):
         lines.append(f"  model {model}: {v['first_opening'][:16]}..{v['last_opening'][:16]} settled={v['settled_openings']} "
                      f"calls={v['displayed_calls']} acc={fmt(v['accuracy'])} wilson95={v['accuracy_wilson_95']} "
                      f"brier={fmt(v['brier_all_recorded'])}")
+    challenge = report.get("phase4_threshold_challenge") or {}
+    fixed = challenge.get("fixed_policy_on_sealed_holdout") or {}
+    if fixed:
+        lines.append(f"THRESHOLD_0.55_HOLDOUT scope={challenge.get('model_scope')} calls={fixed.get('calls')} "
+                     f"acc={fmt(fixed.get('accuracy'))} wilson95={fixed.get('accuracy_wilson_95')} coverage={fmt(fixed.get('coverage'))}")
+        for model, sub in (challenge.get("by_model") or {}).items():
+            f = sub.get("fixed_policy_on_sealed_holdout") or {}
+            lines.append(f"  {model}: holdout calls={f.get('calls')} acc={fmt(f.get('accuracy'))} wilson95={f.get('accuracy_wilson_95')}")
+    quarantine = (report.get("journal_audit") or {}).get("unparseable", {}).get("CONFLICTING_OR_INVALID_OFFICIAL_OUTCOME")
+    if quarantine:
+        lines.append(f"QUARANTINED_SETTLEMENTS {quarantine}")
     q = report.get("quote_snapshot_coverage") or {}
     lines.append(f"QUOTES table={q.get('table_present')} rows={q.get('rows')} preopen_rows={q.get('rows_at_or_before_open')} "
                  f"first={q.get('first_observed_at')} settled_with_preopen={q.get('settled_openings_with_preopen_quote')}")

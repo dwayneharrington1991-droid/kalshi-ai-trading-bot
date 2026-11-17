@@ -68,6 +68,7 @@ def diagnose(artifact, rows):
         "component_count": len(parts),
         "active_components": sum(weight > 0 for weight, _ in parts),
         "input_feature_count": len(union),
+        "requested_87_inputs_matches_artifact": len(union) == 87,
         "rows_examined": len(rows),
     }
     if not rows:
@@ -151,19 +152,38 @@ def diagnose(artifact, rows):
             drop[f"{index}:{member.get('kind')}"] = sum(moved) / len(moved)
         report["component_drop_sensitivity"] = drop
 
-    # Reproduction of recorded live probabilities from frozen inputs. Only an
-    # opening the live engine labelled as made by THIS artifact can be expected
-    # to reproduce; openings made by the statistical fallback (e.g. while a
-    # restarted process had not yet re-loaded the artifact) or by another
-    # artifact are counted separately instead of being reported as failures.
-    expected_model = "opening-candidate/" + str(artifact.get("model_id"))
-    checked, other_models, mismatches = [], {}, []
+    # Reproduction of recorded live probabilities from frozen inputs
+    # (integrated Claude + Codex rule). Only an opening the live engine
+    # labelled as made by THIS artifact (``<model_id>`` or ``.../<model_id>``,
+    # e.g. "opening-candidate/<model_id>") and opened at or after the
+    # artifact's available_at can be expected to reproduce. Openings made by
+    # the statistical fallback or another artifact are counted separately; a
+    # label that predates available_at is impossible for the live engine and
+    # is reported as an anomaly rather than silently trusted.
+    model_id = str(artifact.get("model_id"))
+    available = artifact.get("available_at")
+    checked, mismatches, other_models = [], [], {}
+    missing_model = before_available = pre_release_openings = 0
     for row, p in zip(rows, ensemble):
         recorded = row.get("recorded_up")
         if type(recorded) not in (int, float):
             continue
-        made_by = row.get("recorded_model") or "UNRECORDED"
-        if made_by != expected_model:
+        made_by = row.get("recorded_model")
+        matches = bool(made_by) and (made_by == model_id or made_by.endswith("/" + model_id))
+        try:
+            released = available is None or timestamp(row["opens_at"]) >= timestamp(available)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            released = False
+        if not released:
+            if matches:
+                before_available += 1  # impossible for the live engine: anomaly
+            else:
+                pre_release_openings += 1  # expected: made before this artifact existed
+            continue
+        if not made_by or made_by == "UNRECORDED":
+            missing_model += 1
+            continue
+        if not matches:
             other_models[made_by] = other_models.get(made_by, 0) + 1
             continue
         difference = abs(recorded - p)
@@ -171,16 +191,29 @@ def diagnose(artifact, rows):
         if difference > 1e-6:
             mismatches.append({"ticker": row["ticker"], "opens_at": row.get("opens_at"),
                                "recorded_up": recorded, "recomputed_up": p, "difference": difference})
+    exact = sum(d <= 1e-6 for d in checked)
     report["reproduction"] = {
-        "expected_recorded_model": expected_model,
+        "model_id": model_id,
         "openings_made_by_this_artifact": len(checked),
-        "exactly_reproduced_within_1e_6": sum(d <= 1e-6 for d in checked),
+        "matching_model_id_openings": len(checked),
+        "exactly_reproduced_within_1e_6": exact,
+        "matching_model_id_exactly_reproduced": exact,
         "max_abs_difference": max(checked) if checked else None,
+        "matching_model_id_max_abs_difference": max(checked) if checked else None,
         "mismatches": sorted(mismatches, key=lambda m: -m["difference"])[:20],
         "openings_made_by_other_models": other_models,
-        "reading": ("A mismatch on an opening made by this artifact means the stored frozen inputs or "
-                    "baseline do not reproduce the live call: a real defect to investigate. Openings "
-                    "made by other models are not expected to reproduce."),
+        "different_model_id_openings": sum(other_models.values()),
+        "missing_recorded_model_id": missing_model,
+        "attributed_before_available_at": before_available,
+        "openings_before_artifact_available": pre_release_openings,
+        "status": (
+            "NO_MATCHING_MODEL_COHORT" if not checked
+            else "REPRODUCED" if exact == len(checked)
+            else "MATCHING_MODEL_INPUT_PATH_MISMATCH"
+        ),
+        "reading": ("Only openings attributed to this artifact test reproducibility. A mismatch inside "
+                    "that cohort means the stored frozen inputs or baseline do not reproduce the live "
+                    "call: a real defect to investigate. Other model versions are not expected to reproduce."),
     }
 
     # Out-of-sample for this artifact: openings after its label cutoff.
@@ -220,7 +253,8 @@ def _corr(a, b):
 
 def summary_lines(report):
     lines = [f"MODEL {report.get('model_id')} kind={report.get('model_kind')} components={report.get('component_count')} "
-             f"active={report.get('active_components')} inputs={report.get('input_feature_count')} rows={report.get('rows_examined')}"]
+             f"active={report.get('active_components')} inputs={report.get('input_feature_count')} "
+             f"(exactly 87: {report.get('requested_87_inputs_matches_artifact')}) rows={report.get('rows_examined')}"]
     for c in report.get("components", []):
         lines.append(f"  component {c['kind']} set={c.get('feature_set')} inputs={c['inputs']} weight={c['mixture_weight']:.3f} "
                      f"errors={c.get('prediction_errors')} std={c.get('probability_std')} corr={c.get('correlation_with_ensemble')}")
@@ -235,7 +269,7 @@ def summary_lines(report):
         lines.append(f"  component drop sensitivity={ {k: round(v, 4) for k, v in report['component_drop_sensitivity'].items()} }")
     rep = report.get("reproduction") or {}
     if rep:
-        lines.append(f"  reproduction {rep['exactly_reproduced_within_1e_6']}/{rep['openings_made_by_this_artifact']} "
+        lines.append(f"  reproduction {rep['status']} {rep['exactly_reproduced_within_1e_6']}/{rep['openings_made_by_this_artifact']} "
                      f"max_diff={rep['max_abs_difference']} other_models={rep['openings_made_by_other_models']}")
         for m in rep["mismatches"][:5]:
             lines.append(f"    mismatch {m['ticker']} recorded={m['recorded_up']:.4f} recomputed={m['recomputed_up']:.4f}")

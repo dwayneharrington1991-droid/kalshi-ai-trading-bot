@@ -257,8 +257,11 @@ def test_model_diagnostics_verify_components_inputs_and_contributions(trained):
     # recorded_up was computed before body_fraction was removed, so the
     # reproduction check must report mismatches rather than pass silently.
     rep = report["reproduction"]
-    assert rep["openings_made_by_this_artifact"] == 400
-    assert rep["exactly_reproduced_within_1e_6"] < 400 and rep["max_abs_difference"] > 1e-6
+    # Every row is labelled with this artifact, but only rows 360+ opened after
+    # its available_at; earlier labels are impossible and flagged as anomalies.
+    assert rep["openings_made_by_this_artifact"] == 40 and rep["attributed_before_available_at"] == 360
+    assert rep["exactly_reproduced_within_1e_6"] < 40 and rep["max_abs_difference"] > 1e-6
+    assert rep["status"] == "MATCHING_MODEL_INPUT_PATH_MISMATCH"
     assert rep["mismatches"] and rep["mismatches"][0]["difference"] == rep["max_abs_difference"]
 
 
@@ -277,7 +280,9 @@ def test_model_diagnostics_reproduce_recorded_probabilities_exactly(trained):
     rep = report["reproduction"]
     assert rep["openings_made_by_this_artifact"] == 40
     assert rep["exactly_reproduced_within_1e_6"] == 40 and rep["mismatches"] == []
-    assert rep["openings_made_by_other_models"] == {"opening24h-zero-drift-final-average-v1": 360}
+    # Fallback openings before the artifact existed are expected, not failures.
+    assert rep["openings_made_by_other_models"] == {}
+    assert rep["openings_before_artifact_available"] == 360 and rep["status"] == "REPRODUCED"
     oos = report["out_of_sample_for_this_artifact"]
     # Row 360 opened one minute before row 359's label arrived (the label
     # cutoff), so only rows 361-399 are out-of-sample for this artifact.

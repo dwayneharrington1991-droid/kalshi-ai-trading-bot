@@ -25,7 +25,7 @@ def test_interactions_are_products_of_frozen_values_and_missing_stays_missing():
     f = rows[0]["features"]
     assert f["ix_return_15m_x_rising"] == pytest.approx(0.2) and f["ix_return_15m_x_falling"] == 0.0
     assert f["ix_ema9_21_gap_x_rising"] is None
-    assert "compact_regime_interactions" in research.MODELS
+    assert "momentum_trend_volatility" in research.MODELS
 
 
 def _rows(n=40):
@@ -79,6 +79,6 @@ def test_research_compares_candidates_with_running_model_on_sealed_holdout_only(
     versus = report["versus_running_model"]
     assert versus["status"] == "MEASURED"
     assert versus["holdout_openings_by_current_model"] == report["sealed_holdout"]["holdout_contracts"]
-    assert "compact_regime_interactions" in versus["candidates"]
+    assert "momentum_trend_volatility" in versus["candidates"]
     family = report["multiple_testing"]["results"]
-    assert any(k.startswith("compact_regime_interactions vs") for k in family)
+    assert any(k.startswith("momentum_trend_volatility vs") for k in family)

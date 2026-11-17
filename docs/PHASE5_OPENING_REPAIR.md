@@ -30,7 +30,7 @@ vocabulary, the decision threshold, probability computation and trading
    A recovered forecast is labelled with `input_recovery`.
 3. **Crash-safe reference receipts.** Every accepted BTC reference tick is
    buffered. The server persists only ticks received in the 70 s before a
-   DISCOVERED contract's `opens_at`. They go to the append-only
+   discovered contract's `opens_at` or before the next quarter-hour boundary. They go to the append-only
    `preopen_reference_ticks` table, with UPDATE/DELETE blocked by triggers,
    and record source, receipt time, price, opening and persistence time.
 
@@ -72,6 +72,25 @@ vocabulary, the decision threshold, probability computation and trading
    - `STALE_BTC_FEED` (newest receipt over 10 s old);
    - `CANDLE_WINDOW_NOT_READY`;
    - `MISSING_FEATURE_RECEIPTS`.
+
+## Self-review fixes (author review, not an independent Codex review)
+
+- **Defect: persistence could save nothing in production.** Ticks were saved
+  only for contracts in the market list. The next contract may not be listed
+  (status `open`/`active`) until it opens; Phase 5 found zero pre-open
+  quotes, consistent with that. Ticks are now also saved under the next
+  quarter-hour boundary. Recovery still requires an exact match with the
+  actual opening. The primary key now includes `opens_at`, so one receipt can
+  serve both keys. Test:
+  `test_recovery_works_when_the_contract_is_only_listed_at_its_quarter_hour_opening`
+  (fails without the fix).
+- **Repeated archive reads.** During a failing 120 s window, the freeze loop
+  and the retry re-read the journal candle archive every tick. These are now
+  memoised for 5 s (`Monitor.archived_opening_inputs`). The original
+  generation path is untouched.
+- **Quote diagnostics isolated.** An unexpected error in the new quote
+  diagnostics could have dropped a quote the old recorder kept. It is now
+  recorded as `quote_quality_error` instead.
 
 ## Guarantees and the tests that prove them
 

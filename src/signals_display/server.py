@@ -9,10 +9,11 @@ import json
 from decimal import Decimal
 from pathlib import Path
 import re
+import math
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, parse_qs
 from time import perf_counter, monotonic
 import uuid
@@ -614,6 +615,19 @@ class Monitor:
             return [], None, diagnostics
         return recovered, f"{recovered_source} [journal-recovered pre-opening receipts]", diagnostics
 
+    def archived_opening_inputs(self, opened):
+        """Journal archive of receipt-proven pre-opening candles, memoised for
+        5 s: the grace-window retries otherwise re-read it on every tick."""
+        cache = getattr(self, "_archive_cache", {})
+        wall = utcnow()
+        hit = cache.get(opened)
+        if hit and 0 <= (wall - hit[0]).total_seconds() < 5:
+            return hit[1]
+        value = self.journal.opening_inputs(opened)
+        self._archive_cache = {k: v for k, v in cache.items() if (wall - v[0]).total_seconds() < 60}
+        self._archive_cache[opened] = (wall, value)
+        return value
+
     @staticmethod
     def opening_inputs_complete(history, points, opened):
         """True only when these inputs pass the opening model's own input
@@ -764,12 +778,18 @@ class Monitor:
                         opens.add(timestamp(listed["opens_at"]))
                     except (KeyError, TypeError, ValueError, AttributeError):
                         continue
-                ticks = [
-                    (source, received, price, opened)
-                    for source, received, price in pending
-                    for opened in opens
-                    if 0 <= (opened - received).total_seconds() <= PREOPEN_PERSIST_SECONDS
-                ]
+                ticks = []
+                for source, received, price in pending:
+                    # The next contract may not be listed until it opens, so
+                    # the next quarter-hour boundary (KXBTC15M schedule) is
+                    # also kept. Recovery still requires an exact match with
+                    # the actual opening time, so an extra key is harmless.
+                    boundary = datetime.fromtimestamp(
+                        math.ceil(received.timestamp() / 900) * 900, timezone.utc
+                    )
+                    for opened in opens | {boundary}:
+                        if 0 <= (opened - received).total_seconds() <= PREOPEN_PERSIST_SECONDS:
+                            ticks.append((source, received, price, opened))
                 if ticks:
                     self.journal.record_preopen_references(
                         ticks, mode, utcnow() if mode == "PUBLIC MARKET DATA" else now
@@ -833,7 +853,7 @@ class Monitor:
                     # normal live updates independent of journal size.
                     best_count = max((eligible_count(item) for item in candidates), default=-1)
                     if best_count < 1440 and not existing:
-                        archived = self.journal.opening_inputs(opened)
+                        archived = self.archived_opening_inputs(opened)
                         if isinstance(archived, dict):
                             candidates.append(archived)
                     frozen_history = max(candidates, key=eligible_count) if candidates else {}
@@ -1215,7 +1235,7 @@ class Monitor:
                         if candidate.get("up") is None and not snapshot:
                             options = [frozen, self.preopening_histories.get(m["ticker"])]
                             if frozen is raw_history:
-                                options.append(self.journal.opening_inputs(opened))
+                                options.append(self.archived_opening_inputs(opened))
                             options = [o for o in options if isinstance(o, dict) and o]
                             alt_history = max(options, key=lambda o: _eligible_bar_count(o, opened)) if options else frozen
                             alt_points, alt_source, recovery = self.opening_reference_points(opened, state["mode"])

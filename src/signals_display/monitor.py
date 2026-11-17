@@ -1544,7 +1544,7 @@ class Journal:
                 CREATE TABLE IF NOT EXISTS preopen_reference_ticks (
                     mode TEXT NOT NULL,source TEXT NOT NULL,received_at TEXT NOT NULL,
                     price REAL NOT NULL,opens_at TEXT NOT NULL,persisted_at TEXT NOT NULL,
-                    PRIMARY KEY(mode,source,received_at));
+                    PRIMARY KEY(mode,opens_at,source,received_at));
                 CREATE TRIGGER IF NOT EXISTS preopen_reference_ticks_no_update
                     BEFORE UPDATE ON preopen_reference_ticks BEGIN
                     SELECT RAISE(ABORT,'Pre-opening reference receipts are immutable'); END;
@@ -3042,6 +3042,14 @@ class Journal:
     OPENING_QUOTE_WINDOW_SECONDS = 120
     OPENING_PREOPEN_QUOTE_SECONDS = 60
 
+    @classmethod
+    def _safe_quote_quality(cls, *args):
+        """Diagnostics must never stop a quote the recorder would have kept."""
+        try:
+            return cls._quote_quality(*args)
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"quote_quality_error": type(exc).__name__}
+
     @staticmethod
     def _quote_quality(market, up, down, up_ask, down_ask):
         """Explicit evidence for research (Phase 5); never infers a missing side.
@@ -3115,7 +3123,7 @@ class Journal:
                 market.get("quote_event_time"),
                 json.dumps({"quotes": quotes, "received_at": observed.isoformat(),
                             "recorded_at": now.isoformat(),
-                            **self._quote_quality(market, up, down, up_ask, down_ask)},
+                            **self._safe_quote_quality(market, up, down, up_ask, down_ask)},
                            allow_nan=False),
             )
         except (KeyError, ValueError, TypeError, AttributeError):

@@ -91,14 +91,16 @@ def test_inputs_complete_mirrors_the_opening_models_own_checks():
 # ------------------------------------------------------- restart simulations
 
 
-def _run_process(tmp_path, monkeypatch, *, restart_at=None, persist=True, journal_name="sim.db"):
+def _run_process(tmp_path, monkeypatch, *, restart_at=None, persist=True, journal_name="sim.db",
+                 opened=None, listed_before_open=True):
     """Drive Monitor.tick through one opening. With restart_at, the first
     process stops just before the open and a NEW process (empty memory) takes
     over at restart_at. Returns the immutable opening record."""
-    opened = NOW
+    opened = opened or NOW
     clock = [opened - timedelta(seconds=66)]
     monkeypatch.setattr("src.signals_display.server.utcnow", lambda: clock[0])
     contract = market()
+    contract.update(opens_at=opened.isoformat(), closes_at=(opened + timedelta(minutes=15)).isoformat())
     candles = history(opened - timedelta(minutes=1), opened - timedelta(seconds=1))
     journal = Journal(tmp_path / journal_name)
     if not persist:
@@ -123,6 +125,8 @@ def _run_process(tmp_path, monkeypatch, *, restart_at=None, persist=True, journa
         if step == 13:
             payload["btc_candles"] = candles
         payload["markets"][0]["observed_at"] = now.isoformat()
+        if not listed_before_open:
+            payload["markets"] = []  # Kalshi may list the next contract only once it opens
         first.tick((payload, now, now, 0))
     worker = first
     at = opened + timedelta(seconds=1) if restart_at is None else restart_at
@@ -327,3 +331,55 @@ def test_incomplete_inputs_are_never_frozen_into_a_permanent_snapshot(tmp_path, 
     monitor.tick((payload, opened, opened, 0))
     assert journal.opening_snapshot(contract["ticker"], MODE) is None
     assert journal.opening_record(contract["ticker"], MODE) is None  # still retrying, nothing manufactured
+
+
+def test_recovery_works_when_the_contract_is_only_listed_at_its_quarter_hour_opening(tmp_path, monkeypatch):
+    """Review defect: persistence keyed only to listed contracts saved nothing
+    when the next contract is not listed before it opens."""
+    from datetime import datetime, timezone
+
+    boundary = datetime.fromtimestamp(-(-int(NOW.timestamp()) // 900) * 900, timezone.utc)
+    normal = _run_process(tmp_path, monkeypatch, opened=boundary, listed_before_open=False,
+                          journal_name="unlisted-normal.db")
+    recovered = _run_process(tmp_path, monkeypatch, opened=boundary, listed_before_open=False,
+                             restart_at=boundary + timedelta(seconds=20), journal_name="unlisted-restart.db")
+    assert recovered["up"] is not None and recovered["up"] == normal["up"]
+    assert "journal-recovered" in str(recovered.get("reference_source"))
+    with sqlite3.connect(tmp_path / "unlisted-restart.db") as db:
+        keys = {row[0] for row in db.execute("SELECT DISTINCT opens_at FROM preopen_reference_ticks")}
+    assert keys == {boundary.isoformat()}
+
+
+def test_one_receipt_can_serve_two_opening_keys(tmp_path):
+    journal = Journal(tmp_path / "keys.db")
+    other = NOW + timedelta(seconds=30)
+    tick = ("Coinbase BTC/USD proxy", NOW - timedelta(seconds=10), 100000.0)
+    journal.record_preopen_references([(*tick, NOW), (*tick, other)], MODE, NOW - timedelta(seconds=9))
+    assert journal.preopen_reference_points(NOW, MODE)[0] and journal.preopen_reference_points(other, MODE)[0]
+
+
+def test_quote_diagnostics_failure_never_drops_a_quote(tmp_path, monkeypatch):
+    journal = Journal(tmp_path / "q2.db")
+
+    def boom(*_args):
+        raise RuntimeError("diagnostic bug")
+
+    monkeypatch.setattr(Journal, "_quote_quality", staticmethod(boom))
+    assert journal.record_opening_quote(_quote_market(), MODE, NOW + timedelta(seconds=4))
+    with sqlite3.connect(tmp_path / "q2.db") as db:
+        payload = json.loads(db.execute("SELECT payload FROM opening_quote_snapshots").fetchone()[0])
+    assert payload["quote_quality_error"] == "RuntimeError" and payload["quotes"]
+
+
+def test_archive_reads_are_memoised_inside_the_grace_window(tmp_path, monkeypatch):
+    monitor = Monitor(None, Journal(tmp_path / "memo.db"))
+    calls = []
+    monkeypatch.setattr(monitor.journal, "opening_inputs", lambda opened: calls.append(opened) or {"candles": []})
+    clock = [NOW]
+    monkeypatch.setattr("src.signals_display.server.utcnow", lambda: clock[0])
+    monitor.archived_opening_inputs(NOW)
+    clock[0] = NOW + timedelta(seconds=4)
+    monitor.archived_opening_inputs(NOW)
+    clock[0] = NOW + timedelta(seconds=6)
+    monitor.archived_opening_inputs(NOW)
+    assert len(calls) == 2

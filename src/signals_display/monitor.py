@@ -2850,14 +2850,17 @@ class Journal:
             ),
         }
 
-    BLOCKED_CONFIDENCE = {"NO VERIFIED EDGE", "INSUFFICIENT PREDICTIVE CONFIDENCE", "UNCALIBRATED"}
+    DISPLAYABLE_OPENING_CONFIDENCE = {
+        "CALIBRATED",
+        "EXPERIMENTAL CALIBRATED CANDIDATE",
+    }
 
     def verified_opening_scoreboard(self):
         """Verified live AI performance: immutable opening calls the dashboard
         actually showed as UP/DOWN, matched with official Kalshi settlements.
 
         A call counts only when its saved immutable record says UP or DOWN, its
-        confidence status was displayable (not blocked/uncalibrated), and its
+        confidence status was explicitly displayable/calibrated, and its
         probability agrees with the side. WAIT/UNCLEAR, unsettled contracts,
         replay records, duplicates and invalid records are excluded and counted
         separately. Retrospective research predictions never enter.
@@ -2885,7 +2888,7 @@ class Journal:
                 continue
             direction = saved.get("direction")
             status = (saved.get("confidence") or {}).get("status")
-            if direction not in {"UP", "DOWN"} or status in self.BLOCKED_CONFIDENCE:
+            if direction not in {"UP", "DOWN"} or status not in self.DISPLAYABLE_OPENING_CONFIDENCE:
                 excluded["wait_or_no_call"] += 1
                 continue
             if (

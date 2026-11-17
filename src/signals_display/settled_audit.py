@@ -34,6 +34,8 @@ DISPLAYABLE_CONFIDENCE = {"CALIBRATED", "EXPERIMENTAL CALIBRATED CANDIDATE"}
 HIGH_CONFIDENCE_CLAIM = {"min_confidence": 0.80, "min_calls": 100, "min_wilson_lower": 0.80}
 PHASE4_FIXED_THRESHOLD = 0.55
 PHASE4_THRESHOLD_CHALLENGERS = (0.50, 0.52, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80)
+PHASE5_SCOREBOARD_CLAIM = {"correct": 20, "wrong": 9, "recent_correct": 19,
+                           "recent_wrong": 7, "recent_window": 26}
 BOOTSTRAP_REPLICATES = 2000
 BOOTSTRAP_SEED = 20261117
 
@@ -317,6 +319,151 @@ def dashboard_scoreboard(rows):
                 "models": _count(r["model"] for r in recent),
             }
     return out
+
+
+def _minimum_binomial_samples(max_wilson_half_width):
+    """Conservative n needed for a two-sided 95% Wilson interval precision."""
+    for samples in range(1, 100_001):
+        low, high = wilson_interval(samples // 2, samples)
+        if (high - low) / 2 <= max_wilson_half_width:
+            return samples
+    raise AssertionError("sample-size search exceeded its bounded range")
+
+
+def _pareto_thresholds(alternatives):
+    """Development-only accuracy/coverage frontier; never a policy choice."""
+    usable = [(key, value) for key, value in alternatives.items()
+              if value.get("calls") and value.get("accuracy") is not None]
+    frontier = []
+    for key, value in usable:
+        dominated = any(
+            (other["accuracy"] >= value["accuracy"] and other["coverage"] >= value["coverage"])
+            and (other["accuracy"] > value["accuracy"] or other["coverage"] > value["coverage"])
+            for other_key, other in usable if other_key != key
+        )
+        if not dominated:
+            frontier.append(key)
+    return sorted(frontier, key=float)
+
+
+def phase5_validation(settled, scoreboard, threshold_report, quote_coverage,
+                      hypothetical_pnl, expected_claim=None, current_model=None,
+                      eligible_frozen_openings=None):
+    """Build read-only Phase 5 evidence without selecting or activating policy."""
+    claim = dict(expected_claim or PHASE5_SCOREBOARD_CLAIM)
+    recent_key = f"most_recent_{claim['recent_window']}"
+    recent = scoreboard.get(recent_key) or {}
+    claim_result = {
+        "claimed": claim,
+        "observed": {
+            "correct": scoreboard.get("correct"), "wrong": scoreboard.get("wrong"),
+            "recent_correct": recent.get("correct"), "recent_wrong": recent.get("wrong"),
+            "recent_window_observed": recent.get("calls"),
+        },
+        "overall_exact_match": (scoreboard.get("correct"), scoreboard.get("wrong"))
+                               == (claim["correct"], claim["wrong"]),
+        "recent_exact_match": (recent.get("correct"), recent.get("wrong"), recent.get("calls"))
+                              == (claim["recent_correct"], claim["recent_wrong"],
+                                  claim["recent_window"]),
+        "scope_warning": None if scoreboard.get("single_model") else
+                         "OVERALL_SCOREBOARD_MIXES_MODEL_VERSIONS",
+    }
+    if current_model:
+        cohort = (scoreboard.get("by_model") or {}).get(current_model)
+        claim_result.update(running_model=current_model,
+                            running_model_observed=cohort,
+                            running_model_present=cohort is not None)
+
+    all_calls, total = scoreboard.get("calls", 0), len(settled)
+    eligible = total if eligible_frozen_openings is None else eligible_frozen_openings
+    requirements = {
+        "current_directional_calls": all_calls,
+        "eligible_frozen_openings": eligible,
+        "current_coverage": all_calls / total if total else None,
+        "current_coverage_wilson_95": wilson_interval(all_calls, total),
+        "accuracy_wilson_95": scoreboard.get("accuracy_wilson_95"),
+        "conservative_calls_for_95pct_interval_half_width": {
+            "10_percentage_points": _minimum_binomial_samples(0.10),
+            "7_5_percentage_points": _minimum_binomial_samples(0.075),
+            "5_percentage_points": _minimum_binomial_samples(0.05),
+        },
+        "comparison_minimums": {
+            "paired_directional_calls_per_candidate": 100,
+            "sealed_holdout_contracts": 200,
+            "rationale": ("Planning floors, not proof of power: paired comparisons also require "
+                          "enough discordant outcomes; final uncertainty and Holm-adjusted tests govern."),
+        },
+    }
+
+    def enrich_threshold(scope):
+        alternatives = scope.get("development_alternatives") or {}
+        fixed = alternatives.get(f"{PHASE4_FIXED_THRESHOLD:.2f}") or {}
+        rows = {}
+        for key, metrics in alternatives.items():
+            rows[key] = {
+                **metrics,
+                "additional_calls_vs_0_55": metrics.get("calls", 0) - fixed.get("calls", 0),
+                "accuracy_change_vs_0_55": (
+                    metrics["accuracy"] - fixed["accuracy"]
+                    if metrics.get("accuracy") is not None and fixed.get("accuracy") is not None else None
+                ),
+            }
+        return {
+            "development_only": True,
+            "fixed_reference": PHASE4_FIXED_THRESHOLD,
+            "accuracy_coverage_frontier": _pareto_thresholds(alternatives),
+            "comparisons": rows,
+            "optimal_threshold": None,
+            "selection_allowed": False,
+            "reason": ("Accuracy and coverage are competing objectives. The frontier is exploratory; "
+                       "no threshold may be selected from the sealed holdout or this report alone."),
+        }
+
+    threshold_research = {
+        "pooled_reference": enrich_threshold(threshold_report),
+        "by_model": {model: enrich_threshold(scope)
+                     for model, scope in (threshold_report.get("by_model") or {}).items()},
+    }
+    priced = hypothetical_pnl.get("priced_calls", 0)
+    quote_limit = {
+        "preopening_quote_rows": quote_coverage.get("rows_at_or_before_open", 0),
+        "settled_openings_with_preopening_quote": quote_coverage.get(
+            "settled_openings_with_preopen_quote", 0),
+        "displayed_calls_with_executable_cost_outcome": priced,
+        "market_probability_comparison_status": (
+            "MEASURABLE" if quote_coverage.get("settled_openings_with_preopen_quote", 0)
+            else "NOT_MEASURABLE"
+        ),
+        "after_cost_counterfactual_status": "MEASURABLE" if priced else "NOT_MEASURABLE",
+        "conclusion": ("After-cost results are counterfactual only; displayed quotes are not fills. "
+                       "A Kalshi market-probability comparison separately requires genuine pre-opening quotes."
+                       if priced else
+                       "No executable quote coverage; realized or after-cost profitability cannot be concluded."),
+        "actual_fills_available": False,
+    }
+    blockers = []
+    if not claim_result["overall_exact_match"] or not claim_result["recent_exact_match"]:
+        blockers.append("CLAIMED_SCOREBOARD_NOT_RECONCILED_AT_THIS_ASOF")
+    if claim_result.get("scope_warning"):
+        blockers.append(claim_result["scope_warning"])
+    if current_model and not claim_result.get("running_model_present"):
+        blockers.append("RUNNING_MODEL_NOT_PRESENT_IN_SETTLED_SCOREBOARD")
+    if eligible < requirements["comparison_minimums"]["sealed_holdout_contracts"]:
+        blockers.append("INSUFFICIENT_SETTLED_OPENINGS_FOR_MODEL_PROMOTION_RESEARCH")
+    if quote_limit["market_probability_comparison_status"] != "MEASURABLE":
+        blockers.append("KALSHI_PREOPEN_COMPARISON_NOT_MEASURABLE")
+    if quote_limit["after_cost_counterfactual_status"] != "MEASURABLE":
+        blockers.append("AFTER_COST_PROFITABILITY_NOT_MEASURABLE")
+    return {
+        "role": "READ_ONLY_RESEARCH_READINESS",
+        "activation_allowed": False,
+        "scoreboard_claim_reconciliation": claim_result,
+        "minimum_evidence": requirements,
+        "development_threshold_research": threshold_research,
+        "profitability_evidence": quote_limit,
+        "recommendation": "PASS_RESEARCH_ONLY" if not blockers else "BLOCKED_FOR_PROMOTION",
+        "blockers": blockers,
+    }
 
 
 def integrity_checks(db, rows, asof):
@@ -787,12 +934,17 @@ def day_block_bootstrap(priced, replicates=BOOTSTRAP_REPLICATES, seed=BOOTSTRAP_
     return [means[int(0.025 * replicates)], means[int(0.975 * replicates) - 1]]
 
 
-def audit(db, asof=None):
+def audit(db, asof=None, expected_scoreboard_claim=None, current_model=None,
+          eligible_frozen_openings=None):
     asof = asof or datetime.now(timezone.utc)
     rows, problems = load_openings(db, asof)
     settled = [r for r in rows if r["outcome"] is not None]
     history = official_history(db, asof)
     development, holdout, seal = sealed_split(settled)
+    scoreboard = dashboard_scoreboard(rows)
+    threshold_report = threshold_challenge(settled)
+    quotes = quote_snapshot_coverage(db, rows)
+    all_pnl = hypothetical_pnl(db, [r for r in settled if displayed(r)])
     report = {
         "format": AUDIT_FORMAT,
         "role": "READ_ONLY_RESEARCH",
@@ -800,16 +952,16 @@ def audit(db, asof=None):
         "activation_allowed": False,
         "journal_audit": journal_audit(db, rows, problems, asof),
         "integrity_checks": integrity_checks(db, rows, asof),
-        "quote_snapshot_coverage": quote_snapshot_coverage(db, rows),
+        "quote_snapshot_coverage": quotes,
         "daily_breakdown": daily_breakdown(rows),
         "model_versions": model_versions(settled),
-        "dashboard_scoreboard_replica": dashboard_scoreboard(rows),
+        "dashboard_scoreboard_replica": scoreboard,
         "sealed_holdout": seal,
         "all_settled": {
             "displayed_accuracy": displayed_accuracy(settled),
             "calibration": calibration(settled),
             "versus_market": versus_market(settled, history),
-            "hypothetical_pnl": hypothetical_pnl(db, [r for r in settled if displayed(r)]),
+            "hypothetical_pnl": all_pnl,
         },
         "development": {
             "no_call_reasons": no_call_reasons(development),
@@ -823,7 +975,7 @@ def audit(db, asof=None):
             "versus_market": versus_market(holdout, history),
             "hypothetical_pnl": hypothetical_pnl(db, [r for r in holdout if displayed(r)]),
         },
-        "phase4_threshold_challenge": threshold_challenge(settled),
+        "phase4_threshold_challenge": threshold_report,
         "note": (
             "The recorded AI probabilities were fixed before settlement, so the full "
             "record is already out-of-sample for the live model. The sealed holdout "
@@ -831,6 +983,10 @@ def audit(db, asof=None):
             "here only so the same slice can be reused unchanged."
         ),
     }
+    report["phase5_validation"] = phase5_validation(
+        settled, scoreboard, threshold_report, quotes, all_pnl,
+        expected_scoreboard_claim, current_model, eligible_frozen_openings,
+    )
     return report
 
 
@@ -870,6 +1026,15 @@ def summary_lines(report):
         recent = board.get("most_recent_26")
         if recent:
             lines.append(f"  most_recent_26 {recent['correct']}-{recent['wrong']} from={recent['from']} models={recent['models']}")
+    phase5 = report.get("phase5_validation") or {}
+    if phase5:
+        reconcile = phase5["scoreboard_claim_reconciliation"]
+        evidence = phase5["minimum_evidence"]
+        lines.append(f"PHASE5 {phase5['recommendation']} claim_overall={reconcile['overall_exact_match']} "
+                     f"claim_recent={reconcile['recent_exact_match']} blockers={phase5['blockers']}")
+        lines.append(f"  evidence calls={evidence['current_directional_calls']} coverage={fmt(evidence['current_coverage'])} "
+                     f"coverage_wilson95={evidence['current_coverage_wilson_95']} "
+                     f"accuracy_wilson95={evidence['accuracy_wilson_95']}")
     for model, v in (report.get("model_versions") or {}).items():
         lines.append(f"  model {model}: {v['first_opening'][:16]}..{v['last_opening'][:16]} settled={v['settled_openings']} "
                      f"calls={v['displayed_calls']} acc={fmt(v['accuracy'])} wilson95={v['accuracy_wilson_95']} "

@@ -1130,7 +1130,10 @@ def main():
             coverage = opening_models.dataset_coverage(db, asof)
             # Report A first: the verified historical audit of displayed calls,
             # written and printed before any experimental model research runs.
-            audit = settled_audit.audit(db, asof)
+            audit = settled_audit.audit(
+                db, asof, current_model=args.current_model,
+                eligible_frozen_openings=coverage.get("eligible_frozen_openings"),
+            )
             audit["authoritative_dataset_coverage"] = coverage
             audit_path = args.output.with_name("report_A_settled_audit.json")
             rigor._refuse_foreign_file(audit_path, settled_audit.AUDIT_FORMAT)

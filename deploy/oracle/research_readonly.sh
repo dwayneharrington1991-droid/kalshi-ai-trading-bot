@@ -158,6 +158,12 @@ except Exception as exc:
 print(json.dumps(summary, indent=1, default=str))
 ' "$artifact" | tee "$OUT_DIR/running_model.json"
 
+current_model=""
+if [[ -n $artifact && -f $artifact ]]; then
+  current_model=$(PYTHONNOUSERSITE=1 "$PYTHON" -P -c 'import json,sys; m=json.load(open(sys.argv[1])).get("model_id"); print("opening-candidate/" + m if m else "")' "$artifact" 2>/dev/null || true)
+fi
+say "running model label for score/model-separated comparisons: ${current_model:-NONE}"
+
 manifest=$RUN_ROOT/manifest.json
 asof=$(PYTHONNOUSERSITE=1 "$PYTHON" -P - "$manifest" "$journal" <<'PY'
 import json, os, sys
@@ -185,7 +191,8 @@ run_py() { PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 nice -n 15 "$PYTHON" -P "$
 cd "$OUT_DIR"
 say "Report A: settled audit of displayed calls (port ${journal_port[$journal]} journal)"
 run_py -m src.signals_display.opening_research --journal "$journal" --asof "$asof" \
-  --output "$OUT_DIR/opening_research.report.json" --audit-only | tee "$OUT_DIR/summary_reports_A_B.txt"
+  --output "$OUT_DIR/opening_research.report.json" --audit-only \
+  ${current_model:+--current-model "$current_model"} | tee "$OUT_DIR/summary_reports_A_B.txt"
 # Report A per running service: the dashboard counter on each port counts
 # that port's own journal, so each is audited separately and labelled.
 for each in "${journals[@]}"; do
@@ -203,10 +210,6 @@ if [[ -n $artifact && -f $artifact ]]; then
   run_py -m src.signals_display.artifact_diagnostics --journal "$journal" --artifact "$artifact" --asof "$asof" \
     --output "$OUT_DIR/model_diagnostics.json" | tee -a "$OUT_DIR/summary_reports_A_B.txt" \
     || say "model diagnostics unavailable; continuing"
-fi
-current_model=""
-if [[ -n $artifact && -f $artifact ]]; then
-  current_model=$(PYTHONNOUSERSITE=1 "$PYTHON" -P -c 'import json,sys; m=json.load(open(sys.argv[1])).get("model_id"); print("opening-candidate/" + m if m else "")' "$artifact" 2>/dev/null || true)
 fi
 say "running model label for same-contract comparison: ${current_model:-NONE}"
 say "Report B: offline model research (resumable; limit $RESEARCH_TIMEOUT; rerun the same command to continue)"

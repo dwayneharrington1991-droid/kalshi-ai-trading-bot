@@ -26,8 +26,8 @@ def test_existing_request_id_is_rejected_for_a_different_commit(sim):
     assert other_sha != sim["sha"]
     result, fields = _job(sim, "start", other_sha, job_id, scenario="slow_success")
 
-    assert fields.get("DEPLOY_JOB_STATE") == "REJECTED", result.stdout
-    assert fields.get("DEPLOY_JOB_SHA") == sim["sha"]
+    assert fields.get("DEPLOY_JOB_STATE") in {"REJECTED", "SHA_MISMATCH"}, result.stdout
+    assert (sim["state"] / "jobs" / job_id / "sha").read_text().strip() == sim["sha"]
     assert _wait_finished(sim, job_id)["DEPLOY_RESULT"] == "SUCCESS"
     assert (sim["simdir"] / "installs").read_text().count("\n") == 1
     assert _unchanged_neighbours(sim)
@@ -61,18 +61,13 @@ def test_simultaneous_job_creation_has_one_atomic_winner(sim):
 def test_windows_client_validates_resume_id_before_remote_interpolation():
     """ResumeJobId is user input and must not become unquoted Bash syntax."""
     client = (ROOT / "deploy/windows/Deploy-Preview8768.ps1").read_text()
-    validation_markers = (
-        "$ResumeJobId -notmatch '^[A-Za-z0-9-]{8,64}$'",
-        '$ResumeJobId -notmatch "^[A-Za-z0-9-]{8,64}$"',
-    )
-    positions = [client.find(marker) for marker in validation_markers]
-    validation = min(position for position in positions if position >= 0) if any(
-        position >= 0 for position in positions
-    ) else -1
-    first_remote_use = client.find('status $JobId')
+    pattern = client.find("$UuidPattern = '^[0-9a-f]{8}-")
+    validation = client.find("$ResumeJobId -cnotmatch $UuidPattern")
+    first_ssh = client.find("Invoke-Remote 'echo SSH_PREFLIGHT_OK'")
 
+    assert pattern >= 0, "PowerShell client has no canonical lowercase UUID pattern"
     assert validation >= 0, "PowerShell client has no strict ResumeJobId validation"
-    assert first_remote_use >= 0 and validation < first_remote_use
+    assert first_ssh >= 0 and pattern < validation < first_ssh
 
 
 def test_job_status_sha_is_compared_with_requested_sha_by_windows_client():

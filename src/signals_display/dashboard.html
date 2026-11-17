@@ -80,7 +80,7 @@ main{position:relative;z-index:1}
 .term-track{fill:none;stroke:#ffffff12;stroke-width:7}
 .term-arc{fill:none;stroke:var(--t-tone);stroke-width:7;stroke-linecap:round;stroke-dasharray:326.73;stroke-dashoffset:326.73;filter:drop-shadow(0 0 8px var(--t-tone));transition:stroke-dashoffset .9s cubic-bezier(.2,.8,.2,1),stroke .6s ease}
 #minimal-opening-confidence{position:relative;font-size:clamp(40px,6vw,70px);font-weight:800;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
-.term-qual{position:relative;display:block;margin-top:clamp(16px,3vh,26px);max-width:36ch;font-size:13px;line-height:1.5;color:var(--t-muted);letter-spacing:.02em}
+.term-qual{display:none!important}
 @media(max-width:760px){#minimal-opening{grid-template-columns:1fr;align-content:start;min-height:auto;padding-top:12px}#minimal-opening .minimal-value{min-height:auto;padding:30px 18px;border-radius:22px}.term-gauge{width:min(260px,72vw)}}
 /* Visible top countdown pill (TIME LEFT). Pinned above the centred cards so
    it takes no layout space on desktop; it never moves the two AI cards there. */
@@ -97,6 +97,12 @@ main>div.ai-scoreboard:not(#minimal-opening){display:flex!important;flex-directi
 .ai-scoreboard .score-sample{font-size:10px;letter-spacing:.08em}
 @media(max-width:1100px){main>div.ai-scoreboard:not(#minimal-opening){position:absolute;top:74px;left:50%;right:auto;transform:translateX(-50%);text-align:center;align-items:center}#minimal-opening{padding-top:170px}}
 @media(max-width:760px){main>div.ai-scoreboard:not(#minimal-opening){top:92px;width:calc(100% - 24px)}#minimal-opening{padding-top:200px}}
+/* The subscriber-facing surface intentionally contains only the immutable
+   opening call and calibrated confidence. Countdown and score data continue
+   updating behind the scenes for APIs, audits and future reviewed layouts. */
+main>div.primary-contract:not(#minimal-opening),main>div.ai-scoreboard:not(#minimal-opening){display:none!important}
+#minimal-opening{padding-top:clamp(8px,2vw,24px)}
+@media(max-width:760px){#minimal-opening{padding-top:12px}}
 @media(prefers-reduced-motion:reduce){body:after,#minimal-opening .minimal-value:after,.term-flip{animation:none!important}.term-arc,#minimal-opening .minimal-value{transition:none!important}}
 @media(prefers-contrast:more){#minimal-opening .minimal-value{background:#000;border-color:#fff}.term-qual{color:#fff}#minimal-opening h1{color:#fff;background:none}}
 </style></head><body><main>
@@ -209,7 +215,7 @@ function terminalView(s,i,usable,direction,confidence){
   const closes=Date.parse(i.closes_at),current=!s.market?.ticker||!i.ticker||i.ticker===s.market.ticker;
   if(!Number.isFinite(i.up)||!Number.isFinite(closes)||Date.now()>=closes||!current){terminalUnavailable(Number.isFinite(i.up)?'Contract closed · waiting for the next opening':'No frozen opening prediction for this contract yet');return}
   terminal.closesAt=closes;
-  const calibrated=i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE',call=usable&&['UP','DOWN'].includes(direction)?direction:'WAIT';
+  const calibrated=['CALIBRATED','EXPERIMENTAL CALIBRATED CANDIDATE'].includes(i.confidence?.status),call=usable&&['UP','DOWN'].includes(direction)?direction:'WAIT';
   const callNote='Frozen at '+termTime(i.opens_at)+' open · valid until '+termTime(i.closes_at);
   if(!calibrated){terminalSet(call==='WAIT'?'WAIT':call,'—',callNote,'No calibrated opening model is active · uncalibrated estimate withheld',0);return}
   if(call==='WAIT'){const threshold=i.decision_policy?.threshold;terminalSet('WAIT',termPct(confidence),callNote,'Calibrated · below the validated '+(Number.isFinite(threshold)?termPct(threshold):'')+' call threshold',confidence);return}
@@ -261,14 +267,14 @@ function primaryView(s){
   const scalp=!s.stale&&m.actionable===true&&m.recommendation==='SCALP UP'?'SCALP UP':!s.stale&&m.actionable===true&&m.recommendation==='SCALP DOWN'?'SCALP DOWN':'WAIT';
   const openingModel=audit.opening_ensemble_active?'AI ACTIVE':audit.model_id||i.model?'SHADOW / EXPERIMENTAL':'BASELINE / UNAVAILABLE';
   const liveModel=e.model_status||s.settlement_intelligence?.model_status||'EXPERIMENTAL';
-  const calibratedOpening=i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE',minimalConfidence=calibratedOpening&&Number.isFinite(i.up)?Math.max(i.up,Number.isFinite(i.down)?i.down:1-i.up):null;
+  const calibratedOpening=['CALIBRATED','EXPERIMENTAL CALIBRATED CANDIDATE'].includes(i.confidence?.status),minimalConfidence=calibratedOpening&&Number.isFinite(i.up)?Math.max(i.up,Number.isFinite(i.down)?i.down:1-i.up):null;
   terminalView(s,i,openingUsable,openingDirection,minimalConfidence);
   $('minimal-opening-confidence').title=openingUsable?'Calibrated probability assigned to the immutable UP/DOWN opening call.':minimalConfidence!=null?'Larger calibrated outcome probability. The model still says WAIT because neither side crossed the validation-selected directional threshold.':'No calibrated opening probability was available at the immutable cutoff.';
   txt('primary-contract',e.ticker||s.market?.ticker||'Waiting for KXBTC15M');
   syncContractClock(s);
   txt('primary-opening',openingDirection);
   $('primary-opening').className='forecast-label '+(openingDirection==='UP'?'green':openingDirection==='DOWN'?'red':'amber');
-  const openingProbabilityAvailable=Number.isFinite(i.up),openingThreshold=i.decision_policy?.threshold;
+  const openingProbabilityAvailable=calibratedOpening&&Number.isFinite(i.up),openingThreshold=i.decision_policy?.threshold;
   txt('primary-opening-probability',openingProbabilityAvailable?prob(i.up)+' UP · '+prob(Number.isFinite(i.down)?i.down:1-i.up)+' DOWN'+(Number.isFinite(openingThreshold)?' · directional threshold '+prob(openingThreshold):''):'Probability unavailable');
   txt('primary-opening-reason',openingUsable?'This was the bot’s immutable call at the market opening. Current LIVE staleness cannot change it.':openingProbabilityAvailable?'AI evaluated the frozen opening snapshot and selected WAIT under its validation-frozen abstention policy. '+(i.confidence?.reason||i.neutral_reason||i.reason||'No directional threshold was crossed.'):i.confidence?.reason||i.neutral_reason||i.reason||'Opening inputs were unavailable at the opening cutoff.');
   txt('primary-opening-model','Model: '+openingModel);

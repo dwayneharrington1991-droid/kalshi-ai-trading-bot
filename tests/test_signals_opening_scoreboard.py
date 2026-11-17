@@ -58,5 +58,5 @@ def test_scoreboard_route_cache_invalidation_and_dashboard_wiring():
     page = (root / "dashboard.html").read_text()
     for marker in ('id="ai-scoreboard"', 'id="score-correct"', 'id="score-wrong"', 'id="score-accuracy"',
                    'id="score-sample"', "fetch('/api/opening-scoreboard'", "setInterval(refreshScoreboard,30000)",
-                   "main>div.ai-scoreboard:not(#minimal-opening){display:flex!important"):
+                   "main>div.primary-contract:not(#minimal-opening),main>div.ai-scoreboard:not(#minimal-opening){display:none!important"):
         assert marker in page, marker

@@ -291,7 +291,7 @@ def test_dashboard_contains_incremental_chart_without_external_script():
     assert 'id="minimal-opening-call"' in page
     assert 'id="minimal-opening-confidence"' in page
     assert "main>:not(#minimal-opening){display:none!important}" in page
-    assert "calibratedOpening=i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE'" in page
+    assert "['CALIBRATED','EXPERIMENTAL CALIBRATED CANDIDATE'].includes(i.confidence?.status)" in page
     assert "Larger calibrated outcome probability" in page
     assert 'id="opening-score"' in page
     assert "const openingUsable=Number.isFinite(i.up)" in page

@@ -139,3 +139,42 @@ def test_unexpected_opening_generation_error_is_contained(tmp_path, monkeypatch)
     # Shown as unavailable: WAIT and no probability. Never an invented call.
     assert initial.get("status") == "UNAVAILABLE" and initial.get("up") is None
     assert initial.get("direction") == "WAIT"
+
+
+def test_switch_readiness_probe_passes_a_genuinely_ready_service_and_reports_startup():
+    def run(responses):
+        _Server.responses = responses
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            script = _probe_source() + f'\nPYTHON={sys.executable}\nPREVIEW_PROBE_PORT={server.server_address[1]}\nreadiness_report abc\n'
+            return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        finally:
+            server.shutdown()
+
+    healthy = {
+        "/healthz": (200, {"status": "HEALTHY", "build_commit": "abc", "signals_only": True,
+                           "workers": {"healthy": True}}),
+        "/readyz": (200, {"status": "READY", "signals_only": True, "contract_quotes_fresh": True,
+                          "reference_fresh": True}),
+        "/api/candle-integrity": (200, {"status": "READY", "bars": 1440, "unique_bars": 1440}),
+        "/api/state?view=main": (200, {"decision_intelligence": {"execution_capability": False}}),
+    }
+    ready = run(healthy)
+    assert ready.returncode == 0 and "READINESS PASS" in ready.stdout
+    # Temporary startup: the startup handler answers 503 with its loading phase.
+    startup = dict(healthy, **{"/healthz": (503, {"status": "STARTING", "phase": "LOADING_JOURNAL"}),
+                               "/readyz": (503, {"status": "STARTING", "phase": "LOADING_JOURNAL"})})
+    starting = run(startup)
+    assert starting.returncode != 0 and "LOADING_JOURNAL" in starting.stdout
+
+
+def test_core_market_data_failure_still_makes_the_service_not_ready(tmp_path):
+    class FailingFeed:
+        def poll(self):
+            raise RuntimeError("exchange unavailable")
+
+    monitor = Monitor(FailingFeed(), Journal(tmp_path / "journal.db"))
+    monitor.tick()
+    state = monitor.snapshot()
+    assert state["stale"] and state.get("connection_error")  # genuine failure is never masked

@@ -322,6 +322,12 @@ if [[ -n $OPENING_ARTIFACT ]]; then
   new_args+=(--opening-model-artifact "$OPENING_ARTIFACT")
 fi
 
+# Planned restart: never stop the running preview inside an opening window
+# (90 s before to 150 s after a quarter hour). Rollback paths are not guarded.
+# shellcheck source=deploy/oracle/opening_window_guard.sh
+source "$(dirname "${BASH_SOURCE[0]}")/opening_window_guard.sh"
+opening_window_wait "preview 8768 switch" || fail "opening-window guard refused the planned restart"
+kill -0 "$old_pid" 2>/dev/null || fail "previous preview exited while waiting for the opening window"
 kill -TERM "$old_pid"
 wait_stopped "$old_pid" || fail "preview did not stop gracefully within 30 seconds"
 wait_port_free || fail "port 8768 remained occupied after graceful stop"

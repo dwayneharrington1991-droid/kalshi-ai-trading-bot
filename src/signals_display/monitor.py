@@ -1541,6 +1541,16 @@ class Journal:
                 CREATE TRIGGER IF NOT EXISTS opening_quote_snapshots_no_delete
                     BEFORE DELETE ON opening_quote_snapshots BEGIN
                     SELECT RAISE(ABORT,'Opening quote snapshots are immutable'); END;
+                CREATE TABLE IF NOT EXISTS preopen_reference_ticks (
+                    mode TEXT NOT NULL,source TEXT NOT NULL,received_at TEXT NOT NULL,
+                    price REAL NOT NULL,opens_at TEXT NOT NULL,persisted_at TEXT NOT NULL,
+                    PRIMARY KEY(mode,source,received_at));
+                CREATE TRIGGER IF NOT EXISTS preopen_reference_ticks_no_update
+                    BEFORE UPDATE ON preopen_reference_ticks BEGIN
+                    SELECT RAISE(ABORT,'Pre-opening reference receipts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS preopen_reference_ticks_no_delete
+                    BEFORE DELETE ON preopen_reference_ticks BEGIN
+                    SELECT RAISE(ABORT,'Pre-opening reference receipts are immutable'); END;
                 CREATE TABLE IF NOT EXISTS learning_contract_reviews (
                     ticker TEXT NOT NULL,origin TEXT NOT NULL,observed_at TEXT NOT NULL,
                     outcome INTEGER NOT NULL,payload TEXT NOT NULL,
@@ -1592,6 +1602,7 @@ class Journal:
             "CREATE INDEX IF NOT EXISTS scalp_book_mode_id ON scalp_book_observations(mode,id DESC)",
             "CREATE INDEX IF NOT EXISTS scalp_book_ticker_time ON scalp_book_observations(mode,ticker,recorded_at)",
             "CREATE INDEX IF NOT EXISTS edge_observations_close ON edge_observations(mode,closes_at)",
+            "CREATE INDEX IF NOT EXISTS preopen_reference_ticks_open ON preopen_reference_ticks(mode,opens_at)",
         )
         with self.read() as db:
             existing = {
@@ -3031,6 +3042,47 @@ class Journal:
     OPENING_QUOTE_WINDOW_SECONDS = 120
     OPENING_PREOPEN_QUOTE_SECONDS = 60
 
+    @staticmethod
+    def _quote_quality(market, up, down, up_ask, down_ask):
+        """Explicit evidence for research (Phase 5); never infers a missing side.
+
+        executable: the market status is open/active and the ask is strictly
+        inside (0, 1). Sizes are proven only when the source reported them
+        (order book / stream); listing quotes carry no depth and are labelled
+        SIZE_UNKNOWN rather than treated as proven liquidity.
+        """
+        from .edge_scanner import quantity_fee
+
+        def size(side):
+            value = side.get("ask_size")
+            return float(value) if type(value) in (int, float) and math.isfinite(value) and value > 0 else None
+
+        tradable = str(market.get("status", "")).lower() in {"open", "active"}
+        up_size, down_size = size(up), size(down)
+        multiplier = market.get("fee_multiplier")
+        fees = {}
+        for name, ask in (("up", up_ask), ("down", down_ask)):
+            try:
+                fees[name] = quantity_fee(ask, 1, multiplier)
+            except (TypeError, ValueError):
+                fees[name] = None
+        bid = up.get("bid")
+        return {
+            "quote_quality_version": 1,
+            "market_status": market.get("status"),
+            "quote_source": "DEPTH_REPORTED" if (up_size or down_size) else "LISTING_SIZE_UNKNOWN",
+            "executable": {
+                "up": tradable and 0 < up_ask < 1,
+                "down": tradable and 0 < down_ask < 1,
+            },
+            "ask_size_proven": {"up": up_size, "down": down_size},
+            "up_spread": (round(up_ask - bid, 6)
+                          if type(bid) in (int, float) and 0 <= bid <= up_ask else None),
+            "taker_fee_one_contract": fees,
+            "fee_multiplier_recorded": type(multiplier) in (int, float),
+            "observed_not_inferred": True,
+        }
+
     def record_opening_quote(self, market, mode, now):
         """Append one executable Kalshi quote observed early in a contract.
 
@@ -3062,7 +3114,9 @@ class Journal:
                 market.get("fee_multiplier"), market.get("fee_type"),
                 market.get("quote_event_time"),
                 json.dumps({"quotes": quotes, "received_at": observed.isoformat(),
-                            "recorded_at": now.isoformat()}, allow_nan=False),
+                            "recorded_at": now.isoformat(),
+                            **self._quote_quality(market, up, down, up_ask, down_ask)},
+                           allow_nan=False),
             )
         except (KeyError, ValueError, TypeError, AttributeError):
             return False
@@ -3132,6 +3186,91 @@ class Journal:
                 (mode, market["ticker"]),
             ).fetchone()
         return json.loads(saved[0])
+
+    # A recovered receipt is trusted only if it was written to the journal
+    # promptly after it was received: a row persisted long after its receipt
+    # time cannot prove it was available before the opening.
+    PREOPEN_PERSIST_SLACK_SECONDS = 10
+    PREOPEN_REFERENCE_WINDOW_SECONDS = 65
+
+    def record_preopen_references(self, ticks, mode, persisted_at):
+        """Append pre-opening BTC reference receipts (source, receipt time, price)."""
+        rows = []
+        for source, received, price, opens_at in ticks:
+            if not (type(price) in (int, float) and math.isfinite(price) and price > 0):
+                continue
+            if received > opens_at or (opens_at - received).total_seconds() > 70:
+                continue
+            rows.append((mode, source, received.isoformat(), float(price), opens_at.isoformat(),
+                         persisted_at.isoformat()))
+        if not rows:
+            return 0
+        with self.connect() as db:
+            return db.executemany(
+                "INSERT OR IGNORE INTO preopen_reference_ticks VALUES (?,?,?,?,?,?)", rows
+            ).rowcount
+
+    def preopen_reference_points(self, opened, mode):
+        """Receipt-proven pre-opening reference points for crash recovery.
+
+        Same selection as LiveEstimator.opening_points (latest receipt, then
+        most points, within 65 s before the opening). A row is rejected when
+        its receipt is after the opening, outside the window, or it was
+        persisted more than PREOPEN_PERSIST_SLACK_SECONDS after its receipt.
+        Returns ([(received_at, price), ...], source, diagnostics).
+        """
+        start = opened - timedelta(seconds=self.PREOPEN_REFERENCE_WINDOW_SECONDS)
+        by_source, rejected = {}, {}
+        with self.read() as db:
+            tables = {n for (n,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "preopen_reference_ticks" not in tables:
+                return [], None, {"status": "TABLE_ABSENT"}
+            found = db.execute(
+                "SELECT source,received_at,price,persisted_at FROM preopen_reference_ticks "
+                "WHERE mode=? AND opens_at=? ORDER BY received_at",
+                (mode, opened.isoformat()),
+            ).fetchall()
+        for source, received_at, price, persisted_at in found:
+            try:
+                received, persisted = timestamp(received_at), timestamp(persisted_at)
+                value = float(price)
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                rejected["UNPARSEABLE"] = rejected.get("UNPARSEABLE", 0) + 1
+                continue
+            if received > opened:
+                reason = "RECEIVED_AFTER_OPENING"
+            elif received < start:
+                reason = "OUTSIDE_65S_WINDOW"
+            elif (persisted - received).total_seconds() > self.PREOPEN_PERSIST_SLACK_SECONDS:
+                reason = "PERSISTED_TOO_LATE_TO_PROVE_AVAILABILITY"
+            elif not (math.isfinite(value) and value > 0):
+                reason = "INVALID_PRICE"
+            else:
+                by_source.setdefault(source, []).append((received, value))
+                continue
+            rejected[reason] = rejected.get(reason, 0) + 1
+        diagnostics = {"status": "RECOVERED" if by_source else "NO_VERIFIABLE_RECEIPTS",
+                       "rows": len(found), "rejected": rejected}
+        if not by_source:
+            return [], None, diagnostics
+        source, points = max(by_source.items(), key=lambda item: (item[1][-1][0], len(item[1])))
+        diagnostics.update(source=source, points=len(points), latest_received_at=points[-1][0].isoformat())
+        return points, source, diagnostics
+
+    def recent_openings(self, mode, limit=12):
+        """Most recent immutable opening payloads, oldest first (read only)."""
+        with self.read() as db:
+            rows = db.execute(
+                "SELECT payload FROM btc_engine_opening WHERE mode=? ORDER BY cutoff DESC LIMIT ?",
+                (mode, int(limit)),
+            ).fetchall()
+        out = []
+        for (payload,) in reversed(rows):
+            try:
+                out.append(json.loads(payload))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def opening_record(self, ticker, mode, candidate=None, wall_now=None):
         with self.read() if candidate is None else self.connect() as db:

@@ -292,3 +292,40 @@ def test_phase5_runner_is_read_only_and_command_targets_it():
     assert "StrictHostKeyChecking=yes" in ps and "accept-new" not in ps
     for module in ("data_readiness", "artifact_diagnostics", "opening_research"):
         assert "mode=ro" in (ROOT / "src/signals_display" / f"{module}.py").read_text(), module
+
+
+def test_recovery_simulation_is_strict_labelled_and_never_counts_unverifiable_as_recovered(tmp_path):
+    def build(db):
+        db.execute("CREATE TABLE btc_candles (source TEXT,start INTEGER,payload TEXT,first_received_at TEXT)")
+        _failed(db, 0, "Incomplete 24h window: 1439/1440", 121)            # candles provable, ref unknown
+        _failed(db, 1, "No fresh BTC reference received by opening", 2400)  # no persisted ticks table
+        _failed(db, 2, "Unsupported official settlement rules", 121)
+        opened = int(START.timestamp())
+        db.executemany("INSERT INTO btc_candles VALUES (?,?,?,?)", [
+            ("Coinbase BTC-USD", m, "{}", datetime.fromtimestamp(m + 62, timezone.utc).isoformat())
+            for m in range(opened - 86460, opened, 60)])
+    with _ro(_db(tmp_path, build)) as db:
+        sim = readiness.audit(db, ASOF)["recovery_simulation"]
+    assert sim["label"].startswith("SIMULATED RECOVERY")
+    assert sim["outcomes"] == {"SIMULATED_RECOVERABLE": 0, "HISTORY_PROVEN_REFERENCE_UNVERIFIABLE": 1,
+                               "REFERENCE_UNVERIFIABLE_NO_PERSISTED_TICKS": 1, "NOT_RECOVERABLE": 1}
+    assert sim["tick_persistence_present"] is False
+
+
+def test_recovery_simulation_counts_openings_with_persisted_pre_open_ticks(tmp_path):
+    opened = START + timedelta(minutes=15)
+
+    def build(db):
+        db.execute("""CREATE TABLE preopen_reference_ticks (mode TEXT NOT NULL,source TEXT NOT NULL,
+            received_at TEXT NOT NULL,price REAL NOT NULL,opens_at TEXT NOT NULL,persisted_at TEXT NOT NULL,
+            PRIMARY KEY(mode,source,received_at))""")
+        for offset, persisted in ((-30, -29), (-3, -2)):
+            db.execute("INSERT INTO preopen_reference_ticks VALUES (?,?,?,?,?,?)",
+                       ("PUBLIC MARKET DATA", "Coinbase BTC/USD proxy", (opened + timedelta(seconds=offset)).isoformat(),
+                        100000.0, opened.isoformat(), (opened + timedelta(seconds=persisted)).isoformat()))
+        _failed(db, 1, "No fresh BTC reference received by opening", 2400)
+        _failed(db, 2, "No fresh BTC reference received by opening", 2400)  # no ticks for this opening
+    with _ro(_db(tmp_path, build)) as db:
+        sim = readiness.audit(db, ASOF)["recovery_simulation"]
+    assert sim["tick_persistence_present"] is True
+    assert sim["outcomes"]["SIMULATED_RECOVERABLE"] == 1 and sim["outcomes"]["NOT_RECOVERABLE"] == 1

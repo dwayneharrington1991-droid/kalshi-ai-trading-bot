@@ -54,6 +54,8 @@ from .strategy_paper import evaluate as evaluate_dual_strategy
 from .multi_asset import MarketStrip
 
 OPENING_INPUT_GRACE_SECONDS = 120
+# Pre-opening reference receipts persisted for crash recovery (opening uses 65 s).
+PREOPEN_PERSIST_SECONDS = 70
 # Same limit context24 applies to an opening's candle receipt.
 CANDLE_CACHE_STALE_SECONDS = 150
 
@@ -204,6 +206,19 @@ def process_prediction_frame(monitor, feed, collected):
         monitor.runtime_meter.error("prediction", type(exc).__name__)
         return exc
     return None
+
+
+def _eligible_bar_count(item, opened):
+    """Closed one-minute bars in the 24 h window that were received by the opening."""
+    try:
+        received = timestamp(item["received_at"])
+        return sum(
+            1 for bar in item.get("candles", [])
+            if int(bar["start"]) + 60 <= min(opened.timestamp(), received.timestamp())
+            and int(bar["start"]) >= opened.timestamp() - 86520
+        )
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return -1
 
 
 class Monitor:
@@ -583,6 +598,37 @@ class Monitor:
             self.latest_candles = candles
         return persisted
 
+    def opening_reference_points(self, opened, mode):
+        """Pre-opening reference points: in-memory receipts first; only when
+        none exist (e.g. after a restart) the journal's receipt-proven
+        pre-opening ticks. Returns (points, source, recovery_diagnostics)."""
+        points, source = self.estimator.opening_points(opened)
+        if points:
+            return points, source, None
+        try:
+            recovered, recovered_source, diagnostics = self.journal.preopen_reference_points(opened, mode)
+        except sqlite3.OperationalError as exc:
+            self.runtime_meter.error("preopen_reference_recovery", type(exc).__name__)
+            return [], None, {"status": "STORAGE_UNAVAILABLE"}
+        if not recovered:
+            return [], None, diagnostics
+        return recovered, f"{recovered_source} [journal-recovered pre-opening receipts]", diagnostics
+
+    @staticmethod
+    def opening_inputs_complete(history, points, opened):
+        """True only when these inputs pass the opening model's own input
+        checks: a READY cutoff-safe 24 h window received by the opening and a
+        reference receipt no more than 5 s before it. Mirrors opening_forecast."""
+        try:
+            if timestamp(history["received_at"]) > opened:
+                return False
+            if context24(history, opened).get("status") != "READY":
+                return False
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return False
+        fresh = [when for when, _ in points if opened - timedelta(seconds=65) <= when < opened]
+        return bool(fresh) and (opened - max(fresh)).total_seconds() <= 5
+
     def remember_preopening_histories(self, payload, now):
         """Retain bounded, pre-open-only candle receipts for rollover."""
         raw = payload.get("btc_candles", {}) if isinstance(payload, dict) else {}
@@ -707,6 +753,29 @@ class Monitor:
             # independent of live-data freshness and remains usable when
             # threshold metadata or model generation arrives later.
             mode = payload.get("mode", "PUBLIC MARKET DATA")
+            # Crash-safe pre-opening reference receipts (Phase 5). Written with
+            # the wall-clock persistence time so recovery can prove each one
+            # was stored promptly after receipt, i.e. before the opening.
+            try:
+                pending = self.estimator.drain_preopen_references()
+                opens = set()
+                for listed in payload.get("markets", []) or ([market_now] if market_now else []):
+                    try:
+                        opens.add(timestamp(listed["opens_at"]))
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        continue
+                ticks = [
+                    (source, received, price, opened)
+                    for source, received, price in pending
+                    for opened in opens
+                    if 0 <= (opened - received).total_seconds() <= PREOPEN_PERSIST_SECONDS
+                ]
+                if ticks:
+                    self.journal.record_preopen_references(
+                        ticks, mode, utcnow() if mode == "PUBLIC MARKET DATA" else now
+                    )
+            except Exception as exc:
+                self.runtime_meter.error("preopen_reference_persistence", type(exc).__name__)
             self.remember_preopening_histories(payload, now)
             # Optional evidence capture. A failure here is recorded but must never
             # turn the tick into a market-data failure (stale state -> /readyz 503).
@@ -768,7 +837,14 @@ class Monitor:
                         if isinstance(archived, dict):
                             candidates.append(archived)
                     frozen_history = max(candidates, key=eligible_count) if candidates else {}
-                    frozen_points, frozen_source = self.estimator.opening_points(opened)
+                    frozen_points, frozen_source, _recovery = self.opening_reference_points(opened, mode)
+                    # Phase 5 repair: an immutable snapshot used to be frozen on
+                    # the first tick even when incomplete, so every retry inside
+                    # the grace window reused the same gap. Freeze only inputs
+                    # that pass the opening model's own checks; otherwise keep
+                    # retrying from receipt-proven pre-opening sources.
+                    if not existing and not self.opening_inputs_complete(frozen_history, frozen_points, opened):
+                        continue
                     self.journal.freeze_opening_snapshot(
                         discovered,
                         mode,
@@ -1078,46 +1154,82 @@ class Monitor:
                             frozen = raw_history if eligible else self.journal.opening_inputs(opened)
                             frozen_points, frozen_source = self.estimator.opening_points(opened)
                         generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
-                        candidate = opening_forecast(
-                            m,
-                            frozen,
-                            frozen_points,
-                            generated,
-                            reference_source=frozen_source,
-                            audit_context={
-                                "official_contracts": self.readiness.get("official_contracts"),
-                                "minimum_contracts": self.readiness.get("minimum_contracts", 170),
-                                "artifact_status": self.opening_artifact_status,
-                                "live_model": self.artifact.get("model", {}).get("kind")
-                                if self.artifact
-                                else "experimental statistical fallback",
-                                "live_ensemble_active": bool(
-                                    self.artifact
-                                    and self.artifact.get("model", {}).get("kind") == "ensemble"
-                                ),
-                                "opening_candidate_status": self.opening_artifact_status,
-                                # The fallback quality guard judges the fallback on
-                                # its own probability-implied record only.
-                                "opening_forward_accuracy": self.readiness.get(
-                                    "opening_fallback_forward_accuracy",
-                                    self.readiness.get("opening_forward_accuracy", {}),
-                                ),
-                            },
-                            frozen_context={
-                                **self.intelligence.summarize(
-                                    opened, candles=frozen, primary_source=primary
-                                ),
-                                "primary_source": primary,
-                                "order_flow": self.preopening_flow.get(m["ticker"]),
-                                "advanced_features": self.advanced.summarize(
-                                    opened,
-                                    candles=frozen,
-                                    primary_source=primary,
-                                    threshold=m["strike"],
-                                ),
-                            },
-                            candidate_artifact=self.opening_artifact,
-                        )
+
+                        def forecast(history, points, source):
+                            return opening_forecast(
+                                m,
+                                history,
+                                points,
+                                generated,
+                                reference_source=source,
+                                audit_context={
+                                    "official_contracts": self.readiness.get("official_contracts"),
+                                    "minimum_contracts": self.readiness.get("minimum_contracts", 170),
+                                    "artifact_status": self.opening_artifact_status,
+                                    "live_model": self.artifact.get("model", {}).get("kind")
+                                    if self.artifact
+                                    else "experimental statistical fallback",
+                                    "live_ensemble_active": bool(
+                                        self.artifact
+                                        and self.artifact.get("model", {}).get("kind") == "ensemble"
+                                    ),
+                                    "opening_candidate_status": self.opening_artifact_status,
+                                    # The fallback quality guard judges the fallback on
+                                    # its own probability-implied record only.
+                                    "opening_forward_accuracy": self.readiness.get(
+                                        "opening_fallback_forward_accuracy",
+                                        self.readiness.get("opening_forward_accuracy", {}),
+                                    ),
+                                },
+                                frozen_context={
+                                    **self.intelligence.summarize(
+                                        opened, candles=history, primary_source=primary
+                                    ),
+                                    "primary_source": primary,
+                                    "order_flow": self.preopening_flow.get(m["ticker"]),
+                                    "advanced_features": self.advanced.summarize(
+                                        opened,
+                                        candles=history,
+                                        primary_source=primary,
+                                        threshold=m["strike"],
+                                    ),
+                                },
+                                candidate_artifact=self.opening_artifact,
+                            )
+
+                        # The original input path always runs first, so an
+                        # opening that was already valid is computed exactly as
+                        # before. Only when it yields no probability is a second
+                        # attempt made from other RECEIPT-PROVEN pre-opening
+                        # inputs (Phase 5 repair). Nothing received after the
+                        # opening can enter: histories are cutoff-checked by
+                        # context24 and reference receipts must precede the open.
+                        candidate = forecast(frozen, frozen_points, frozen_source)
+                        if snapshot and "journal-recovered" in str(frozen_source) and candidate.get("up") is not None:
+                            candidate["input_recovery"] = {
+                                "status": "RECOVERED_FROM_RECEIPT_PROVEN_PREOPENING_INPUTS",
+                                "history_replaced": False,
+                                "reference_points_recovered_from_journal": True,
+                                "via": "complete opening snapshot frozen from journal-recovered receipts",
+                            }
+                        if candidate.get("up") is None and not snapshot:
+                            options = [frozen, self.preopening_histories.get(m["ticker"])]
+                            if frozen is raw_history:
+                                options.append(self.journal.opening_inputs(opened))
+                            options = [o for o in options if isinstance(o, dict) and o]
+                            alt_history = max(options, key=lambda o: _eligible_bar_count(o, opened)) if options else frozen
+                            alt_points, alt_source, recovery = self.opening_reference_points(opened, state["mode"])
+                            if alt_history is not frozen or alt_points != frozen_points:
+                                retried = forecast(alt_history, alt_points, alt_source)
+                                if retried.get("up") is not None:
+                                    retried["input_recovery"] = {
+                                        "status": "RECOVERED_FROM_RECEIPT_PROVEN_PREOPENING_INPUTS",
+                                        "history_replaced": alt_history is not frozen,
+                                        "reference_points_recovered_from_journal": bool(recovery),
+                                        "reference_recovery": recovery,
+                                        "primary_failure_reason": candidate.get("reason"),
+                                    }
+                                    candidate = retried
                         if state["mode"] == "PUBLIC MARKET DATA":
                             generated = utcnow()
                             candidate["timestamp"] = candidate["generated_at"] = generated.isoformat()
@@ -1953,6 +2065,38 @@ def make_handler(monitor):
                     )
                 body = json.dumps(
                     candle_integrity_report(source, utcnow()), allow_nan=False
+                ).encode()
+                content_type = "application/json"
+            elif route == "/api/data-quality-alerts":
+                # Read-only Phase 5 monitoring; never changes a forecast and is
+                # independent of /healthz and /readyz.
+                from .opening_alerts import compute_alerts
+
+                wall = utcnow()
+                with monitor.candle_lock:
+                    source = deepcopy(
+                        monitor.latest_candles
+                        or getattr(monitor.feed, "candle_cache", None)
+                        or {}
+                    )
+                ages = {
+                    name: (wall - history[-1][0]).total_seconds()
+                    for name, history in list(monitor.estimator.opening_references.items())
+                    if history
+                }
+                artifact = getattr(monitor, "opening_artifact", None) or {}
+                model = artifact.get("model") or {}
+                inputs = sorted({
+                    name for part in (model.get("components") or [model])
+                    for name in ((part.get("preprocessor") or {}).get("names") or [])
+                })
+                try:
+                    recent = monitor.journal.recent_openings("PUBLIC MARKET DATA")
+                except sqlite3.OperationalError:
+                    recent = []
+                body = json.dumps(
+                    compute_alerts(recent, candle_integrity_report(source, wall), ages, inputs, wall),
+                    allow_nan=False, default=str,
                 ).encode()
                 content_type = "application/json"
             elif route == "/api/market-history":

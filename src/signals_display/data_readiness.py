@@ -268,6 +268,93 @@ def _settled_tickers(db, asof):
     return [t for t, (observed, _y) in outcomes.items() if (_ts(observed) or asof) <= asof]
 
 
+def _reference_proven(db, opened):
+    """Same rules as Journal.preopen_reference_points: a receipt within 65 s
+    before the open, persisted promptly after receipt, the latest no more than
+    5 s before the open. None when the journal predates tick persistence."""
+    if "preopen_reference_ticks" not in _tables(db):
+        return None
+    latest = None
+    for received_at, persisted_at, price in db.execute(
+        "SELECT received_at,persisted_at,price FROM preopen_reference_ticks WHERE mode=? AND opens_at=?",
+        (MODE, opened.isoformat()),
+    ):
+        received, persisted = _ts(received_at), _ts(persisted_at)
+        if received is None or persisted is None or not (type(price) in (int, float) and price > 0):
+            continue
+        if not (opened - timedelta(seconds=65) <= received <= opened):
+            continue
+        if (persisted - received).total_seconds() > 10:
+            continue
+        latest = received if latest is None or received > latest else latest
+    return latest is not None and (opened - latest).total_seconds() <= 5
+
+
+def recovery_simulation(db, rows):
+    """SIMULATED: which past probability-less openings the Phase 5 repair could
+    have recovered using ONLY inputs provably received before the opening.
+
+    Strict rules: candle failures need the full context24 window received by
+    the open AND proof of a fresh pre-open reference (never reached by the
+    failed forecast); reference failures (history already passed) need
+    persisted pre-open ticks. Journals that predate tick persistence cannot
+    prove reference availability, so such openings are UNVERIFIABLE, not
+    recoverable. This is not observed live performance.
+    """
+    settled_missing = [r for r in rows if r["settled"] and r["up"] is None]
+    counts = {"SIMULATED_RECOVERABLE": 0, "HISTORY_PROVEN_REFERENCE_UNVERIFIABLE": 0,
+              "REFERENCE_UNVERIFIABLE_NO_PERSISTED_TICKS": 0, "NOT_RECOVERABLE": 0}
+    records = []
+    for row in settled_missing:
+        category = classify_reason(row["saved"].get("reason") or row["saved"].get("status"))
+        reference = _reference_proven(db, row["opens_at"])
+        if category in CANDLE_CATEGORIES:
+            history = (_candles_recorded_by_open(db, row["opens_at"]) or 0) >= 1440
+            if history and reference:
+                outcome = "SIMULATED_RECOVERABLE"
+            elif history:
+                outcome = "HISTORY_PROVEN_REFERENCE_UNVERIFIABLE"
+            else:
+                outcome = "NOT_RECOVERABLE"
+        elif category == "REFERENCE_MISSING_AT_OPEN":
+            outcome = ("SIMULATED_RECOVERABLE" if reference
+                       else "REFERENCE_UNVERIFIABLE_NO_PERSISTED_TICKS" if reference is None
+                       else "NOT_RECOVERABLE")
+        else:
+            outcome = "NOT_RECOVERABLE"
+        counts[outcome] += 1
+        records.append({"ticker": row["ticker"], "category": category, "simulated_outcome": outcome})
+    return {
+        "label": "SIMULATED RECOVERY - not observed live performance; no prediction is created or stored",
+        "settled_openings_without_probability": len(settled_missing),
+        "outcomes": counts,
+        "tick_persistence_present": "preopen_reference_ticks" in _tables(db),
+        "records": records[-60:],
+    }
+
+
+def model_input_table(rows, inputs):
+    """Coverage of EVERY model input (not only sparse ones) with recorded statuses."""
+    made = [r for r in rows if r["up"] is not None and (r["saved"].get("frozen_features") or {}).get("values")]
+    if not made or not inputs:
+        return {"status": "NO_FROZEN_OPENINGS_OR_NO_ARTIFACT_INPUTS"}
+    recent = made[-96:]
+    table = {}
+    for name in inputs:
+        present = sum(type(r["saved"]["frozen_features"]["values"].get(name)) in (int, float) for r in made)
+        table[name] = {
+            "coverage": present / len(made),
+            "recent_24h_coverage": sum(type(r["saved"]["frozen_features"]["values"].get(name)) in (int, float)
+                                       for r in recent) / len(recent),
+            "recorded_statuses": _count(str((r["saved"]["frozen_features"].get("optional_feature_status") or {})
+                                            .get(name, "NOT_RECORDED")) for r in recent),
+        }
+    return {"inputs": len(table), "examined_openings": len(made),
+            "always_present": sum(v["coverage"] == 1 for v in table.values()),
+            "below_50pct": sorted(n for n, v in table.items() if v["coverage"] < SPARSE),
+            "by_input": table}
+
+
 def pipeline_timing(rows):
     made = [r for r in rows if r["up"] is not None]
     history_age, reference_age, delays, bars = [], [], [], []
@@ -519,6 +606,8 @@ def audit(db, asof=None, artifact=None):
         "quote_coverage": quote_coverage(db),
         "collection_health": collection_health(db, asof),
         "readiness": readiness_projection(db, rows, asof),
+        "recovery_simulation": recovery_simulation(db, rows),
+        "model_inputs": model_input_table(rows, inputs),
         "writes_performed": 0,
     }
     report["alerts"] = alerts(report)
@@ -540,6 +629,12 @@ def summary_lines(report):
         lines.append(f"SPARSE {name}: {item['present']}/{item['examined']} recent24h={item['recent_24h_coverage']} "
                      f"group={item['source_group']} -> {item['diagnosis']}")
     lines.append(f"QUOTES {q.get('rows_by_seconds_from_open')} pre_open_executable={q.get('executable_two_sided_rows_at_or_before_open')} -> {q.get('diagnosis')}")
+    sim = report.get("recovery_simulation") or {}
+    lines.append(f"SIMULATED_RECOVERY (not live performance) missing={sim.get('settled_openings_without_probability')} "
+                 f"outcomes={sim.get('outcomes')} tick_persistence={sim.get('tick_persistence_present')}")
+    mi = report.get("model_inputs") or {}
+    if mi.get("inputs"):
+        lines.append(f"MODEL_INPUTS {mi['inputs']} inputs: always_present={mi['always_present']} below_50pct={mi['below_50pct']}")
     lines.append(f"READINESS eligible={r['eligible_frozen_openings']}/{r['eligible_needed_for_report_b']} "
                  f"rate/day={r['settled_probability_openings_per_day_last_48h']} days~{r['estimated_days_at_recent_rate']}")
     for alert in report["alerts"]:

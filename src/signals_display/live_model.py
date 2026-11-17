@@ -21,6 +21,7 @@ VERSION = "independent-basis-forecast-v3"
 MIN_SAMPLES = 61
 MIN_SECONDS = 120
 MAX_GAP = 5
+PREOPEN_PERSIST_SECONDS = 70  # opening_points uses 65 s; keep a margin
 PATHS = 2000
 
 
@@ -108,6 +109,9 @@ class LiveEstimator:
         # volatility buffer, a reconnect/gap must not erase observations that
         # were genuinely received before the contract opened.
         self.opening_references = {}
+        # Accepted reference receipts awaiting the server's pre-opening
+        # persistence filter (drained every tick; bounded).
+        self.pending_preopen_references = []
         self.quotes = {}
         self.reference_source = None
         self.developing = DevelopingCandle()
@@ -190,7 +194,15 @@ class LiveEstimator:
         if history and received < history[-1][0]:
             return False
         history.append((received, price))
+        # The server persists only receipts inside the 70 s before a DISCOVERED
+        # contract's actual opening; the estimator does not assume a schedule.
+        self.pending_preopen_references.append((source, received, price))
+        del self.pending_preopen_references[:-5000]  # bounded if never drained
         return True
+
+    def drain_preopen_references(self):
+        drained, self.pending_preopen_references = self.pending_preopen_references, []
+        return drained
 
     def opening_points(self, opened):
         """Select one proxy source using receipts at or before opening only."""

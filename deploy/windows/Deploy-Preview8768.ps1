@@ -18,7 +18,14 @@ param(
   [scriptblock]$TestTunnelHealth  # test hook only: returns a /healthz object
 )
 $ErrorActionPreference = 'Stop'
-if ($Sha -notmatch '^[0-9a-f]{40}$') { throw 'DEPLOY BLOCKED: an exact 40-character commit is required.' }
+# Strict, case-sensitive validation BEFORE any SSH call. Both values are
+# embedded in remote commands, so nothing else may ever reach the server.
+$UuidPattern = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+if ($Sha -cnotmatch '^[0-9a-f]{40}$') { throw 'DEPLOY BLOCKED: an exact 40-character lowercase commit is required.' }
+if ($Branch -cnotmatch '^[A-Za-z0-9._/-]{1,100}$') { throw 'DEPLOY BLOCKED: invalid branch name.' }
+if ($ResumeJobId -and $ResumeJobId -cnotmatch $UuidPattern) {
+  throw 'DEPLOY BLOCKED: -ResumeJobId must be the exact lowercase job id printed when the job started (e.g. 1b4e28ba-2fa1-11d2-883f-0016d3cca427). Nothing was contacted.'
+}
 $sshDir = Join-Path $env:USERPROFILE '.ssh'
 $Key = $env:ORACLE_SSH_KEY
 if (-not $Key -and (Test-Path -LiteralPath $sshDir)) {
@@ -75,14 +82,14 @@ else
   mv "$stage/checkout" "$NEW"
   rmdir "$stage"
 fi
-exec bash "$NEW/deploy/oracle/deploy_job_8768.sh" start "$SHA" __REQUEST__
+exec bash "$NEW/deploy/oracle/deploy_job_8768.sh" start "$SHA" '__REQUEST__'
 '@
 
 if ($ResumeJobId) {
   $JobId = $ResumeJobId
   Write-Host "2/4 Resuming deployment job $JobId (nothing new is started)..."
 } else {
-  $JobId = [guid]::NewGuid().ToString()
+  $JobId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
   Write-Host "2/4 Starting server-owned deployment job $JobId for $Sha (preview 8768 only)..."
   Write-Host "    If this window closes, resume with:  -ResumeJobId $JobId" -ForegroundColor Cyan
   $started = $null
@@ -92,6 +99,7 @@ if ($ResumeJobId) {
     $f = Get-Fields $start
     if ($f['DEPLOY_JOB_STATE'] -eq 'BUSY') { throw "DEPLOY BLOCKED: another preview 8768 deployment job ($($f['DEPLOY_ACTIVE_JOB'])) is running on Oracle. Nothing was started." }
     if ($f['DEPLOY_JOB_STATE'] -eq 'REJECTED') { throw 'DEPLOY BLOCKED: the job was rejected (see DEPLOY_JOB lines above). Nothing was changed.' }
+    if ($f['DEPLOY_JOB_STATE'] -eq 'SHA_MISMATCH') { throw "DEPLOY BLOCKED: job $JobId belongs to a different commit. Nothing was started." }
     if ($f['DEPLOY_JOB_ID'] -eq $JobId) { $started = $f } else { Start-Sleep -Seconds ([Math]::Min(5, [Math]::Max(0, $PollSeconds))) }
   }
   if (-not $started) { throw "DEPLOY RESULT UNKNOWN: could not confirm that job $JobId started. Rerun with -ResumeJobId $JobId to check it (this never starts a duplicate)." }
@@ -104,7 +112,7 @@ $final = $null
 $lastLog = ''
 while (-not $final) {
   if ((Get-Date) -gt $deadline) { throw "DEPLOY STILL RUNNING after $MaxMinutes minutes. Nothing is stopped by this client; resume later with -ResumeJobId $JobId" }
-  $status = Invoke-Remote "bash $jobScript status $JobId" -Quiet
+  $status = Invoke-Remote "bash '$jobScript' status '$JobId' '$Sha'" -Quiet
   $f = Get-Fields $status
   $log = @($status.Lines | Where-Object { $_ -like 'LOG: *' }) | Select-Object -Last 1
   if ($log -and $log -ne $lastLog) { Write-Host $log; $lastLog = $log }
@@ -113,12 +121,14 @@ while (-not $final) {
   switch ($state) {
     'FINISHED' { $final = $f }
     'DIED' {
-      if ($recoverRequested) { throw "DEPLOY STOPPED: job $JobId died again during recovery. MANUAL RECOVERY REQUIRED; see the job log: bash $jobScript status $JobId" }
+      if ($recoverRequested) { throw "DEPLOY STOPPED: job $JobId died again during recovery. MANUAL RECOVERY REQUIRED; see the job log: bash $jobScript status $JobId $Sha" }
       Write-Host 'The server job was interrupted; asking Oracle to recover it under the deployment lock...' -ForegroundColor Yellow
-      [void](Invoke-Remote "bash $jobScript recover $JobId")
+      [void](Invoke-Remote "bash '$jobScript' recover '$JobId' '$Sha'")
       $recoverRequested = $true
     }
     'UNKNOWN' { throw "DEPLOY BLOCKED: Oracle has no job $JobId." }
+    'SHA_MISMATCH' { throw "DEPLOY BLOCKED: job $JobId is bound to a different commit than $Sha. Nothing was done; resume it with the commit it was started with." }
+    'REJECTED' { throw 'DEPLOY BLOCKED: Oracle rejected the job request. Nothing was done.' }
   }
   if (-not $final) { Start-Sleep -Seconds $PollSeconds }
 }
@@ -131,23 +141,23 @@ switch ($result) {
   'BLOCKED_CONCURRENT_DEPLOYMENT' { throw 'DEPLOY BLOCKED: another preview 8768 deployment held the lock. Nothing was changed.' }
   'BLOCKED' { throw 'DEPLOY BLOCKED: preconditions failed. Nothing was changed.' }
   'INTERRUPTED_BEFORE_CHANGE' { throw 'DEPLOY INTERRUPTED before any change; preview 8768 was not modified.' }
-  'MANUAL_RECOVERY_REQUIRED' { throw "DEPLOY STOPPED: MANUAL RECOVERY REQUIRED. Automatic recovery was not safe; the exact steps are in the job log: bash $jobScript status $JobId" }
-  default { throw "DEPLOY RESULT UNKNOWN ($result). Check: bash $jobScript status $JobId" }
+  'MANUAL_RECOVERY_REQUIRED' { throw "DEPLOY STOPPED: MANUAL RECOVERY REQUIRED. Automatic recovery was not safe; the exact steps are in the job log: bash $jobScript status $JobId $Sha" }
+  default { throw "DEPLOY RESULT UNKNOWN ($result). Check: bash $jobScript status $JobId $Sha" }
 }
 
 function Invoke-ClientRollback([string]$Reason) {
   Write-Host "LOCAL VERIFICATION FAILED: $Reason - asking Oracle for the guarded rollback of job $JobId..." -ForegroundColor Red
-  [void](Invoke-Remote "bash $jobScript rollback $JobId")
+  [void](Invoke-Remote "bash '$jobScript' rollback '$JobId' '$Sha'")
   $end = (Get-Date).AddMinutes(10)
   while ((Get-Date) -lt $end) {
     Start-Sleep -Seconds $PollSeconds
-    $f = Get-Fields (Invoke-Remote "bash $jobScript status $JobId" -Quiet)
+    $f = Get-Fields (Invoke-Remote "bash '$jobScript' status '$JobId' '$Sha'" -Quiet)
     if ($f['DEPLOY_JOB_STATE'] -eq 'FINISHED' -and $f['DEPLOY_RESULT'] -ne 'SUCCESS') {
       if ($f['DEPLOY_RESULT'] -eq 'ROLLED_BACK') { throw "DEPLOY ROLLED BACK after local verification failed: $Reason" }
-      throw "DEPLOY STOPPED: rollback result $($f['DEPLOY_RESULT']). MANUAL RECOVERY REQUIRED; see: bash $jobScript status $JobId"
+      throw "DEPLOY STOPPED: rollback result $($f['DEPLOY_RESULT']). MANUAL RECOVERY REQUIRED; see: bash $jobScript status $JobId $Sha"
     }
   }
-  throw "DEPLOY ROLLBACK STILL RUNNING; check: bash $jobScript status $JobId"
+  throw "DEPLOY ROLLBACK STILL RUNNING; check: bash $jobScript status $JobId $Sha"
 }
 
 if ($SkipTunnel) { return 'SUCCESS' }

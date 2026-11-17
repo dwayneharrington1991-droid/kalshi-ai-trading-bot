@@ -28,12 +28,13 @@ function global:Mock-Ssh {
   $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
   $kind = if ($text -match 'SSH_PREFLIGHT_OK') { 'preflight' }
           elseif ($text -match 'deploy_job_8768\.sh" start') { 'start' }
-          elseif ($text -match 'deploy_job_8768\.sh status ') { 'status' }
-          elseif ($text -match 'deploy_job_8768\.sh recover ') { 'recover' }
-          elseif ($text -match 'deploy_job_8768\.sh rollback ') { 'rollback' }
+          elseif ($text -match "deploy_job_8768\.sh'? status ") { 'status' }
+          elseif ($text -match "deploy_job_8768\.sh'? recover ") { 'recover' }
+          elseif ($text -match "deploy_job_8768\.sh'? rollback ") { 'rollback' }
           else { 'other' }
   $global:MockCalls += $kind
-  if ($kind -eq 'start' -and $text -match 'start "\$SHA" ([0-9a-f-]{36})') { $global:MockRequestIds += $Matches[1] }
+  $global:MockTexts += $text
+  if ($kind -eq 'start' -and $text -match "start `"\`$SHA`" '?([0-9a-f-]{36})") { $global:MockRequestIds += $Matches[1] }
   $queue = $global:MockReplies[$kind]
   $index = [Math]::Min($global:MockIndex[$kind], $queue.Count - 1)
   $global:MockIndex[$kind] = $global:MockIndex[$kind] + 1
@@ -48,6 +49,7 @@ function Invoke-Scenario($Replies, [hashtable]$Extra = @{}) {
   $global:MockReplies = $Replies
   $global:MockIndex = @{ preflight = 0; start = 0; status = 0; recover = 0; rollback = 0; other = 0 }
   $global:MockCalls = @()
+  $global:MockTexts = @()
   $global:MockRequestIds = @()
   $env:ORACLE_SSH_KEY = 'C:\nonexistent\test-key'
   try {
@@ -104,6 +106,22 @@ Check 'a lost start is retried with the SAME request id' ($r.Output -contains 'S
 
 $r = Run-Job @((Finished 'SUCCESS'), (Finished 'ROLLED_BACK')) @{ TestTunnelHealth = { [pscustomobject]@{ build_commit = ('b' * 40) } } }
 Check 'wrong build through the tunnel triggers the server-side rollback job' ($r.Error -like 'DEPLOY ROLLED BACK after local verification failed*' -and ($r.Calls -contains 'rollback')) $r.Error
+
+# Blocker 1: ResumeJobId is validated strictly, before any SSH call.
+foreach ($bad in @('12345678-AAAA-bbbb-cccc-1234567890ab', "12345678-aaaa-bbbb-cccc-1234567890ab'; touch /tmp/x; '", '$(id)', '../x')) {
+  $r = Run-Job @((Finished 'SUCCESS')) @{ ResumeJobId = $bad }
+  Check "invalid ResumeJobId '$bad' is refused before any SSH call" ($r.Error -like 'DEPLOY BLOCKED: -ResumeJobId must be*' -and $r.Calls.Count -eq 0) $r.Error
+}
+$r = Run-Job @($running, (Finished 'SUCCESS'))
+Check 'generated job id is a lowercase UUID' ($r.Ids.Count -ge 1 -and $r.Ids[0] -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') ($r.Ids -join ',')
+
+# Blocker 2: every job command names the job's commit; a mismatch stops the client.
+$statusTexts = @($global:MockTexts | Where-Object { $_ -match "status '" })
+Check 'status requests carry the job id and commit, quoted' ($statusTexts.Count -ge 1 -and @($statusTexts | Where-Object { $_ -notmatch "'$Sha'" }).Count -eq 0)
+$r = Run-Job @(@{ Lines = @('DEPLOY_JOB: job is bound to a different commit', 'DEPLOY_JOB_STATE=SHA_MISMATCH'); Exit = 2 }) @{ ResumeJobId = '12345678-aaaa-bbbb-cccc-1234567890ab' }
+Check 'a commit mismatch from Oracle stops the client' ($r.Error -like '*bound to a different commit*' -and ($r.Calls -notcontains 'recover')) $r.Error
+$r = Run-Job @($running) @{} -Start @(@{ Lines = @('DEPLOY_JOB_STATE=SHA_MISMATCH'); Exit = 2 })
+Check 'starting an id bound to another commit is refused' ($r.Error -like '*belongs to a different commit*' -and ($r.Calls -notcontains 'status')) $r.Error
 
 Remove-Item Env:ORACLE_SSH_KEY -ErrorAction SilentlyContinue
 if ($failures) { Write-Host "$failures check(s) FAILED" -ForegroundColor Red; exit 1 }

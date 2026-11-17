@@ -32,7 +32,7 @@ def _job(sim, *args, scenario="success"):
 def _wait_finished(sim, job_id, timeout=90):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        _, fields = _job(sim, "status", job_id)
+        _, fields = _job(sim, "status", job_id, sim["sha"])
         if fields.get("DEPLOY_JOB_STATE") in {"FINISHED", "DIED"}:
             return fields
         time.sleep(1)
@@ -114,10 +114,10 @@ def test_interrupted_job_is_recovered_after_reconnect(sim):
     pid = int((sim["state"] / "jobs" / job_id / "pid").read_text())
     os.killpg(pid, signal.SIGKILL)  # the job itself dies (e.g. OOM kill) mid-deployment
     time.sleep(1)
-    _, status = _job(sim, "status", job_id)
+    _, status = _job(sim, "status", job_id, sim["sha"])
     assert status["DEPLOY_JOB_STATE"] == "DIED"
     assert _lock_released(sim)  # a dead holder cannot keep the lock
-    _, recover = _job(sim, "recover", job_id, scenario="slow_success")
+    _, recover = _job(sim, "recover", job_id, sim["sha"], scenario="slow_success")
     fields = _wait_finished(sim, job_id)
     assert fields["DEPLOY_RESULT"] == "ROLLED_BACK", fields
     assert sim["health"]()["build_commit"] == OLD
@@ -130,7 +130,7 @@ def test_failed_rollback_reports_manual_recovery_and_releases_the_lock(sim):
     _job(sim, "start", sim["sha"], job_id, scenario="fail_break_restore")
     fields = _wait_finished(sim, job_id)
     assert fields["DEPLOY_RESULT"] == "MANUAL_RECOVERY_REQUIRED"
-    result, _ = _job(sim, "status", job_id)
+    result, _ = _job(sim, "status", job_id, sim["sha"])
     assert "LOG: DEPLOY_MANUAL" in result.stdout and "restore.sh" in result.stdout
     assert _lock_released(sim) and _unchanged_neighbours(sim)
 
@@ -173,7 +173,7 @@ def test_job_directory_is_private_and_holds_no_secrets(sim):
 def test_invalid_requests_are_rejected_without_side_effects(sim):
     _, bad_sha = _job(sim, "start", "abc", str(uuid.uuid4()))
     _, bad_id = _job(sim, "start", sim["sha"], "x;rm -rf /")
-    _, unknown = _job(sim, "status", str(uuid.uuid4()))
+    _, unknown = _job(sim, "status", str(uuid.uuid4()), sim["sha"])
     assert bad_sha["DEPLOY_JOB_STATE"] == bad_id["DEPLOY_JOB_STATE"] == "REJECTED"
     assert unknown["DEPLOY_JOB_STATE"] == "UNKNOWN"
     assert sim["listener"](8768) == str(sim["old"].pid)
@@ -183,9 +183,83 @@ def test_client_requested_rollback_runs_detached_and_only_after_success(sim):
     job_id = str(uuid.uuid4())
     _job(sim, "start", sim["sha"], job_id, scenario="success")
     assert _wait_finished(sim, job_id)["DEPLOY_RESULT"] == "SUCCESS"
-    _job(sim, "rollback", job_id)
+    _job(sim, "rollback", job_id, sim["sha"])
     fields = _wait_finished(sim, job_id)
     assert fields["DEPLOY_RESULT"] == "ROLLED_BACK" and sim["health"]()["build_commit"] == OLD
     assert _lock_released(sim) and _unchanged_neighbours(sim)
-    again, _ = _job(sim, "rollback", job_id)  # result is now ROLLED_BACK: refused
+    again, _ = _job(sim, "rollback", job_id, sim["sha"])  # result is now ROLLED_BACK: refused
     assert "only a successful job" in again.stdout
+
+
+# ---------------------------------------------------------------- blockers
+
+
+@pytest.mark.parametrize("bad_id", [
+    "12345678-AAAA-bbbb-cccc-1234567890ab",       # uppercase: not canonical
+    "12345678-aaaa-bbbb-cccc-1234567890ab;id",    # injection attempt
+    "$(touch /tmp/pwned)", "../../etc", "", "a" * 36,
+])
+def test_job_ids_must_be_canonical_lowercase_uuids(sim, bad_id):
+    for command in (["start", sim["sha"], bad_id], ["status", bad_id, sim["sha"]],
+                    ["recover", bad_id, sim["sha"]], ["rollback", bad_id, sim["sha"]]):
+        result, fields = _job(sim, *command)
+        assert result.returncode == 2 and fields["DEPLOY_JOB_STATE"] == "REJECTED", (command, result.stdout)
+    assert not (sim["simdir"] / "installs").exists()
+    assert not Path("/tmp/pwned").exists()
+    assert sim["listener"](8768) == str(sim["old"].pid)
+
+
+def test_every_job_is_bound_to_its_exact_commit(sim):
+    job_id = str(uuid.uuid4())
+    other = "f" * 40
+    _job(sim, "start", sim["sha"], job_id, scenario="success")
+    assert _wait_finished(sim, job_id)["DEPLOY_RESULT"] == "SUCCESS"
+    for command in (["status", job_id, other], ["recover", job_id, other], ["rollback", job_id, other],
+                    ["start", other, job_id]):
+        result, fields = _job(sim, *command)
+        assert fields["DEPLOY_JOB_STATE"] == "SHA_MISMATCH" and result.returncode == 2, command
+    # Nothing was rolled back or reinstalled by the mismatched requests.
+    assert sim["health"]()["build_commit"] == sim["sha"]
+    assert (sim["simdir"] / "installs").read_text().count("\n") == 1
+    assert (sim["state"] / "jobs" / job_id / "sha").read_text().strip() == sim["sha"]
+
+
+def _parallel(sim, commands, scenario):
+    procs = [subprocess.Popen(["bash", str(sim["repo"] / "deploy/oracle/deploy_job_8768.sh"), *c],
+                              env=sim["make_env"](scenario), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) for c in commands]
+    return [p.communicate(timeout=90)[0] for p in procs]
+
+
+def test_simultaneous_identical_requests_create_exactly_one_job(sim):
+    job_id = str(uuid.uuid4())
+    outputs = _parallel(sim, [["start", sim["sha"], job_id]] * 8, "slow_success")
+    assert all(f"DEPLOY_JOB_ID={job_id}" in out for out in outputs)
+    assert _wait_finished(sim, job_id)["DEPLOY_RESULT"] == "SUCCESS"
+    assert (sim["simdir"] / "installs").read_text().count("\n") == 1
+    jobs = [p for p in (sim["state"] / "jobs").iterdir()]
+    assert [p.name for p in jobs] == [job_id]  # no duplicate or half-written (.new-*) directories
+    assert (sim["state"] / "jobs" / job_id / "sha").read_text().strip() == sim["sha"]
+
+
+def test_simultaneous_different_requests_start_only_one_deployment(sim):
+    ids = [str(uuid.uuid4()) for _ in range(8)]
+    outputs = _parallel(sim, [["start", sim["sha"], i] for i in ids], "slow_success")
+    started = [i for i, out in zip(ids, outputs) if "DEPLOY_JOB_STATE=BUSY" not in out]
+    assert len(started) == 1, outputs
+    assert all("DEPLOY_JOB_STATE=BUSY" in out for i, out in zip(ids, outputs) if i not in started)
+    assert _wait_finished(sim, started[0])["DEPLOY_RESULT"] == "SUCCESS"
+    assert (sim["simdir"] / "installs").read_text().count("\n") == 1
+    assert sorted(p.name for p in (sim["state"] / "jobs").iterdir()) == started
+    assert _lock_released(sim) and _unchanged_neighbours(sim)
+
+
+def test_job_files_are_private_after_atomic_creation(sim):
+    job_id = str(uuid.uuid4())
+    _job(sim, "start", sim["sha"], job_id, scenario="success")
+    _wait_finished(sim, job_id)
+    job = sim["state"] / "jobs" / job_id
+    assert stat.S_IMODE(job.stat().st_mode) == 0o700
+    for name in ("sha", "created_at", "log", "pid", "result"):
+        assert stat.S_IMODE((job / name).stat().st_mode) == 0o600, name
+    assert stat.S_IMODE((sim["state"] / "jobs.lock").stat().st_mode) == 0o600

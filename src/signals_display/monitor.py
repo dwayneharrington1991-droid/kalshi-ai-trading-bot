@@ -525,6 +525,11 @@ class PublicFeed:
                 self.candle_cache = {
                     **(self.candle_cache or {}),
                     "candles": [merged[t] for t in sorted(merged)],
+                    # The cache is an immutable view of this exact closed-minute
+                    # window.  API readers must not reinterpret it against a
+                    # later wall-clock minute while the next provider request is
+                    # still in flight.
+                    "window_cutoff": cutoff,
                     "received_at": now.isoformat(),
                     "diagnostics": dict(self.candle_diagnostics),
                 }
@@ -658,6 +663,7 @@ class PublicFeed:
             ])
             self.candle_cache = {
                 "candles": ordered,
+                "window_cutoff": cutoff,
                 "source": "Coinbase BTC-USD public one-minute candles; Exchange endpoint fills verified gaps",
                 "received_at": received.isoformat(),
                 "refresh": {

@@ -114,9 +114,32 @@ check(r.get("contract_quotes_fresh") is True and r.get("reference_fresh") is Tru
 if c.get("status") == "READY":
     check(c.get("bars")==1440 and c.get("unique_bars")==1440 and not c.get("missing_intervals") and not c.get("duplicate_bars"), "candle integrity inconsistent")
 else:
-    opening = (s.get("prediction_engine") or {}).get("initial") or {}
-    check(c.get("status")=="INCOMPLETE" and bool(c.get("missing_intervals")) and opening.get("up") is None
-          and opening.get("direction") in {"WAIT", "UNCLEAR"}, "candle window incomplete without a withheld opening")
+    engine = s.get("prediction_engine") or {}
+    opening = engine.get("initial") or {}
+    withheld = opening.get("direction") in {"WAIT", "UNCLEAR"}
+    quality = opening.get("data_quality") or {}
+    # A live rolling-window gap that appears after contract opening does not
+    # retroactively invalidate an immutable, cutoff-safe opening snapshot. It
+    # must, however, have explicit evidence of its own complete 1,440-bar
+    # history and belong to the current contract. Otherwise direction is
+    # required to be withheld.
+    frozen_safe = (
+        opening.get("direction") in {"UP", "DOWN"}
+        and quality.get("closed_history_bars") == 1440
+        and opening.get("data_cutoff") is not None
+        and opening.get("history_last_close") is not None
+        and (not opening.get("ticker") or opening.get("ticker") == engine.get("ticker"))
+    )
+    if frozen_safe:
+        try:
+            from datetime import datetime
+            cutoff = datetime.fromisoformat(str(opening["data_cutoff"]).replace("Z", "+00:00")).timestamp()
+            frozen_safe = float(opening["history_last_close"]) <= cutoff
+        except (TypeError, ValueError, OverflowError):
+            frozen_safe = False
+    check(c.get("status")=="INCOMPLETE" and bool(c.get("missing_intervals"))
+          and (withheld or frozen_safe),
+          "candle window incomplete without a withheld or independently verified frozen opening")
 check(results["/api/candle-integrity"][0] == 200 and results["/api/state?view=main"][0] == 200, "candle-integrity or state endpoint not HTTP 200")
 check((s.get("decision_intelligence") or {}).get("execution_capability") is False, "execution capability not disabled")
 print("READINESS " + ("PASS" if not failures else "FAIL: " + "; ".join(failures)))

@@ -56,6 +56,88 @@ from .multi_asset import MarketStrip
 OPENING_INPUT_GRACE_SECONDS = 120
 
 
+def candle_integrity_report(source, observed_at):
+    """Describe one published candle snapshot against its own immutable cutoff.
+
+    Collector and HTTP workers run independently. Grading the previous
+    collector snapshot against the request's newer wall-clock minute creates a
+    false 1439/1440 gap at minute rollover. ``window_cutoff`` is the exact
+    window the collector asked providers to fill; older payloads derive it
+    from their receipt timestamp for compatibility.
+    """
+    source = source if isinstance(source, dict) else {}
+    wall_cutoff = int(observed_at.timestamp()) // 60 * 60
+    try:
+        snapshot_cutoff = int(source.get("window_cutoff"))
+    except (TypeError, ValueError):
+        try:
+            snapshot_cutoff = int(timestamp(source["received_at"]).timestamp()) // 60 * 60
+        except (KeyError, TypeError, ValueError, AttributeError):
+            snapshot_cutoff = wall_cutoff
+    cutoff_valid = (
+        snapshot_cutoff % 60 == 0
+        and snapshot_cutoff <= wall_cutoff
+        and wall_cutoff - snapshot_cutoff <= 86400
+    )
+    starts, invalid = [], 0
+    for raw in source.get("candles", []):
+        try:
+            start = int(raw["start"])
+            if start % 60:
+                raise ValueError("unaligned")
+            starts.append(start)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            invalid += 1
+    unique = sorted(set(starts))
+    out_of_order = starts != sorted(starts)
+    expected = list(range(snapshot_cutoff - 86400, snapshot_cutoff, 60))
+    expected_set = set(expected)
+    unique_set = set(unique)
+    missing = [stamp for stamp in expected if stamp not in unique_set]
+    unexpected = [stamp for stamp in unique if stamp not in expected_set]
+    age = wall_cutoff - snapshot_cutoff if cutoff_valid else None
+    structurally_ready = bool(
+        cutoff_valid and not missing and not unexpected and len(starts) == 1440
+        and len(unique) == 1440 and not invalid and not out_of_order
+    )
+    status = "READY" if structurally_ready and age <= 120 else (
+        "STALE" if structurally_ready else "INCOMPLETE"
+    )
+    diagnostics = source.get("diagnostics", {})
+    return {
+        "status": status,
+        "cutoff": snapshot_cutoff,
+        "wall_clock_cutoff": wall_cutoff,
+        "snapshot_age_seconds": age,
+        "cutoff_source": (
+            "collector_window_cutoff" if source.get("window_cutoff") is not None
+            else "received_at_compatibility_fallback"
+        ),
+        "interval_seconds": 60,
+        "received_at": source.get("received_at"),
+        "starts": unique,
+        "bars": len(starts),
+        "unique_bars": len(unique),
+        "duplicate_bars": len(starts) - len(unique),
+        "invalid_bars": invalid,
+        "out_of_order": out_of_order,
+        "missing_intervals": missing,
+        "unexpected_intervals": unexpected,
+        "recovery": {
+            "attempts": diagnostics.get("provider_attempts", []),
+            "backoffs": diagnostics.get("provider_backoffs", []),
+            "next_retry_at": diagnostics.get("next_retry_at"),
+            "reason": diagnostics.get("reason"),
+        },
+        "diagnostics": diagnostics,
+        "note": (
+            "Timestamp-only integrity evidence for the collector's published "
+            "snapshot; no prices, credentials, account data, or historical rows "
+            "are exposed."
+        ),
+    }
+
+
 def process_prediction_frame(monitor, feed, collected):
     """Process one latest-value frame and isolate recoverable enrichment faults.
 
@@ -1812,56 +1894,16 @@ def make_handler(monitor):
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
             elif route == "/api/candle-integrity":
-                source = (
-                    monitor.latest_candles
-                    or getattr(monitor.feed, "candle_cache", None)
-                    or {}
-                )
-                cutoff = int(utcnow().timestamp()) // 60 * 60
-                starts = []
-                invalid = 0
-                for raw in source.get("candles", []):
-                    try:
-                        start = int(raw["start"])
-                        if start % 60:
-                            raise ValueError("unaligned")
-                        starts.append(start)
-                    except (KeyError, TypeError, ValueError, OverflowError):
-                        invalid += 1
-                unique = sorted(set(starts))
-                expected = list(range(cutoff - 86400, cutoff, 60))
-                missing = [stamp for stamp in expected if stamp not in set(unique)]
-                unexpected = [stamp for stamp in unique if stamp not in set(expected)]
-                diagnostics = source.get("diagnostics", {})
+                # Copy one atomic publication. Never combine bars from one
+                # collector cycle with diagnostics from another.
+                with monitor.candle_lock:
+                    source = deepcopy(
+                        monitor.latest_candles
+                        or getattr(monitor.feed, "candle_cache", None)
+                        or {}
+                    )
                 body = json.dumps(
-                    {
-                        "status": "READY"
-                        if not missing and not unexpected and len(starts) == 1440
-                        and len(unique) == 1440 and not invalid
-                        else "INCOMPLETE",
-                        "cutoff": cutoff,
-                        "interval_seconds": 60,
-                        "received_at": source.get("received_at"),
-                        "starts": unique,
-                        "bars": len(starts),
-                        "unique_bars": len(unique),
-                        "duplicate_bars": len(starts) - len(unique),
-                        "invalid_bars": invalid,
-                        "missing_intervals": missing,
-                        "unexpected_intervals": unexpected,
-                        "recovery": {
-                            "attempts": diagnostics.get("provider_attempts", []),
-                            "backoffs": diagnostics.get("provider_backoffs", []),
-                            "next_retry_at": diagnostics.get("next_retry_at"),
-                            "reason": diagnostics.get("reason"),
-                        },
-                        "diagnostics": diagnostics,
-                        "note": (
-                            "Timestamp-only integrity evidence; no prices, credentials, "
-                            "account data, or historical rows are exposed."
-                        ),
-                    },
-                    allow_nan=False,
+                    candle_integrity_report(source, utcnow()), allow_nan=False
                 ).encode()
                 content_type = "application/json"
             elif route == "/api/market-history":

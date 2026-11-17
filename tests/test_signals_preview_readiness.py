@@ -169,6 +169,68 @@ def test_switch_readiness_probe_passes_a_genuinely_ready_service_and_reports_sta
     assert starting.returncode != 0 and "LOADING_JOURNAL" in starting.stdout
 
 
+def test_switch_accepts_later_live_gap_when_frozen_opening_has_independent_complete_history():
+    _Server.responses = {
+        "/healthz": (200, {"status": "HEALTHY", "build_commit": "abc", "signals_only": True,
+                           "workers": {"healthy": True}}),
+        "/readyz": (200, {"status": "READY", "signals_only": True,
+                           "contract_quotes_fresh": True, "reference_fresh": True}),
+        "/api/candle-integrity": (200, {"status": "INCOMPLETE", "bars": 1439,
+                                         "unique_bars": 1439,
+                                         "missing_intervals": [1794887760]}),
+        "/api/state?view=main": (200, {
+            "prediction_engine": {
+                "ticker": "KXBTC15M-TEST",
+                "initial": {
+                    "ticker": "KXBTC15M-TEST", "direction": "UP", "up": 0.7,
+                    "data_cutoff": "2026-11-17T03:45:00+00:00",
+                    "history_last_close": 1794887100,
+                    "data_quality": {"closed_history_bars": 1440},
+                },
+            },
+            "decision_intelligence": {"execution_capability": False},
+        }),
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        script = _probe_source() + f'\nPYTHON={sys.executable}\nPREVIEW_PROBE_PORT={server.server_address[1]}\nreadiness_report abc\n'
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    finally:
+        server.shutdown()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "READINESS PASS" in result.stdout
+
+
+def test_switch_rejects_directional_opening_without_complete_frozen_evidence():
+    _Server.responses = {
+        "/healthz": (200, {"status": "HEALTHY", "build_commit": "abc", "signals_only": True,
+                           "workers": {"healthy": True}}),
+        "/readyz": (200, {"status": "READY", "signals_only": True,
+                           "contract_quotes_fresh": True, "reference_fresh": True}),
+        "/api/candle-integrity": (200, {"status": "INCOMPLETE", "bars": 1439,
+                                         "unique_bars": 1439, "missing_intervals": [1]}),
+        "/api/state?view=main": (200, {
+            "prediction_engine": {"ticker": "KXBTC15M-TEST", "initial": {
+                "ticker": "KXBTC15M-TEST", "direction": "DOWN", "up": 0.2,
+                "data_cutoff": "2026-11-17T04:00:00+00:00",
+                "history_last_close": 1794888000,
+                "data_quality": {"closed_history_bars": 1439},
+            }},
+            "decision_intelligence": {"execution_capability": False},
+        }),
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        script = _probe_source() + f'\nPYTHON={sys.executable}\nPREVIEW_PROBE_PORT={server.server_address[1]}\nreadiness_report abc\n'
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    finally:
+        server.shutdown()
+    assert result.returncode != 0
+    assert "independently verified frozen opening" in result.stdout
+
+
 def test_core_market_data_failure_still_makes_the_service_not_ready(tmp_path):
     class FailingFeed:
         def poll(self):

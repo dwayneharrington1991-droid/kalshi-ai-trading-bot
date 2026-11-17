@@ -54,6 +54,8 @@ from .strategy_paper import evaluate as evaluate_dual_strategy
 from .multi_asset import MarketStrip
 
 OPENING_INPUT_GRACE_SECONDS = 120
+# Same limit context24 applies to an opening's candle receipt.
+CANDLE_CACHE_STALE_SECONDS = 150
 
 
 def process_prediction_frame(monitor, feed, collected):
@@ -1817,7 +1819,21 @@ def make_handler(monitor):
                     or getattr(monitor.feed, "candle_cache", None)
                     or {}
                 )
-                cutoff = int(utcnow().timestamp()) // 60 * 60
+                # Judge the cached window against the cache's OWN cutoff: the last
+                # minute boundary at or before it was received. Using the request
+                # clock instead made the newest just-closed minute look "missing"
+                # (and the oldest "unexpected") whenever a minute boundary passed
+                # between collector refreshes. A cache older than the opening
+                # model's 150 s freshness limit is reported STALE, never READY.
+                wall = utcnow()
+                try:
+                    received = timestamp(source["received_at"])
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    received = None
+                anchor = min(wall, received) if received is not None else wall
+                cutoff = int(anchor.timestamp()) // 60 * 60
+                age = (wall - received).total_seconds() if received is not None else None
+                stale = age is None or not 0 <= age <= CANDLE_CACHE_STALE_SECONDS
                 starts = []
                 invalid = 0
                 for raw in source.get("candles", []):
@@ -1835,11 +1851,14 @@ def make_handler(monitor):
                 diagnostics = source.get("diagnostics", {})
                 body = json.dumps(
                     {
-                        "status": "READY"
+                        "status": "STALE" if stale else "READY"
                         if not missing and not unexpected and len(starts) == 1440
                         and len(unique) == 1440 and not invalid
                         else "INCOMPLETE",
                         "cutoff": cutoff,
+                        "wall_clock_cutoff": int(wall.timestamp()) // 60 * 60,
+                        "cache_age_seconds": round(age, 3) if age is not None else None,
+                        "stale_after_seconds": CANDLE_CACHE_STALE_SECONDS,
                         "interval_seconds": 60,
                         "received_at": source.get("received_at"),
                         "starts": unique,

@@ -178,3 +178,121 @@ def test_core_market_data_failure_still_makes_the_service_not_ready(tmp_path):
     monitor.tick()
     state = monitor.snapshot()
     assert state["stale"] and state.get("connection_error")  # genuine failure is never masked
+
+
+# ---- 902e825 failure: live candle window vs frozen opening, snapshot coherence ----
+
+from datetime import datetime, timedelta, timezone
+from urllib.request import urlopen
+
+from src.signals_display.server import make_handler
+from tests.test_signals_opening_models import opening as frozen_opening
+
+
+def _probe(responses):
+    _Server.responses = responses
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        script = _probe_source() + f'\nPYTHON={sys.executable}\nPREVIEW_PROBE_PORT={server.server_address[1]}\nreadiness_report abc\n'
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    finally:
+        server.shutdown()
+
+
+def _responses(candles, initial):
+    return {
+        "/healthz": (200, {"status": "HEALTHY", "build_commit": "abc", "signals_only": True,
+                           "workers": {"healthy": True}}),
+        "/readyz": (200, {"status": "READY", "signals_only": True, "contract_quotes_fresh": True,
+                          "reference_fresh": True}),
+        "/api/candle-integrity": (200, candles),
+        "/api/state?view=main": (200, {"decision_intelligence": {"execution_capability": False},
+                                       "prediction_engine": {"initial": initial}}),
+    }
+
+
+GAP = {"status": "INCOMPLETE", "missing_intervals": [1794887760], "bars": 1439, "unique_bars": 1439}
+
+
+def test_live_gap_after_a_complete_frozen_opening_is_ready():
+    complete = frozen_opening()  # real opening record built from complete pre-open history
+    assert complete["up"] is not None
+    assert complete["data_quality"]["closed_history_bars"] == 1440
+    assert complete["frozen_features"]["closed_history_bars"] == 1440
+    result = _probe(_responses(GAP, complete))
+    assert result.returncode == 0 and "READINESS PASS" in result.stdout, result.stdout
+
+
+def test_withheld_and_rollover_placeholder_openings_pass_with_a_live_gap():
+    for initial in ({"up": None, "direction": "WAIT"},
+                    {"status": "INSUFFICIENT DATA", "up": None, "reason": "No frozen opening inputs available"}):
+        result = _probe(_responses(GAP, initial))
+        assert result.returncode == 0, (initial, result.stdout)
+
+
+def test_probability_without_complete_frozen_provenance_still_fails():
+    complete = frozen_opening()
+    partial = json.loads(json.dumps(complete))
+    partial["data_quality"]["closed_history_bars"] = 1439
+    late = json.loads(json.dumps(complete))
+    late["frozen_features"]["max_input_received_at"] = (
+        datetime.fromisoformat(complete["opens_at"]) + timedelta(seconds=5)).isoformat()
+    unknown = {"up": 0.61, "direction": "WAIT"}  # probability with no provenance at all
+    for bad in (partial, late, unknown):
+        result = _probe(_responses(GAP, bad))
+        assert result.returncode != 0 and "complete-frozen opening" in result.stdout
+
+
+def test_stale_candle_collector_never_passes_even_with_a_valid_opening():
+    stale = dict(GAP, status="STALE")
+    result = _probe(_responses(stale, frozen_opening()))
+    assert result.returncode != 0
+
+
+def test_no_opening_probability_is_generated_from_an_incomplete_history():
+    from tests.test_signals_display import NOW
+    from tests.test_signals_prediction_engine import history, market, points
+    from src.signals_display import prediction_engine as engine
+
+    data = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=1))
+    data["candles"] = [bar for i, bar in enumerate(data["candles"]) if i != 700]  # one genuine gap
+    result = engine.opening_forecast(market(), data, points(), NOW + timedelta(seconds=2))
+    assert result["up"] is None and result["direction"] not in {"UP", "DOWN"}
+    assert "Incomplete 24h window" in result["reason"]
+
+
+def _integrity(monitor, now):
+    import src.signals_display.server as server_module
+    original = server_module.utcnow
+    server_module.utcnow = lambda: now
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with urlopen(f"http://127.0.0.1:{server.server_port}/api/candle-integrity", timeout=5) as response:
+            return json.load(response)
+    finally:
+        server.shutdown()
+        server_module.utcnow = original
+
+
+def test_candle_integrity_uses_the_cache_cutoff_across_minute_boundaries(tmp_path):
+    received = datetime(2026, 11, 17, 3, 56, 30, tzinfo=timezone.utc)
+    cutoff = int(received.timestamp()) // 60 * 60
+    monitor = Monitor(None, Journal(tmp_path / "integrity.db"))
+    monitor.latest_candles = {
+        "received_at": received.isoformat(), "diagnostics": {"status": "READY"},
+        "candles": [{"start": t, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+                    for t in range(cutoff - 86400, cutoff, 60)],
+    }
+    # 35 s later the wall clock has crossed 03:57; the cache is still coherent.
+    later = _integrity(monitor, received + timedelta(seconds=35))
+    assert later["status"] == "READY" and later["missing_intervals"] == []
+    assert later["cutoff"] == cutoff and later["wall_clock_cutoff"] == cutoff + 60
+    # A genuine gap inside the cache's own window is still reported exactly.
+    gap = cutoff - 300
+    monitor.latest_candles["candles"] = [b for b in monitor.latest_candles["candles"] if b["start"] != gap]
+    assert _integrity(monitor, received + timedelta(seconds=35))["missing_intervals"] == [gap]
+    # A cache older than 150 s is STALE, never READY.
+    monitor.latest_candles["candles"].append({"start": gap, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1})
+    assert _integrity(monitor, received + timedelta(seconds=200))["status"] == "STALE"

@@ -114,9 +114,35 @@ check(r.get("contract_quotes_fresh") is True and r.get("reference_fresh") is Tru
 if c.get("status") == "READY":
     check(c.get("bars")==1440 and c.get("unique_bars")==1440 and not c.get("missing_intervals") and not c.get("duplicate_bars"), "candle integrity inconsistent")
 else:
+    # The live rolling window may have a genuine public-data gap after the
+    # current contract's opening was frozen from its own receipt-proven
+    # pre-open snapshot (possibly by the previous process). A later live gap
+    # does not invalidate data the opening already used, so the opening is
+    # judged by its own inputs: it must be withheld, or provably built from a
+    # complete 1,440-bar history whose cutoff is the opening and whose inputs
+    # were all received by then. A STALE collector never passes.
+    from datetime import datetime
+    def when(value):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
     opening = (s.get("prediction_engine") or {}).get("initial") or {}
-    check(c.get("status")=="INCOMPLETE" and bool(c.get("missing_intervals")) and opening.get("up") is None
-          and opening.get("direction") in {"WAIT", "UNCLEAR"}, "candle window incomplete without a withheld opening")
+    # No probability means no call is shown (also the pre-record placeholder at rollover).
+    withheld = opening.get("up") is None and opening.get("direction") in {None, "WAIT", "UNCLEAR"}
+    quality = opening.get("data_quality") or {}
+    frozen = opening.get("frozen_features") or {}
+    opened, data_cutoff = when(opening.get("opens_at")), when(opening.get("data_cutoff"))
+    latest_input = when(frozen.get("max_input_received_at"))
+    complete_frozen = bool(
+        opening.get("up") is not None
+        and quality.get("closed_history_bars") == 1440
+        and frozen.get("closed_history_bars") == 1440
+        and opened is not None and data_cutoff == opened
+        and latest_input is not None and latest_input <= opened
+    )
+    check(c.get("status")=="INCOMPLETE" and bool(c.get("missing_intervals")) and (withheld or complete_frozen),
+          "candle window incomplete without a withheld or complete-frozen opening")
 check(results["/api/candle-integrity"][0] == 200 and results["/api/state?view=main"][0] == 200, "candle-integrity or state endpoint not HTTP 200")
 check((s.get("decision_intelligence") or {}).get("execution_capability") is False, "execution capability not disabled")
 print("READINESS " + ("PASS" if not failures else "FAIL: " + "; ".join(failures)))

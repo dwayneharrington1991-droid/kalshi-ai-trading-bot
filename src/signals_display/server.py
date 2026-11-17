@@ -757,7 +757,10 @@ class Monitor:
             # the wall-clock persistence time so recovery can prove each one
             # was stored promptly after receipt, i.e. before the opening.
             try:
-                pending = self.estimator.drain_preopen_references()
+                # Peek/ack rather than drain-before-write. If SQLite is busy or
+                # the transaction fails, the receipts remain queued for the
+                # next tick instead of being silently lost.
+                pending = self.estimator.peek_preopen_references()
                 opens = set()
                 for listed in payload.get("markets", []) or ([market_now] if market_now else []):
                     try:
@@ -774,6 +777,7 @@ class Monitor:
                     self.journal.record_preopen_references(
                         ticks, mode, utcnow() if mode == "PUBLIC MARKET DATA" else now
                     )
+                self.estimator.acknowledge_preopen_references(len(pending))
             except Exception as exc:
                 self.runtime_meter.error("preopen_reference_persistence", type(exc).__name__)
             self.remember_preopening_histories(payload, now)

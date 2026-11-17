@@ -19,6 +19,7 @@ readonly READY_TIMEOUT=${PREVIEW_READY_TIMEOUT_SECONDS:-600}
 old_pid=
 new_pid=
 old_cwd=
+old_pythonpath=
 switched=0
 declare -a old_argv=()
 declare -a old_env=()
@@ -170,7 +171,10 @@ write_rollback_command() {
   install -d -m 0700 "$STATE_ROOT"
   {
     printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ncd %q\n' "$old_cwd"
-    printf 'nohup '
+    # Python safe-path mode (-P) deliberately excludes the working directory.
+    # Preserve the old process's code identity explicitly or the manual
+    # rollback could import the repaired tree, an installed package, or fail.
+    printf 'nohup env PYTHONPATH=%q PYTHONNOUSERSITE=1 ' "$old_pythonpath"
     for arg in "${old_argv[@]}"; do printf '%q ' "$arg"; done
     printf '> %q 2>&1 &\n' "$OLD_ROOT/logs/preview-8768-rollback.log"
     printf 'echo "rollback_pid=$!"\n'
@@ -259,6 +263,16 @@ old_pid=$(listener_pid "$PORT") || fail "exactly one process must listen on 127.
 mapfile -d '' -t old_argv <"/proc/$old_pid/cmdline"
 mapfile -d '' -t old_env <"/proc/$old_pid/environ"
 old_cwd=$(readlink -f "/proc/$old_pid/cwd")
+for entry in "${old_env[@]}"; do
+  if [[ $entry == PYTHONPATH=* ]]; then
+    old_pythonpath=${entry#PYTHONPATH=}
+    break
+  fi
+done
+# Legacy preview launches may not carry PYTHONPATH. Their working directory is
+# the verified old release root, so use it as the explicit safe-path import
+# root in the persisted rollback command.
+[[ -n $old_pythonpath ]] || old_pythonpath=$old_cwd
 [[ $old_cwd == "$OLD_ROOT" ]] || fail "8768 process cwd is not $OLD_ROOT"
 [[ ${old_argv[*]} == *"src.signals_display.server"* ]] || fail "8768 listener is not signals server"
 has_arg_pair --port 8768 || fail "8768 process command identity mismatch"

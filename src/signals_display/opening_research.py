@@ -33,6 +33,7 @@ THRESHOLDS = (0.50, 0.52, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)
 RETROSPECTIVE_LIMIT = 3000
 SLIPPAGE = 0.01
 QUOTE_WINDOW_SECONDS = 60
+PREOPEN_QUOTE_WINDOW_SECONDS = 60
 WALK_START = 170
 WALK_BLOCK = 30
 MAX_FOLDS = 20
@@ -121,13 +122,24 @@ ASSUMED_FEE_MULTIPLIER = 1.0  # Kalshi standard taker schedule; labelled when us
 
 
 def _preopen_mid(db, row):
-    """Latest Kalshi UP mid received at or before the opening call (as-of only)."""
+    """Latest fresh Kalshi UP mid received no later than the market opening.
+
+    The immutable call can be generated after the opening while the server
+    recovers its receipt-proven snapshot.  Using the call time here would then
+    admit post-opening prices into a feature advertised as pre-opening.
+    """
+    opened = timestamp(row["opens_at"])
     found = db.execute(
         """SELECT up_bid,up_ask FROM opening_quote_snapshots
-           WHERE ticker=? AND mode='PUBLIC MARKET DATA' AND julianday(observed_at)<=julianday(?)
+           WHERE ticker=? AND mode='PUBLIC MARKET DATA'
+             AND julianday(observed_at)>=julianday(?) AND julianday(observed_at)<=julianday(?)
              AND up_bid IS NOT NULL AND up_ask IS NOT NULL
            ORDER BY observed_at DESC LIMIT 1""",
-        (row["ticker"], timestamp(row["timestamp"]).isoformat()),
+        (
+            row["ticker"],
+            (opened - timedelta(seconds=PREOPEN_QUOTE_WINDOW_SECONDS)).isoformat(),
+            opened.isoformat(),
+        ),
     ).fetchone()
     if not found:
         return None
@@ -150,6 +162,11 @@ def _snapshot_quote_at(db, row):
     if not found:
         return None
     at, up_bid, up_ask, down_ask, multiplier = found
+    if any(type(value) not in (int, float) or not math.isfinite(value)
+           for value in (up_ask, down_ask)):
+        return None
+    if not (0 < up_ask < 1 and 0 < down_ask < 1):
+        return None
     assumed = type(multiplier) not in (int, float) or not math.isfinite(multiplier)
     mid = (up_bid + up_ask) / 2 if type(up_bid) in (int, float) and 0 <= up_bid <= up_ask else None
     return {"observed_at": at, "up_ask": up_ask, "down_ask": down_ask, "up_mid": mid,
@@ -226,7 +243,14 @@ def _fit(train, validation, spec):
                 fit_rows = [r for r in fit_rows if timestamp(r["label_available_at"]) <= start]
                 if len(fit_rows) < 20:
                     continue
-                m = rigor.fit_logistic(fit_rows, prep, l2, use_offset=spec["offset"])
+                # Scaling is learned from each fold's past-only fit rows.  The
+                # final preprocessor above is valid for the final train fit,
+                # but reusing it here would leak later feature distributions
+                # into the inner hyperparameter selection.
+                fold_prep = _preprocess(fit_rows, names)
+                if not fold_prep["names"]:
+                    continue
+                m = rigor.fit_logistic(fit_rows, fold_prep, l2, use_offset=spec["offset"])
                 losses += rigor._log_losses([rigor.raw_probability(m, r) for r in held], [r["outcome"] for r in held])
             if losses and (best is None or sum(losses) / len(losses) < best[0]):
                 best = (sum(losses) / len(losses), l2)
@@ -331,6 +355,37 @@ def threshold_table(probabilities, rows):
     return table
 
 
+DISPLAYABLE_RECORDED_CONFIDENCE = {
+    "CALIBRATED", "EXPERIMENTAL CALIBRATED CANDIDATE"
+}
+
+
+def recorded_decision_metrics(rows):
+    """Score only the immutable UP/DOWN decisions actually displayed live.
+
+    Counterfactual probability cutoffs remain in ``threshold_table``; they
+    must not be confused with the bot's historical call record.
+    """
+    pairs, waits, invalid = [], 0, 0
+    for row in rows:
+        direction = row.get("recorded_direction")
+        status = row.get("recorded_confidence_status")
+        probability = row.get("recorded_up")
+        if direction not in {"UP", "DOWN"} or status not in DISPLAYABLE_RECORDED_CONFIDENCE:
+            waits += 1
+            continue
+        if (
+            type(probability) not in (int, float)
+            or not math.isfinite(probability)
+            or not 0 <= probability <= 1
+            or (direction == "UP") != (probability >= 0.5)
+        ):
+            invalid += 1
+            continue
+        pairs.append((probability, row))
+    return {**call_metrics(pairs), "wait_or_withheld": waits, "invalid_direction_records": invalid}
+
+
 def _choose_threshold(probabilities, rows):
     """Development-only choice: best mean net P&L with enough priced calls."""
     best = None
@@ -399,6 +454,8 @@ def research(rows, progress=None):
         "p90_confidence": 0.5 + confidences[int(len(confidences) * 0.9)] if confidences else None,
         "share_at_or_above_55": sum(c >= 0.05 for c in confidences) / len(confidences) if confidences else None,
         "saved_calls": _count(str(r["recorded_direction"]) for r in recorded),
+        "actual_displayed_decisions": recorded_decision_metrics(recorded),
+        "threshold_table_scope": "Counterfactual probability cutoffs; not historical displayed calls",
         "threshold_table": threshold_table([r["recorded_up"] for r in recorded], recorded),
     }
     report["conditions_exploratory"] = condition_report(rows)
@@ -453,7 +510,11 @@ def research(rows, progress=None):
                 regime: call_metrics([(p, r) for p, r in picked if r.get("regime") == regime])
                 for regime in sorted({r.get("regime") for r in hold})
             }
-        base = [r for r in hold if r["ticker"] in sources["opening_statistical_baseline"]]
+        base = [
+            r for r in hold
+            if r["ticker"] in by_ticker
+            and r["ticker"] in sources["opening_statistical_baseline"]
+        ]
         if name != "opening_statistical_baseline" and base:
             entry["holdout_log_loss_vs_baseline"] = rigor.paired_superiority_test(
                 rigor._log_losses([by_ticker[r["ticker"]] for r in base], [r["outcome"] for r in base]),
@@ -740,6 +801,7 @@ def main():
     try:
         rigor._refuse_foreign_file(args.output, REPORT_FORMAT)
         with closing(sqlite3.connect(args.journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            coverage = opening_models.dataset_coverage(db)
             rows = load(db)
             buckets = live_rows(db) if args.intracontract else None
             retro, retro_info = (
@@ -754,6 +816,7 @@ def main():
         progress = lambda m: print("RESEARCH_PROGRESS " + m, flush=True)
         print(f"Loaded {len(rows)} eligible frozen openings (read-only)", flush=True)
         report = research(rows, progress=progress)
+        report["authoritative_dataset_coverage"] = coverage
         if args.retrospective:
             print(f"Retrospective candle-only reconstruction: {retro_info}", flush=True)
             report["retrospective_candle_only"] = {"reconstruction": retro_info, **research(retro, progress=progress)}

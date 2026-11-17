@@ -59,6 +59,20 @@ def test_threshold_table_counts_calls_at_each_confidence_level():
     assert table["0.50"]["coverage"] == pytest.approx(5 / 6)
 
 
+def test_recorded_metrics_score_only_actual_displayed_directional_calls():
+    rows = [
+        {**_row(1), "recorded_up": 0.7, "recorded_direction": "UP", "recorded_confidence_status": "CALIBRATED"},
+        {**_row(0), "recorded_up": 0.3, "recorded_direction": "DOWN", "recorded_confidence_status": "CALIBRATED"},
+        {**_row(1), "recorded_up": 0.8, "recorded_direction": "WAIT", "recorded_confidence_status": "CALIBRATED"},
+        {**_row(1), "recorded_up": 0.8, "recorded_direction": "UP", "recorded_confidence_status": "NO VERIFIED EDGE"},
+        {**_row(1), "recorded_up": 0.2, "recorded_direction": "UP", "recorded_confidence_status": "CALIBRATED"},
+    ]
+    metrics = research.recorded_decision_metrics(rows)
+    assert metrics["calls"] == 2 and metrics["correct"] == 2
+    assert metrics["wait_or_withheld"] == 2
+    assert metrics["invalid_direction_records"] == 1
+
+
 def _journal(path, called_at):
     with sqlite3.connect(path) as db:
         db.execute("CREATE TABLE predictions (id INTEGER PRIMARY KEY, ticker TEXT, mode TEXT, timestamp TEXT, payload TEXT)")
@@ -126,7 +140,9 @@ def test_cli_opens_journal_read_only_and_refuses_foreign_output(tmp_path):
     subprocess.run([sys.executable, "-m", "src.signals_display.opening_research", "--journal", str(journal),
                     "--output", str(output)], cwd=ROOT, check=True, capture_output=True)
     assert hashlib.sha256(journal.read_bytes()).hexdigest() == before
-    assert json.loads(output.read_text())["format"] == research.REPORT_FORMAT
+    report = json.loads(output.read_text())
+    assert report["format"] == research.REPORT_FORMAT
+    assert report["authoritative_dataset_coverage"]["official_settled_contracts"] == 0
     foreign = tmp_path / "opening_shadow.json"
     foreign.write_text(json.dumps({"format": "kxbtc-opening-shadow-v1"}))
     result = subprocess.run([sys.executable, "-m", "src.signals_display.opening_research", "--journal", str(journal),
@@ -217,8 +233,80 @@ def test_preopen_market_price_uses_only_quotes_received_by_the_call(tmp_path):
     book(-5, 0.50, 0.54)   # latest at or before the call
     book(+3, 0.70, 0.74)   # after the call: never used
     with sqlite3.connect(tmp_path / "j.db") as db:
-        mid = research._preopen_mid(db, {"ticker": "KXBTC15M-P", "timestamp": opened.isoformat()})
+        # The immutable forecast can be generated after the opening.  The +3 s
+        # quote must still be excluded from a feature described as pre-open.
+        mid = research._preopen_mid(db, {
+            "ticker": "KXBTC15M-P",
+            "opens_at": opened.isoformat(),
+            "timestamp": (opened + timedelta(seconds=5)).isoformat(),
+        })
     assert mid == pytest.approx(0.52)
+
+
+def test_snapshot_quote_rejects_malformed_executable_prices(tmp_path):
+    from src.signals_display.monitor import Journal
+
+    called = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+    Journal(tmp_path / "j.db")
+    with sqlite3.connect(tmp_path / "j.db") as db:
+        db.execute(
+            "INSERT INTO opening_quote_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("PUBLIC MARKET DATA", "KXBTC15M-BAD", called.isoformat(), called.isoformat(), 0,
+             0.49, 1.2, 0.48, -0.1, 1, 1, 1.0, "quadratic", called.isoformat(), "{}"),
+        )
+        quote = research._snapshot_quote_at(
+            db, {"ticker": "KXBTC15M-BAD", "timestamp": called.isoformat()}
+        )
+    assert quote is None
+
+
+def test_inner_cv_preprocessor_is_fit_on_each_past_only_fold(monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for i in range(100):
+        at = start + timedelta(minutes=15 * i)
+        rows.append({
+            "ticker": f"T{i}", "timestamp": at.isoformat(),
+            "label_available_at": (at + timedelta(minutes=1)).isoformat(),
+            "features": {"return_5m": float(i)}, "outcome": i % 2, "baseline": 0.5,
+        })
+    seen_means = []
+
+    def fake_fit(fit_rows, prep, l2, *, use_offset):
+        seen_means.append(prep["means"][0])
+        return {
+            "preprocessor": prep, "weights": [0.0] * (2 * len(prep["names"]) + 1),
+            "use_baseline_offset": use_offset,
+        }
+
+    monkeypatch.setattr(research.rigor, "fit_logistic", fake_fit)
+    research._fit(rows[:80], rows[80:], {"features": ("return_5m",), "offset": True})
+    assert seen_means[0] == pytest.approx(9.5)
+    assert seen_means[-1] == pytest.approx(39.5)  # final model uses all training rows
+
+
+def test_sparse_market_baseline_comparison_uses_only_common_holdout_contracts(monkeypatch):
+    rows = _augment(synthetic.opening_rows(260, seed=94, signal=0.2))
+    for index, row in enumerate(rows):
+        if index % 2 == 0:
+            row["kalshi_preopen_mid"] = 0.52
+            row["features"]["kalshi_preopen_mid_logit"] = research.learning.logit(0.52)
+        else:
+            row["kalshi_preopen_mid"] = None
+
+    def fake_walk(ordered, **_kwargs):
+        eligible = ordered[research.WALK_START:]
+        return {
+            name: {row["ticker"]: row["baseline"] for row in eligible}
+            for name in research.MODELS
+        }, 1
+
+    monkeypatch.setattr(research, "walk_forward", fake_walk)
+    report = research.research(rows)
+    compact = report["model_comparison"]["compact_offset"]
+    market = report["model_comparison"]["kalshi_preopen_mid_as_of_call"]
+    assert 0 < market["holdout_contracts"] < compact["holdout_contracts"]
+    assert market["holdout_log_loss_vs_baseline"]["samples"] == market["holdout_contracts"]
 
 
 def test_intracontract_rows_carry_same_time_quotes_and_are_researched_per_bucket():

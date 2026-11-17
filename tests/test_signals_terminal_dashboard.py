@@ -41,7 +41,7 @@ def test_terminal_never_uses_live_estimate_or_uncalibrated_confidence():
     body = html[start: html.index("function primaryView(")]
     # Fed only by the frozen opening record `i`; never the live engine estimate.
     assert "e.up" not in body and "e.direction" not in body
-    assert "i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE'" in body
+    assert "['CALIBRATED','EXPERIMENTAL CALIBRATED CANDIDATE'].includes(i.confidence?.status)" in body
     assert "uncalibrated estimate withheld" in body
     assert "Date.now()>=closes" in body
     assert "function expired(reason){terminalUnavailable(" in html

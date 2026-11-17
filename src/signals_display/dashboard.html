@@ -100,7 +100,7 @@ main>div.ai-scoreboard:not(#minimal-opening){display:flex!important;flex-directi
 @media(prefers-reduced-motion:reduce){body:after,#minimal-opening .minimal-value:after,.term-flip{animation:none!important}.term-arc,#minimal-opening .minimal-value{transition:none!important}}
 @media(prefers-contrast:more){#minimal-opening .minimal-value{background:#000;border-color:#fff}.term-qual{color:#fff}#minimal-opening h1{color:#fff;background:none}}
 </style></head><body><main>
-<section id="minimal-opening" aria-label="AI opening prediction" data-tone="amber"><article class="card minimal-value term-call"><h1>AI OPENING CALL</h1><strong id="minimal-opening-call" class="amber" role="status" aria-live="polite">WAIT</strong><span id="term-call-qualifier" class="term-qual">Waiting for the frozen opening prediction</span><p id="minimal-opening-call-note">Waiting for the immutable opening snapshot.</p></article><article class="card minimal-value term-conf"><h1>AI CONFIDENCE</h1><div class="term-gauge"><svg viewBox="-14 -14 148 148" aria-hidden="true" focusable="false"><circle class="term-track" cx="60" cy="60" r="52"/><circle id="term-gauge-arc" class="term-arc" cx="60" cy="60" r="52"/></svg><strong id="minimal-opening-confidence" class="amber term-muted" aria-live="polite">—</strong></div><span id="term-confidence-qualifier" class="term-qual">Unavailable</span><p id="minimal-opening-confidence-note">Probability unavailable.</p></article></section>
+<section id="minimal-opening" aria-label="AI opening prediction" data-tone="amber"><article id="minimal-opening-card" class="card minimal-value term-call" data-signal="WAIT"><h1>AI OPENING CALL</h1><strong id="minimal-opening-call" class="amber" role="status" aria-live="polite">WAIT</strong><span id="term-call-qualifier" class="term-qual">Waiting for the frozen opening prediction</span><p id="minimal-opening-call-note">Waiting for the immutable opening snapshot.</p></article><article id="minimal-confidence-card" class="card minimal-value term-conf" data-signal="WAIT"><h1>AI CONFIDENCE</h1><div id="minimal-confidence-gauge" class="term-gauge unavailable" role="meter" aria-valuemin="0" aria-valuemax="100" aria-label="Calibrated opening confidence unavailable"><svg viewBox="-14 -14 148 148" aria-hidden="true" focusable="false"><circle class="term-track" cx="60" cy="60" r="52"/><circle id="term-gauge-arc" class="term-arc" cx="60" cy="60" r="52"/></svg><strong id="minimal-opening-confidence" class="amber term-muted" aria-live="polite">—</strong></div><span id="term-confidence-qualifier" class="term-qual">Unavailable</span><p id="minimal-opening-confidence-note">Probability unavailable.</p></article></section>
 <header><div><div class="eyebrow">KX15 INTELLIGENCE · SIGNALS ONLY</div><h1>Bitcoin 15-Minute Command Center</h1></div><div class="header-status"><div class="opening-score" aria-live="polite"><span>IMMUTABLE OPENING CALLS</span><strong id="opening-score">— correct · — wrong</strong><small id="opening-score-note">Official outcomes only</small></div><span class="tag" id="freshness" role="status">WARMING UP</span></div></header>
 <p class="small">Your market prediction helper. Three simple answers, with the hard analysis handled behind the scenes. You place every trade yourself.</p>
 <div id="critical-warning" class="notice" role="alert" hidden></div>
@@ -202,6 +202,10 @@ function terminalSet(call,confidence,callNote,confidenceNote,fraction){
   if(c.textContent!==call){c.textContent=call;c.classList.remove('term-flip');void c.offsetWidth}
   c.className=tone+' term-flip';k.textContent=confidence;k.className=confidence==='—'?'amber term-muted':tone;
   section.dataset.tone=tone;txt('term-call-qualifier',callNote);txt('term-confidence-qualifier',confidenceNote);
+  $('minimal-opening-card').dataset.signal=call;$('minimal-confidence-card').dataset.signal=call;
+  const gauge=$('minimal-confidence-gauge'),shown=confidence!=='—';gauge.classList.toggle('unavailable',!shown);
+  if(shown){gauge.setAttribute('aria-valuenow',String(Math.round(fraction*1000)/10));gauge.setAttribute('aria-label','Calibrated opening confidence '+(fraction*100).toFixed(1)+' percent')}
+  else{gauge.removeAttribute('aria-valuenow');gauge.setAttribute('aria-label','Calibrated opening confidence unavailable')}
   const arc=$('term-gauge-arc');if(arc){arc.style.strokeDasharray=terminal.C;arc.style.strokeDashoffset=terminal.C*(1-Math.max(0,Math.min(1,fraction||0)))}
 }
 function terminalUnavailable(reason){terminal.closesAt=null;terminalSet('WAIT','—',reason,'Unavailable',0)}
@@ -209,7 +213,7 @@ function terminalView(s,i,usable,direction,confidence){
   const closes=Date.parse(i.closes_at),current=!s.market?.ticker||!i.ticker||i.ticker===s.market.ticker;
   if(!Number.isFinite(i.up)||!Number.isFinite(closes)||Date.now()>=closes||!current){terminalUnavailable(Number.isFinite(i.up)?'Contract closed · waiting for the next opening':'No frozen opening prediction for this contract yet');return}
   terminal.closesAt=closes;
-  const calibrated=i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE',call=usable&&['UP','DOWN'].includes(direction)?direction:'WAIT';
+  const calibrated=['CALIBRATED','EXPERIMENTAL CALIBRATED CANDIDATE'].includes(i.confidence?.status),call=usable&&['UP','DOWN'].includes(direction)?direction:'WAIT';
   const callNote='Frozen at '+termTime(i.opens_at)+' open · valid until '+termTime(i.closes_at);
   if(!calibrated){terminalSet(call==='WAIT'?'WAIT':call,'—',callNote,'No calibrated opening model is active · uncalibrated estimate withheld',0);return}
   if(call==='WAIT'){const threshold=i.decision_policy?.threshold;terminalSet('WAIT',termPct(confidence),callNote,'Calibrated · below the validated '+(Number.isFinite(threshold)?termPct(threshold):'')+' call threshold',confidence);return}
@@ -261,14 +265,14 @@ function primaryView(s){
   const scalp=!s.stale&&m.actionable===true&&m.recommendation==='SCALP UP'?'SCALP UP':!s.stale&&m.actionable===true&&m.recommendation==='SCALP DOWN'?'SCALP DOWN':'WAIT';
   const openingModel=audit.opening_ensemble_active?'AI ACTIVE':audit.model_id||i.model?'SHADOW / EXPERIMENTAL':'BASELINE / UNAVAILABLE';
   const liveModel=e.model_status||s.settlement_intelligence?.model_status||'EXPERIMENTAL';
-  const calibratedOpening=i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE',minimalConfidence=calibratedOpening&&Number.isFinite(i.up)?Math.max(i.up,Number.isFinite(i.down)?i.down:1-i.up):null;
+  const calibratedOpening=['CALIBRATED','EXPERIMENTAL CALIBRATED CANDIDATE'].includes(i.confidence?.status),minimalConfidence=calibratedOpening&&Number.isFinite(i.up)?Math.max(i.up,Number.isFinite(i.down)?i.down:1-i.up):null;
   terminalView(s,i,openingUsable,openingDirection,minimalConfidence);
   $('minimal-opening-confidence').title=openingUsable?'Calibrated probability assigned to the immutable UP/DOWN opening call.':minimalConfidence!=null?'Larger calibrated outcome probability. The model still says WAIT because neither side crossed the validation-selected directional threshold.':'No calibrated opening probability was available at the immutable cutoff.';
   txt('primary-contract',e.ticker||s.market?.ticker||'Waiting for KXBTC15M');
   syncContractClock(s);
   txt('primary-opening',openingDirection);
   $('primary-opening').className='forecast-label '+(openingDirection==='UP'?'green':openingDirection==='DOWN'?'red':'amber');
-  const openingProbabilityAvailable=Number.isFinite(i.up),openingThreshold=i.decision_policy?.threshold;
+  const openingProbabilityAvailable=calibratedOpening&&Number.isFinite(i.up),openingThreshold=i.decision_policy?.threshold;
   txt('primary-opening-probability',openingProbabilityAvailable?prob(i.up)+' UP · '+prob(Number.isFinite(i.down)?i.down:1-i.up)+' DOWN'+(Number.isFinite(openingThreshold)?' · directional threshold '+prob(openingThreshold):''):'Probability unavailable');
   txt('primary-opening-reason',openingUsable?'This was the bot’s immutable call at the market opening. Current LIVE staleness cannot change it.':openingProbabilityAvailable?'AI evaluated the frozen opening snapshot and selected WAIT under its validation-frozen abstention policy. '+(i.confidence?.reason||i.neutral_reason||i.reason||'No directional threshold was crossed.'):i.confidence?.reason||i.neutral_reason||i.reason||'Opening inputs were unavailable at the opening cutoff.');
   txt('primary-opening-model','Model: '+openingModel);

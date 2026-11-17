@@ -291,8 +291,17 @@ def test_dashboard_contains_incremental_chart_without_external_script():
     assert 'id="minimal-opening-call"' in page
     assert 'id="minimal-opening-confidence"' in page
     assert "main>:not(#minimal-opening){display:none!important}" in page
-    assert "calibratedOpening=i.confidence?.status==='EXPERIMENTAL CALIBRATED CANDIDATE'" in page
+    assert "['CALIBRATED','EXPERIMENTAL CALIBRATED CANDIDATE'].includes(i.confidence?.status)" in page
     assert "Larger calibrated outcome probability" in page
+    assert 'id="minimal-confidence-gauge"' in page
+    # Integrated terminal gauge: SVG arc with an accessible meter role.
+    assert 'id="term-gauge-arc"' in page and 'role="meter"' in page
+    assert "@media(prefers-reduced-motion:reduce)" in page
+    assert "gauge.classList.toggle('unavailable',!shown)" in page
+    assert "gauge.removeAttribute('aria-valuenow')" in page
+    assert "gauge.setAttribute('aria-valuenow'" in page
+    assert "$('minimal-opening-card').dataset.signal=call" in page
+    assert "function expired(reason){terminalUnavailable(" in page
     assert 'id="opening-score"' in page
     assert "const openingUsable=Number.isFinite(i.up)" in page
     assert "Current LIVE staleness cannot change it" in page

@@ -21,6 +21,12 @@
 #   MANUAL_RECOVERY_REQUIRED (12)  STATUS (0)
 set -Euo pipefail
 umask 077
+# A server-owned deployment job must never die with the SSH session that
+# started it (deploy_job_8768.sh also runs it under setsid/nohup).
+trap '' HUP
+# Optional private job directory (set by deploy_job_8768.sh): progress and the
+# final result are written there atomically for reconnecting clients.
+readonly JOB_DIR=${PREVIEW_JOB_DIR:-}
 
 readonly PORT=8768
 readonly STATE_ROOT=${PREVIEW_STATE_ROOT:-/home/opc/.kalshi-deploy/preview-8768}
@@ -33,7 +39,18 @@ readonly INSTALLER=${PREVIEW_TEST_INSTALLER:-$NEW_ROOT/deploy/oracle/install_pre
 export PREVIEW_DEPLOY_LOCK_PATH=${PREVIEW_DEPLOY_LOCK_PATH:-$STATE_ROOT/deploy.lock}
 
 say() { printf 'DEPLOY: %s\n' "$*"; }
-finish() { printf 'DEPLOY_RESULT=%s\n' "$1"; exit "$2"; }
+job_write() {
+  # job_write <file> <content>: atomic, private; never holds secrets.
+  [[ -n $JOB_DIR && -d $JOB_DIR ]] || return 0
+  printf '%s\n' "$2" >"$JOB_DIR/$1.next" && chmod 0600 "$JOB_DIR/$1.next" && mv -f "$JOB_DIR/$1.next" "$JOB_DIR/$1"
+}
+finish() {
+  job_write result "DEPLOY_RESULT=$1
+EXIT=$2
+FINISHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'DEPLOY_RESULT=%s\n' "$1"
+  exit "$2"
+}
 
 listener() {
   local l
@@ -226,10 +243,11 @@ case $mode in
   status)
     state_json | "$PY" -P -c 'import json,sys;s=json.load(sys.stdin);print("DEPLOY_STATUS "+json.dumps({k:s.get(k) for k in ("pid8768","build","health","model_id","threshold","components","inputs","execution_capability","pid8765","pid8767")},sort_keys=True))'
     finish STATUS 0 ;;
-  deploy|rollback) ;;
-  *) echo "usage: $0 deploy <commit> | rollback <commit> <run id> | status" >&2; finish BLOCKED 2 ;;
+  deploy|rollback|recover) ;;
+  *) echo "usage: $0 deploy <commit> | rollback <commit> <run id> | recover <commit> <run id> | status" >&2; finish BLOCKED 2 ;;
 esac
 
+job_write pid "$$"
 sha=${2:-}
 [[ $sha =~ ^[0-9a-f]{40}$ ]] || { say "an exact 40-character commit is required"; finish BLOCKED 2; }
 [[ $(id -un) == opc || -n ${PREVIEW_TEST_INSTALLER:-} ]] || { say "must run as opc"; finish BLOCKED 2; }
@@ -239,11 +257,26 @@ source "$SCRIPT_DIR/preview_deploy_lock.sh"
 install -d -m 0700 "$STATE_ROOT"
 preview_deploy_lock || finish BLOCKED_CONCURRENT_DEPLOYMENT 75
 
-if [[ $mode == rollback ]]; then
+if [[ $mode == rollback || $mode == recover ]]; then
   run_id=${3:-}
   [[ $run_id =~ ^[0-9A-Za-z_-]+$ && -f $STATE_ROOT/runs/$run_id/pre.json ]] ||
     { say "unknown run id"; finish BLOCKED 2; }
-  guarded_restore "$STATE_ROOT/runs/$run_id" "$sha" "requested by the deployment client"
+  run=$STATE_ROOT/runs/$run_id
+  if [[ $mode == recover ]]; then
+    # An interrupted job (killed before writing a result): decide from the
+    # live state, under the lock, without guessing.
+    pre_build=$("$PY" -P -c 'import json,sys;print(json.load(open(sys.argv[1]))["build"])' "$run/pre.json")
+    if [[ $(check_state "$run/pre.json" "$sha" 1) == OK ]]; then
+      say "recovered: the new build $sha is healthy and fully verified"
+      finish SUCCESS 0
+    fi
+    if [[ $(check_state "$run/pre.json" "$pre_build" 0) == OK ]]; then
+      say "recovered: the previous build $pre_build is healthy with the same artifact and journal"
+      finish FAILED_PREVIOUS_STILL_RUNNING 10
+    fi
+    guarded_restore "$run" "$sha" "interrupted deployment: neither build is confirmed healthy"
+  fi
+  guarded_restore "$run" "$sha" "requested by the deployment client"
 fi
 
 [[ $(git -C "$NEW_ROOT" rev-parse HEAD 2>/dev/null) == "$sha" ]] || { say "staged checkout is not $sha"; finish BLOCKED 2; }
@@ -260,6 +293,7 @@ if [[ $pre_health != HEALTHY || -z $pre_build || $pre_build == None || $pre_arti
   finish BLOCKED 2
 fi
 printf 'DEPLOY_RUN_ID=%s\n' "$run_id"
+job_write run_id "$run_id"
 say "previous build $pre_build (pid $pre_pid) recorded; installing $sha on preview 8768 only"
 prune_runs
 

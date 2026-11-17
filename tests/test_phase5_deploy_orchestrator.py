@@ -54,7 +54,10 @@ source "$(dirname "$0")/deploy/oracle/preview_deploy_lock.sh"
 preview_deploy_lock || exit 9          # must inherit the orchestrator's lock
 kill_old() { pkill -f "fake_server.py .*--port 8768( |$)"; for _ in $(seq 50); do pgrep -f "fake_server.py .*--port 8768( |$)" >/dev/null || break; sleep 0.1; done; }
 start() { (cd "$SIM_DIR" || exit 1; nohup "$SIM_PY" "$SIM_DIR/fake_server.py" --port 8768 "$@" >/dev/null 2>&1 </dev/null 9>&- &); sleep 0.8; }
+echo "$sha" >>"$SIM_DIR/installs"            # counts installer invocations
 case $SIM_INSTALL in
+  slow_success)       kill_old; sleep 3; start --build-commit "$sha" --alerts --opening-model-artifact "$SIM_DIR/artifact.json" --journal j.db; exit 0 ;;
+  fail_break_restore) kill_old; echo DEGRADED >"$SIM_DIR/old_health"; exit 1 ;;
   success)            kill_old; start --build-commit "$sha" --alerts --opening-model-artifact "$SIM_DIR/artifact.json" --journal j.db; exit 0 ;;
   fail_nochange)      exit 1 ;;
   fail_restored)      kill_old; start --build-commit "$SIM_OLD" --opening-model-artifact "$SIM_DIR/artifact.json" --journal j.db; exit 1 ;;
@@ -92,7 +95,7 @@ def sim(tmp_path):
         pytest.skip("ports 8765/8767/8768 are in use on this machine")
     repo = tmp_path / "repo"
     (repo / "deploy/oracle").mkdir(parents=True)
-    for name in ("deploy_preview_8768.sh", "preview_deploy_lock.sh"):
+    for name in ("deploy_preview_8768.sh", "preview_deploy_lock.sh", "deploy_job_8768.sh"):
         shutil.copy(ROOT / "deploy/oracle" / name, repo / "deploy/oracle" / name)
     (repo / "fake_installer.sh").write_text(FAKE_INSTALLER)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -129,11 +132,14 @@ def sim(tmp_path):
                 "--health-file", str(simdir / "old_health"), env=secret_env)
     p65, p67 = start(8765, "prod"), start(8767, "p2")
 
+    def make_env(scenario="success", extra_env=None):
+        return {**os.environ, "PATH": f"{simdir / 'bin'}:/usr/bin:/bin", "PREVIEW_STATE_ROOT": str(tmp_path / "state"),
+                "PREVIEW_PYTHON": sys.executable, "PREVIEW_TEST_INSTALLER": str(repo / "fake_installer.sh"),
+                "PREVIEW_HEALTH_TIMEOUT_SECONDS": "15", "SIM_INSTALL": scenario, "SIM_DIR": str(simdir),
+                "SIM_PY": sys.executable, "SIM_OLD": OLD, **(extra_env or {})}
+
     def run(*args, scenario="success", extra_env=None):
-        env = {**os.environ, "PATH": f"{simdir / 'bin'}:/usr/bin:/bin", "PREVIEW_STATE_ROOT": str(tmp_path / "state"),
-               "PREVIEW_PYTHON": sys.executable, "PREVIEW_TEST_INSTALLER": str(repo / "fake_installer.sh"),
-               "PREVIEW_HEALTH_TIMEOUT_SECONDS": "15", "SIM_INSTALL": scenario, "SIM_DIR": str(simdir),
-               "SIM_PY": sys.executable, "SIM_OLD": OLD, **(extra_env or {})}
+        env = make_env(scenario, extra_env)
         result = subprocess.run(["bash", str(repo / "deploy/oracle/deploy_preview_8768.sh"), *args],
                                 env=env, capture_output=True, text=True, timeout=120)
         status = [l for l in result.stdout.splitlines() if l.startswith("DEPLOY_RESULT=")]
@@ -148,7 +154,7 @@ def sim(tmp_path):
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:8768/healthz", timeout=3) as r:
             return json.load(r)
 
-    ctx = dict(run=run, sha=sha, listener=listener, health=health, old=old, p65=p65, p67=p67,
+    ctx = dict(run=run, make_env=make_env, repo=repo, sha=sha, listener=listener, health=health, old=old, p65=p65, p67=p67,
                simdir=simdir, state=tmp_path / "state", secret_env=secret_env, start=start)
     yield ctx
     subprocess.run(["pkill", "-f", str(simdir / "fake_server.py")])

@@ -18,9 +18,9 @@ import pytest
 from tests.test_phase5_deploy_orchestrator import OLD, _unchanged_neighbours, sim  # noqa: F401
 
 
-def _job(sim, *args, scenario="success"):
+def _job(sim, *args, scenario="success", extra_env=None):
     result = subprocess.run(["bash", str(sim["repo"] / "deploy/oracle/deploy_job_8768.sh"), *args],
-                            env=sim["make_env"](scenario), capture_output=True, text=True, timeout=60)
+                            env=sim["make_env"](scenario, extra_env), capture_output=True, text=True, timeout=60)
     fields = {}
     for line in result.stdout.splitlines():
         if "=" in line and not line.startswith(("LOG:", "DEPLOY_JOB:")):
@@ -108,7 +108,9 @@ def test_control_the_old_session_owned_orchestrator_dies_with_ssh(sim):
 
 def test_interrupted_job_is_recovered_after_reconnect(sim):
     job_id = str(uuid.uuid4())
-    result, fields = _job(sim, "start", sim["sha"], job_id, scenario="slow_success")
+    # Watchdog effectively idle here, so the client-requested recovery path is tested.
+    result, fields = _job(sim, "start", sim["sha"], job_id, scenario="slow_success",
+                          extra_env={"PREVIEW_WATCH_INTERVAL": "600"})
     assert fields["DEPLOY_JOB_ID"] == job_id
     _wait_old_stopped(sim)
     pid = int((sim["state"] / "jobs" / job_id / "pid").read_text())
@@ -123,6 +125,28 @@ def test_interrupted_job_is_recovered_after_reconnect(sim):
     assert sim["health"]()["build_commit"] == OLD
     assert _lock_released(sim) and _unchanged_neighbours(sim)
     assert (sim["simdir"] / "installs").read_text().count("\n") == 1  # recovery never reinstalls
+
+
+def test_watchdog_recovers_a_dead_orchestrator_without_any_client(sim):
+    job_id = str(uuid.uuid4())
+    _job(sim, "start", sim["sha"], job_id, scenario="slow_success")
+    _wait_old_stopped(sim)
+    pid = int((sim["state"] / "jobs" / job_id / "pid").read_text())
+    os.killpg(pid, signal.SIGKILL)          # orchestrator dies; nobody is connected
+    deadline, fields = time.time() + 120, {}
+    while time.time() < deadline:            # status reads only; no recover request is sent
+        _, fields = _job(sim, "status", job_id, sim["sha"])
+        if fields.get("DEPLOY_JOB_STATE") == "FINISHED":
+            break
+        time.sleep(1)
+    assert fields["DEPLOY_RESULT"] in {"ROLLED_BACK", "SUCCESS"}, fields
+    log = (sim["state"] / "jobs" / job_id / "log").read_text()
+    assert "watchdog: orchestrator gone without a result; requesting guarded recovery" in log
+    if fields["DEPLOY_RESULT"] == "SUCCESS":  # only possible after a fresh full soak
+        assert "soak passed" in log and "postflight passed" in log
+    else:
+        assert sim["health"]()["build_commit"] == OLD
+    assert _lock_released(sim) and _unchanged_neighbours(sim)
 
 
 def test_failed_rollback_reports_manual_recovery_and_releases_the_lock(sim):

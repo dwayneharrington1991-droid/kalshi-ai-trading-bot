@@ -1,102 +1,93 @@
-# Deploying the Phase 5 performance upgrade to preview 8768 without retiring 8769
+# Deploying the Phase 5 performance upgrade to preview 8768 (revision 2)
 
-Author: Claude (implementation). Independent assessment requested by the owner;
-this is NOT Codex's review. Nothing here has been executed on Oracle.
+Author: Claude. Revision 2 resolves the six blockers from Codex's DEPLOY HOLD
+on 839a79c. Not executed on Oracle. Requires Codex PASS and owner approval.
 
-## Verdict: YES, with the gates below
+## Why 8769 need not be retired first (unchanged)
 
-There is no functional dependency between 8768 and 8769:
+8768 and 8769 share no port, journal, directory, code path or lock; 8769's
+commit `7ba1763` is already inside the 8768 build. They share only the single
+CPU core and memory, which the upgrade reduces (offline: cycle CPU -54%,
+prediction calculation -61%, identical outputs). The gates below measure the
+real effect on Oracle and roll back automatically if it is not met.
 
-| Possible coupling | 8768 | 8769 | Shared? |
-|---|---|---|---|
-| Port | 8768 | 8769 | no |
-| Journal | `upgraded-live-8768.db` | `repair-test-8769.db` | no |
-| Directory / release | `kalshi-preview-upgrade` + new release root | `kalshi-gap-repair-stage` | no |
-| Code | target build contains `7ba1763` already | runs `7ba1763` | 8769 tests nothing 8768 lacks |
-| Deployment lock / tooling | `preview-8768` job + lock | not referenced | no |
-| CPU (1 core) and memory | yes | yes | **only shared resource** |
+## The deployment is ONE Oracle-owned job; all gates run inside it
 
-The deployment switch stops the old 8768 process before starting the new one
-(one 8768 process at a time), so memory demand does not double. The only
-risk 8769 adds is CPU contention, which is exactly what the upgrade reduces:
+`deploy_job_8768.sh start` launches `deploy_preview_8768.sh` detached (own
+session, nohup, SIGHUP ignored) under the exclusive preview-8768 lock, plus a
+detached watchdog. The Windows client only starts and watches; closing it or
+losing the network changes nothing.
 
-- Measured on Oracle (old build 6c19623, 21% of the core):
-  publish-after-collection p50 2.59 s, p95 4.25 s, p99 5.15 s; prediction
-  calculation p50 1.70 s. The old build already passes readiness, but only
-  intermittently.
-- Measured offline with realistic inputs (identical outputs): cycle CPU
-  169 -> 78 ms (-54%), prediction calculation 148.5 -> 58.4 ms (-61%);
-  per-request paper summary 79 -> 1.1 ms; /readyz no longer builds the full
-  dashboard; background analytics run at nice 10.
-- Expected at the same CPU share: roughly half the publish latency (p95
-  around 2-2.5 s). This is an extrapolation; the soak gate below measures it
-  on Oracle and rolls back if it is not met.
-- The readiness gate (d61b0e0) now requires 3 consecutive full passes within
-  600 s, so a warm-up flap no longer aborts after ~55 s, and nothing is relaxed.
+1. **Preflight** (`preview_gates_8768.py preflight`, before ANY change; failure = `BLOCKED`, nothing changed):
+   load1 <= 12.0 (observed 7.1-8.4 on 1 core); MemAvailable >= 768 MiB;
+   SwapFree >= 1024 MiB; swap activity <= 200 pages/s over 10 s; disk free
+   >= 3 GiB; not inside an opening window (90 s before to 150 s after a
+   quarter hour); exactly one readable listener on 8765 and 8767 (PID and
+   start time recorded); the current 8768 CPU share measured over 20 s as the
+   baseline.
+2. **Install + switch + verification** (existing): exact 40-char build,
+   HEALTHY, signals-only, same artifact/model/threshold/inputs/journal,
+   execution capability disabled, 8765/8767 unchanged; readiness must hold
+   for 3 consecutive full probes within 600 s.
+3. **Soak, 15 minutes, rollback armed** (`soak`; every 10 s on a fixed cadence):
+   every sample must have `/healthz` 200 HEALTHY, workers healthy,
+   signals-only and `build_commit` EXACTLY the 40-character commit;
+   `/readyz` 200 READY with fresh quotes and reference; `/api/state` 200 with
+   measurable quote/reference ages and latency meters (any unsuccessful or
+   unmeasurable response fails immediately); age never above 10 s and <= 5 s
+   in >= 95% of samples; at EVERY sample whose meters hold >= 100
+   measurements: publish-after-collection p95 <= 3000 ms and p99 <= 4500 ms,
+   prediction p50 <= 1020 ms (a breach at any point fails, not only at the
+   end); >= 80% of samples must have that much latency data and >= 90% of
+   the expected samples must be taken; the 8768 listener PID constant; 8765
+   and 8767 identities unchanged.
+4. **Postflight** (`postflight`): 8765/8767 identities unchanged;
+   MemAvailable >= 512 MiB; SwapFree >= 768 MiB; swap activity <= 200
+   pages/s; load1 <= 14 and <= preflight + 2.0; new 8768 CPU over 60 s <=
+   preflight baseline + 5 points and <= 60%; final `/healthz` HEALTHY on the
+   exact build.
+5. **SUCCESS** is written only here (the orchestrator has a single SUCCESS
+   exit, after soak and postflight). Any failure in 3 or 4 runs the existing
+   guarded restore: it stops ONLY this run's new build (identified by
+   `--build-commit <sha>`), restarts the exact previous process (argv, cwd,
+   full environment from the private snapshot) and verifies it: `ROLLED_BACK`.
 
-Retiring 8769 later remains worthwhile (about 22% CPU, 570 MiB) but is not a
-precondition.
+Rollback stays armed until SUCCESS even if the orchestrator dies: the
+watchdog detects a dead orchestrator without a result and requests the
+guarded `recover`, which never marks SUCCESS without a fresh full soak and
+postflight, and otherwise restores the previous build. A client disconnect
+has no effect at all (the job is server-owned).
 
-## Preconditions
+## Codex blockers on 839a79c and their resolution
 
-1. Codex PASS for the exact target commit, covering the performance code
-   (b6af8ad, 8c40a10; already PASSED) AND the readiness-gate change in
-   `deploy/oracle/switch_preview_8768.sh` (d61b0e0) and this soak gate. If
-   the readiness-gate change was not part of the performance review, it must
-   be reviewed first.
-2. A paste-ready Windows command generated for that exact commit (the
-   existing `deploy/windows/Deploy-Preview8768.ps1` with `-Sha` and
-   `-Branch claude/phase5-deploy-failure-repair`), with the Windows PowerShell
-   5.1 tests re-run on the owner's PC.
-3. Owner authorization. Production 8765 is never touched; 8767 and 8769 are
-   left running.
+| # | Blocker | Resolution |
+|---|---|---|
+| 1 | Soak not inside an Oracle-owned job with automatic rollback | Soak and postflight run inside the detached orchestrator under the lock; failure -> commit-bound guarded restore; watchdog covers orchestrator death; recover re-soaks. |
+| 2 | Latency only checked at the end | Checked at every sample with enough data; a mid-soak breach fails (tested with a breach that recovers before the end). |
+| 3 | No minimum sample counts | >= 100 measurements per meter for a statistic to count; >= 80% of samples must qualify; >= 90% of expected samples. |
+| 4 | Failed /api/state tolerated | Any non-200, non-JSON, missing field or non-numeric value fails immediately. |
+| 5 | Prefix build match | Exact 40-character equality (soak rejects shorter input; `/healthz` must equal the full commit). |
+| 6 | Manual resource/window/listener checks | Automated preflight and postflight with the thresholds above. |
 
-## Gates
+## Verification (local; never Oracle)
 
-### G1 Pre-deploy baseline (read-only, about 70 s)
-Run the existing process profile (`collect_process_profile.sh`, commit
-b6af8ad command). Proceed only if ALL hold:
-- 8768 (old build) answers HEALTHY;
-- host available memory >= 1.0 GB and swap is not growing between vmstat samples;
-- 1-minute load <= 10 (observed 7.1-8.4);
-- no opening window in progress (the switch also enforces 90 s before to 150 s after each quarter hour).
-Record the 8765 listener PID, the 8768 baseline percentiles and 8768 CPU.
+- `bash -n` and `shellcheck -S warning` clean for every deploy script (three
+  pre-existing SC2155/SC2034 warnings fixed).
+- Orchestrator and job rehearsals with real processes on 8768/8765/8767:
+  success only after soak and postflight; rollback to the exact previous
+  process (same environment) for: unready, slow latency, mid-soak latency
+  breach, `/api/state` 500 inside the soak, too few latency samples, short
+  build inside the soak, postflight CPU and memory failures; preflight
+  blocks with no install for a missing protected listener and for memory,
+  load, disk and swap limits; overrides refused outside test mode; opening
+  window boundaries; watchdog recovers a SIGKILLed orchestrator with no
+  client; client-requested recovery still works.
+- Full suite: 1402 passed, 9 skipped.
 
-### G2 Deployment job (automatic, already implemented)
-The server-owned job (disconnect-safe, exclusive lock, commit-bound) passes
-only if: `/healthz` HEALTHY, workers healthy, signals-only and build == target;
-`/readyz` READY with fresh quotes AND reference (5-second rule unchanged) for
-3 consecutive probes within 600 s; candle integrity 1440 bars (or a verified
-frozen opening); execution capability disabled; 8765 and 8767 listener PIDs
-unchanged. Any failure restores the exact previous 8768 process automatically
-(`FAILED_PREVIOUS_STILL_RUNNING`).
+## After Codex PASS
 
-### G3 Post-deploy soak (read-only, 15 minutes, strict, automated)
-On Oracle, immediately after `SUCCESS`:
-```bash
-bash /home/opc/kalshi-preview-repair-<sha7>/deploy/oracle/verify_preview_8768_soak.sh <sha> 15 <8765 pid from G1>
-```
-PASS (exit 0) requires, over every 10-second sample for 15 minutes:
-- HEALTHY, workers healthy, signals-only, build == target; READY with fresh quotes and reference;
-- quote and reference age <= 5 s in >= 95% of samples and never > 10 s;
-- publish-after-collection p95 <= 3000 ms and p99 <= 4500 ms (old: 4254 / 5154);
-- prediction calculation p50 <= 1020 ms (60% of the old 1698 ms);
-- the 8765 listener PID never changes.
-Then re-run the G1 profile once: 8768 CPU must not exceed the G1 value by
-more than 5 percentage points and load must not rise by more than 1.0.
-
-### G4 Rollback (on any G3 failure, or owner request)
-```bash
-bash /home/opc/kalshi-preview-repair-<sha7>/deploy/oracle/deploy_job_8768.sh rollback <job id> <sha>
-bash /home/opc/kalshi-preview-repair-<sha7>/deploy/oracle/deploy_job_8768.sh status <job id> <sha>
-```
-This is the existing commit-bound, locked rollback of a successful job: it
-restores the exact previous process (argv, working directory, full
-environment from the job's private snapshot) and verifies it. Afterwards
-confirm 8768 answers with build 6c19623, HEALTHY and READY, and that 8765's
-PID is unchanged. No journal is modified by deployment or rollback.
-
-## What this plan does not do
-- It does not stop, restart or modify 8765, 8767 or 8769.
-- It does not change the model, the 87 inputs, the 55% threshold, journals
-  or trading (signals-only throughout).
+A paste-ready Windows command for the exact approved commit is generated
+from `deploy/windows/Deploy-Preview8768.ps1` (`-Sha <commit>`, `-Branch
+claude/phase5-deploy-failure-repair`). Expected duration about 25-30 minutes
+(install, up to 10 minutes readiness, 15-minute soak, postflight); the client
+waits up to 45 minutes and can be resumed with `-ResumeJobId`.

@@ -5,6 +5,7 @@
 #   deploy_job_8768.sh status   <job id> <40-char commit>
 #   deploy_job_8768.sh recover  <job id> <40-char commit>
 #   deploy_job_8768.sh rollback <job id> <40-char commit>
+#   deploy_job_8768.sh watch    <job id> <40-char commit>   (internal)
 #
 # `start` launches deploy_preview_8768.sh DETACHED (own session via setsid,
 # nohup, SIGHUP ignored, stdin from /dev/null, no inherited lock fd), so an
@@ -19,6 +20,12 @@
 # a short jobs.lock, the job directory is built privately and renamed into
 # place (never seen half-written), and the lock is held until the job's pid
 # is recorded, so simultaneous requests see the running job and start nothing.
+# A detached WATCHDOG (`watch`, started with every new job) keeps rollback
+# armed even if the orchestrator itself dies (OOM, kill, reboot of the job
+# process) while nobody is connected: when the orchestrator is gone without a
+# result it requests the guarded `recover`, which never marks SUCCESS without
+# a fresh full soak and otherwise restores the previous build.
+#
 # Status, result and log are private (0700, files 0600); the orchestrator
 # prints no environment or credentials. The exclusive deployment lock itself
 # is held by deploy_preview_8768.sh for install, verification and rollback.
@@ -28,7 +35,7 @@ trap '' HUP
 readonly STATE_ROOT=${PREVIEW_STATE_ROOT:-/home/opc/.kalshi-deploy/preview-8768}
 readonly JOBS=$STATE_ROOT/jobs
 readonly JOBS_LOCK=$STATE_ROOT/jobs.lock
-readonly SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); readonly SCRIPT_DIR
 readonly ORCHESTRATOR=$SCRIPT_DIR/deploy_preview_8768.sh
 
 say() { printf 'DEPLOY_JOB: %s\n' "$*"; }
@@ -122,7 +129,28 @@ case $cmd in
     mv -T -n "$tmp" "$JOBS/$id" 2>/dev/null
     if [[ -d $tmp ]]; then rm -rf -- "$tmp"; reject "job $id could not be created atomically; nothing was started"; fi
     launch "$JOBS/$id" deploy "$sha"
+    # Watchdog: own session, no lock fds, survives SSH disconnects.
+    setsid nohup bash "$SCRIPT_DIR/deploy_job_8768.sh" watch "$id" "$sha" \
+      >>"$JOBS/$id/log" 2>&1 </dev/null 8>&- 9>&- &
     emit_status "$id" ;;
+  watch)
+    id=${2:-}; sha=${3:-}; job=$JOBS/$id
+    valid_id "$id" && valid_sha "$sha" && [[ -d $job ]] || exit 2
+    require_bound "$job" "$sha" >/dev/null
+    interval=${PREVIEW_WATCH_INTERVAL:-10}
+    attempts=0 deadline=$((SECONDS + ${PREVIEW_WATCH_MAX_SECONDS:-14400}))
+    while (( SECONDS < deadline )); do
+      sleep "$interval"
+      [[ -f $job/result ]] && exit 0
+      [[ -f $job/pid ]] || continue                 # orchestrator not started yet
+      job_pid_alive "$job" && continue
+      [[ -f $job/result ]] && exit 0                # finished between the two checks
+      (( attempts >= 2 )) && { say "watchdog: orchestrator died twice without a result; manual review"; exit 3; }
+      attempts=$((attempts + 1))
+      say "watchdog: orchestrator gone without a result; requesting guarded recovery ($attempts/2)"
+      bash "$SCRIPT_DIR/deploy_job_8768.sh" recover "$id" "$sha" >/dev/null 2>&1
+    done
+    exit 0 ;;
   status)
     id=${2:-}; sha=${3:-}
     valid_id "$id" || reject "invalid job id (a lowercase UUID is required)"
@@ -155,5 +183,5 @@ case $cmd in
       launch "$job" rollback "$sha" "$(<"$job/run_id")"
     fi
     emit_status "$id" ;;
-  *) echo "usage: $0 start <commit> <id> | status|recover|rollback <id> <commit>" >&2; exit 2 ;;
+  *) echo "usage: $0 start <commit> <id> | status|recover|rollback|watch <id> <commit>" >&2; exit 2 ;;
 esac

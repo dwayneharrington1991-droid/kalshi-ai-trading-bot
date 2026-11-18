@@ -29,8 +29,34 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         p = self.path.split("?")[0]
         health = open(health_file).read().strip() if health_file and os.path.exists(health_file) else "HEALTHY"
-        body = {"/healthz": {"status": health, "build_commit": build, "signals_only": True},
-                "/api/state": {"decision_intelligence": {"execution_capability": False}}}.get(p)
+        soak = val("--soak", "good")
+        if p == "/api/state":
+            H.state_requests = getattr(H, "state_requests", 0) + 1
+        if soak == "flip_unready" and os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "soak_started")):
+            soak = "unready"
+        # mid_slow: latency breaches only in the middle of the soak, then recovers,
+        # so a check of only the final snapshot would pass.
+        mid = soak == "mid_slow" and 4 <= getattr(H, "state_requests", 0) <= 5
+        p95 = 5200 if soak == "slow" or mid else 2100
+        samples = 10 if soak == "few_samples" else 300
+        if p == "/healthz":
+            H.health_requests = getattr(H, "health_requests", 0) + 1
+        # late_*: misbehave only after post-install verification (inside the soak).
+        if soak == "late_short_build" and getattr(H, "health_requests", 0) > 3:
+            soak = "short_build"
+        if soak == "late_state_error" and getattr(H, "state_requests", 0) > 3:
+            soak = "state_error"
+        body = {"/healthz": {"status": health, "build_commit": build[:7] if soak == "short_build" else build,
+                             "signals_only": True, "workers": {"healthy": True}},
+                "/readyz": {"status": "NOT_READY" if soak == "unready" else "READY", "signals_only": True,
+                            "contract_quotes_fresh": soak != "unready", "reference_fresh": True},
+                "/api/state": {"decision_intelligence": {"execution_capability": False},
+                               "market_health": {"quote_age_seconds": 1.1, "reference_age_seconds": 0.7},
+                               "runtime": {"latency_percentiles": {
+                                   "publish_after_collection": {"p95_ms": p95, "p99_ms": 3300, "samples": samples},
+                                   "prediction_calculation": {"p50_ms": 640, "samples": samples}}}}}.get(p)
+        if p == "/api/state" and soak == "state_error":
+            self.send_response(500); self.end_headers(); return
         if p == "/api/data-quality-alerts" and "--alerts" in a:
             body = {"read_only": True, "status": "OK", "alerts": []}
         if body is None:
@@ -66,6 +92,7 @@ case $SIM_INSTALL in
   fail_unknown)       kill_old; start --build-commit 9999999999999999999999999999999999999999 --opening-model-artifact "$SIM_DIR/artifact.json" --journal j.db; exit 1 ;;
   fail_original_sick) echo DEGRADED >"$SIM_DIR/old_health"; exit 1 ;;
   verify_fails)       kill_old; start --build-commit "$sha" --alerts --opening-model-artifact "$SIM_DIR/other_artifact.json" --journal j.db; exit 0 ;;
+  soak_*)             kill_old; start --build-commit "$sha" --alerts --soak "${SIM_INSTALL#soak_}" --opening-model-artifact "$SIM_DIR/artifact.json" --journal j.db; exit 0 ;;
 esac
 exit 1
 '''
@@ -77,6 +104,10 @@ ARTIFACT = {"model_id": "b50b9dc30f6d664c", "decision_policy": {"threshold": 0.5
                 {"preprocessor": {"names": [f"f{i}" for i in range(87)]}},
                 {"kind": "volatility_baseline"}]}}
 OLD = "1" * 40
+GATE_TEST_OVERRIDES = {"opening_window": False, "min_swap_free_mib": 0, "post_min_swap_free_mib": 0,
+                       "cpu_sample_s": 0.3, "swap_sample_s": 0.2, "post_cpu_sample_s": 0.3,
+                       "soak_seconds": 2, "soak_interval_s": 0.25, "post_max_load_increase": 100,
+                       "max_load1": 100, "post_max_load1": 100}
 
 
 def _ports_free():
@@ -101,7 +132,7 @@ def sim(tmp_path):
         pytest.skip("ports 8765/8767/8768 are in use on this machine")
     repo = tmp_path / "repo"
     (repo / "deploy/oracle").mkdir(parents=True)
-    for name in ("deploy_preview_8768.sh", "preview_deploy_lock.sh", "deploy_job_8768.sh"):
+    for name in ("deploy_preview_8768.sh", "preview_deploy_lock.sh", "deploy_job_8768.sh", "preview_gates_8768.py"):
         shutil.copy(ROOT / "deploy/oracle" / name, repo / "deploy/oracle" / name)
     (repo / "fake_installer.sh").write_text(FAKE_INSTALLER)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -142,7 +173,12 @@ def sim(tmp_path):
         return {**os.environ, "PATH": f"{simdir / 'bin'}:/usr/bin:/bin", "PREVIEW_STATE_ROOT": str(tmp_path / "state"),
                 "PREVIEW_PYTHON": sys.executable, "PREVIEW_TEST_INSTALLER": str(repo / "fake_installer.sh"),
                 "PREVIEW_HEALTH_TIMEOUT_SECONDS": "15", "SIM_INSTALL": scenario, "SIM_DIR": str(simdir),
-                "SIM_PY": sys.executable, "SIM_OLD": OLD, **(extra_env or {})}
+                "SIM_PY": sys.executable, "SIM_OLD": OLD,
+                # Test-only gate settings (refused outside test mode): the
+                # sandbox has no swap and an arbitrary clock; the soak is short.
+                "PREVIEW_GATES_TEST_OVERRIDES": json.dumps(GATE_TEST_OVERRIDES),
+                "PREVIEW_WATCH_INTERVAL": "1", "PREVIEW_WATCH_MAX_SECONDS": "180",
+                **(extra_env or {})}
 
     def run(*args, scenario="success", extra_env=None):
         env = make_env(scenario, extra_env)
@@ -336,3 +372,126 @@ def test_every_deploy_launch_detaches_stdin_and_closes_the_lock_fd():
         for launch in launches:
             assert "</dev/null" in launch and "9>&-" in launch, (name, launch[:80])
         assert not re.search(r"&&\s*nohup", text), name  # never background a `cd && nohup` list
+
+
+# ---------------------------------------------------------------- gate tests
+def _installs(sim):
+    f = sim["simdir"] / "installs"
+    return f.read_text().count("\n") if f.exists() else 0
+
+
+@pytest.mark.parametrize("scenario,reason", [
+    ("soak_unready", "/readyz not READY"),
+    ("soak_slow", "publish p95"),
+    ("soak_mid_slow", "publish p95"),
+    ("soak_late_state_error", "/api/state unsuccessful"),
+    ("soak_few_samples", "latency statistics had >= 100 measurements in only"),
+    ("soak_late_short_build", "is not exactly"),
+])
+def test_soak_failure_rolls_back_to_the_exact_previous_process(sim, scenario, reason):
+    old_env = _environ(sim["old"].pid)
+    result, status = sim["run"]("deploy", sim["sha"], scenario=scenario)
+    assert status == "ROLLED_BACK" and result.returncode == 11, result.stdout
+    assert reason in result.stdout, result.stdout
+    assert "soak failed" in result.stdout and "SUCCESS" not in result.stdout
+    assert sim["health"]()["build_commit"] == OLD
+    assert _environ(int(sim["listener"](8768))) == old_env      # exact previous environment
+    assert _unchanged_neighbours(sim)
+
+
+@pytest.mark.parametrize("scenario,reason", [("soak_state_error", "execution capability"),
+                                             ("soak_short_build", "build is ")])
+def test_broken_state_or_short_build_is_rejected_before_the_soak_too(sim, scenario, reason):
+    result, status = sim["run"]("deploy", sim["sha"], scenario=scenario)
+    assert status == "ROLLED_BACK" and reason in result.stdout, result.stdout
+    assert sim["health"]()["build_commit"] == OLD and _unchanged_neighbours(sim)
+
+
+def test_success_is_written_only_after_soak_and_postflight(sim):
+    result, status = sim["run"]("deploy", sim["sha"], scenario="success")
+    assert status == "SUCCESS", result.stdout
+    out = result.stdout
+    assert out.index("preflight passed") < out.index("soak started") < out.index("soak passed") \
+        < out.index("postflight passed") < out.index("DEPLOY_RESULT=SUCCESS")
+    run = next((sim["state"] / "runs").iterdir())
+    for f in ("preflight.json", "soak.json", "postflight.json"):
+        assert oct((run / f).stat().st_mode & 0o777) == "0o600"
+    assert json.loads((run / "soak.json").read_text())["result"] == "PASS"
+
+
+def test_preflight_failure_blocks_before_any_change(sim):
+    sim["p67"].kill(); sim["p67"].wait()                       # a protected listener is missing
+    result, status = sim["run"]("deploy", sim["sha"], scenario="success")
+    assert status == "BLOCKED" and "preflight: port 8767" in result.stdout
+    assert _installs(sim) == 0 and sim["listener"](8768) == str(sim["old"].pid)
+
+
+@pytest.mark.parametrize("override,text", [
+    ({"min_mem_available_mib": 10**9}, "MemAvailable"),
+    ({"max_load1": -1}, "load1"),
+    ({"min_disk_free_mib": 10**12}, "disk free"),
+    ({"min_swap_free_mib": 10**9}, "SwapFree"),
+])
+def test_preflight_resource_limits_block_without_change(sim, override, text):
+    result, status = sim["run"]("deploy", sim["sha"], scenario="success",
+                                extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps({**GATE_TEST_OVERRIDES, **override})})
+    assert status == "BLOCKED" and text in result.stdout, result.stdout
+    assert _installs(sim) == 0 and sim["listener"](8768) == str(sim["old"].pid)
+
+
+@pytest.mark.parametrize("override,text", [
+    ({"post_max_cpu_pct": -1}, "new 8768 CPU"),
+    ({"post_min_mem_available_mib": 10**9}, "MemAvailable"),
+])
+def test_postflight_failure_rolls_back(sim, override, text):
+    result, status = sim["run"]("deploy", sim["sha"], scenario="success",
+                                extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps({**GATE_TEST_OVERRIDES, **override})})
+    assert status == "ROLLED_BACK" and "postflight failed" in result.stdout and text in result.stdout, result.stdout
+    assert sim["health"]()["build_commit"] == OLD and _unchanged_neighbours(sim)
+
+
+def test_orchestrator_has_a_single_success_exit_after_the_gates():
+    code = (ROOT / "deploy/oracle/deploy_preview_8768.sh").read_text()
+    assert code.count("finish SUCCESS") == 1
+    body = code[code.index("soak_and_finish() {"):code.index("\n}\n", code.index("soak_and_finish() {"))]
+    assert body.index("soak") < body.index("postflight") < body.index("finish SUCCESS")
+    assert 'soak_and_finish "$run" "$sha"' in code[code.index("if [[ $mode == recover ]]"):]
+
+
+def _gates():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gates", ROOT / "deploy/oracle/preview_gates_8768.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_opening_window_boundaries():
+    g = _gates()
+    base = 1794981600 - (1794981600 % 900)
+    assert g.in_opening_window(base) and g.in_opening_window(base + 149)
+    assert not g.in_opening_window(base + 150) and not g.in_opening_window(base + 809)
+    assert g.in_opening_window(base + 810) and g.in_opening_window(base + 899)
+
+
+def test_gate_overrides_are_refused_outside_test_mode(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "PREVIEW_TEST_INSTALLER"}
+    env["PREVIEW_GATES_TEST_OVERRIDES"] = json.dumps({"soak_seconds": 1})
+    result = subprocess.run([sys.executable, str(ROOT / "deploy/oracle/preview_gates_8768.py"), "preflight",
+                             str(tmp_path / "x.json")], capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 1 and "only accepted in local test mode" in result.stdout
+
+
+def test_production_limits_are_realistic_for_the_single_core_host():
+    L = _gates().LIMITS
+    assert L["soak_seconds"] == 900 and L["soak_interval_s"] == 10 and L["opening_window"] is True
+    assert L["max_publish_p95_ms"] <= 3000 and L["max_publish_p99_ms"] <= 4500 and L["max_prediction_p50_ms"] <= 1020
+    assert L["min_latency_samples"] >= 100 and L["min_evaluable_share"] >= 0.8 and L["max_age_s"] <= 10
+    assert 8.4 < L["max_load1"] <= 12 and 512 <= L["min_mem_available_mib"] <= 2048
+    assert L["post_max_cpu_increase_pts"] <= 5
+
+
+def test_soak_requires_exact_40_character_build():
+    result = subprocess.run([sys.executable, str(ROOT / "deploy/oracle/preview_gates_8768.py"), "soak",
+                             "abc1234", "pre.json", "out.json"], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2 and "40-character" in result.stdout

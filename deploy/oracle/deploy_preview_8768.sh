@@ -15,6 +15,17 @@
 # never killed. If recovery cannot be made safe it stops with exact manual
 # steps. Ports 8765/8767 are only observed (their PIDs must not change).
 #
+# Gates (preview_gates_8768.py): a strict PREFLIGHT (CPU baseline, memory,
+# swap and swap activity, disk, load, opening window, protected listeners)
+# runs before anything changes; after verification a 15-minute SOAK (every
+# sample: exact 40-character build, health, workers, readiness, measurable
+# /api/state, quote/reference age, latency percentiles with minimum sample
+# counts, unchanged listeners) and a POSTFLIGHT (resources, protected
+# identities, CPU vs the preflight baseline) run while rollback stays armed.
+# SUCCESS is written only after all of them pass; any failure rolls back to
+# the exact previous process. `recover` never marks SUCCESS without a fresh
+# full soak and postflight.
+#
 # Every outcome ends with one line:  DEPLOY_RESULT=<status>
 #   SUCCESS (0)  BLOCKED (2)  BLOCKED_CONCURRENT_DEPLOYMENT (75)
 #   FAILED_PREVIOUS_STILL_RUNNING (10)  ROLLED_BACK (11)
@@ -28,14 +39,14 @@ trap '' HUP
 # final result are written there atomically for reconnecting clients.
 readonly JOB_DIR=${PREVIEW_JOB_DIR:-}
 
-readonly PORT=8768
 readonly STATE_ROOT=${PREVIEW_STATE_ROOT:-/home/opc/.kalshi-deploy/preview-8768}
 readonly PY=${PREVIEW_PYTHON:-/home/opc/kalshi-ai-trading-bot/.venv/bin/python}
 readonly HEALTH_TIMEOUT=${PREVIEW_HEALTH_TIMEOUT_SECONDS:-180}
-readonly SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-readonly NEW_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); readonly SCRIPT_DIR
+NEW_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd); readonly NEW_ROOT
 # Test hook only (unset in production): substitute the installer.
 readonly INSTALLER=${PREVIEW_TEST_INSTALLER:-$NEW_ROOT/deploy/oracle/install_preview_8768.sh}
+readonly GATES=$SCRIPT_DIR/preview_gates_8768.py
 export PREVIEW_DEPLOY_LOCK_PATH=${PREVIEW_DEPLOY_LOCK_PATH:-$STATE_ROOT/deploy.lock}
 
 say() { printf 'DEPLOY: %s\n' "$*"; }
@@ -238,6 +249,21 @@ prune_runs() {
   for dir in "${old[@]}"; do rm -rf -- "$dir"; done
 }
 
+# Soak and postflight with rollback armed; SUCCESS only after both pass.
+soak_and_finish() {
+  local run=$1 sha=$2
+  [[ -s $run/preflight.json ]] || guarded_restore "$run" "$sha" "no preflight baseline for this run; cannot verify"
+  job_write phase SOAK
+  say "verified build $sha; soak and postflight follow; rollback stays armed until both pass"
+  "$PY" -P "$GATES" soak "$sha" "$run/preflight.json" "$run/soak.json" ||
+    guarded_restore "$run" "$sha" "soak failed (see the soak lines above)"
+  "$PY" -P "$GATES" postflight "$sha" "$run/preflight.json" "$run/postflight.json" ||
+    guarded_restore "$run" "$sha" "postflight failed (see the postflight lines above)"
+  job_write soak PASSED
+  say "soak and postflight passed; same artifact, model, threshold, inputs and journal; 8765/8767 unchanged; trading disabled"
+  finish SUCCESS 0
+}
+
 mode=${1:-}
 case $mode in
   status)
@@ -267,8 +293,8 @@ if [[ $mode == rollback || $mode == recover ]]; then
     # live state, under the lock, without guessing.
     pre_build=$("$PY" -P -c 'import json,sys;print(json.load(open(sys.argv[1]))["build"])' "$run/pre.json")
     if [[ $(check_state "$run/pre.json" "$sha" 1) == OK ]]; then
-      say "recovered: the new build $sha is healthy and fully verified"
-      finish SUCCESS 0
+      say "recovered: the new build $sha is healthy; it must still pass a fresh full soak and postflight"
+      soak_and_finish "$run" "$sha"
     fi
     if [[ $(check_state "$run/pre.json" "$pre_build" 0) == OK ]]; then
       say "recovered: the previous build $pre_build is healthy with the same artifact and journal"
@@ -282,11 +308,14 @@ fi
 [[ $(git -C "$NEW_ROOT" rev-parse HEAD 2>/dev/null) == "$sha" ]] || { say "staged checkout is not $sha"; finish BLOCKED 2; }
 pre_pid=$(listener 8768)
 [[ -n $pre_pid ]] || { say "no process is listening on 8768; nothing was changed"; finish BLOCKED 2; }
+preflight_tmp=$STATE_ROOT/preflight-$$.json
+"$PY" -P "$GATES" preflight "$preflight_tmp" || { say "preflight failed; nothing was changed"; finish BLOCKED 2; }
 run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
 run=$STATE_ROOT/runs/$run_id
 snapshot "$run" "$pre_pid"
 state_json >"$run/pre.json"
 chmod 0600 "$run/pre.json"
+mv -f "$preflight_tmp" "$run/preflight.json" && chmod 0600 "$run/preflight.json"
 read -r pre_health pre_build pre_artifact_error < <("$PY" -P -c 'import json,sys;s=json.load(open(sys.argv[1]));print(s.get("health"),s.get("build"),s.get("artifact_error") or "-")' "$run/pre.json")
 if [[ $pre_health != HEALTHY || -z $pre_build || $pre_build == None || $pre_artifact_error != - ]]; then
   say "the running preview is not healthy or its artifact is unreadable; nothing was changed"
@@ -302,8 +331,7 @@ rc=$?
 
 if (( rc == 0 )); then
   if verdict=$(wait_for_build "$run/pre.json" "$sha" 1); then
-    say "verified: build $sha healthy; same artifact, model, threshold, components, inputs and journal; 8765/8767 unchanged; trading disabled"
-    finish SUCCESS 0
+    soak_and_finish "$run" "$sha"
   fi
   guarded_restore "$run" "$sha" "post-install verification failed: $verdict"
 fi

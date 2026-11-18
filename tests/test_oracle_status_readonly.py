@@ -30,3 +30,12 @@ def test_never_changes_anything_or_prints_secrets():
             assert not re.search(forbidden, code), (path.name, forbidden)
     steps = _code(STEPS)
     assert "Journal.__new__(Journal)" in steps and "j.read()" in steps
+
+
+def test_production_collector_diagnostic_is_read_only():
+    code = _code(ROOT / "deploy/oracle/prod_8765_collector_diag.sh")
+    assert subprocess.run(["bash", "-n", str(ROOT / "deploy/oracle/prod_8765_collector_diag.sh")]).returncode == 0
+    for forbidden in (r"\bkill\b", r"systemctl", r"/environ", r"\brm\b", r"\bmv\b", r"INSERT\s", r"UPDATE\s",
+                      r"DELETE\s", r"BEGIN IMMEDIATE", r"VACUUM", r"PRAGMA\s+(?!query_only)", r"nohup", r"setsid"):
+        assert not re.search(forbidden, code), forbidden
+    assert "mode=ro" in code and "/proc/locks" in code

@@ -159,7 +159,24 @@ def test_service_inventory_is_read_only_and_sends_no_http_requests():
     assert 'flag names: ${flags[*]}' in code and "basename \"${journal:-none}\"" in code
 
 
-def test_service_inventory_rejects_bad_window():
-    for bad in ("5", "301", "x"):
-        result = subprocess.run(["bash", str(INVENTORY), bad], capture_output=True, text=True, timeout=30)
-        assert result.returncode == 2 and "COLLECTED_AT" not in result.stdout
+def test_service_inventory_is_time_bounded_and_avoids_unbounded_scans():
+    code = "\n".join(l for l in INVENTORY.read_text().splitlines() if not l.lstrip().startswith("#"))
+    assert "LIMIT=80" in code and "timeout -k 1 5" in code
+    for slow in (r"\bdu\b", r"git\b[^\n]*\bstatus\b", r"/proc/\[0-9\]\*/fd", r"\bfind\b"):
+        assert not re.search(slow, code), slow
+    # Every git/ss/systemctl/ps/stat/crontab/grep -r call goes through the 5 s wrapper.
+    for line in code.splitlines():
+        for tool in ("git -C", "ss -H", "systemctl ", "crontab -l", "grep -rls", "ps -o", "stat -c", "pgrep"):
+            if tool in line:
+                assert "t " + tool.split()[0] in line, line
+
+
+def test_service_inventory_completes_quickly_with_no_listeners(tmp_path):
+    import time
+    started = time.monotonic()
+    result = subprocess.run(["bash", str(INVENTORY)], capture_output=True, text=True, timeout=90,
+                            env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(tmp_path),
+                                 "INVENTORY_PORTS": "1 2"})
+    assert "SERVICE_INVENTORY_COMPLETE" in result.stdout
+    assert "port 1: not running" in result.stdout
+    assert time.monotonic() - started < 85

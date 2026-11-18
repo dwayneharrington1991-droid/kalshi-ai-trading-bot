@@ -1,50 +1,55 @@
 #!/usr/bin/env bash
-# READ-ONLY inventory of the dashboard services on ports 8765/8767/8768/8769.
+# READ-ONLY, time-bounded owner/launch/usage check for dashboard ports.
 #
-#   collect_service_inventory.sh [seconds]     (default 60, allowed 20..300)
+#   collect_service_inventory.sh            (ports 8767 8769 by default)
 #
-# For each listener: owner, launch mechanism (systemd unit / cron / shell
-# session from /proc/<pid>/cgroup and the parent-process chain), start time,
-# working directory and the git commit/branch checked out there, bind
-# address, minimal identity (module, --port, --mode, journal NAME, and the
-# NAMES of other flags; never values or environment), established client
-# connections sampled over the window (who is actually using it), and which
-# processes hold each journal open. Also systemd units, crontab lines,
-# reverse-proxy/tunnel configuration that mention these ports, and sizes.
+# For each port: listener pid, user, start time, launch mechanism (cgroup and
+# parent chain), bind address, working directory, checked-out git commit,
+# module/mode/journal NAME and flag NAMES (never values or environment),
+# client connections sampled 4 times over 20 s, other processes using the
+# same journal, and systemd/cron/proxy references.
 #
-# Nothing is started, stopped, signalled, attached to, written or deleted, and
-# no HTTP request is sent to ANY port (8765/8767 are only observed via /proc
-# and socket tables). Runs at the lowest CPU and I/O priority.
+# Bounded: every external command runs under `timeout 5`; no directory-size
+# scans, no `git status`, no system-wide file-descriptor scan; the whole
+# script stops itself after 80 s. Nothing is started, stopped, signalled,
+# written or deleted, and no HTTP request is sent to any port.
 set -uo pipefail
 umask 077
-secs=${1:-60}
-[[ $secs =~ ^[0-9]+$ ]] && (( secs >= 20 && secs <= 300 )) || { echo "seconds must be 20..300"; exit 2; }
-read -r -a PORTS <<<"${INVENTORY_PORTS:-8765 8767 8768 8769}"
+read -r -a PORTS <<<"${INVENTORY_PORTS:-8767 8769}"
+START=$SECONDS
+LIMIT=80
 renice -n 19 -p $$ >/dev/null 2>&1 || true
 ionice -c3 -p $$ >/dev/null 2>&1 || true
+t() { timeout -k 1 5 "$@" 2>/dev/null; }
+left() { (( SECONDS - START < LIMIT )); }
 section() { printf '\n===== %s =====\n' "$*"; }
 redact() { sed -E 's/((secret|token|password|passwd|api[_-]?key|private[_-]?key|authorization)[^=:]*[=:]).*/\1 [REDACTED]/I'; }
-listener_pid() { ss -Hltnp "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2; }
 
-section "COLLECTED_AT $(date -u +%Y-%m-%dT%H:%M:%SZ) user=$(id -un) window=${secs}s"
+section "COLLECTED_AT $(date -u +%Y-%m-%dT%H:%M:%SZ) user=$(id -un) ports=${PORTS[*]}"
+LISTEN=$(t ss -Hltnp)
 
+declare -A PID JOURNAL ANCESTORS
 for port in "${PORTS[@]}"; do
+  left || break
   section "PORT $port"
-  pid=$(listener_pid "$port")
+  line=$(grep -E "[:.]${port}[[:space:]]" <<<"$LISTEN" | head -n1)
+  pid=$(grep -oE 'pid=[0-9]+' <<<"$line" | head -n1 | cut -d= -f2)
   if [[ -z $pid ]]; then echo "no listener"; continue; fi
-  echo "bind: $(ss -Hltn "sport = :$port" 2>/dev/null | awk '{print $4}' | sort -u | tr '\n' ' ')"
-  echo "pid $pid  user $(ps -o user= -p "$pid")  started $(ps -o lstart= -p "$pid")  elapsed $(ps -o etime= -p "$pid" | tr -d ' ')"
-  echo "cgroup (launch mechanism): $(tr '\n' ' ' <"/proc/$pid/cgroup" 2>/dev/null)"
-  chain="" p=$pid
-  for _ in 1 2 3 4 5 6 7 8; do
-    pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  PID[$port]=$pid
+  echo "bind: $(awk '{print $4}' <<<"$line")"
+  read -r user lstart <<<"$(t ps -o user=,lstart= -p "$pid")"
+  echo "pid $pid  user $user  started $lstart  elapsed $(t ps -o etime= -p "$pid" | tr -d ' ')"
+  echo "cgroup: $(head -c 400 "/proc/$pid/cgroup" 2>/dev/null | tr '\n' ' ')"
+  chain="$pid:$(cat "/proc/$pid/comm" 2>/dev/null)" p=$pid
+  for _ in 1 2 3 4 5 6; do
+    pp=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null)
     [[ -z $pp || $pp == 0 ]] && break
-    chain+=" <- $pp:$(ps -o comm= -p "$pp" 2>/dev/null)"
+    chain+=" <- $pp:$(cat "/proc/$pp/comm" 2>/dev/null)"
     [[ $pp == 1 ]] && break
     p=$pp
   done
-  echo "parent chain: $pid:$(ps -o comm= -p "$pid")$chain"
-  echo "session id: $(ps -o sid= -p "$pid" | tr -d ' ')  tty: $(ps -o tty= -p "$pid" | tr -d ' ')"
+  echo "parent chain: $chain"
+  ANCESTORS[$port]=" $(sed -E 's/:[^ ]*//g; s/<-//g' <<<"$chain") "
   mapfile -d '' -t argv <"/proc/$pid/cmdline"
   module= mode= journal= flags=()
   for ((i=0; i<${#argv[@]}; i++)); do
@@ -55,79 +60,75 @@ for port in "${PORTS[@]}"; do
       --*) flags+=("${argv[i]}") ;;
     esac
   done
-  echo "module: $module  mode: $mode  journal file: $(basename "${journal:-none}")"
+  JOURNAL[$port]=$journal
+  echo "module: $module  mode: $mode  journal: $(basename "${journal:-none}")"
   echo "flag names: ${flags[*]}"
   cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
   echo "cwd: $cwd"
-  if [[ -n $cwd ]] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
-    echo "git: $(git -C "$cwd" rev-parse HEAD 2>/dev/null) branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-    echo "git last commit: $(git -C "$cwd" log -1 --format='%cI %s' 2>/dev/null | cut -c1-160)"
-    echo "git uncommitted files: $(git -C "$cwd" status --porcelain 2>/dev/null | wc -l)"
+  if [[ -n $cwd ]] && t git -C "$cwd" rev-parse --git-dir >/dev/null; then
+    echo "git HEAD: $(t git -C "$cwd" rev-parse HEAD)  branch: $(t git -C "$cwd" rev-parse --abbrev-ref HEAD)"
+    echo "git last commit: $(t git -C "$cwd" log -1 --format='%cI %s' | cut -c1-140)"
   else
-    echo "git: not a checkout"
+    echo "git: not a checkout (or timed out)"
   fi
-  echo "journal path size: $( [[ -n $journal ]] && du -h --apparent-size "$journal" 2>/dev/null | cut -f1 ) last modified: $( [[ -n $journal ]] && stat -c %y "$journal" 2>/dev/null | cut -c1-19 )"
-  echo "cwd size: $( [[ -n $cwd ]] && du -sh "$cwd" 2>/dev/null | cut -f1 )"
-  echo "files at cwd top level: $(ls -1 "$cwd" 2>/dev/null | head -n 40 | tr '\n' ' ')"
+  [[ -n $journal ]] && echo "journal: $(t stat -c '%s bytes, last write %y' "$journal" | cut -c1-60)"
+  echo "process fds: $(ls /proc/$pid/fd 2>/dev/null | wc -l)  threads: $(awk '/^Threads:/{print $2}' "/proc/$pid/status")"
 done
 
-section "CLIENT CONNECTIONS SAMPLED EVERY 5 s FOR ${secs}s (who actually uses each port)"
-end=$((SECONDS + secs))
-declare -A seen
-while (( SECONDS < end )); do
+section "CLIENT CONNECTIONS (4 samples over 20 s)"
+declare -A PEERS
+for n in 1 2 3 4; do
+  left || break
+  snap=$(t ss -Htn state established)
   for port in "${PORTS[@]}"; do
-    while read -r line; do
-      [[ -z $line ]] && continue
-      peer=$(awk '{print $4}' <<<"$line")
-      seen["$port $peer"]=1
-    done < <(ss -Htn state established "( sport = :$port )" 2>/dev/null)
+    while read -r peer; do
+      [[ -n $peer ]] && PEERS["$port $peer"]=1
+    done < <(awk -v p=":$port" '$3 ~ p"$" {print $4}' <<<"$snap")
   done
-  sleep 5
+  (( n < 4 )) && sleep 5
 done
 for port in "${PORTS[@]}"; do
-  peers=()
-  for k in "${!seen[@]}"; do [[ $k == "$port "* ]] && peers+=("${k#* }"); done
-  echo "port $port: ${#peers[@]} distinct client endpoints seen"
+  c=0; for k in "${!PEERS[@]}"; do [[ $k == "$port "* ]] && c=$((c + 1)); done
+  echo "port $port: $c distinct client connections seen"
 done
-echo "--- client-side processes of local connections to these ports (now) ---"
-port_re=$(IFS='|'; echo "${PORTS[*]}")
-ss -Htnp state established 2>/dev/null \
-  | awk -v re=":(${port_re})$" '$4 ~ re {print $4, $5}' | sed -E 's/fd=[0-9]+//g' | sort | uniq -c | head -n 40
+echo "--- client processes connected to these ports (now) ---"
+t ss -Htnp state established | awk -v re=":($(IFS='|'; echo "${PORTS[*]}"))$" '$4 ~ re {print $4, $5}' \
+  | sed -E 's/fd=[0-9]+,?//g' | sort | uniq -c | head -n 20
 
-section "WHICH PROCESSES HOLD EACH JOURNAL OPEN"
-for fd in /proc/[0-9]*/fd/*; do
-  target=$(readlink "$fd" 2>/dev/null) || continue
-  [[ $target == *.db || $target == *.db-wal || $target == *.lock ]] || continue
-  p=${fd#/proc/}; p=${p%%/*}
-  printf '%s pid=%s comm=%s\n' "$target" "$p" "$(cat /proc/$p/comm 2>/dev/null)"
-done 2>/dev/null | sort -u | head -n 60
-
-section "SYSTEMD UNITS AND TIMERS MENTIONING THE BOT"
-systemctl list-units --all --no-pager --plain 2>/dev/null | grep -iE 'kalshi|signal|dashboard|preview|learning' | head -n 30
-systemctl --user list-units --all --no-pager --plain 2>/dev/null | grep -iE 'kalshi|signal|dashboard|preview|learning' | head -n 30
-systemctl list-timers --all --no-pager 2>/dev/null | grep -iE 'kalshi|signal|dashboard|preview|learning' | head -n 20
-for d in /etc/systemd/system "$HOME/.config/systemd/user"; do
-  grep -lsE '876[5-9]|kalshi' "$d"/*.service "$d"/*.timer 2>/dev/null | while read -r f; do
-    echo "--- $f"; grep -E '^(Description|ExecStart|WorkingDirectory|Restart|User)=' "$f" | redact | cut -c1-200
+section "OTHER PROCESSES USING THE SAME JOURNAL (python processes only)"
+for port in "${PORTS[@]}"; do
+  j=${JOURNAL[$port]:-}; [[ -z $j ]] && continue
+  users=()
+  for p in $(t pgrep -f python | head -n 40); do
+    [[ ${ANCESTORS[$port]:-} == *" $p "* || $p == "$$" ]] && continue   # the server and its launcher
+    if { ls -l "/proc/$p/fd" | grep -qF "$(basename "$j")"; } 2>/dev/null; then
+      users+=("$p:$(cat /proc/$p/comm 2>/dev/null)")
+    elif { tr '\0' ' ' <"/proc/$p/cmdline" | grep -qF "$(basename "$j")"; } 2>/dev/null; then
+      users+=("$p:$(cat /proc/$p/comm 2>/dev/null)(argv)")
+    fi
   done
+  echo "port $port journal $(basename "$j"): ${users[*]:-none}"
 done
 
-section "CRON LINES MENTIONING THE BOT"
-crontab -l 2>/dev/null | grep -vE '^\s*#' | grep -iE 'kalshi|876[5-9]|python|signals' | redact | cut -c1-200
-grep -lsE 'kalshi|876[5-9]' /etc/cron.d/* 2>/dev/null
+section "SUPERVISION: SYSTEMD, CRON, PROXIES"
+left && t systemctl list-units --all --no-pager --plain | grep -iE 'kalshi|signal|dashboard|preview' | head -n 15
+left && t systemctl --user list-units --all --no-pager --plain | grep -iE 'kalshi|signal|dashboard|preview' | head -n 15
+for port in "${PORTS[@]}"; do
+  left || break
+  hits=$(t grep -rlsE "\b${port}\b" /etc/systemd/system "$HOME/.config/systemd/user" /etc/nginx /etc/caddy /etc/cloudflared "$HOME/.cloudflared" | head -n 5 | tr '\n' ' ')
+  echo "config files mentioning $port: ${hits:-none}"
+  echo "crontab lines mentioning $port: $(t crontab -l | grep -vE '^\s*#' | grep -cE "\b${port}\b")"
+done
 
-section "REVERSE PROXY / TUNNEL REFERENCES TO THE PORTS"
-grep -rsnE '876[5-9]' /etc/nginx /etc/caddy /etc/cloudflared "$HOME/.cloudflared" "$HOME/.ssh/config" 2>/dev/null | redact | cut -c1-200 | head -n 20
-ps -eo pid,comm,etime | grep -iE 'cloudflared|ngrok|autossh|caddy|nginx|tailscale' | head
-
-section "OTHER BOT PROCESSES (identity only)"
-ps -eww -o pid,etime,comm,args --sort=start_time | grep -E 'python' | grep -v grep \
-  | awk '{printf "%s %s %s", $1, $2, $3; prev=""; for (i=4;i<=NF;i++) { if ($i ~ /\.py$/ || $i ~ /^--port$/ || prev=="--port") printf " %s", $i; prev=$i }; print ""}' \
-  | head -n 20
-
-section "DISK"
-df -h /home/opc
-du -sh /home/opc/kalshi-backups/* 2>/dev/null | head
-
+section "VERDICT INPUTS"
+for port in "${PORTS[@]}"; do
+  pid=${PID[$port]:-}
+  [[ -z $pid ]] && { echo "port $port: not running"; continue; }
+  c=0; for k in "${!PEERS[@]}"; do [[ $k == "$port "* ]] && c=$((c + 1)); done
+  sup="shell/nohup"
+  grep -q '\.service' "/proc/$pid/cgroup" 2>/dev/null && sup="systemd: $(grep -oE '[^/]+\.service' "/proc/$pid/cgroup" | head -n1)"
+  echo "port $port: launched by $sup; clients seen: $c"
+done
 echo
+echo "elapsed: $((SECONDS - START)) s"
 echo "SERVICE_INVENTORY_COMPLETE (read-only; nothing was changed)"

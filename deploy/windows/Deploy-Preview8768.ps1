@@ -57,6 +57,20 @@ function Get-Fields($Result) {
   return $fields
 }
 
+# Every start/status response describing a job must carry that job's commit,
+# and it must equal the requested commit exactly (ordinal, case-sensitive).
+# Nothing is reported, recovered or rolled back on an unverified response.
+function Assert-JobSha($Fields, [string]$Context) {
+  $jobSha = $Fields['DEPLOY_JOB_SHA']
+  if (-not $jobSha) {
+    throw "DEPLOY BLOCKED: Oracle's $Context response did not include DEPLOY_JOB_SHA, so the job's commit could not be verified. Nothing further was done."
+  }
+  if (-not [string]::Equals($jobSha, $Sha, [System.StringComparison]::Ordinal)) {
+    throw "DEPLOY BLOCKED: Oracle's $Context response is for commit $jobSha, not the requested $Sha. Nothing further was done."
+  }
+}
+$JobStates = @('STARTING', 'RUNNING', 'DIED', 'FINISHED')
+
 Write-Host '1/4 Checking SSH access to Oracle (no changes)...'
 $pre = Invoke-Remote 'echo SSH_PREFLIGHT_OK'
 if (-not ($pre.Lines -contains 'SSH_PREFLIGHT_OK')) {
@@ -100,7 +114,7 @@ if ($ResumeJobId) {
     if ($f['DEPLOY_JOB_STATE'] -eq 'BUSY') { throw "DEPLOY BLOCKED: another preview 8768 deployment job ($($f['DEPLOY_ACTIVE_JOB'])) is running on Oracle. Nothing was started." }
     if ($f['DEPLOY_JOB_STATE'] -eq 'REJECTED') { throw 'DEPLOY BLOCKED: the job was rejected (see DEPLOY_JOB lines above). Nothing was changed.' }
     if ($f['DEPLOY_JOB_STATE'] -eq 'SHA_MISMATCH') { throw "DEPLOY BLOCKED: job $JobId belongs to a different commit. Nothing was started." }
-    if ($f['DEPLOY_JOB_ID'] -eq $JobId) { $started = $f } else { Start-Sleep -Seconds ([Math]::Min(5, [Math]::Max(0, $PollSeconds))) }
+    if ($f['DEPLOY_JOB_ID'] -ceq $JobId) { Assert-JobSha $f 'start'; $started = $f } else { Start-Sleep -Seconds ([Math]::Min(5, [Math]::Max(0, $PollSeconds))) }
   }
   if (-not $started) { throw "DEPLOY RESULT UNKNOWN: could not confirm that job $JobId started. Rerun with -ResumeJobId $JobId to check it (this never starts a duplicate)." }
 }
@@ -118,6 +132,7 @@ while (-not $final) {
   if ($log -and $log -ne $lastLog) { Write-Host $log; $lastLog = $log }
   $state = $f['DEPLOY_JOB_STATE']
   if (-not $state) { Write-Host '    (connection lost; reconnecting...)' -ForegroundColor DarkYellow; $state = 'NO_ANSWER' }
+  if ($JobStates -contains $state) { Assert-JobSha $f 'status' }
   switch ($state) {
     'FINISHED' { $final = $f }
     'DIED' {
@@ -152,6 +167,7 @@ function Invoke-ClientRollback([string]$Reason) {
   while ((Get-Date) -lt $end) {
     Start-Sleep -Seconds $PollSeconds
     $f = Get-Fields (Invoke-Remote "bash '$jobScript' status '$JobId' '$Sha'" -Quiet)
+    if ($JobStates -contains $f['DEPLOY_JOB_STATE']) { Assert-JobSha $f 'rollback status' }
     if ($f['DEPLOY_JOB_STATE'] -eq 'FINISHED' -and $f['DEPLOY_RESULT'] -ne 'SUCCESS') {
       if ($f['DEPLOY_RESULT'] -eq 'ROLLED_BACK') { throw "DEPLOY ROLLED BACK after local verification failed: $Reason" }
       throw "DEPLOY STOPPED: rollback result $($f['DEPLOY_RESULT']). MANUAL RECOVERY REQUIRED; see: bash $jobScript status $JobId $Sha"

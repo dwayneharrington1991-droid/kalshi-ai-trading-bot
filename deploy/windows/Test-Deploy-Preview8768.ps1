@@ -62,12 +62,13 @@ function Invoke-Scenario($Replies, [hashtable]$Extra = @{}) {
   }
 }
 $ok = @(@{ Lines = @('SSH_PREFLIGHT_OK'); Exit = 0 })
-function Finished($Result) { @{ Lines = @('DEPLOY_JOB_STATE=FINISHED', "DEPLOY_RESULT=$Result", 'LOG: DEPLOY: done'); Exit = 0 } }
-$running = @{ Lines = @('DEPLOY_JOB_STATE=RUNNING', 'LOG: DEPLOY: installing'); Exit = 0 }
+# Every job reply carries the job's commit, as deploy_job_8768.sh prints it.
+function Finished($Result, $JobSha = $Sha) { @{ Lines = @('DEPLOY_JOB_STATE=FINISHED', "DEPLOY_JOB_SHA=$JobSha", "DEPLOY_RESULT=$Result", 'LOG: DEPLOY: done'); Exit = 0 } }
+$running = @{ Lines = @('DEPLOY_JOB_STATE=RUNNING', "DEPLOY_JOB_SHA=$Sha", 'LOG: DEPLOY: installing'); Exit = 0 }
 $lost = @{ Lines = @('Connection reset by peer'); Exit = 255 }
 
 function Run-Job($StatusQueue, $Extra = @{}, $Recover = @(@{ Lines = @('DEPLOY_JOB_STATE=RUNNING'); Exit = 0 }), $Rollback = @(@{ Lines = @('DEPLOY_JOB_STATE=RUNNING'); Exit = 0 }), $Preflight = $ok, $Start = $null) {
-  if (-not $Start) { $Start = @(@{ Lines = @('DEPLOY_JOB_ID=ECHO', 'DEPLOY_JOB_STATE=RUNNING'); Exit = 0 }) }
+  if (-not $Start) { $Start = @(@{ Lines = @('DEPLOY_JOB_ID=ECHO', 'DEPLOY_JOB_STATE=RUNNING', "DEPLOY_JOB_SHA=$Sha"); Exit = 0 }) }
   Invoke-Scenario @{ preflight = $Preflight; start = $Start; status = $StatusQueue; recover = $Recover; rollback = $Rollback } $Extra
 }
 
@@ -95,13 +96,13 @@ Check 'failed post-install verification is rolled back' ($r.Error -like 'DEPLOY 
 $r = Run-Job @($running, $lost, $lost, $running, (Finished 'SUCCESS'))
 Check 'SSH disconnect during polling reconnects and never restarts' ($r.Output -contains 'SUCCESS' -and @($r.Calls | Where-Object { $_ -eq 'start' }).Count -eq 1) $r.Error
 
-$r = Run-Job @(@{ Lines = @('DEPLOY_JOB_STATE=DIED'); Exit = 0 }, $running, (Finished 'ROLLED_BACK'))
+$r = Run-Job @(@{ Lines = @('DEPLOY_JOB_STATE=DIED', "DEPLOY_JOB_SHA=$Sha"); Exit = 0 }, $running, (Finished 'ROLLED_BACK'))
 Check 'a died job is recovered by the server once' ($r.Error -like 'DEPLOY ROLLED BACK:*' -and @($r.Calls | Where-Object { $_ -eq 'recover' }).Count -eq 1) $r.Error
 
 $r = Run-Job @($running, (Finished 'SUCCESS')) @{ ResumeJobId = '12345678-aaaa-bbbb-cccc-1234567890ab' }
 Check 'resuming by job id never starts a new job' ($r.Output -contains 'SUCCESS' -and ($r.Calls -notcontains 'start')) $r.Error
 
-$r = Run-Job @($running, (Finished 'SUCCESS')) @{} -Start @($lost, @{ Lines = @('DEPLOY_JOB_ID=ECHO', 'DEPLOY_JOB_STATE=RUNNING'); Exit = 0 })
+$r = Run-Job @($running, (Finished 'SUCCESS')) @{} -Start @($lost, @{ Lines = @('DEPLOY_JOB_ID=ECHO', 'DEPLOY_JOB_STATE=RUNNING', "DEPLOY_JOB_SHA=$Sha"); Exit = 0 })
 Check 'a lost start is retried with the SAME request id' ($r.Output -contains 'SUCCESS' -and $r.Ids.Count -eq 2 -and $r.Ids[0] -eq $r.Ids[1]) $r.Error
 
 $r = Run-Job @((Finished 'SUCCESS'), (Finished 'ROLLED_BACK')) @{ TestTunnelHealth = { [pscustomobject]@{ build_commit = ('b' * 40) } } }
@@ -122,6 +123,31 @@ $r = Run-Job @(@{ Lines = @('DEPLOY_JOB: job is bound to a different commit', 'D
 Check 'a commit mismatch from Oracle stops the client' ($r.Error -like '*bound to a different commit*' -and ($r.Calls -notcontains 'recover')) $r.Error
 $r = Run-Job @($running) @{} -Start @(@{ Lines = @('DEPLOY_JOB_STATE=SHA_MISMATCH'); Exit = 2 })
 Check 'starting an id bound to another commit is refused' ($r.Error -like '*belongs to a different commit*' -and ($r.Calls -notcontains 'status')) $r.Error
+
+# DEPLOY_JOB_SHA must be present and exactly equal (case-sensitive) on every
+# start and status response; nothing is reported, recovered or rolled back otherwise.
+$other = 'b' * 40
+$upper = $Sha.ToUpperInvariant()
+$r = Run-Job @($running, (Finished 'SUCCESS'))
+Check 'matching DEPLOY_JOB_SHA on start and status succeeds' ($r.Output -contains 'SUCCESS' -and -not $r.Error) $r.Error
+foreach ($case in @(@{ Name = 'missing'; Lines = @('DEPLOY_JOB_ID=ECHO', 'DEPLOY_JOB_STATE=RUNNING') },
+                    @{ Name = 'mismatched'; Lines = @('DEPLOY_JOB_ID=ECHO', 'DEPLOY_JOB_STATE=RUNNING', "DEPLOY_JOB_SHA=$other") },
+                    @{ Name = 'different case'; Lines = @('DEPLOY_JOB_ID=ECHO', 'DEPLOY_JOB_STATE=RUNNING', "DEPLOY_JOB_SHA=$upper") })) {
+  $r = Run-Job @($running, (Finished 'SUCCESS')) @{} -Start @(@{ Lines = $case.Lines; Exit = 0 })
+  Check "$($case.Name) DEPLOY_JOB_SHA on start is BLOCKED before polling" ($r.Error -like 'DEPLOY BLOCKED:*start response*' -and $r.Output -notcontains 'SUCCESS' -and ($r.Calls -notcontains 'status')) $r.Error
+}
+foreach ($case in @(@{ Name = 'missing'; Reply = @{ Lines = @('DEPLOY_JOB_STATE=FINISHED', 'DEPLOY_RESULT=SUCCESS'); Exit = 0 } },
+                    @{ Name = 'mismatched'; Reply = (Finished 'SUCCESS' $other) },
+                    @{ Name = 'different case'; Reply = (Finished 'SUCCESS' $upper) })) {
+  $r = Run-Job @($case.Reply) @{ TestTunnelHealth = { [pscustomobject]@{ build_commit = ('c' * 40) } } }
+  Check "$($case.Name) DEPLOY_JOB_SHA on a SUCCESS status is BLOCKED (no success, no rollback)" ($r.Error -like 'DEPLOY BLOCKED:*status response*' -and $r.Output -notcontains 'SUCCESS' -and ($r.Calls -notcontains 'rollback')) $r.Error
+}
+$r = Run-Job @($running, @{ Lines = @('DEPLOY_JOB_STATE=DIED', "DEPLOY_JOB_SHA=$other"); Exit = 0 })
+Check 'mismatched DEPLOY_JOB_SHA on a DIED status never triggers recovery' ($r.Error -like 'DEPLOY BLOCKED:*status response*' -and ($r.Calls -notcontains 'recover')) $r.Error
+$r = Run-Job @($running, @{ Lines = @('DEPLOY_JOB_STATE=RUNNING'); Exit = 0 }, (Finished 'SUCCESS'))
+Check 'missing DEPLOY_JOB_SHA on a RUNNING status stops polling' ($r.Error -like 'DEPLOY BLOCKED:*status response*' -and $r.Output -notcontains 'SUCCESS') $r.Error
+$r = Run-Job @((Finished 'SUCCESS'), (Finished 'ROLLED_BACK' $other)) @{ TestTunnelHealth = { [pscustomobject]@{ build_commit = ('c' * 40) } } }
+Check 'mismatched DEPLOY_JOB_SHA on a rollback status is BLOCKED (no rollback claim)' ($r.Error -like 'DEPLOY BLOCKED:*rollback status response*') $r.Error
 
 Remove-Item Env:ORACLE_SSH_KEY -ErrorAction SilentlyContinue
 if ($failures) { Write-Host "$failures check(s) FAILED" -ForegroundColor Red; exit 1 }

@@ -1,6 +1,6 @@
 # Phase 5 deployment command (DO NOT RUN until Codex verifies)
 
-Deploys `9315e541b310d0257db8b57f835e83f8d476884e` to **Oracle preview 8768 only**, as a server-owned job that
+Deploys `ae05d37301790388f2cf985413ec5849fde970a1` to **Oracle preview 8768 only**, as a server-owned job that
 survives SSH disconnects. It is generated from
 `deploy/windows/Deploy-Preview8768.ps1` with the commit filled in.
 
@@ -15,7 +15,7 @@ survives SSH disconnects. It is generated from
    running on Oracle. To check it again, paste the same command and add
    ` -ResumeJobId <id>` right after its final closing `}`. This never starts
    a second deployment. Or run:
-   `ssh opc@129.146.120.195 bash /home/opc/kalshi-preview-repair-9315e54/deploy/oracle/deploy_job_8768.sh status <id> 9315e541b310d0257db8b57f835e83f8d476884e`
+   `ssh opc@129.146.120.195 bash /home/opc/kalshi-preview-repair-ae05d37/deploy/oracle/deploy_job_8768.sh status <id> ae05d37301790388f2cf985413ec5849fde970a1`
 4. The final line is one of: `SUCCESS`, `DEPLOY FAILED` (previous build still
    healthy), `DEPLOY ROLLED BACK`, `DEPLOY BLOCKED`, or `MANUAL RECOVERY
    REQUIRED` (exact steps are in the job log).
@@ -27,7 +27,9 @@ survives SSH disconnects. It is generated from
 - Status and log files are private (0700/0600). No environment or
   credentials are printed.
 - Job IDs are lowercase UUIDs, validated before any SSH call; every job is
-  bound to its exact commit (a mismatch is refused). The job ID is the request ID. Retries and reconnects never start a second
+  bound to its exact commit (a mismatch is refused). The client checks
+  `DEPLOY_JOB_SHA` on every start/status response and stops if it is
+  missing or different. The job ID is the request ID. Retries and reconnects never start a second
   installation; a start while another job runs is refused (BUSY).
 - A job that dies is recovered on request: the new build is confirmed, or
   the previous build is confirmed, or the exact previous process is
@@ -48,7 +50,7 @@ survives SSH disconnects. It is generated from
 # died, and owns the local dashboard tunnel. It never targets 8765 or 8767.
 #   Resume watching an existing job:   -ResumeJobId <id printed earlier>
 param(
-  [string]$Sha = '9315e541b310d0257db8b57f835e83f8d476884e',
+  [string]$Sha = 'ae05d37301790388f2cf985413ec5849fde970a1',
   [string]$Branch = 'claude/phase5-opening-repair',
   [string]$Server = 'opc@129.146.120.195',
   [string]$ResumeJobId = '',
@@ -98,6 +100,20 @@ function Get-Fields($Result) {
   return $fields
 }
 
+# Every start/status response describing a job must carry that job's commit,
+# and it must equal the requested commit exactly (ordinal, case-sensitive).
+# Nothing is reported, recovered or rolled back on an unverified response.
+function Assert-JobSha($Fields, [string]$Context) {
+  $jobSha = $Fields['DEPLOY_JOB_SHA']
+  if (-not $jobSha) {
+    throw "DEPLOY BLOCKED: Oracle's $Context response did not include DEPLOY_JOB_SHA, so the job's commit could not be verified. Nothing further was done."
+  }
+  if (-not [string]::Equals($jobSha, $Sha, [System.StringComparison]::Ordinal)) {
+    throw "DEPLOY BLOCKED: Oracle's $Context response is for commit $jobSha, not the requested $Sha. Nothing further was done."
+  }
+}
+$JobStates = @('STARTING', 'RUNNING', 'DIED', 'FINISHED')
+
 Write-Host '1/4 Checking SSH access to Oracle (no changes)...'
 $pre = Invoke-Remote 'echo SSH_PREFLIGHT_OK'
 if (-not ($pre.Lines -contains 'SSH_PREFLIGHT_OK')) {
@@ -141,7 +157,7 @@ if ($ResumeJobId) {
     if ($f['DEPLOY_JOB_STATE'] -eq 'BUSY') { throw "DEPLOY BLOCKED: another preview 8768 deployment job ($($f['DEPLOY_ACTIVE_JOB'])) is running on Oracle. Nothing was started." }
     if ($f['DEPLOY_JOB_STATE'] -eq 'REJECTED') { throw 'DEPLOY BLOCKED: the job was rejected (see DEPLOY_JOB lines above). Nothing was changed.' }
     if ($f['DEPLOY_JOB_STATE'] -eq 'SHA_MISMATCH') { throw "DEPLOY BLOCKED: job $JobId belongs to a different commit. Nothing was started." }
-    if ($f['DEPLOY_JOB_ID'] -eq $JobId) { $started = $f } else { Start-Sleep -Seconds ([Math]::Min(5, [Math]::Max(0, $PollSeconds))) }
+    if ($f['DEPLOY_JOB_ID'] -ceq $JobId) { Assert-JobSha $f 'start'; $started = $f } else { Start-Sleep -Seconds ([Math]::Min(5, [Math]::Max(0, $PollSeconds))) }
   }
   if (-not $started) { throw "DEPLOY RESULT UNKNOWN: could not confirm that job $JobId started. Rerun with -ResumeJobId $JobId to check it (this never starts a duplicate)." }
 }
@@ -159,6 +175,7 @@ while (-not $final) {
   if ($log -and $log -ne $lastLog) { Write-Host $log; $lastLog = $log }
   $state = $f['DEPLOY_JOB_STATE']
   if (-not $state) { Write-Host '    (connection lost; reconnecting...)' -ForegroundColor DarkYellow; $state = 'NO_ANSWER' }
+  if ($JobStates -contains $state) { Assert-JobSha $f 'status' }
   switch ($state) {
     'FINISHED' { $final = $f }
     'DIED' {
@@ -193,6 +210,7 @@ function Invoke-ClientRollback([string]$Reason) {
   while ((Get-Date) -lt $end) {
     Start-Sleep -Seconds $PollSeconds
     $f = Get-Fields (Invoke-Remote "bash '$jobScript' status '$JobId' '$Sha'" -Quiet)
+    if ($JobStates -contains $f['DEPLOY_JOB_STATE']) { Assert-JobSha $f 'rollback status' }
     if ($f['DEPLOY_JOB_STATE'] -eq 'FINISHED' -and $f['DEPLOY_RESULT'] -ne 'SUCCESS') {
       if ($f['DEPLOY_RESULT'] -eq 'ROLLED_BACK') { throw "DEPLOY ROLLED BACK after local verification failed: $Reason" }
       throw "DEPLOY STOPPED: rollback result $($f['DEPLOY_RESULT']). MANUAL RECOVERY REQUIRED; see: bash $jobScript status $JobId $Sha"

@@ -15,6 +15,7 @@ readonly STATE_ROOT=/home/opc/.kalshi-deploy/preview-8768
 readonly LOG_PATH="$OLD_ROOT/logs/preview-8768-${TARGET:0:7}.log"
 readonly OPENING_ARTIFACT=${PREVIEW_OPENING_MODEL_ARTIFACT:-}
 readonly READY_TIMEOUT=${PREVIEW_READY_TIMEOUT_SECONDS:-600}
+readonly READY_CONSECUTIVE=3
 
 old_pid=
 new_pid=
@@ -167,6 +168,19 @@ check((s.get("decision_intelligence") or {}).get("execution_capability") is Fals
 print("READINESS " + ("PASS" if not failures else "FAIL: " + "; ".join(failures)))
 print(json.dumps({"health": h.get("status"), "ready": r.get("status"), "candles": c.get("status"),
                   "missing": c.get("missing_intervals"), "signals_only": True}, sort_keys=True, default=str))
+# Diagnostics only (never part of the pass/fail decision): how old the quote
+# and reference were at this probe, and how long the server's last processing
+# cycle took, so a sustained stall can be told apart from a marginal one.
+mh = s.get("market_health") or {}
+rt = s.get("runtime") or {}
+print("READINESS_TIMING " + json.dumps({
+    "quote_age_seconds": mh.get("quote_age_seconds"),
+    "reference_age_seconds": mh.get("reference_age_seconds"),
+    "processing_ms": rt.get("processing_ms"),
+    "update_interval_ms": rt.get("update_interval_ms"),
+    "phases_ms": rt.get("phases_ms"),
+    "state_age_seconds": rt.get("state_age_seconds"),
+}, sort_keys=True, default=str)[:600])
 sys.exit(1 if failures else 0)
 PY
 }
@@ -389,13 +403,27 @@ new_pid=$!
 # Readiness: every original condition is still required. The wait is bounded
 # by wall-clock time (a large preserved journal can make startup slow), and
 # each failing endpoint is reported with its HTTP status and body.
+ready_started=$SECONDS
 ready_deadline=$((SECONDS + READY_TIMEOUT))
 next_progress=$((SECONDS + 30))
+# Readiness must HOLD: READY_CONSECUTIVE successive passing probes (2 s apart),
+# each requiring every original condition. A single pass followed by a failure
+# no longer ends the wait early; the streak restarts and the wait continues up
+# to the same deadline. Nothing is relaxed: every probe is the full check.
+streak=0 passes=0 probes=0 best_streak=0
 while (( SECONDS < ready_deadline )); do
   kill -0 "$new_pid" 2>/dev/null || { tail -n 60 "$LOG_PATH" >&2 || true; fail "repaired preview exited during startup"; }
-  if readiness_report "$TARGET" >/dev/null 2>&1; then break; fi
+  probes=$((probes + 1))
+  if readiness_report "$TARGET" >/dev/null 2>&1; then
+    streak=$((streak + 1)); passes=$((passes + 1))
+    (( streak > best_streak )) && best_streak=$streak
+    (( streak >= READY_CONSECUTIVE )) && break
+  else
+    streak=0
+  fi
   if (( SECONDS >= next_progress )); then
-    printf 'PREVIEW_READINESS_PROGRESS elapsed=%ss\n' "$((READY_TIMEOUT - (ready_deadline - SECONDS)))" >&2
+    printf 'PREVIEW_READINESS_PROGRESS elapsed=%ss probes=%s passes=%s streak=%s\n' \
+      "$((SECONDS - ready_started))" "$probes" "$passes" "$streak" >&2
     readiness_report "$TARGET" >&2 || true
     next_progress=$((SECONDS + 30))
   fi
@@ -403,8 +431,10 @@ while (( SECONDS < ready_deadline )); do
 done
 
 # Final checks are repeated outside the loop so timeout is a hard failure.
-if ! readiness_report "$TARGET"; then
-  printf 'PREVIEW_READINESS_TIMEOUT after %ss; last 60 lines of %s:\n' "$READY_TIMEOUT" "$LOG_PATH" >&2
+if (( streak < READY_CONSECUTIVE )) || ! readiness_report "$TARGET"; then
+  printf 'PREVIEW_READINESS_TIMEOUT elapsed=%ss limit=%ss probes=%s passes=%s best_consecutive=%s required=%s; last 60 lines of %s:\n' \
+    "$((SECONDS - ready_started))" "$READY_TIMEOUT" "$probes" "$passes" "$best_streak" \
+    "$READY_CONSECUTIVE" "$LOG_PATH" >&2
   tail -n 60 "$LOG_PATH" >&2 || true
   fail "repaired preview did not become healthy and ready"
 fi

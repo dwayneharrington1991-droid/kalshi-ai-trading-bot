@@ -4,6 +4,7 @@ Optional per-tick data capture must never make the core prediction state
 stale, and the guarded switch must explain which readiness endpoint failed
 instead of dying on an unexplained HTTPError.
 """
+import re
 import json
 import subprocess
 import sys
@@ -401,3 +402,61 @@ def test_invalid_candle_snapshot_never_passes_readiness():
     invalid = dict(GAP, status="INVALID")
     assert _probe(_responses(invalid, {"up": None, "direction": "WAIT"})).returncode != 0
     assert _probe(_responses(dict(GAP, status="STALE"), {"up": None, "direction": "WAIT"})).returncode != 0
+
+
+def _gate_source():
+    source = SWITCH.read_text()
+    start = source.index("ready_started=$SECONDS")
+    end = source.index('  fail "repaired preview did not become healthy and ready"\nfi\n', start)
+    return source[start:end] + '  fail "repaired preview did not become healthy and ready"\nfi\necho GATE_PASSED\n'
+
+
+def _run_gate(tmp_path, outcomes, timeout_seconds=4):
+    """Run the real readiness gate with a scripted sequence of probe outcomes
+    (1 = every condition holds, 0 = any condition fails; exhausted = fail)."""
+    seq = tmp_path / "seq"
+    seq.write_text("\n".join(str(o) for o in outcomes) + "\n")
+    script = f"""set -Eeuo pipefail
+READY_TIMEOUT={timeout_seconds}; READY_CONSECUTIVE=3; TARGET=abc; new_pid=$$
+LOG_PATH={tmp_path}/server.log; echo server-log-line > "$LOG_PATH"
+fail() {{ echo "FAIL: $*"; exit 1; }}
+sleep() {{ :; }}
+readiness_report() {{
+  local first; first=$(head -n1 {seq} 2>/dev/null || true)
+  sed -i 1d {seq} 2>/dev/null || true
+  [[ $first == 1 ]]
+}}
+""" + _gate_source()
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+
+
+def test_single_pass_then_failure_keeps_waiting_instead_of_failing_early(tmp_path):
+    # Old gate: break on the first pass, then fail hard if the immediate
+    # re-check failed. New gate: the streak restarts and the wait continues.
+    result = _run_gate(tmp_path, [0, 1, 0, 0, 1, 1, 1, 1])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "GATE_PASSED" in result.stdout
+
+
+def test_readiness_must_hold_consecutively_and_final_check_is_still_required(tmp_path):
+    # Two passes are never enough, and a failure on the final re-check fails.
+    flapping = _run_gate(tmp_path, [1, 1, 0] * 3, timeout_seconds=2)
+    assert flapping.returncode == 1 and "did not become healthy and ready" in flapping.stdout
+    final_fails = _run_gate(tmp_path, [1, 1, 1, 0], timeout_seconds=2)
+    assert final_fails.returncode == 1 and "did not become healthy and ready" in final_fails.stdout
+
+
+def test_sustained_failure_reports_true_elapsed_time_and_probe_counts(tmp_path):
+    result = _run_gate(tmp_path, [], timeout_seconds=3)
+    assert result.returncode == 1
+    line = next(l for l in result.stderr.splitlines() if l.startswith("PREVIEW_READINESS_TIMEOUT"))
+    assert "limit=3s" in line and "passes=0" in line and "best_consecutive=0" in line and "required=3" in line
+    assert re.search(r"elapsed=[2-9]s", line), line
+    assert "server-log-line" in result.stderr
+
+
+def test_probe_prints_quote_and_reference_ages_as_diagnostics_only():
+    source = SWITCH.read_text()
+    assert "READINESS_TIMING" in source and "quote_age_seconds" in source
+    # The decision line is computed before the timing diagnostics are printed.
+    assert source.index('print("READINESS " + ("PASS"') < source.index('print("READINESS_TIMING "')

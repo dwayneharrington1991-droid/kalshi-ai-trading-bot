@@ -50,3 +50,16 @@ def test_production_recovery_check_is_read_only():
                       r"wal_checkpoint", r"journal_mode\s*=", r"nohup", r"--vacuum", r"--rotate"):
         assert not re.search(forbidden, code), forbidden
     assert "mode=ro" in code and "PRAGMA query_only=ON" in code
+
+
+def test_8768_audit_is_read_only_and_never_prints_environment_values():
+    path = ROOT / "deploy/oracle/audit_8768_readonly.sh"
+    code = _code(path)
+    assert subprocess.run(["bash", "-n", str(path)]).returncode == 0
+    for forbidden in (r"\bkill\b", r"\bsystemctl\b", r"\brm\b", r"\bmv\b", r"\bcp\b", r"INSERT\s", r"UPDATE\s",
+                      r"DELETE\s", r"VACUUM", r"wal_checkpoint", r"journal_mode\s*=", r"nohup", r"git\s+(checkout|reset|pull|merge\s)",
+                      r"\bprintenv\b", r"\benv\b\s*$"):
+        assert not re.search(forbidden, code, re.M), forbidden
+    environ_lines = [line for line in code.splitlines() if "/environ" in line]
+    assert environ_lines and all("cut -d= -f1" in line for line in environ_lines)
+    assert "j.read()" in code and "AUDIT_8768_COMPLETE" in code

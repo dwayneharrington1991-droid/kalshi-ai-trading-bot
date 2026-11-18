@@ -1,4 +1,4 @@
-# Retirement of test service 8769 (revision 2, after Codex HOLD on ccab3e2)
+# Retirement of test service 8769 (revision 3, after Codex HOLDs on ccab3e2 and f64f088)
 
 Author: Claude. NOT executed anywhere except a local rehearsal on test ports.
 Running it on Oracle requires (1) Codex approval of this revision and (2) the
@@ -45,6 +45,18 @@ deployment lock (so no deployment can run concurrently); a token that binds
 the approval to the exact PID and start time seen by `check`; launch state
 stored 0700/0600 and never printed; journal files are never deleted, moved,
 truncated or opened for writing by the script.
+
+## Codex's seven defects in f64f088 and their fixes (revision 3)
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | Zombie not recognized as exited | `alive_same` treats state Z/X (or a different start time, or a vanished PID) as exited. After exit the script waits (bounded) and REQUIRES the listener to be gone and the journal files to have no holders; otherwise exit 4. Rehearsed with a real zombie (the test process stays the parent and does not reap). |
+| 2 | Unchecked state capture | Every capture step is checked (`|| die "capture failed: ..."`); `validate_state` then requires the directory 0700/owned and all nine files present, non-empty, regular, 0600, with valid contents (port, 40-hex commit, absolute cwd/journal, identity format, protected snapshot format, non-empty NUL-separated argv/env), and the captured argv must equal the running process's argv (streamed compare: /proc files report size 0). All before SIGTERM. Rollback re-validates the same way. |
+| 3 | Silent failures in checks | Supervisor search: grep exit 2 (permission/unreadable entry) and timeouts fail (retry once with passwordless sudo when available); launch-script search fails the same way; `crontab -l` must succeed or report exactly "no crontab"; `systemctl --system/--user list-units` and `list-timers` must succeed. /proc scan: an existing but unreadable cmdline fails (vanished processes are benign); hidepid without root/sudo blocks. Journal holders: fuser exit codes other than 0/1, fallback scan permission errors or timeouts fail. Protected identity reads fail rather than print placeholders. |
+| 4 | Deployment lock optional | `secure_lock` always creates/opens the preview-8768 deployment lock (and the retire lock): directory created owner-only if missing and must be owned and not group/other writable; lock must be a regular, owned, non-symlink file, set 0600, and `flock -n` acquired, else blocked. |
+| 5 | Supervisor checks not repeated before SIGTERM | The final re-check runs `gate_supervisors`, journal holders, process references, parent, protected identity and 8768 health, then the client check last, immediately before the pidfd signal. |
+| 6 | 8768 health only printed | `healthy()` enforces HTTP 200, HEALTHY, workers healthy and signals_only; required before retirement (gate), before the signal, and after retirement (exit 4 on failure). |
+| 7 | Rollback compared fresh snapshots | Rollback compares 8765/8768 against the SAVED pre-retirement snapshot before relaunch (refuses on any difference) and again after verification; protected health is enforced too. |
 
 ## Residual races (documented, cannot be fully removed without changing the host)
 

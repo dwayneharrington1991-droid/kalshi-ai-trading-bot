@@ -3,19 +3,30 @@ import re
 import subprocess
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parents[1] / "deploy/oracle/oracle_status_readonly.sh"
-CODE = "\n".join(l for l in SCRIPT.read_text().splitlines() if not l.lstrip().startswith("#"))
+ROOT = Path(__file__).resolve().parents[1]
+SHELL = ROOT / "deploy/oracle/oracle_status_readonly.sh"
+STEPS = ROOT / "deploy/oracle/oracle_status_steps.py"
 
 
-def test_syntax_and_bounds():
-    assert subprocess.run(["bash", "-n", str(SCRIPT)]).returncode == 0
-    assert "timeout -k 5 170" in CODE
+def _code(path):
+    return "\n".join(l for l in path.read_text().splitlines() if not l.lstrip().startswith("#"))
+
+
+def test_syntax_and_every_step_is_individually_bounded():
+    assert subprocess.run(["bash", "-n", str(SHELL)]).returncode == 0
+    code = _code(SHELL)
+    for name in ("processes", "dashboards", "clients", "journal"):
+        assert re.search(rf"step \d+ {name}", code), name
+    assert "timeout -k 3 120 bash" in code and "retire_service_8769.sh\" check" in code
+    assert "preview_gates_8768.py\" preflight" in code
 
 
 def test_never_changes_anything_or_prints_secrets():
-    for forbidden in (r"\bkill\b", r"systemctl\s+(start|stop|restart)", r"/environ", r"\brm\b", r"\bmv\b",
-                      r"INSERT\s", r"UPDATE\s", r"DELETE\s", r"DROP\s", r"VACUUM", r"Journal\(path",
-                      r"method=.POST", r"place_order|create_order|cancel_order"):
-        assert not re.search(forbidden, CODE), forbidden
-    # Journals are opened only through the read-only connection, without schema setup.
-    assert "Journal.__new__(Journal)" in CODE and "j.read()" in CODE
+    for path in (SHELL, STEPS):
+        code = _code(path)
+        for forbidden in (r"\bkill\b", r"systemctl\s+(start|stop|restart)", r"/environ", r"\bmv\b",
+                          r"INSERT\s", r"UPDATE\s", r"DELETE\s", r"DROP\s", r"VACUUM", r"Journal\(path",
+                          r"method=.POST", r"place_order|create_order|cancel_order", r"retire_service_8769.sh\" retire"):
+            assert not re.search(forbidden, code), (path.name, forbidden)
+    steps = _code(STEPS)
+    assert "Journal.__new__(Journal)" in steps and "j.read()" in steps

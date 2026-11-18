@@ -39,3 +39,14 @@ def test_production_collector_diagnostic_is_read_only():
                       r"DELETE\s", r"BEGIN IMMEDIATE", r"VACUUM", r"PRAGMA\s+(?!query_only)", r"nohup", r"setsid"):
         assert not re.search(forbidden, code), forbidden
     assert "mode=ro" in code and "/proc/locks" in code
+
+
+def test_production_recovery_check_is_read_only():
+    path = ROOT / "deploy/oracle/prod_8765_recovery_check.sh"
+    code = _code(path)
+    assert subprocess.run(["bash", "-n", str(path)]).returncode == 0
+    for forbidden in (r"\bkill\b", r"systemctl\s+(start|stop|restart|edit|set-property|daemon-reload)", r"/environ",
+                      r"\brm\b", r"\bmv\b", r"INSERT\s", r"UPDATE\s", r"DELETE\s", r"BEGIN", r"VACUUM",
+                      r"wal_checkpoint", r"journal_mode\s*=", r"nohup", r"--vacuum", r"--rotate"):
+        assert not re.search(forbidden, code), forbidden
+    assert "mode=ro" in code and "PRAGMA query_only=ON" in code

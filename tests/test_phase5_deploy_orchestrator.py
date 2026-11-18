@@ -91,6 +91,12 @@ def _ports_free():
 def sim(tmp_path):
     if shutil.which("flock") is None or shutil.which("pgrep") is None:
         pytest.skip("flock/pgrep unavailable")
+    # A previous test's servers may still be exiting; never skip a safety test
+    # for a transient port, only for a machine where the ports are really used.
+    for _ in range(100):
+        if _ports_free():
+            break
+        time.sleep(0.1)
     if not _ports_free():
         pytest.skip("ports 8765/8767/8768 are in use on this machine")
     repo = tmp_path / "repo"
@@ -158,6 +164,13 @@ def sim(tmp_path):
                simdir=simdir, state=tmp_path / "state", secret_env=secret_env, start=start)
     yield ctx
     subprocess.run(["pkill", "-f", str(simdir / "fake_server.py")])
+    # Wait until every fake service has exited and released its port, so the
+    # next test does not see a transiently busy port and skip.
+    for _ in range(100):
+        if _ports_free() and subprocess.run(["pgrep", "-f", str(simdir / "fake_server.py")],
+                                            capture_output=True).returncode != 0:
+            break
+        time.sleep(0.1)
     for p in procs:
         try:
             p.kill()

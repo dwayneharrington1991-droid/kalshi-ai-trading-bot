@@ -49,12 +49,23 @@ class H(BaseHTTPRequestHandler):
         body = {"/healthz": {"status": health, "build_commit": build[:7] if soak == "short_build" else build,
                              "signals_only": True, "workers": {"healthy": True}},
                 "/readyz": {"status": "NOT_READY" if soak == "unready" else "READY", "signals_only": True,
-                            "contract_quotes_fresh": soak != "unready", "reference_fresh": True},
+                            "contract_quotes_fresh": soak != "unready", "reference_fresh": True,
+                            "stale_reasons": ["QUOTE_OLDER_THAN_5_SECONDS"] if soak == "unready" else []},
                 "/api/state": {"decision_intelligence": {"execution_capability": False},
                                "market_health": {"quote_age_seconds": 1.1, "reference_age_seconds": 0.7},
-                               "runtime": {"latency_percentiles": {
+                               "runtime": {"state_version": 200 * getattr(H, "state_requests", 0),
+                                           "latency_percentiles": {
                                    "publish_after_collection": {"p95_ms": p95, "p99_ms": 3300, "samples": samples},
                                    "prediction_calculation": {"p50_ms": 640, "samples": samples}}}}}.get(p)
+        if p == "/readyz":
+            H.ready_requests = getattr(H, "ready_requests", 0) + 1
+        if soak in ("rollover_flap", "reference_flap") and 3 <= getattr(H, "ready_requests", 0) <= 4 and p == "/readyz":
+            body = {"status": "NOT_READY", "signals_only": True, "contract_quotes_fresh": False,
+                    "reference_fresh": soak == "rollover_flap",
+                    "stale_reasons": ["NO_ACTIVE_CONTRACT"] if soak == "rollover_flap" else ["REFERENCE_OLDER_THAN_5_SECONDS"]}
+            data = json.dumps(body).encode(); self.send_response(503); self.end_headers(); self.wfile.write(data); return
+        if p == "/api/state" and soak in ("rollover_flap", "reference_flap") and 3 <= getattr(H, "ready_requests", 0) <= 4:
+            body["market_health"] = {"quote_age_seconds": None, "reference_age_seconds": 0.9}
         if p == "/api/state" and soak == "state_error":
             self.send_response(500); self.end_headers(); return
         if p == "/api/data-quality-alerts" and "--alerts" in a:
@@ -107,7 +118,9 @@ OLD = "1" * 40
 GATE_TEST_OVERRIDES = {"opening_window": False, "min_swap_free_mib": 0, "post_min_swap_free_mib": 0,
                        "cpu_sample_s": 0.3, "swap_sample_s": 0.2, "post_cpu_sample_s": 0.3,
                        "soak_seconds": 2, "soak_interval_s": 0.25, "post_max_load_increase": 100,
-                       "max_load1": 100, "post_max_load1": 100}
+                       "max_load1": 100, "post_max_load1": 100,
+                       # the sandbox clock is arbitrary: rollover tolerance off unless a test forces it
+                       "rollover_before_s": 0, "rollover_after_s": 0}
 
 
 def _ports_free():
@@ -385,7 +398,8 @@ def _installs(sim):
     ("soak_slow", "publish p95"),
     ("soak_mid_slow", "publish p95"),
     ("soak_late_state_error", "/api/state unsuccessful"),
-    ("soak_few_samples", "latency statistics had >= 100 measurements in only"),
+    ("soak_few_samples", "latency statistics were fully refreshed"),
+    ("soak_rollover_flap", "outside the rollover window"),
     ("soak_late_short_build", "is not exactly"),
 ])
 def test_soak_failure_rolls_back_to_the_exact_previous_process(sim, scenario, reason):
@@ -486,12 +500,50 @@ def test_production_limits_are_realistic_for_the_single_core_host():
     L = _gates().LIMITS
     assert L["soak_seconds"] == 900 and L["soak_interval_s"] == 10 and L["opening_window"] is True
     assert L["max_publish_p95_ms"] <= 3000 and L["max_publish_p99_ms"] <= 4500 and L["max_prediction_p50_ms"] <= 1020
-    assert L["min_latency_samples"] >= 100 and L["min_evaluable_share"] >= 0.8 and L["max_age_s"] <= 10
+    assert L["min_latency_samples"] >= 100 and L["min_evaluable_share"] >= 0.5 and L["max_age_s"] <= 10
     assert 8.4 < L["max_load1"] <= 12 and 512 <= L["min_mem_available_mib"] <= 2048
-    assert L["post_max_cpu_increase_pts"] <= 5
+    assert L["post_max_cpu_increase_pts"] <= 10 and L["post_max_cpu_pct"] <= 40
 
 
 def test_soak_requires_exact_40_character_build():
     result = subprocess.run([sys.executable, str(ROOT / "deploy/oracle/preview_gates_8768.py"), "soak",
                              "abc1234", "pre.json", "out.json"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 2 and "40-character" in result.stdout
+
+
+ALWAYS_ROLLOVER = {**GATE_TEST_OVERRIDES, "rollover_before_s": 900, "rollover_after_s": 0}
+
+
+def test_contract_rollover_not_ready_is_tolerated_only_inside_the_window(sim):
+    result, status = sim["run"]("deploy", sim["sha"], scenario="soak_rollover_flap",
+                                extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps(ALWAYS_ROLLOVER)})
+    assert status == "SUCCESS", result.stdout
+    run = next((sim["state"] / "runs").iterdir())
+    assert json.loads((run / "soak.json").read_text())["rollover_samples"] == 2
+
+
+def test_stale_reference_is_never_tolerated_even_at_rollover(sim):
+    result, status = sim["run"]("deploy", sim["sha"], scenario="soak_reference_flap",
+                                extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps(ALWAYS_ROLLOVER)})
+    assert status == "ROLLED_BACK" and "/readyz not READY" in result.stdout, result.stdout
+    assert sim["health"]()["build_commit"] == OLD
+
+
+def test_latency_is_judged_only_on_a_window_refreshed_after_the_soak_began():
+    g = _gates()
+    src = (ROOT / "deploy/oracle/preview_gates_8768.py").read_text()
+    assert 'version - version0 >= L["latency_window_cycles"]' in src and g.LIMITS["latency_window_cycles"] == 300
+
+
+def test_rollover_window_boundaries():
+    g = _gates()
+    base = 1794981600 - (1794981600 % 900)
+    assert g.in_rollover(g.LIMITS, base) and g.in_rollover(g.LIMITS, base + 59) and g.in_rollover(g.LIMITS, base - 20)
+    assert not g.in_rollover(g.LIMITS, base + 60) and not g.in_rollover(g.LIMITS, base - 21)
+
+
+def test_protected_identity_is_pid_and_start_time_only(tmp_path):
+    g = _gates()
+    ident = g.proc_identity(os.getpid())
+    assert set(ident) == {"pid", "start"}           # run state (R/S/D) would flap
+    assert g.proc_identity(os.getpid()) == ident

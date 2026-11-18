@@ -1,4 +1,4 @@
-# Deploying the Phase 5 performance upgrade to preview 8768 (revision 2)
+# Deploying the Phase 5 performance upgrade to preview 8768 (revision 3)
 
 Author: Claude. Revision 2 resolves the six blockers from Codex's DEPLOY HOLD
 on 839a79c. Not executed on Oracle. Requires Codex PASS and owner approval.
@@ -69,6 +69,37 @@ has no effect at all (the job is server-owned).
 | 5 | Prefix build match | Exact 40-character equality (soak rejects shorter input; `/healthz` must equal the full commit). |
 | 6 | Manual resource/window/listener checks | Automated preflight and postflight with the thresholds above. |
 
+## Revision 3: adversarial review by Claude (Codex unavailable)
+
+This is Claude's own adversarial review of the whole workflow, NOT an
+independent Codex review. Four defects were found and fixed, each of which
+would have caused a false rollback on Oracle that the simulation could not:
+
+1. Latency history: the server keeps its last 300 cycles per stage, so at
+   soak start the percentiles still contained slow startup cycles. Latency
+   limits now apply at every sample once >= 300 cycles were published after
+   the soak began (server `state_version`), i.e. on soak-only data; >= 50% of
+   samples must reach that point (a build too slow to refresh fails).
+2. Contract rollover: every 15-minute soak crosses a quarter hour, where the
+   active contract changes and `/readyz` is briefly NOT_READY. From 20 s
+   before to 60 s after a quarter hour, only contract-quote reasons are
+   tolerated (no active contract / not open / expired / stale or missing
+   quote); health, workers, signals-only, exact build, `/api/state` 200,
+   latency meters, a fresh reference (<= 10 s) and protected identities stay
+   strict on every sample, and freshness is scored on the other samples.
+3. The gates' HTTP helper discarded the JSON body of 503 responses, so
+   `/readyz` reasons were unreadable (verified against a real local server).
+4. Protected identity included the process run state (R/S/D), which flaps;
+   it is now PID + kernel start time only.
+
+CPU postflight was also made realistic for four CPU-bound processes sharing
+one core: new 8768 CPU <= preflight baseline + 10 points and <= 40%.
+
+Verified against a real signals server: every field the soak reads exists
+(`/healthz` workers/build/signals_only, `/readyz` 503 JSON with
+stale_reasons, `/api/state?view=main` runtime.state_version, market_health
+ages, latency meters with p50/p95/p99/samples).
+
 ## Verification (local; never Oracle)
 
 - `bash -n` and `shellcheck -S warning` clean for every deploy script (three
@@ -82,7 +113,7 @@ has no effect at all (the job is server-owned).
   load, disk and swap limits; overrides refused outside test mode; opening
   window boundaries; watchdog recovers a SIGKILLed orchestrator with no
   client; client-requested recovery still works.
-- Full suite: 1402 passed, 9 skipped.
+- Full suite: 1408 passed, 9 skipped.
 
 ## After Codex PASS
 

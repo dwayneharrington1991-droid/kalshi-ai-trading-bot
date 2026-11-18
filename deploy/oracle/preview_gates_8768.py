@@ -44,15 +44,26 @@ LIMITS = {
     "max_publish_p99_ms": 4500,
     "max_prediction_p50_ms": 1020,     # 60% of the measured 1698 ms
     "min_latency_samples": 100,        # per meter, for a statistic to count
-    "min_evaluable_share": 0.80,       # of soak samples with enough latency data
+    # The server keeps the last 300 cycles per stage; a statistic counts only
+    # once >= 300 cycles were published after the soak began, so startup
+    # cycles can never hide in (or inflate) the soak's percentiles.
+    "latency_window_cycles": 300,
+    "min_evaluable_share": 0.50,       # of soak samples with a fully refreshed window
+    # Contract rollover: from 20 s before to 60 s after each quarter hour the
+    # active contract legitimately changes; only contract-quote readiness
+    # reasons are tolerated there (health, build, state, reference strict).
+    "rollover_before_s": 20,
+    "rollover_after_s": 60,
     "min_sample_share": 0.90,          # of the expected number of soak samples
     # postflight
     "post_min_mem_available_mib": 512,
     "post_min_swap_free_mib": 768,
     "post_max_load1": 14.0,
     "post_max_load_increase": 2.0,
-    "post_max_cpu_increase_pts": 5.0,
-    "post_max_cpu_pct": 60.0,
+    # Four CPU-hungry processes share one core: a faster build may take about
+    # its fair share again, so allow +10 points, never above 40% of the core.
+    "post_max_cpu_increase_pts": 10.0,
+    "post_max_cpu_pct": 40.0,
     "post_cpu_sample_s": 60,
 }
 PROTECTED = (8765, 8767)
@@ -96,9 +107,13 @@ def listener(port):
 
 
 def proc_identity(pid):
+    """PID and kernel start time: together they prove it is the same process.
+    (The run state R/S/D changes constantly and must not be compared.)"""
     raw = open(f"/proc/{pid}/stat").read()
     fields = raw.rsplit(")", 1)[1].split()
-    return {"pid": int(pid), "start": fields[19], "state": fields[0]}
+    if fields[0] in ("Z", "X"):
+        raise OSError(f"process {pid} has exited")
+    return {"pid": int(pid), "start": fields[19]}
 
 
 def cpu_ticks(pid):
@@ -143,12 +158,24 @@ def in_opening_window(now=None):
     return pos >= 810 or pos < 150
 
 
+ROLLOVER_REASONS = {"NO_ACTIVE_CONTRACT", "ACTIVE_CONTRACT_SELECTION_PENDING", "CONTRACT_NOT_OPEN",
+                    "CONTRACT_EXPIRED", "QUOTE_OLDER_THAN_5_SECONDS", "INVALID_CONTRACT_OR_QUOTE_TIMESTAMP"}
+
+
+def in_rollover(L, now=None):
+    pos = (now if now is not None else time.time()) % 900
+    return pos >= 900 - L["rollover_before_s"] or pos < L["rollover_after_s"]
+
+
 def get(path):
     try:
         with OPENER.open(f"http://127.0.0.1:{PORT}{path}", timeout=5) as r:
             return r.status, json.load(r)
     except HTTPError as e:
-        return e.code, None
+        try:                                   # /readyz answers 503 with a JSON body of reasons
+            return e.code, json.load(e)
+        except Exception:
+            return e.code, None
     except Exception as e:
         return None, {"_error": type(e).__name__}
 
@@ -231,8 +258,9 @@ def soak(sha, pre_path, out_path, L):
     expected_n = int(L["soak_seconds"] / L["soak_interval_s"])
     started = time.monotonic()
     deadline = started + L["soak_seconds"]
-    samples = evaluable = fresh = 0
+    samples = evaluable = fresh = strict_samples = rollover_samples = 0
     first_pid = None
+    version0 = None
     worst = {"publish_p95": 0, "publish_p99": 0, "prediction_p50": 0, "age": 0}
     say(f"soak started: {L['soak_seconds']} s, every {L['soak_interval_s']} s; rollback armed")
 
@@ -248,10 +276,19 @@ def soak(sha, pre_path, out_path, L):
             stop(f"sample {samples}: /healthz not HEALTHY with healthy workers and signals-only (HTTP {hc})")
         if h.get("build_commit") != sha:
             stop(f"sample {samples}: build {h.get('build_commit')!r} is not exactly {sha}")
+        rollover = in_rollover(L)
         rc, r = get("/readyz")
-        if not (rc == 200 and isinstance(r, dict) and r.get("status") == "READY" and r.get("signals_only") is True
-                and r.get("contract_quotes_fresh") is True and r.get("reference_fresh") is True):
-            stop(f"sample {samples}: /readyz not READY with fresh quotes and reference (HTTP {rc})")
+        if not (rc in (200, 503) and isinstance(r, dict) and r.get("signals_only") is True):
+            stop(f"sample {samples}: /readyz unsuccessful or not signals-only (HTTP {rc})")
+        ready = (rc == 200 and r.get("status") == "READY" and r.get("contract_quotes_fresh") is True
+                 and r.get("reference_fresh") is True)
+        if not ready:
+            reasons = set(r.get("stale_reasons") or [])
+            tolerated = (rollover and r.get("reference_fresh") is True and reasons
+                         and reasons <= ROLLOVER_REASONS)
+            if not tolerated:
+                stop(f"sample {samples}: /readyz not READY (HTTP {rc}, reasons {sorted(reasons)}"
+                     f"{', outside the rollover window' if not rollover else ''})")
         sc, s = get("/api/state?view=main")
         if sc != 200 or not isinstance(s, dict):
             stop(f"sample {samples}: /api/state unsuccessful (HTTP {sc})")
@@ -259,14 +296,25 @@ def soak(sha, pre_path, out_path, L):
         if not isinstance(mh, dict) or not isinstance(rt, dict):
             stop(f"sample {samples}: /api/state lacks market_health/runtime")
         q, ref = mh.get("quote_age_seconds"), mh.get("reference_age_seconds")
-        if not (number(q) and number(ref)):
-            stop(f"sample {samples}: quote/reference age unmeasurable ({q!r}, {ref!r})")
-        age = max(q, ref)
-        worst["age"] = max(worst["age"], age)
-        if age < 0 or age > L["max_age_s"]:
-            stop(f"sample {samples}: quote/reference age {age} s outside 0..{L['max_age_s']}")
-        if age <= L["fresh_age_s"]:
-            fresh += 1
+        if not number(ref) or ref < 0 or ref > L["max_age_s"]:
+            stop(f"sample {samples}: reference age {ref!r} unmeasurable or outside 0..{L['max_age_s']} s")
+        if ready:
+            strict_samples += 1
+            if not number(q):
+                stop(f"sample {samples}: quote age unmeasurable ({q!r}) while READY")
+            age = max(q, ref)
+            worst["age"] = max(worst["age"], age)
+            if age < 0 or age > L["max_age_s"]:
+                stop(f"sample {samples}: quote/reference age {age} s outside 0..{L['max_age_s']}")
+            if age <= L["fresh_age_s"]:
+                fresh += 1
+        else:
+            rollover_samples += 1
+            age = ref
+        version = rt.get("state_version")
+        if not number(version):
+            stop(f"sample {samples}: runtime state_version unmeasurable")
+        version0 = version if version0 is None else version0
         lat = rt.get("latency_percentiles")
         if not isinstance(lat, dict):
             stop(f"sample {samples}: latency percentiles missing")
@@ -276,7 +324,8 @@ def soak(sha, pre_path, out_path, L):
         for meter, keys in ((pub, ("p95_ms", "p99_ms", "samples")), (pred, ("p50_ms", "samples"))):
             if not all(number(meter.get(k)) for k in keys):
                 stop(f"sample {samples}: latency meter values unmeasurable")
-        if min(pub["samples"], pred["samples"]) >= L["min_latency_samples"]:
+        refreshed = version - version0 >= L["latency_window_cycles"]
+        if refreshed and min(pub["samples"], pred["samples"]) >= L["min_latency_samples"]:
             evaluable += 1
             worst["publish_p95"] = max(worst["publish_p95"], pub["p95_ms"])
             worst["publish_p99"] = max(worst["publish_p99"], pub["p99_ms"])
@@ -298,7 +347,7 @@ def soak(sha, pre_path, out_path, L):
         if problems or now != pre["protected"]:
             stop(f"sample {samples}: protected listener identity changed or unreadable")
         if samples % 6 == 0:
-            say(f"soak sample {samples}: age {age:.2f} s, publish p95 {pub['p95_ms']} ms, prediction p50 {pred['p50_ms']} ms")
+            say(f"soak sample {samples}: age {age:.2f} s{' (rollover)' if not ready else ''}, publish p95 {pub['p95_ms']} ms, prediction p50 {pred['p50_ms']} ms")
         # Fixed cadence: sample k is due at started + k * interval, so slow
         # requests do not stretch the schedule (samples ~= expected).
         next_due = started + samples * L["soak_interval_s"]
@@ -306,12 +355,15 @@ def soak(sha, pre_path, out_path, L):
     if samples < L["min_sample_share"] * expected_n:
         stop(f"only {samples} samples (need >= {L['min_sample_share']:.0%} of {expected_n})")
     if evaluable < L["min_evaluable_share"] * samples:
-        stop(f"latency statistics had >= {L['min_latency_samples']} measurements in only {evaluable}/{samples} samples")
-    share = fresh / samples
+        stop(f"latency statistics were fully refreshed (>= {L['latency_window_cycles']} soak cycles, "
+             f">= {L['min_latency_samples']} measurements) in only {evaluable}/{samples} samples")
+    if strict_samples == 0:
+        stop("no READY samples during the soak")
+    share = fresh / strict_samples
     if share < L["min_fresh_share"]:
         stop(f"quote/reference fresh in {share:.0%} of samples (need {L['min_fresh_share']:.0%})")
     write(out_path, {"result": "PASS", "samples": samples, "evaluable": evaluable, "fresh_share": share,
-                     "worst": worst, "pid": first_pid})
+                     "rollover_samples": rollover_samples, "worst": worst, "pid": first_pid})
     say(f"soak passed: {samples} samples, {evaluable} with full latency data, fresh {share:.0%}, worst {worst}")
     return 0
 

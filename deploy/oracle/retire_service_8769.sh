@@ -234,6 +234,11 @@ launcher_reason() {  # pid -> prints a refusal reason, or nothing if one-shot
   (( count == 1 )) || { echo "launcher starts the server $count times"; return; }
   tail=${script#*signals_display.server}
   tail=$(sed -E 's/[0-9]*>&[0-9]+//g; s/[0-9]*>>?[[:space:]]*[^[:space:];&|]+//g; s/<[[:space:]]*[^[:space:];&|]+//g' <<<"$tail")
+  # One trailing `&` (and nothing after it) backgrounds the WHOLE list: bash
+  # runs it in a subshell that waits for the server and then has nothing left
+  # to run. That subshell is the living parent seen on Oracle (PPID 1,
+  # do_wait). Anything after the `&`, or `&&`/`|`/`;`, is still refused.
+  tail=$(sed -E 's/[[:space:]]&[[:space:]]*$//' <<<"$tail")
   [[ $tail != *[\;\&\|]* && $(wc -l <<<"$tail") -le 1 ]] ||
     { echo "launcher runs further commands after the server (would restart or continue after it exits)"; return; }
   kids=$(ps -o pid= --ppid "$pp" 2>/dev/null | tr -d ' ' | grep -v '^$' || true)

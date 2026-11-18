@@ -160,7 +160,10 @@ def _make_rehearsal(tmp_path, *, zombie=False, launcher=None):
         cmd = " ".join(server)
         script = {"oneshot": f"cd {stage} && nohup {cmd} >/dev/null 2>&1",
                   "loop": f"cd {stage} && while true; do {cmd} >/dev/null 2>&1; done",
-                  "twice": f"cd {stage} && {cmd} >/dev/null 2>&1; {cmd} >/dev/null 2>&1"}[launcher]
+                  "twice": f"cd {stage} && {cmd} >/dev/null 2>&1; {cmd} >/dev/null 2>&1",
+                  # Exact Oracle 8769 form (PID 475991): whole list backgrounded with `&`.
+                  "oracle_bg": f"mkdir -p {stage}/logs && cd {stage} && nohup {cmd} > {stage}/repair-8769.log 2>&1 < /dev/null &",
+                  "bg_then_more": f"cd {stage} && nohup {cmd} > /dev/null 2>&1 < /dev/null & echo relaunch-marker"}[launcher]
         procs.append(subprocess.Popen(["setsid", "bash", "-c", script], stdin=subprocess.DEVNULL,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                       start_new_session=True))
@@ -400,7 +403,7 @@ def test_rehearsal_fails_closed_on_usage_dependencies_and_unverifiable_checks(re
 
 
 
-@pytest.fixture(params=["oneshot", "loop", "twice"])
+@pytest.fixture(params=["oneshot", "oracle_bg", "loop", "twice", "bg_then_more"])
 def launcher_rehearsal(tmp_path, request):
     info, cleanup = _make_rehearsal(tmp_path, launcher=request.param)
     info["launcher"] = request.param
@@ -416,7 +419,7 @@ def test_launcher_parent_one_shot_is_retired_and_loops_are_refused(launcher_rehe
     env, port, kind = launcher_rehearsal["env"], launcher_rehearsal["port"], launcher_rehearsal["launcher"]
     original = _listener(port)
     check = _run(env, "check")
-    if kind == "oneshot":
+    if kind in ("oneshot", "oracle_bg"):
         assert check.returncode == 0, check.stdout + check.stderr
         assert "is a one-shot launcher" in check.stdout
         assert "parent launcher" in check.stderr and "command (redacted)" in check.stderr
@@ -432,7 +435,8 @@ def test_launcher_parent_one_shot_is_retired_and_loops_are_refused(launcher_rehe
         assert rollback.returncode == 0 and "ROLLBACK VERIFIED" in rollback.stdout, rollback.stdout
     else:
         assert check.returncode == 2, check.stdout
-        expected = {"loop": "loop/retry/supervision construct", "twice": "starts the server 2 times"}[kind]
+        expected = {"loop": "loop/retry/supervision construct", "twice": "starts the server 2 times",
+                    "bg_then_more": "runs further commands after the server"}[kind]
         assert expected in check.stdout, check.stdout
         assert _run(env, "retire", "--approve", "RETIRE-8769-PID1-START1").returncode == 2
         assert _listener(port) == original                     # nothing was stopped

@@ -160,6 +160,7 @@ def in_opening_window(now=None):
     return pos >= 810 or pos < 150
 
 
+STALENESS_REASONS = {"QUOTE_OLDER_THAN_5_SECONDS", "REFERENCE_OLDER_THAN_5_SECONDS"}
 ROLLOVER_REASONS = {"NO_ACTIVE_CONTRACT", "ACTIVE_CONTRACT_SELECTION_PENDING", "CONTRACT_NOT_OPEN",
                     "CONTRACT_EXPIRED", "QUOTE_OLDER_THAN_5_SECONDS", "INVALID_CONTRACT_OR_QUOTE_TIMESTAMP"}
 
@@ -260,7 +261,7 @@ def soak(sha, pre_path, out_path, L):
     expected_n = int(L["soak_seconds"] / L["soak_interval_s"])
     started = time.monotonic()
     deadline = started + L["soak_seconds"]
-    samples = evaluable = fresh = strict_samples = rollover_samples = 0
+    samples = evaluable = fresh = strict_samples = rollover_samples = stale_samples = 0
     first_pid = None
     version0 = None
     worst = {"publish_p95": 0, "publish_p99": 0, "prediction_p50": 0, "age": 0}
@@ -284,8 +285,12 @@ def soak(sha, pre_path, out_path, L):
             stop(f"sample {samples}: /readyz unsuccessful or not signals-only (HTTP {rc})")
         ready = (rc == 200 and r.get("status") == "READY" and r.get("contract_quotes_fresh") is True
                  and r.get("reference_fresh") is True)
-        if not ready:
-            reasons = set(r.get("stale_reasons") or [])
+        reasons = set(r.get("stale_reasons") or [])
+        # A NOT_READY caused ONLY by quote/reference age is a stale sample: it is
+        # scored by the documented freshness rule (<= 5 s in >= 95% of samples,
+        # never > 10 s) instead of failing the soak on a single blip.
+        stale_only = not ready and bool(reasons) and reasons <= STALENESS_REASONS
+        if not ready and not stale_only:
             tolerated = (rollover and r.get("reference_fresh") is True and reasons
                          and reasons <= ROLLOVER_REASONS)
             if not tolerated:
@@ -300,16 +305,18 @@ def soak(sha, pre_path, out_path, L):
         q, ref = mh.get("quote_age_seconds"), mh.get("reference_age_seconds")
         if not number(ref) or ref < 0 or ref > L["max_age_s"]:
             stop(f"sample {samples}: reference age {ref!r} unmeasurable or outside 0..{L['max_age_s']} s")
-        if ready:
+        if ready or stale_only:
             strict_samples += 1
             if not number(q):
-                stop(f"sample {samples}: quote age unmeasurable ({q!r}) while READY")
+                stop(f"sample {samples}: quote age unmeasurable ({q!r})")
             age = max(q, ref)
             worst["age"] = max(worst["age"], age)
             if age < 0 or age > L["max_age_s"]:
                 stop(f"sample {samples}: quote/reference age {age} s outside 0..{L['max_age_s']}")
-            if age <= L["fresh_age_s"]:
+            if ready and age <= L["fresh_age_s"]:
                 fresh += 1
+            elif stale_only:
+                stale_samples += 1
         else:
             rollover_samples += 1
             age = ref
@@ -363,9 +370,10 @@ def soak(sha, pre_path, out_path, L):
         stop("no READY samples during the soak")
     share = fresh / strict_samples
     if share < L["min_fresh_share"]:
-        stop(f"quote/reference fresh in {share:.0%} of samples (need {L['min_fresh_share']:.0%})")
+        stop(f"quote/reference fresh in {share:.0%} of samples ({stale_samples} stale) (need {L['min_fresh_share']:.0%})")
     write(out_path, {"result": "PASS", "samples": samples, "evaluable": evaluable, "fresh_share": share,
-                     "rollover_samples": rollover_samples, "worst": worst, "pid": first_pid})
+                     "rollover_samples": rollover_samples, "stale_samples": stale_samples,
+                     "worst": worst, "pid": first_pid})
     say(f"soak passed: {samples} samples, {evaluable} with full latency data, fresh {share:.0%}, worst {worst}")
     return 0
 

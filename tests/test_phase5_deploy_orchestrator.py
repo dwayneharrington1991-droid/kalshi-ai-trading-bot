@@ -50,7 +50,7 @@ class H(BaseHTTPRequestHandler):
                              "signals_only": True, "workers": {"healthy": True}},
                 "/readyz": {"status": "NOT_READY" if soak == "unready" else "READY", "signals_only": True,
                             "contract_quotes_fresh": soak != "unready", "reference_fresh": True,
-                            "stale_reasons": ["QUOTE_OLDER_THAN_5_SECONDS"] if soak == "unready" else []},
+                            "stale_reasons": ["LATEST_PUBLIC_POLL_FAILED"] if soak == "unready" else []},
                 "/api/state": {"decision_intelligence": {"execution_capability": False},
                                "market_health": {"quote_age_seconds": 1.1, "reference_age_seconds": 0.7},
                                "runtime": {"state_version": 200 * getattr(H, "state_requests", 0),
@@ -59,6 +59,15 @@ class H(BaseHTTPRequestHandler):
                                    "prediction_calculation": {"p50_ms": 640, "samples": samples}}}}}.get(p)
         if p == "/readyz":
             H.ready_requests = getattr(H, "ready_requests", 0) + 1
+        # stale_blip: one readiness probe stale by age only (6.5 s); stale_long: 12 s.
+        if soak in ("stale_blip", "stale_long") and getattr(H, "ready_requests", 0) == 5:
+            if p == "/readyz":
+                body = {"status": "NOT_READY", "signals_only": True, "contract_quotes_fresh": False,
+                        "reference_fresh": True, "stale_reasons": ["QUOTE_OLDER_THAN_5_SECONDS"]}
+                data = json.dumps(body).encode(); self.send_response(503); self.end_headers(); self.wfile.write(data); return
+            if p == "/api/state":
+                body["market_health"] = {"quote_age_seconds": 6.5 if soak == "stale_blip" else 12.0,
+                                         "reference_age_seconds": 0.8}
         if soak in ("rollover_flap", "reference_flap") and 3 <= getattr(H, "ready_requests", 0) <= 4 and p == "/readyz":
             body = {"status": "NOT_READY", "signals_only": True, "contract_quotes_fresh": False,
                     "reference_fresh": soak == "rollover_flap",
@@ -525,7 +534,9 @@ def test_contract_rollover_not_ready_is_tolerated_only_inside_the_window(sim):
 def test_stale_reference_is_never_tolerated_even_at_rollover(sim):
     result, status = sim["run"]("deploy", sim["sha"], scenario="soak_reference_flap",
                                 extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps(ALWAYS_ROLLOVER)})
-    assert status == "ROLLED_BACK" and "/readyz not READY" in result.stdout, result.stdout
+    # A stale reference is never a tolerated rollover reason: it is scored as stale
+    # (and here fails the 95% freshness rule) or fails immediately.
+    assert status == "ROLLED_BACK" and "GATE FAIL: soak" in result.stdout and "rollover_samples" not in result.stdout, result.stdout
     assert sim["health"]()["build_commit"] == OLD
 
 
@@ -547,3 +558,28 @@ def test_protected_identity_is_pid_and_start_time_only(tmp_path):
     ident = g.proc_identity(os.getpid())
     assert set(ident) == {"pid", "start"}           # run state (R/S/D) would flap
     assert g.proc_identity(os.getpid()) == ident
+
+
+LONG_SOAK = {**GATE_TEST_OVERRIDES, "soak_seconds": 7, "soak_interval_s": 0.25}
+
+
+def test_single_stale_blip_is_scored_by_the_95_percent_rule_not_fatal(sim):
+    result, status = sim["run"]("deploy", sim["sha"], scenario="soak_stale_blip",
+                                extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps(LONG_SOAK)})
+    assert status == "SUCCESS", result.stdout
+    run = next((sim["state"] / "runs").iterdir())
+    soak = json.loads((run / "soak.json").read_text())
+    assert soak["stale_samples"] == 1 and soak["fresh_share"] >= 0.95
+
+
+def test_stale_sample_above_ten_seconds_still_fails_immediately(sim):
+    result, status = sim["run"]("deploy", sim["sha"], scenario="soak_stale_long",
+                                extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps(LONG_SOAK)})
+    assert status == "ROLLED_BACK" and "outside 0..10.0" in result.stdout, result.stdout
+    assert sim["health"]()["build_commit"] == OLD
+
+
+def test_too_many_stale_samples_fail_the_95_percent_rule(sim):
+    # default short soak: one stale sample out of ~8 is below 95% fresh
+    result, status = sim["run"]("deploy", sim["sha"], scenario="soak_stale_blip")
+    assert status == "ROLLED_BACK" and "1 stale" in result.stdout, result.stdout

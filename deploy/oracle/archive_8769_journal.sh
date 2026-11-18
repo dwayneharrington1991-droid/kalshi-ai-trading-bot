@@ -54,10 +54,8 @@ prove_unused() {
 manifest() { local f; for f in $(files); do printf 'MANIFEST %s %s %s\n' "$(nice -n 19 sha256sum "$f" | cut -d' ' -f1)" "$(stat -c %s "$f")" "$f"; done; }
 token_of() { sha256sum <<<"$1" | cut -c1-16; }
 
-health() {
-  local port
-  for port in 8768 8765; do
-    "$PY" -P -c '
+health_ok() {  # port -> 0 only for HTTP 200, HEALTHY, workers healthy, signals_only
+  "$PY" -P -c '
 import json, sys
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, build_opener
@@ -66,9 +64,12 @@ try:
         c, h = r.status, json.load(r)
 except HTTPError as e:
     c, h = e.code, {}
-print(f"health {sys.argv[1]}: HTTP {c} {h.get(\"status\")} signals_only={h.get(\"signals_only\")} workers_healthy={(h.get(\"workers\") or {}).get(\"healthy\")}")
-' "$port" 2>/dev/null || say "health $port: unavailable"
-  done
+except Exception as e:
+    c, h = None, {"error": type(e).__name__}
+w = (h.get("workers") or {}).get("healthy")
+print(f"health {sys.argv[1]}: HTTP {c} {h.get(\"status\")} signals_only={h.get(\"signals_only\")} workers_healthy={w}")
+sys.exit(0 if c == 200 and h.get("status") == "HEALTHY" and h.get("signals_only") is True and w is True else 1)
+' "$1" 2>/dev/null
 }
 
 case ${1:-} in
@@ -80,16 +81,29 @@ case ${1:-} in
     say "free now: $(df -B1 --output=avail "$FS" | tail -1 | tr -d ' ') bytes" ;;
   remove)
     [[ ${2:-} == --approve && ${3:-} == REMOVE-8769-* && $# -eq 3 ]] || die "usage: $0 remove --approve REMOVE-8769-<token>"
-    prove_unused
-    m=$(manifest)
+    [[ -f $DB ]] || die "$DB not found; nothing removed"
+    m=$(manifest)                                  # slow (checksums): done FIRST
     [[ "REMOVE-8769-$(token_of "$m")" == "$3" ]] || die "files changed since the verified copy (manifest differs); nothing removed"
-    say "manifest unchanged since the verified copy; removing exactly:"
+    declare -A STAMP
+    while read -r _ _ _ f; do STAMP[$f]=$(stat -c '%s %Y' "$f"); done <<<"$m"
+    prove_unused                                   # LAST check before deletion
+    say "manifest identical to the verified copy and files unused; removing exactly:"
     printf '%s\n' "$m"
-    while read -r _ _ _ f; do rm -f -- "$f" && say "removed $f"; done <<<"$m"
+    removed=0 total=0
+    while read -r _ _ _ f; do
+      total=$((total + 1))
+      [[ $(stat -c '%s %Y' "$f" 2>/dev/null) == "${STAMP[$f]}" ]] || { say "changed during removal, kept: $f"; continue; }
+      rm -f -- "$f" && [[ ! -e $f ]] && { removed=$((removed + 1)); say "removed $f"; }
+    done <<<"$m"
+    if (( removed != total )); then say "REMOVAL_PARTIAL: removed $removed of $total files (the verified archive on your PC holds all of them)"; exit 6; fi
+    say "REMOVAL_COMPLETE: removed $removed verified file(s); the archive on your PC is the preserved copy"
+    say "--- post-removal checks (separate from the removal above)"
     free=$(df -B1 --output=avail "$FS" | tail -1 | tr -d ' ')
     say "free after: $free bytes ($(awk -v b="$free" 'BEGIN{printf "%.2f", b/1073741824}') GiB)"
-    health
-    (( free >= TARGET_BYTES )) && { say "STORAGE_OK: >= 11 GiB free"; exit 0; }
-    say "STORAGE_SHORT: below 11 GiB"; exit 4 ;;
+    bad=0
+    for port in 8768 8765; do health_ok "$port" || bad=1; done
+    if (( bad )); then say "POST_CHECK_FAILED: removal completed, but a health check above did not pass (removal is not the cause: only retired 8769 files were removed)"; exit 5; fi
+    (( free >= TARGET_BYTES )) || { say "STORAGE_SHORT: removal completed, 8768/8765 healthy, but free space is below 11 GiB"; exit 4; }
+    say "STORAGE_OK: >= 11 GiB free; 8768 and 8765 healthy"; exit 0 ;;
   *) die "usage: $0 prepare | remove --approve REMOVE-8769-<token>" ;;
 esac

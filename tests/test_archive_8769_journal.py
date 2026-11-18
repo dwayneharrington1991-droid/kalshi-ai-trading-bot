@@ -46,7 +46,10 @@ def test_prepare_then_remove_with_matching_token(tmp_path):
     assert _run(tmp_path, "remove", "--approve", "REMOVE-8769-0000000000000000").returncode == 2
     assert db.exists()
     done = _run(tmp_path, "remove", "--approve", token)
-    assert "removed" in done.stdout and not db.exists()
+    assert "REMOVAL_COMPLETE: removed 2" in done.stdout and not db.exists()
+    # No dashboards in the sandbox: removal succeeded but health checks fail -> distinct outcome.
+    assert done.returncode == 5 and "POST_CHECK_FAILED: removal completed" in done.stdout
+    assert done.stdout.index("REMOVAL_COMPLETE") < done.stdout.index("--- post-removal checks")
     assert not (tmp_path / (NAME + ".dashboard.lock")).exists()
     assert (tmp_path / "active-other.db").read_text() == "must stay"
 
@@ -66,3 +69,12 @@ def test_changed_or_open_journal_is_never_removed(tmp_path):
     finally:
         holder.kill()
     assert db.exists()
+
+
+def test_unused_check_runs_after_the_checksums_and_right_before_deletion():
+    code = SCRIPT.read_text()
+    remove = code[code.index("  remove)"):code.index("  *) die")]
+    assert remove.index("m=$(manifest)") < remove.index("prove_unused") < remove.index("rm -f --")
+    assert "STAMP[$f]" in remove and "changed during removal, kept" in remove
+    for marker in ("REMOVAL_PARTIAL", "REMOVAL_COMPLETE", "POST_CHECK_FAILED", "STORAGE_SHORT", "STORAGE_OK"):
+        assert marker in remove

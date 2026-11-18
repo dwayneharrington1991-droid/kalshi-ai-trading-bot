@@ -42,6 +42,10 @@ CANDLE_WINDOW = 1440
 CANDLE_SECONDS = 60
 TRADE_RECOVERY_LIMIT = 1000
 TRADE_RECOVERY_MAX_MINUTES = 5
+# A minute the trade endpoint CONFIRMED to contain no trades cannot be filled
+# (no bar is ever invented). Re-check it at most this often instead of on
+# every 5-second retry for up to 24 hours.
+CONFIRMED_EMPTY_RECHECK_SECONDS = 600
 
 
 def utcnow():
@@ -68,6 +72,8 @@ class PublicFeed:
         self.transport_diagnostics = []
         self.candle_cache = None
         self.candles_checked = None
+        self.confirmed_empty_minutes = {}       # minute start -> confirmation time
+        self.only_confirmed_empty_missing = False
         self.candle_diagnostics = {
             "status": "WARMING_UP", "last_attempt_at": None,
             "last_success_at": None, "error_type": None,
@@ -285,6 +291,12 @@ class PublicFeed:
         )
         return re.sub(r"\W+", "_", code).strip("_") or type(exc).__name__
 
+    def _candle_retry_seconds(self, retained):
+        """60 s when complete, or when every still-missing minute was confirmed
+        empty by the trade endpoint (retrying sooner cannot fill it); else 5 s."""
+        complete = retained >= 1440 and not (self.candle_cache or {}).get("error")
+        return 60 if complete or self.only_confirmed_empty_missing else 5
+
     def sampled_candles(self, now):
         if self.candle_pool is None:
             return self.candles(now)
@@ -306,7 +318,7 @@ class PublicFeed:
                 }
             self.candle_job = None
         retained = len((self.candle_cache or {}).get("candles", []))
-        retry_seconds = 60 if retained >= 1440 and not (self.candle_cache or {}).get("error") else 5
+        retry_seconds = self._candle_retry_seconds(retained)
         if self.candle_job is None and (
             self.candle_started is None
             or (now - self.candle_started).total_seconds() >= retry_seconds
@@ -444,7 +456,7 @@ class PublicFeed:
     def candles(self, now):
         self.candle_diagnostics["last_attempt_at"] = now.isoformat()
         retained = len((self.candle_cache or {}).get("candles", []))
-        retry_seconds = 60 if retained >= 1440 and not (self.candle_cache or {}).get("error") else 5
+        retry_seconds = self._candle_retry_seconds(retained)
         if (
             self.candles_checked is not None
             and (now - self.candles_checked).total_seconds() < retry_seconds
@@ -514,6 +526,7 @@ class PublicFeed:
                 else:
                     ranges.append([stamp, stamp + CANDLE_SECONDS])
             if not ranges:
+                self.only_confirmed_empty_missing = False
                 self.candle_diagnostics.update(
                     status="READY", last_success_at=utcnow().isoformat(), error_type=None,
                     retained_bars=len(merged), missing_bars=0, missing_intervals=[],
@@ -611,7 +624,17 @@ class PublicFeed:
             remaining = [t for t in range(cutoff - 86400, cutoff, CANDLE_SECONDS)
                          if t not in merged]
             trade_recovery = []
-            for stamp in remaining[:TRADE_RECOVERY_MAX_MINUTES]:
+            self.confirmed_empty_minutes = {
+                t: at for t, at in self.confirmed_empty_minutes.items() if t >= cutoff - 86400
+            }
+
+            def recently_confirmed_empty(stamp):
+                at = self.confirmed_empty_minutes.get(stamp)
+                return at is not None and 0 <= (now - at).total_seconds() < CONFIRMED_EMPTY_RECHECK_SECONDS
+
+            for stamp in [t for t in remaining if recently_confirmed_empty(t)][:TRADE_RECOVERY_MAX_MINUTES]:
+                trade_recovery.append({"start": stamp, "status": "CONFIRMED_NO_TRADES_RECHECK_LATER"})
+            for stamp in [t for t in remaining if not recently_confirmed_empty(t)][:TRADE_RECOVERY_MAX_MINUTES]:
                 try:
                     requests += 1
                     bar = self._candle_from_market_trades(stamp, cutoff)
@@ -629,6 +652,7 @@ class PublicFeed:
                     })
                     continue
                 if bar is None:
+                    self.confirmed_empty_minutes[stamp] = now
                     provider_attempts.append({
                         "provider": "Coinbase Advanced Trade market trades",
                         "range_start": stamp, "range_end": stamp + CANDLE_SECONDS,
@@ -658,6 +682,9 @@ class PublicFeed:
             remaining = [stamp for stamp in expected if stamp not in merged]
             ordered = [merged[t] for t in expected if t in merged]
             status = "READY" if not remaining else "INCOMPLETE"
+            self.only_confirmed_empty_missing = bool(remaining) and all(
+                recently_confirmed_empty(t) for t in remaining
+            )
             backoffs = self.retry_status([
                 "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles",
                 COINBASE_EXCHANGE_CANDLES,

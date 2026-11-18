@@ -133,7 +133,7 @@ def _listener(port):
     return int(found[0]) if found else None
 
 
-def _make_rehearsal(tmp_path, *, zombie=False):
+def _make_rehearsal(tmp_path, *, zombie=False, launcher=None):
     stage = tmp_path / "stage"
     subprocess.run(["git", "worktree", "add", "--detach", str(stage), "HEAD"], cwd=ROOT,
                    check=True, capture_output=True)
@@ -152,9 +152,20 @@ def _make_rehearsal(tmp_path, *, zombie=False):
 
     # zombie=True: this test process stays the parent and does not reap, so
     # the stopped service remains a zombie (Codex defect 1).
-    launch(stage, ["-m", "src.signals_display.server", "--mode", "public", "--host", "127.0.0.1",
-                   "--port", str(port), "--journal", str(journal), "--build-commit", commit[:7],
-                   "--disable-scheduled-learning"], orphan=not zombie)
+    server = [sys.executable, "-m", "src.signals_display.server", "--mode", "public", "--host", "127.0.0.1",
+              "--port", str(port), "--journal", str(journal), "--build-commit", commit[:7],
+              "--disable-scheduled-learning"]
+    if launcher:
+        # A living bash parent like Oracle's PID 475991 (orphaned to init).
+        cmd = " ".join(server)
+        script = {"oneshot": f"cd {stage} && nohup {cmd} >/dev/null 2>&1",
+                  "loop": f"cd {stage} && while true; do {cmd} >/dev/null 2>&1; done",
+                  "twice": f"cd {stage} && {cmd} >/dev/null 2>&1; {cmd} >/dev/null 2>&1"}[launcher]
+        procs.append(subprocess.Popen(["setsid", "bash", "-c", script], stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      start_new_session=True))
+    else:
+        launch(stage, server[1:], orphan=not zombie)
     launch(tmp_path, ["-m", "http.server", str(p1), "--bind", "127.0.0.1"])
     launch(ROOT, ["-m", "src.signals_display.server", "--mode", "public", "--host", "127.0.0.1",
                   "--port", str(p2), "--journal", str(tmp_path / "protected.db"), "--build-commit", "prot",
@@ -184,6 +195,7 @@ def _make_rehearsal(tmp_path, *, zombie=False):
         "RETIRE_HEALTH_PROBE_PORTS": str(p2), "RETIRE_STATE_ROOT": str(tmp_path / "state"),
         "RETIRE_DEPLOY_LOCK": str(tmp_path / "deploylock" / "deploy.lock"), "RETIRE_PYTHON": sys.executable,
         "RETIRE_CLIENT_SAMPLES": "2", "RETIRE_CLIENT_INTERVAL": "1", "RETIRE_READY_TIMEOUT": "90",
+        "RETIRE_RESPAWN_WATCH": "3",
         # Rehearsal-only: no market feed in the sandbox (readiness cannot pass);
         # orphans are adopted by the sandbox init; in the zombie rehearsal the
         # test process itself is the parent.
@@ -385,3 +397,52 @@ def test_rehearsal_fails_closed_on_usage_dependencies_and_unverifiable_checks(re
     blocked(result, "required tool missing")
 
     assert _listener(port) == original                                    # nothing was ever stopped
+
+
+
+@pytest.fixture(params=["oneshot", "loop", "twice"])
+def launcher_rehearsal(tmp_path, request):
+    info, cleanup = _make_rehearsal(tmp_path, launcher=request.param)
+    info["launcher"] = request.param
+    try:
+        yield info
+    finally:
+        subprocess.run(["pkill", "-f", str(info["stage"])], capture_output=True)
+        cleanup()
+
+
+@needs_tools
+def test_launcher_parent_one_shot_is_retired_and_loops_are_refused(launcher_rehearsal):
+    env, port, kind = launcher_rehearsal["env"], launcher_rehearsal["port"], launcher_rehearsal["launcher"]
+    original = _listener(port)
+    check = _run(env, "check")
+    if kind == "oneshot":
+        assert check.returncode == 0, check.stdout + check.stderr
+        assert "is a one-shot launcher" in check.stdout
+        assert "parent launcher" in check.stderr and "command (redacted)" in check.stderr
+        token = re.search(r"APPROVAL TOKEN: (\S+)", check.stdout).group(1)
+        retire = _run(env, "retire", "--approve", token)
+        assert retire.returncode == 0, retire.stdout + retire.stderr
+        for line in ("exited with the service", "post: no respawn", "RETIRED"):
+            assert line in retire.stdout, line
+        assert _listener(port) is None
+        state = Path(re.search(r"rollback (\S+) --approve", retire.stdout).group(1))
+        assert (state / "launcher-argv").exists() and oct((state / "launcher-argv").stat().st_mode & 0o777) == "0o600"
+        rollback = _run(env, "rollback", str(state), "--approve", "ROLLBACK-8769")
+        assert rollback.returncode == 0 and "ROLLBACK VERIFIED" in rollback.stdout, rollback.stdout
+    else:
+        assert check.returncode == 2, check.stdout
+        expected = {"loop": "loop/retry/supervision construct", "twice": "starts the server 2 times"}[kind]
+        assert expected in check.stdout, check.stdout
+        assert _run(env, "retire", "--approve", "RETIRE-8769-PID1-START1").returncode == 2
+        assert _listener(port) == original                     # nothing was stopped
+
+
+def test_launcher_rules_cannot_be_bypassed_statically():
+    code = SCRIPT.read_text()
+    reason = code[code.index("launcher_reason() {"):code.index("\n}\n", code.index("launcher_reason() {"))]
+    for rule in ("[[ $gp == 1 ]]", "${argv[1]} == -c", "while|until|for", "count == 1",
+                 "runs further commands after the server", "not only $TARGET_PID"):
+        assert rule in reason, rule
+    retire = code[code.index("  retire)"):code.index("  rollback)")]
+    assert "still alive after the service exited" in retire and "started listening on $PORT again" in retire

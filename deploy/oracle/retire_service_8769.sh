@@ -42,6 +42,7 @@ PYTHON=${RETIRE_PYTHON:-/home/opc/kalshi-ai-trading-bot/.venv/bin/python}
 CLIENT_SAMPLES=${RETIRE_CLIENT_SAMPLES:-3}
 CLIENT_INTERVAL=${RETIRE_CLIENT_INTERVAL:-10}
 STOP_WAIT=${RETIRE_STOP_WAIT:-30}
+RESPAWN_WATCH=${RETIRE_RESPAWN_WATCH:-15}
 READY_TIMEOUT=${RETIRE_READY_TIMEOUT:-300}
 REQUIRE_READY=${RETIRE_REQUIRE_READY:-1}
 # Accepted direct parents: an orphaned nohup process is adopted by init or a
@@ -199,16 +200,65 @@ gate_listener() {
   gate_ok "listener PID $TARGET_PID start=$TARGET_START cwd=$EXPECT_CWD commit=${TARGET_HEAD:0:12} journal=$JOURNAL_NAME signals-only"
 }
 
+PARENT_LAUNCHER="" PARENT_LAUNCHER_START=""
+# A living parent is accepted ONLY as a strictly one-shot launcher:
+#   * `bash|sh|dash -c <one command string>`, itself orphaned (its PPID is 1);
+#   * its ONLY child is the service;
+#   * the command launches src.signals_display.server on exactly this port;
+#   * the command has no loop/retry construct and runs no other script.
+# Anything else may be a restart supervisor and fails closed. The launcher's
+# full command is printed (credential-like text redacted) for the record.
+launcher_reason() {  # pid -> prints a refusal reason, or nothing if one-shot
+  local pp=$1 comm gp kids script
+  local -a argv=()
+  comm=$(cat "/proc/$pp/comm") || { echo "cannot read parent $pp"; return; }
+  [[ $comm =~ ^(bash|sh|dash)$ ]] || { echo "parent $pp is '$comm', not a shell launcher"; return; }
+  gp=$(awk '/^PPid:/{print $2}' "/proc/$pp/status") || { echo "cannot read parent's parent"; return; }
+  [[ $gp == 1 ]] || { echo "launcher $pp still has a living parent $gp (session or supervisor)"; return; }
+  mapfile -d '' -t argv <"/proc/$pp/cmdline" || { echo "cannot read launcher command"; return; }
+  (( ${#argv[@]} == 3 )) && [[ ${argv[1]} == -c ]] || { echo "launcher is not '<shell> -c <command>' (${#argv[@]} arguments)"; return; }
+  script=${argv[2]}
+  say >&2 "parent launcher $pp command (redacted): $(sed -E 's/((secret|token|password|passwd|api[_-]?key|private[_-]?key|authorization)[^=:]*[=:])[^[:space:]]*/\1[REDACTED]/Ig' <<<"$script" | head -c 1500)"
+  if grep -qE '(^|[^[:alnum:]_])(while|until|for|select|trap|sleep|watch|restart|retry|respawn|loop|wait|timeout|supervise|systemd-run|setsid)([^[:alnum:]_]|$)' <<<"$script"; then
+    echo "launcher command contains a loop/retry/supervision construct"; return
+  fi
+  if grep -qE '\.sh([^[:alnum:]_]|$)|(^|[;&|[:space:]])(bash|sh|dash|source|\.)[[:space:]]' <<<"$script"; then
+    echo "launcher command runs another script or shell"; return
+  fi
+  [[ $script == *src.signals_display.server* && $script =~ $PORT_RE ]] ||
+    { echo "launcher command does not launch src.signals_display.server on port $PORT"; return; }
+  # The server launch must appear exactly once and be the LAST command: after
+  # it only redirections may follow, so nothing can run once the server exits.
+  local count tail
+  count=$(grep -o 'signals_display\.server' <<<"$script" | wc -l)
+  (( count == 1 )) || { echo "launcher starts the server $count times"; return; }
+  tail=${script#*signals_display.server}
+  tail=$(sed -E 's/[0-9]*>&[0-9]+//g; s/[0-9]*>>?[[:space:]]*[^[:space:];&|]+//g; s/<[[:space:]]*[^[:space:];&|]+//g' <<<"$tail")
+  [[ $tail != *[\;\&\|]* && $(wc -l <<<"$tail") -le 1 ]] ||
+    { echo "launcher runs further commands after the server (would restart or continue after it exits)"; return; }
+  kids=$(ps -o pid= --ppid "$pp" 2>/dev/null | tr -d ' ' | grep -v '^$' || true)
+  [[ $kids == "$TARGET_PID" ]] || { echo "launcher children are '$(tr '\n' ' ' <<<"$kids")', not only $TARGET_PID"; return; }
+}
+
 gate_parent() {
-  local pp comm
+  local pp comm reason
   pp=$(awk '/^PPid:/{print $2}' "/proc/$TARGET_PID/status") || { gate_fail "parent: cannot read status"; return; }
   [[ $pp =~ ^[0-9]+$ ]] || { gate_fail "parent: unreadable parent PID"; return; }
   comm=$(cat "/proc/$pp/comm") || { gate_fail "parent: cannot read parent $pp"; return; }
   if [[ $pp == 1 ]] || grep -qwF -- "$comm" <<<"$ALLOWED_PARENTS"; then
+    PARENT_LAUNCHER="" PARENT_LAUNCHER_START=""
     gate_ok "parent $pp ($comm): no restart loop above the service"
-  else
-    gate_fail "parent: living parent $pp ($comm) could be a restart loop; inspect it manually"
+    return
   fi
+  reason=$(launcher_reason "$pp")
+  if [[ -n $reason ]]; then
+    PARENT_LAUNCHER="" PARENT_LAUNCHER_START=""
+    gate_fail "parent: living parent $pp ($comm) could be a restart loop: $reason"
+    return
+  fi
+  PARENT_LAUNCHER=$pp
+  PARENT_LAUNCHER_START=$(starttime "$pp") || { gate_fail "parent: cannot read launcher start time"; return; }
+  gate_ok "parent $pp ($comm) is a one-shot launcher (orphaned, single child, no loop); it must exit with the service"
 }
 
 gate_clients() {  # $1 = samples
@@ -254,6 +304,8 @@ gate_process_refs() {  # any other process naming the port, journal or directory
   for p in /proc/[0-9]*; do
     p=${p#/proc/}
     [[ $p == "$TARGET_PID" || $p == "$$" || $p == "$BASHPID" ]] && continue
+    # The verified one-shot launcher (same PID AND start time) is the only exemption.
+    [[ -n $PARENT_LAUNCHER && $p == "$PARENT_LAUNCHER" && $(starttime "$p" 2>/dev/null) == "$PARENT_LAUNCHER_START" ]] && continue
     if ! args=$(tr '\0' ' ' 2>/dev/null <"/proc/$p/cmdline"); then
       [[ -d /proc/$p ]] && unreadable+=("$p")            # exists but unreadable: cannot verify
       continue                                            # vanished meanwhile: benign
@@ -416,6 +468,10 @@ case $cmd in
     identity "$TARGET_PID" >"$S/identity" || die "capture failed: identity"
     stat -c '%n %i %s %Y' -- "${JOURNAL_FILES[@]}" >"$S/journal-files" || die "capture failed: journal files"
     printf '%s\n' "$PROTECTED_BEFORE" >"$S/protected-before" || die "capture failed: protected snapshot"
+    if [[ -n $PARENT_LAUNCHER ]]; then
+      cp -- "/proc/$PARENT_LAUNCHER/cmdline" "$S/launcher-argv" || die "capture failed: launcher argv"
+      printf '%s|%s\n' "$PARENT_LAUNCHER" "$PARENT_LAUNCHER_START" >"$S/launcher-identity" || die "capture failed: launcher identity"
+    fi
     chmod 600 "$S"/* || die "capture failed: permissions"
     validate_state "$S" || die "captured state failed validation; nothing was stopped (state kept in $S)"
     # /proc files report size 0, so compare the streamed contents, not the files.
@@ -427,7 +483,7 @@ case $cmd in
     FAILURES=()
     pid_now=$(listener_pids "$PORT") || gate_fail "listener: ss failed"
     [[ ${pid_now:-} == "$TARGET_PID" ]] && alive_same "$TARGET_PID" "$TARGET_START" || gate_fail "listener identity changed"
-    gate_supervisors; gate_journal_users; gate_process_refs; gate_parent
+    gate_parent; gate_supervisors; gate_journal_users; gate_process_refs
     [[ $(protected_snapshot) == "$PROTECTED_BEFORE" ]] || gate_fail "protected services changed before the stop"
     for p in "${HEALTH_PORTS[@]}"; do healthy "$p" || gate_fail "protected $p not healthy before the stop"; done
     gate_clients 1                                           # last check before the signal
@@ -446,6 +502,14 @@ case $cmd in
     fi
     say "process exited$( [[ $(proc_stat "$TARGET_PID" 2>/dev/null) == Z* ]] && echo ' (zombie awaiting its parent: treated as exited)')"
     rc=0
+    if [[ -n $PARENT_LAUNCHER ]]; then
+      for ((i=0; i<20; i++)); do alive_same "$PARENT_LAUNCHER" "$PARENT_LAUNCHER_START" || break; sleep 0.5; done
+      if alive_same "$PARENT_LAUNCHER" "$PARENT_LAUNCHER_START"; then
+        say "POST FAIL: launcher $PARENT_LAUNCHER is still alive after the service exited (possible restart loop); NOT killed"; rc=4
+      else
+        say "post: one-shot launcher $PARENT_LAUNCHER exited with the service"
+      fi
+    fi
     # The listener and journal handles must be released (bounded wait).
     for ((i=0; i<20; i++)); do
       l=$(listener_pids "$PORT") || { l=SS_FAILED; }
@@ -454,6 +518,13 @@ case $cmd in
       sleep 0.5
     done
     [[ -z $l ]] && say "post: port $PORT free" || { say "POST FAIL: port $PORT listener: $l"; rc=4; }
+    # Respawn watch: nothing may start listening on the port again.
+    for ((i=0; i<RESPAWN_WATCH; i++)); do
+      sleep 1
+      l2=$(listener_pids "$PORT") || l2=SS_FAILED
+      [[ -z $l2 ]] || { say "POST FAIL: a process ($l2) started listening on $PORT again (respawn); NOT killed"; rc=4; break; }
+    done
+    (( rc == 0 )) && say "post: no respawn on $PORT for ${RESPAWN_WATCH}s"
     [[ -z $h ]] && say "post: journal handles released" || { say "POST FAIL: journal still held/unverifiable: $h"; rc=4; }
     after=$(protected_snapshot)
     printf '%s\n' "$after" >"$S/protected-after" && chmod 600 "$S/protected-after"

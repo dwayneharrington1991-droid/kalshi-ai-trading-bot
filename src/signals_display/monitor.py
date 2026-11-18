@@ -6,7 +6,9 @@ from __future__ import annotations
 from .storage import connect as storage_connect
 
 from dataclasses import asdict
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import threading
 import json
 import math
 import re
@@ -1434,6 +1436,8 @@ class Journal:
         self.path = str(path)
         self._last_candle_batch = None
         self._last_learning_sample = {}
+        self._strategy_cache = None
+        self._strategy_cache_lock = threading.Lock()
         try:
             existing_size = Path(self.path).stat().st_size
         except FileNotFoundError:
@@ -2531,8 +2535,35 @@ class Journal:
                 )
 
     def strategy_performance(self, asof=None):
+        """Paper-strategy summary, recomputed only when its inputs change.
+
+        strategy_paper.performance rereads and re-aggregates every paper signal
+        ever recorded; it ran on every prediction cycle and every /api/state
+        request, so its cost grew without bound with the journal. Both paper
+        tables are insert-only (UPDATE/DELETE abort via triggers) and
+        forecast_outcomes is insert-only, so the result is fully determined by
+        the newest row of each paper table, the official-outcome count and the
+        calendar day of ``asof`` (used only for today's P&L). A cache hit returns
+        an independent copy of exactly the value a full recomputation returns.
+        """
+        day = (timestamp(asof) if isinstance(asof, str) else asof or utcnow()).date()
         with self.read() as db:
-            return strategy_paper.performance(db, asof=asof)
+            key = (
+                db.execute("SELECT MAX(rowid) FROM strategy_paper_signals").fetchone()[0],
+                db.execute("SELECT MAX(rowid) FROM strategy_paper_outcomes").fetchone()[0],
+                db.execute(
+                    "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
+                ).fetchone()[0],
+                day,
+            )
+            with self._strategy_cache_lock:
+                cached = self._strategy_cache
+            if cached is not None and cached[0] == key:
+                return deepcopy(cached[1])
+            value = strategy_paper.performance(db, asof=asof)
+        with self._strategy_cache_lock:
+            self._strategy_cache = (key, deepcopy(value))
+        return value
 
     def settle(self, ticker, yes_result, mode, observed_at=None):
         if yes_result not in {"yes", "no"}:

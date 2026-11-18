@@ -125,3 +125,22 @@ def test_latency_collector_measures_per_minute_ages_without_changing_the_journal
     assert "readiness progress reports in job log: 1" in out
     assert "LATENCY_EVIDENCE_COMPLETE" in out
     assert (tmp_path / "j.db").read_bytes() == before
+
+
+PROFILE = ROOT / "deploy/oracle/collect_process_profile.sh"
+
+
+def test_process_profiler_is_read_only_and_never_queries_production_ports():
+    code = "\n".join(l for l in PROFILE.read_text().splitlines() if not l.lstrip().startswith("#"))
+    for forbidden in (r"\bkill\b", r"\bflock\b", r"/environ", r"\brm\b", r"\bmv\b", r"py-spy",
+                      r"ptrace", r"\bgdb\b", r"pip install", r"8765", r"8767", r"systemctl"):
+        assert not re.search(forbidden, code), forbidden
+    assert "PREVIEW_PORT=${PREVIEW_PROBE_PORT:-8768}" in code
+    # Only a minimal identity is printed, never full argv.
+    assert "json.dumps(who" in code and "argv)" not in code.replace("argv) ", "")
+
+
+def test_process_profiler_rejects_bad_window():
+    for bad in ("5", "301", "abc"):
+        result = subprocess.run(["bash", str(PROFILE), bad], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 2 and "COLLECTED_AT" not in result.stdout

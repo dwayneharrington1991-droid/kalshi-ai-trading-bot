@@ -44,7 +44,7 @@ from .live_model import LiveEstimator
 from .learning import load_artifact, predict as learned_predict
 from .model import Display, timestamp
 from .monitor import Journal, PublicFeed, ReplayFeed, active_market, analyze, utcnow
-from .runtime import CachedReport, LatestPayload, RuntimeMeter
+from .runtime import CachedReport, LatestPayload, RuntimeMeter, background_pool, background_thread_priority
 from .intelligence import MarketIntelligence
 from .comparison import model_market
 from .alerts import MonitoringAlerts, risk_alerts
@@ -368,15 +368,11 @@ class Monitor:
         }
         self.worker_threads = {}
         self.index_maintenance = {"status": "PENDING"}
-        self.maintenance_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="settlement-results"
-        )
+        self.maintenance_pool = background_pool(1, "settlement-results")
         self.maintenance_job = None
         self.maintenance_error = None
         self.readiness_job = None
-        self.readiness_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="learning-readiness"
-        )
+        self.readiness_pool = background_pool(1, "learning-readiness")
         self.engine_report = CachedReport(
             self.prediction_performance, interval=30, name="prediction-performance"
         )
@@ -1717,6 +1713,37 @@ class Monitor:
                     }
         self.manual.guidance(self.manual_quotes, now, state)
 
+    def readiness_view(self):
+        """The /readyz inputs of snapshot(), without the dashboard extras.
+
+        /readyz used to build a full dashboard snapshot (account view, manual
+        guidance, paper-strategy summary, edge scanner, ...) only to read three
+        values; under readiness probing and open dashboards that work competed
+        with the market-data path on a single CPU. The decision here applies the
+        SAME rules as snapshot(): stale state, the 0..5 s snapshot age and
+        unexpired-contract check, and diagnose_market's 5-second quote and
+        reference freshness, using one clock. Nothing is relaxed.
+        """
+        with self.lock:
+            state = dict(self.state)
+            last_tick = self.last_tick
+        clock = (
+            utcnow()
+            if state.get("mode") == "PUBLIC MARKET DATA"
+            else timestamp(state["now"]) + (utcnow() - last_tick)
+        )
+        stale = bool(state.get("stale", True))
+        market = state.get("market")
+        if market:
+            age = (clock - timestamp(market["observed_at"])).total_seconds()
+            remaining = max(0, (timestamp(market["closes_at"]) - clock).total_seconds())
+            if not 0 <= age <= 5 or not remaining:
+                stale = True
+        health = diagnose_market(state, clock)
+        if not health["contract_quotes_fresh"] or not health["reference_fresh"]:
+            stale = True
+        return {"stale": stale, "market": market, "market_health": health}
+
     def snapshot(self):
         with self.lock:
             state = dict(self.state)
@@ -2298,7 +2325,7 @@ def make_handler(monitor):
                 ).encode()
                 content_type = "application/json"
             elif route == "/readyz":
-                state = monitor.snapshot()
+                state = monitor.readiness_view()
                 health = state.get("market_health", {})
                 ready = bool(
                     not state.get("stale", True)
@@ -2793,6 +2820,7 @@ def main():
                 monitor.worker_event("prediction", "stopped")
 
     def maintain_indexes():
+        background_thread_priority()
         try:
             result = journal.ensure_performance_indexes()
             monitor.index_maintenance = result

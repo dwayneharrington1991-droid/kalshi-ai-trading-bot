@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
+import os
 import threading
 from time import monotonic, perf_counter
 from time import process_time
@@ -13,13 +14,39 @@ from pathlib import Path
 from collections import deque
 
 
+# Background analytics (cached reports, learning readiness, settlement and
+# index maintenance) must never compete on equal terms with the market-data
+# collector and prediction threads: on a single shared CPU that competition
+# delayed published quotes past the 5-second freshness limit. Linux nice values
+# are per thread, so only these worker threads are lowered; the process, the
+# market threads and every other process are unaffected. Never raises priority.
+BACKGROUND_NICE = 10
+
+
+def background_thread_priority():
+    """Lower the calling OS thread's CPU priority to BACKGROUND_NICE (best effort)."""
+    try:
+        tid = threading.get_native_id()
+        if os.getpriority(os.PRIO_PROCESS, tid) < BACKGROUND_NICE:
+            os.setpriority(os.PRIO_PROCESS, tid, BACKGROUND_NICE)
+    except (AttributeError, OSError):
+        pass
+
+
+def background_pool(max_workers, name):
+    """ThreadPoolExecutor whose worker threads run at background priority."""
+    return ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix=name, initializer=background_thread_priority
+    )
+
+
 class CachedReport:
     """One calculation at a time; HTTP requests only read the last result."""
 
     def __init__(self, calculate, *, interval=30, name="dashboard-report"):
         self.calculate = calculate
         self.interval = interval
-        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
+        self.pool = background_pool(1, name)
         self.lock = threading.Lock()
         self.future = None
         self.started = None

@@ -74,7 +74,10 @@ def test_job_status_sha_is_compared_with_requested_sha_by_windows_client():
     """A resumed job cannot be reported as the requested build by assumption."""
     client = (ROOT / "deploy/windows/Deploy-Preview8768.ps1").read_text()
     assert "DEPLOY_JOB_SHA" in client
-    assert "job commit" in client.lower() or "job sha" in client.lower()
+    assert "[string]::Equals($jobSha, $Sha, [System.StringComparison]::Ordinal)" in client
+    assert "Assert-JobSha $f 'start'" in client
+    assert "Assert-JobSha $f 'status'" in client
+    assert "Assert-JobSha $f 'rollback status'" in client
 
 
 def test_disconnect_and_identity_regressions_remain_in_the_suite():

@@ -213,10 +213,13 @@ def _eligible_bar_count(item, opened):
     """Closed one-minute bars in the 24 h window that were received by the opening."""
     try:
         received = timestamp(item["received_at"])
+        # Same arithmetic as before; the per-bar constants are computed once.
+        limit = min(opened.timestamp(), received.timestamp())
+        floor = opened.timestamp() - 86520
         return sum(
             1 for bar in item.get("candles", [])
-            if int(bar["start"]) + 60 <= min(opened.timestamp(), received.timestamp())
-            and int(bar["start"]) >= opened.timestamp() - 86520
+            if int(bar["start"]) + 60 <= limit
+            and int(bar["start"]) >= floor
         )
     except (KeyError, ValueError, TypeError, AttributeError):
         return -1
@@ -837,12 +840,13 @@ class Monitor:
                     def eligible_count(item):
                         try:
                             received = timestamp(item["received_at"])
+                            # Same arithmetic; per-bar constants computed once.
+                            limit = min(opened.timestamp(), received.timestamp())
+                            floor = opened.timestamp() - 86520
                             return sum(
                                 1 for bar in item.get("candles", [])
-                                if int(bar["start"]) + 60 <= min(
-                                    opened.timestamp(), received.timestamp()
-                                )
-                                and int(bar["start"]) >= opened.timestamp() - 86520
+                                if int(bar["start"]) + 60 <= limit
+                                and int(bar["start"]) >= floor
                             )
                         except (KeyError, ValueError, TypeError, AttributeError):
                             return -1

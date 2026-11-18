@@ -2,10 +2,11 @@
 from datetime import datetime, timezone
 import math
 
+from . import candle_memo
 from .model import number, timestamp
 
 
-def candle_context(data, now):
+def _candle_context_uncached(data, now):
     try:
         if not data:
             raise ValueError("MISSING_CANDLES: one-minute BTC candles not supplied")
@@ -55,3 +56,36 @@ def candle_context(data, now):
         }, None
     except (KeyError, ValueError, TypeError, OverflowError) as exc:
         return {}, str(exc)
+
+
+def candle_context(data, now):
+    """candle_context with exact reuse while the candle content and the set of
+    closed bars are unchanged (see candle_memo for the correctness contract).
+
+    For minute-aligned bars, "start + 60 > now" excludes exactly the bars whose
+    (start + 60) / 60 exceeds now // 60, so (content, now // 60) fixes every
+    included bar. A success implies every bar is aligned (the original checks
+    alignment before skipping forming bars). The receipt-age check (first) and
+    the latest-closed-bar age check are re-evaluated on every call.
+    """
+    try:
+        fp = candle_memo.fingerprint(data) if data else None
+        received = timestamp(data["received_at"]) if fp is not None else None
+        stamp = now.timestamp()
+    except Exception:
+        fp = None
+    if fp is None or not 0 <= (now - received).total_seconds() <= 150:
+        candle_memo.bypass()
+        return _candle_context_uncached(data, now)
+    key = ("candle_context", fp, stamp // 60)
+    hit = candle_memo.get(key)
+    if hit is not None:
+        value, last_close = hit
+        if not stamp - last_close > 150:
+            return candle_memo.copy(value), None
+        return _candle_context_uncached(data, now)
+    value, error = _candle_context_uncached(data, now)
+    if error is None:
+        last_close = datetime.fromisoformat(value["last_closed_at"]).timestamp()
+        candle_memo.put(key, (candle_memo.copy(value), last_close))
+    return value, error

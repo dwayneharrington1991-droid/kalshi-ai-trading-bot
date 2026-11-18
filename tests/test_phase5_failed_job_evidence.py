@@ -144,3 +144,22 @@ def test_process_profiler_rejects_bad_window():
     for bad in ("5", "301", "abc"):
         result = subprocess.run(["bash", str(PROFILE), bad], capture_output=True, text=True, timeout=30)
         assert result.returncode == 2 and "COLLECTED_AT" not in result.stdout
+
+
+INVENTORY = ROOT / "deploy/oracle/collect_service_inventory.sh"
+
+
+def test_service_inventory_is_read_only_and_sends_no_http_requests():
+    code = "\n".join(l for l in INVENTORY.read_text().splitlines() if not l.lstrip().startswith("#"))
+    for forbidden in (r"\bkill\b", r"pkill", r"\bflock\b", r"/environ", r"\brm\b", r"\bmv\b",
+                      r"\bcurl\b", r"\bwget\b", r"urlopen", r"http://", r"systemctl\s+(start|stop|restart|enable|disable|kill)",
+                      r"crontab\s+-[er]", r"\bsqlite3\b", r"git\s+-C\s+\S+\s+(checkout|reset|pull|fetch|clean|stash|commit)"):
+        assert not re.search(forbidden, code), forbidden
+    # Argument VALUES are never printed except module/mode/port/journal file name.
+    assert 'flag names: ${flags[*]}' in code and "basename \"${journal:-none}\"" in code
+
+
+def test_service_inventory_rejects_bad_window():
+    for bad in ("5", "301", "x"):
+        result = subprocess.run(["bash", str(INVENTORY), bad], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 2 and "COLLECTED_AT" not in result.stdout

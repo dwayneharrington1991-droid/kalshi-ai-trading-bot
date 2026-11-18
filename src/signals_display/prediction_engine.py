@@ -631,6 +631,43 @@ def aggregate(bars, minutes):
 
 
 def context24(data, now):
+    """context24 with exact reuse while the candle content and the window
+    cutoff are unchanged (see candle_memo for the correctness contract).
+
+    After its two clock checks, the original depends on ``now`` only through
+    ``cutoff`` (the latest complete minute received by ``now``). Both checks and
+    the cutoff are recomputed here exactly as in the original on every call;
+    only READY results are reused, keyed by (candle content, cutoff).
+    """
+    from . import candle_memo
+
+    try:
+        fp = candle_memo.fingerprint(data)
+        received = timestamp(data["received_at"]) if fp is not None else None
+        stamp = now.timestamp()
+        starts = [int(row[0]) for row in fp[2]] if fp is not None else None
+    except Exception:
+        fp = None
+    if fp is None or not 0 <= (now - received).total_seconds() <= 150:
+        candle_memo.bypass()
+        return _context24_uncached(data, now)
+    limit = min(stamp, received.timestamp())
+    available = [start + 60 for start in starts if start + 60 <= limit]
+    cutoff = max(available) if available else int(stamp) // 60 * 60
+    if not 0 <= stamp - cutoff <= 120:
+        candle_memo.bypass()
+        return _context24_uncached(data, now)
+    key = ("context24", fp, cutoff)
+    hit = candle_memo.get(key)
+    if hit is not None:
+        return candle_memo.copy(hit)
+    value = _context24_uncached(data, now)
+    if value.get("status") == "READY":
+        candle_memo.put(key, candle_memo.copy(value))
+    return value
+
+
+def _context24_uncached(data, now):
     result = {
         "status": "INSUFFICIENT DATA",
         "reason": "Need 1440 contiguous closed one-minute candles",

@@ -30,7 +30,9 @@ LIMITS = {
     "min_mem_available_mib": 768,
     "min_swap_free_mib": 1024,
     "max_swap_pages_per_s": 200,       # no deployment during swap thrashing
-    "min_disk_free_mib": 3072,
+    # Same floor as switch_preview_8768.sh (MIN_FREE_BYTES = 10 GiB), so a
+    # storage shortage blocks here, before anything changes, not mid-install.
+    "min_disk_free_mib": 10240,
     "opening_window": True,            # block 90 s before .. 150 s after each quarter hour
     "cpu_sample_s": 20,
     "swap_sample_s": 10,

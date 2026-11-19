@@ -55,9 +55,10 @@ def probe_live(port):
             return None, {}
     hc, h = get("/healthz")
     rc, r = get("/readyz")
-    return {"health": h.get("status") if hc == 200 else None, "ready": r.get("status") if rc == 200 else None,
+    return {"health": h.get("status") if hc in (200, 503) else None,
+            "ready": r.get("status") if rc in (200, 503) else None,
             "signals_only": h.get("signals_only") is True, "workers_healthy": (h.get("workers") or {}).get("healthy"),
-            "quote_age_s": None}
+            "quote_age_s": None, "model_file_sha": h.get("model_file_sha")}
 
 
 def probe_resources():
@@ -172,6 +173,23 @@ def run(journal, state_dir, commit, live_artifact, *, asof, min_new=lc.MIN_NEW_S
     return out
 
 
+def build_guarded(args):
+    """Guarded activator. Refuses anything but a rehearsal restart config: the production service
+    has no verified restart path here, so production stays on the disabled activator."""
+    from . import guarded_activator as ga
+    from . import activation_rehearsal as rh
+    if args.restart_config is None or not args.restart_config.is_file():
+        return None
+    cfg = json.loads(args.restart_config.read_text())
+    if cfg.get("kind") != "rehearsal" or int(cfg.get("port", 0)) == int(args.port):
+        return None
+    restarter = rh.ProcessRestarter(int(cfg["port"]), cfg["pidfile"], cfg["log"])
+    config = {"restart": "rehearsal-process", "port": int(cfg["port"])}
+    return ga.GuardedActivator(args.state_dir, authorization_file=args.state_dir / "promotion-authorization.txt",
+                               config=config, restarter=restarter,
+                               probe=lambda: probe_live(int(cfg["port"])))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--journal", type=Path, required=True)
@@ -180,12 +198,16 @@ def main(argv=None):
     parser.add_argument("--live-artifact", type=Path, required=True)
     parser.add_argument("--min-new", type=int, default=lc.MIN_NEW_SETTLED)
     parser.add_argument("--port", type=int, default=8768)
-    parser.add_argument("--activator", choices=["disabled"], default="disabled")
+    parser.add_argument("--activator", choices=["disabled", "guarded"], default="disabled")
+    parser.add_argument("--restart-config", type=Path, help="JSON; only kind=rehearsal is accepted")
     args = parser.parse_args(argv)
+    activator = None
+    if args.activator == "guarded":
+        activator = build_guarded(args)
     now = datetime.now(timezone.utc)
     since = (now.minute % 15) * 60 + now.second
     out = run(args.journal, args.state_dir, args.commit, args.live_artifact, asof=now, min_new=args.min_new,
-              port=args.port, notify=make_notifier(), seconds_to_opening=900 - since)
+              port=args.port, notify=make_notifier(), seconds_to_opening=900 - since, activator=activator)
     print(json.dumps({k: out[k] for k in ("retrain_decision", "promotion", "live_model", "activation")}, default=str))
 
 

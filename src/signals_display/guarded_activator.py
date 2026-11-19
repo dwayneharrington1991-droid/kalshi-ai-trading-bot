@@ -1,23 +1,26 @@
-"""Guarded model activator for the promotion controller. OFF unless explicitly authorized.
+"""Guarded model activator. OFF unless explicitly authorized AND a restart + probe are configured.
 
-It is the only component that may change the live opening model, and it only does so when ALL hold:
+Activation is a pointer swap plus a restart, verified end to end:
 
-  1 an explicit authorization file exists whose content is exactly
-    "AUTHORIZE-AUTO-PROMOTION:<activator checksum>" (written by you, never by code)
-  2 the candidate artifact matches its checksum, is deployable, and was QUALIFIED
-    (the controller has already verified this; re-checked here)
-  3 the live model can be identified, and the live probe is HEALTHY, READY, signals-only
-  4 the switch is outside a protected 15-minute opening window
-  5 the switch is atomic: the active pointer is replaced with os.replace, never edited in place
-  6 the restart is performed by an injected, verified restarter (the guarded deploy path);
-    without one, activation refuses (RESTART_PATH_NOT_CONFIGURED)
-  7 after restart, health is verified; if not, the previous model is restored and verified
+  1 authorization: state_dir/promotion-authorization.txt must contain exactly
+    "AUTHORIZE-AUTO-PROMOTION:<activator_checksum>" where the checksum covers the
+    restart configuration. Code never writes this file.
+  2 the candidate is verified: checksum, deployable artifact (validate_artifact).
+  3 the window guard: never switch inside a protected 15-minute opening window.
+  4 the live service is HEALTHY, READY and signals-only before switching.
+  5 the pointer (live_model_pointer.json) is replaced ATOMICALLY (write temp, os.replace).
+  6 the service is restarted with the new artifact, and the probe must report the
+     SAME model file sha256 the activator wrote. Health alone is not enough.
+  7 on any failure the previous pointer is restored, the service is restarted with
+     the previous artifact, and that model is verified the same way.
 
-Nothing here places orders, touches the journal, or edits the retired services.
+Rollback uses the same verified path. Nothing here places orders, touches the journal,
+or edits any service other than the one whose restart is configured.
 """
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,87 +30,119 @@ from . import promotion as pr
 
 AUTH_PREFIX = "AUTHORIZE-AUTO-PROMOTION:"
 POINTER = "live_model_pointer.json"
+WAIT_SECONDS = 20.0
+WAIT_STEP = 0.25
 
 
 def activator_checksum(config):
-    """Identity of the activator configuration the authorization refers to."""
     return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
 
 
+def file_sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 class GuardedActivator(pr.Activator):
-    def __init__(self, state_dir, live_pointer, *, authorization_file, config, restarter=None, probe=None,
-                 seconds_to_opening=lambda: 900, window_safe=lc.opening_window_safe, now=None):
+    def __init__(self, state_dir, *, authorization_file, config, restarter=None, probe=None,
+                 window_safe=lc.opening_window_safe, clock=lambda: datetime.now(timezone.utc),
+                 sleep=time.sleep):
         self.state_dir = Path(state_dir)
-        self.live_pointer = Path(live_pointer)
+        self.pointer = self.state_dir / POINTER
         self.authorization_file = Path(authorization_file)
         self.config = config
-        self.restarter = restarter            # callable(artifact_path) -> bool, the guarded deploy path
-        self.probe = probe                    # callable() -> health sample dict of the live service
+        self.restarter = restarter            # callable(artifact_path) -> bool
+        self.probe = probe                    # callable() -> dict with health fields and model_file_sha
         self.window_safe = window_safe
-        self.enabled = self._authorized()
+        self.clock = clock
+        self.sleep = sleep
+        self.enabled = bool(self._authorized() and restarter is not None and probe is not None)
 
     def _authorized(self):
         try:
-            text = self.authorization_file.read_text().strip()
+            return self.authorization_file.read_text().strip() == AUTH_PREFIX + activator_checksum(self.config)
         except OSError:
             return False
-        return text == AUTH_PREFIX + activator_checksum(self.config)
 
-    def current(self):
+    # --- pointer -----------------------------------------------------------------------------
+    def _read_pointer(self):
         try:
-            return json.loads(self.live_pointer.read_text())["checksum"]
-        except (OSError, ValueError, KeyError):
+            return json.loads(self.pointer.read_text())
+        except (OSError, ValueError):
             return None
 
-    def _verified_artifact(self, path, checksum):
-        body = lc.load_verified(path)
-        if body.get("checksum") != checksum:
-            raise ValueError("artifact checksum does not match")
-        opening_models.validate_artifact(body["artifact"])
-        return body
-
-    def _point(self, path, checksum):
-        tmp = self.live_pointer.with_suffix(".next")
-        tmp.write_text(json.dumps({"checksum": checksum, "artifact": str(path)}, sort_keys=True))
+    def _write_pointer(self, record):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.pointer.with_name(self.pointer.name + ".next")
+        tmp.write_text(json.dumps(record, sort_keys=True))
         os.chmod(tmp, 0o600)
-        os.replace(tmp, self.live_pointer)            # atomic replacement; never a partial pointer
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, self.pointer)          # atomic: readers see the old or the new record, never a partial one
 
+    def bootstrap(self, live_artifact_path):
+        """Record the CURRENT production model's identity without changing what is served."""
+        if self._read_pointer() is None:
+            sha = file_sha(live_artifact_path)
+            self._write_pointer({"checksum": "production:" + sha, "file_sha": sha,
+                                 "artifact": str(live_artifact_path)})
+        return self._read_pointer()
+
+    def current(self):
+        record = self._read_pointer()
+        return record["checksum"] if record else None
+
+    # --- verification ------------------------------------------------------------------------
+    def _verify_candidate(self, artifact_path, checksum):
+        body = lc.load_verified(artifact_path)
+        if body.get("checksum") != checksum:
+            raise ValueError("candidate checksum does not match")
+        opening_models.validate_artifact(body["artifact"])
+
+    def _await_model(self, expected_file_sha):
+        """Poll the probe until the service reports the expected model and is healthy."""
+        deadline = time.monotonic() + WAIT_SECONDS
+        last = None
+        while True:
+            last = self.probe()
+            if pr._live_healthy(last) and last.get("model_file_sha") == expected_file_sha:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            self.sleep(WAIT_STEP)
+
+    def _switch_to(self, record):
+        """Point at a model, restart, and verify. Returns True only if the service runs exactly that file."""
+        self._write_pointer(record)
+        if not self.restarter(Path(record["artifact"])):
+            return False
+        return self._await_model(record["file_sha"])
+
+    # --- public interface used by the controller ---------------------------------------------
     def activate(self, artifact_path, checksum):
         if not self.enabled:
-            return {"ok": False, "detail": "ACTIVATION_DISABLED: not authorized"}
-        if self.restarter is None or self.probe is None:
-            return {"ok": False, "detail": "RESTART_PATH_NOT_CONFIGURED"}
-        try:
-            self._verified_artifact(artifact_path, checksum)
-        except (ValueError, KeyError, TypeError, OSError) as exc:
-            return {"ok": False, "detail": f"artifact refused ({type(exc).__name__})"}
-        if not self.window_safe(datetime.now(timezone.utc)):
+            return {"ok": False, "detail": "ACTIVATION_DISABLED: not authorized or not configured"}
+        if not self.window_safe(self.clock()):
             return {"ok": False, "detail": "inside a protected opening window"}
-        sample = self.probe()
-        if not pr._live_healthy(sample):
+        try:
+            self._verify_candidate(artifact_path, checksum)
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            return {"ok": False, "detail": f"candidate refused ({type(exc).__name__})"}
+        before = self.probe()
+        if not pr._live_healthy(before):
             return {"ok": False, "detail": "live service not HEALTHY/READY/signals-only before switch"}
-        previous = self.current()
-        self._point(artifact_path, checksum)
-        if not self.restarter(artifact_path) or not pr._live_healthy(self.probe()):
-            if previous is not None:
-                self._restore(previous)
-            return {"ok": False, "detail": "post-switch health check failed; previous model restored"}
-        return {"ok": True, "detail": f"switched to {checksum[:12]}"}
-
-    def _restore(self, previous_checksum):
-        backup = self.state_dir / "backups"
-        candidates = sorted(backup.glob("live-*.json")) if backup.exists() else []
-        for path in candidates:
-            if hashlib.sha256(path.read_bytes()).hexdigest().startswith(previous_checksum[:16]):
-                self._point(path, previous_checksum)
-                if self.restarter:
-                    self.restarter(path)
-                return True
-        return False
+        previous = self._read_pointer()
+        if previous is None:
+            return {"ok": False, "detail": "no verified rollback reference (bootstrap missing)"}
+        new = {"checksum": checksum, "file_sha": file_sha(artifact_path), "artifact": str(artifact_path)}
+        if self._switch_to(new):
+            return {"ok": True, "detail": f"switched to {checksum[:12]} (verified model file)"}
+        restored = self._switch_to(previous)
+        return {"ok": False, "detail": "post-switch verification failed; previous model "
+                + ("restored and verified" if restored else "RESTORE NOT VERIFIED - manual recovery required")}
 
     def rollback(self, artifact_path, checksum):
-        if not self.enabled or self.restarter is None:
+        if not self.enabled:
             return {"ok": False, "detail": "rollback path not configured"}
-        self._point(artifact_path, checksum)
-        ok = bool(self.restarter(artifact_path)) and pr._live_healthy(self.probe() if self.probe else None)
-        return {"ok": ok, "detail": "restored" if ok else "rollback health check failed"}
+        record = {"checksum": checksum, "file_sha": file_sha(artifact_path), "artifact": str(artifact_path)}
+        ok = self._switch_to(record)
+        return {"ok": ok, "detail": "rolled back and verified" if ok else "rollback NOT verified"}

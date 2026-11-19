@@ -150,7 +150,8 @@ def _live_healthy(sample):
 
 
 def promotion_cycle(state_dir, status, activator, *, live_artifact_path, health_samples, resources,
-                    telegram_ok, seconds_to_opening, notify=lambda event, data: None, now=None):
+                    telegram_ok, seconds_to_opening, notify=lambda event, data: None, now=None,
+                    post_samples=None):
     """Run one controller cycle. Returns a result dict; never raises past its own boundary."""
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -162,7 +163,7 @@ def promotion_cycle(state_dir, status, activator, *, live_artifact_path, health_
         return {"result": "LOCKED", "detail": "another controller cycle is running"}
     try:
         return _cycle(state_dir, status, activator, live_artifact_path, health_samples, resources,
-                      telegram_ok, seconds_to_opening, notify, now)
+                      telegram_ok, seconds_to_opening, notify, now, post_samples)
     except Exception as exc:  # fail closed: any unexpected error stops promotion and is recorded
         History(state_dir).append("CONTROLLER_ERROR", {"error": type(exc).__name__})
         notify("critical_failure", {"error": type(exc).__name__})
@@ -173,7 +174,7 @@ def promotion_cycle(state_dir, status, activator, *, live_artifact_path, health_
 
 
 def _cycle(state_dir, status, activator, live_artifact_path, health_samples, resources, telegram_ok,
-           seconds_to_opening, notify, now):
+           seconds_to_opening, notify, now, post_samples=None):
     history = History(state_dir)
     if not history.verify_chain():
         notify("critical_failure", {"reason": "history checksum chain is broken"})
@@ -261,7 +262,9 @@ def _cycle(state_dir, status, activator, live_artifact_path, health_samples, res
         return {"result": "ROLLED_BACK", "detail": result.get("detail")}
 
     # 8 monitor after the switch
-    decision = lc.rollback_decision(health_samples, previous)
+    # post-switch samples are measured AFTER the switch; the pre-switch samples are never reused here
+    observed = post_samples() if callable(post_samples) else health_samples
+    decision = lc.rollback_decision(observed, previous)
     if decision["decision"] == "ROLLBACK_REQUIRED":
         rb = activator.rollback(backup_path, previous)
         history.append("ROLLED_BACK", {"reason": decision.get("reason"), "rolled_back": bool(rb.get("ok"))})

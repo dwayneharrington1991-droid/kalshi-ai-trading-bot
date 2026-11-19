@@ -91,3 +91,22 @@ Rule tested: for each eligible opening after the first 60, pick a confidence thr
 Verdict: rejected. The paired gain is 3 calls out of 70, well inside sampling noise. The threshold is chosen from seven options on the same export, and the accuracy falls from 77% to 63% between halves. Not promoted, not deployed.
 
 Constant-DOWN baseline over all 294 eligible openings: 162 correct, 55.1% (49.4–60.7%).
+
+## UNCLEAR versus WAIT (traced in code and export)
+
+`WAIT` is the candidate's own abstention: `opening_models.decision()` returns WAIT when the probability lies strictly between 0.45 and 0.55. `UNCLEAR` is a fourth label written in three places in `prediction_engine.py`:
+
+1. Weak-fallback guard (about line 1686): after 20 past directional openings, the uncalibrated fallback direction is suppressed to UNCLEAR.
+2. Fallback without a verified edge (about line 1777): UNCLEAR is written when the fallback probability is withheld or unvalidated.
+3. Candidate tie (about line 1845): UNCLEAR is written when the candidate probability displays as exactly 50.0.
+
+Export breakdown of the 13 UNCLEAR rows: 6 fallback rows with no probability, 2 fallback rows at exactly 0.5, 2 fallback rows at 0.551 and 0.587 suppressed by the uncalibrated guard, and 3 candidate rows at 0.4997–0.5004 (path 3).
+
+Finding: no UNCLEAR row is a wrong directional call. The inconsistency is the label. Path 3 would have produced WAIT under the candidate's own threshold rule. Changing that label would alter how new immutable records are written, so it is not changed here.
+
+## Feed timing (from the export)
+
+- `input_lag_seconds` (cutoff minus latest input): max 3.2 s over 294 eligible rows. No row exceeds 5 s, so the five-second reference freshness rule held on every recorded call.
+- `opening_delay_seconds` (`generated_at` minus `opens_at`, from `opening_models._assess_opening`): median 10 s, p90 19 s, p99 121 s, max 127 s. 224 of 300 rows were generated more than 5 seconds after the open, and 7 rows more than 60 seconds after it.
+
+Open question: the frozen inputs were fresh, but the record was written after the open. The export does not show when the call was first visible to the user, so the timing risk is not measured. This needs the dashboard publish time, which is not in this export.

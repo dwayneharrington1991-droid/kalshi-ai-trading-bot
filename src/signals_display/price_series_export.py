@@ -55,6 +55,18 @@ def price_points(db, source=PRICE_SOURCE):
     return points, skipped
 
 
+def points_from_export_csv(path):
+    """(available_epoch, price) from a server export. Availability is the exported available_at_utc,
+    which is local receipt based. The exchange event time is never read here."""
+    import csv
+    points = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            points.append((_epoch(row["available_at_utc"]), float(row["price"])))
+    points.sort()
+    return points
+
+
 def candle_coverage(db):
     row = db.execute("SELECT COUNT(*), MIN(start), MAX(start) FROM btc_candles WHERE source LIKE 'Coinbase%'").fetchone()
     return {"bars": row[0], "first_start": row[1], "last_start": row[2], "bar_seconds": 60}

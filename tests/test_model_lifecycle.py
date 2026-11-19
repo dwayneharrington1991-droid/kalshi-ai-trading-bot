@@ -463,6 +463,6 @@ def test_scheduled_minutes_are_outside_the_opening_window_guard():
     """Cron must not fire on the 15-minute boundaries, which the guard always refuses."""
     for minute in lc.SCHEDULE_MINUTES:
         assert lc.opening_window_safe(datetime(2026, 11, 19, 3, minute, 0, tzinfo=timezone.utc)), minute
-    assert lc.SCHEDULE_MINUTES == (7, 37)
+    assert lc.SCHEDULE_MINUTES == (7, 22, 37, 52)
     assert not lc.opening_window_safe(datetime(2026, 11, 19, 3, 0, 0, tzinfo=timezone.utc))
     assert not lc.opening_window_safe(datetime(2026, 11, 19, 3, 30, 0, tzinfo=timezone.utc))

@@ -88,15 +88,15 @@ def test_opening_fallback_explains_model_and_feature_role_not_constant_probabili
     assert result["up"] == pytest.approx(
         0.5 * (1 + math.erf(result["probability_inputs"]["z_score"] / math.sqrt(2)))
     )
-    assert result["direction"] == "UNCLEAR"
+    assert result["direction"] == "WAIT"
     assert result["confidence"]["status"] == "NO VERIFIED EDGE"
     assert result["opening_quality_guard"]["status"] == "WAIT_UNCALIBRATED_FALLBACK"
-    assert engine.recorded_opening_direction(result) == "UNCLEAR"
+    assert engine.recorded_opening_direction(result) == "WAIT"
 
 
 def test_unvalidated_fallback_wait_does_not_hide_legacy_directional_results():
     current = opening()
-    assert current["direction"] == "UNCLEAR"
+    assert current["direction"] == "WAIT"
     # Historical rows without an explicit saved WAIT retain their original
     # probability-derived scoring.  This prevents the new policy from erasing
     # or reclassifying prior losses.
@@ -444,7 +444,7 @@ def test_read_only_opening_audit_scores_immutable_official_records(tmp_path):
     forensic = report["records"][0]
     assert forensic["ticker"] == result["ticker"]
     assert forensic["model"] == "opening24h-zero-drift-final-average-v1"
-    assert forensic["direction"] == "UNCLEAR"
+    assert forensic["direction"] == "WAIT"
     assert forensic["correct"] is None
     assert forensic["closed_history_bars"] == 1440
     assert forensic["preopening_inputs_verified"] is True
@@ -492,3 +492,13 @@ def test_neutral_forecasts_are_not_directional_accuracy_wins():
     assert result["samples"] == 2 and result["directional_samples"] == 0
     assert result["unclear"] == 2 and result["correct"] == 0 and result["accuracy"] is None
     assert result["brier"] is not None and result["log_loss"] is not None
+
+
+def test_abstention_is_recorded_as_wait_while_historical_unclear_rows_keep_their_label():
+    """New abstentions show WAIT; the safety state stays in the confidence status.
+    Historical official rows saved as UNCLEAR are read back unchanged, so no record is reclassified."""
+    fresh = opening()
+    assert fresh["direction"] == "WAIT"
+    assert fresh["confidence"]["status"] in {"NO VERIFIED EDGE", "INSUFFICIENT PREDICTIVE CONFIDENCE", "UNCALIBRATED"}
+    historical = {"model": "opening24h-zero-drift-final-average-v1", "up": 0.5, "direction": "UNCLEAR"}
+    assert engine.recorded_opening_direction(historical) == "UNCLEAR"

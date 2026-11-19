@@ -1683,7 +1683,7 @@ def opening_forecast(
             "probability_changed": False,
         }
         if weak_fallback:
-            result["direction"] = "UNCLEAR"
+            result["direction"] = "WAIT"  # abstention label; the safety state stays in confidence
             result["confidence"] = {
                 "status": "INSUFFICIENT PREDICTIVE CONFIDENCE",
                 "reason": "Past-only official opening results do not support a directional call; the experimental probability is retained for continued evaluation",
@@ -1774,7 +1774,7 @@ def opening_forecast(
     ):
         prior_guard = result.get("opening_quality_guard", {})
         weak_evidence = prior_guard.get("status") == "INSUFFICIENT_PREDICTIVE_CONFIDENCE"
-        result["direction"] = "UNCLEAR"
+        result["direction"] = "WAIT"  # abstention label; the safety state stays in confidence
         if not weak_evidence:
             result["confidence"] = {
                 "status": "NO VERIFIED EDGE",
@@ -1842,7 +1842,7 @@ def opening_forecast(
     result["forecasted_price_movement_from_threshold"] = movement
     displayed = display_probability_pair(result.get("up"))
     if displayed["up"] == 50.0:
-        result["direction"] = "UNCLEAR"
+        result["direction"] = "WAIT"  # abstention label; the safety state stays in confidence
         result["neutral_reason"] = (
             "INSUFFICIENT PREDICTIVE CONFIDENCE: the eligible opening-only candidate is tied "
             "at displayed precision; no directional call is supported"

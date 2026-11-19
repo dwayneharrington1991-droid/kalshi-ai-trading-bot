@@ -138,7 +138,7 @@ def test_past_only_quality_guard_withholds_weak_fallback_without_changing_probab
     )
     assert guarded["up"] == unguarded["up"]
     assert guarded["probability_inputs"] == unguarded["probability_inputs"]
-    assert guarded["direction"] == "UNCLEAR"
+    assert guarded["direction"] == "WAIT"
     assert guarded["confidence"]["status"] == "INSUFFICIENT PREDICTIVE CONFIDENCE"
     assert guarded["opening_quality_guard"]["probability_changed"] is False
 
@@ -155,7 +155,7 @@ def test_basis_anchor_replay_accepts_one_fresh_preopen_proxy_receipt_without_zer
     assert opening["data_quality"]["basis_coverage"].startswith("REDUCED")
     assert opening["reference_received_at"] == receipt[0].isoformat()
     assert opening["confidence"]["status"] == "INSUFFICIENT PREDICTIVE CONFIDENCE"
-    assert opening["direction"] == "UNCLEAR"
+    assert opening["direction"] == "WAIT"
     assert opening["forecasted_price_movement_from_threshold"] == pytest.approx(0)
     assert "zero expected drift" in opening["feature_usage"]["active_probability_inputs"]
     assert "RSI" in opening["feature_usage"]["inactive_directional_feature_groups"]
@@ -546,7 +546,7 @@ def test_opening_panel_reports_supported_price_and_uncalibrated_quality_without_
     opening = engine.opening_forecast(
         m, h, points(), NOW + timedelta(seconds=2), reference_source="Mock Coinbase spot"
     )
-    assert opening["direction"] == "UNCLEAR"
+    assert opening["direction"] == "WAIT"
     assert opening["up"] + opening["down"] == pytest.approx(1)
     assert opening["confidence"]["status"] == "NO VERIFIED EDGE"
     assert opening["data_quality"]["closed_history_bars"] == 1440

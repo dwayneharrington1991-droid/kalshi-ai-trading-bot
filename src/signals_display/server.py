@@ -2309,6 +2309,13 @@ def make_handler(monitor):
                 lifecycle_path = f"{monitor.journal.path}.lifecycle-status.json"
                 body = json.dumps(combined_status(status_path, lifecycle_path), allow_nan=False, default=str).encode()
                 content_type = "application/json"
+            elif route == "/api/shadow-opening":
+                # Read-only view of the independent shadow ledger. It never computes, substitutes or feeds live output.
+                from .opening_shadow_view import ledger_view, shadow_ledger_path
+                body = json.dumps(
+                    ledger_view(shadow_ledger_path(monitor.journal.path)), allow_nan=False, default=str
+                ).encode()
+                content_type = "application/json"
             elif route == "/api/learning-summary":
                 report = monitor.quick_learning_report.get()
                 body = json.dumps(

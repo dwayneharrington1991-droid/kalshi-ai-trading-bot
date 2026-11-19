@@ -120,3 +120,34 @@ def test_the_journal_connection_used_for_scoring_cannot_write(tmp_path):
             ro.execute("INSERT INTO btc_engine_opening VALUES ('PUBLIC MARKET DATA','x')")
     finally:
         ro.close()
+
+
+def test_outcome_copy_takes_only_official_outcomes_for_shadow_tickers_and_is_idempotent(tmp_path):
+    journal = tmp_path / "j.db"
+    db = sqlite3.connect(journal)
+    db.execute("CREATE TABLE forecast_outcomes (ticker TEXT, origin TEXT, observed_at TEXT, outcome INTEGER, "
+               "PRIMARY KEY(ticker, origin))")
+    db.execute("INSERT INTO forecast_outcomes VALUES ('KX-A','official',?,1)", ((T0 + timedelta(minutes=16)).isoformat(),))
+    db.execute("INSERT INTO forecast_outcomes VALUES ('KX-B','official',?,0)", ((T0 + timedelta(minutes=17)).isoformat(),))
+    db.execute("INSERT INTO forecast_outcomes VALUES ('KX-NOT-SHADOW','official',?,1)", ((T0 + timedelta(minutes=16)).isoformat(),))
+    db.execute("INSERT INTO forecast_outcomes VALUES ('KX-A','predicted',?,0)", ((T0 + timedelta(minutes=16)).isoformat(),))
+    db.commit()
+    db.close()
+    ledger = tmp_path / "led.sqlite3"
+    sh.write_ledger(ledger, [
+        {"ticker": "KX-A", "opens_at": T0.isoformat(), "generated_at": T0.isoformat(), "scored_at": T0.isoformat(),
+         "seconds_after_open": 1.0, "inputs_complete": 1, "probability": 0.6, "decision": "UP", "model_sha256": "m"},
+        {"ticker": "KX-B", "opens_at": T0.isoformat(), "generated_at": T0.isoformat(), "scored_at": T0.isoformat(),
+         "seconds_after_open": 1.0, "inputs_complete": 1, "probability": 0.4, "decision": "DOWN", "model_sha256": "m"},
+    ])
+    ro = sqlite3.connect(f"file:{journal.resolve()}?mode=ro", uri=True)
+    try:
+        assert sh.sync_outcomes(ro, ledger, T0) == 2
+        assert sh.sync_outcomes(ro, ledger, T0) == 0          # idempotent: nothing new on a second run
+    finally:
+        ro.close()
+    with sqlite3.connect(ledger) as led:
+        copied = dict(led.execute("SELECT ticker, outcome FROM shadow_outcomes"))
+        assert copied == {"KX-A": 1, "KX-B": 0}              # the non-shadow ticker and the 'predicted' origin are absent
+        with pytest.raises(sqlite3.DatabaseError):
+            led.execute("UPDATE shadow_outcomes SET outcome=0")

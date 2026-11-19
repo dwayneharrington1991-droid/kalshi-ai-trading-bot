@@ -38,6 +38,16 @@ CREATE TRIGGER IF NOT EXISTS shadow_no_update BEFORE UPDATE ON shadow_openings
 BEGIN SELECT RAISE(ABORT, 'shadow ledger is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS shadow_no_delete BEFORE DELETE ON shadow_openings
 BEGIN SELECT RAISE(ABORT, 'shadow ledger is append-only'); END;
+CREATE TABLE IF NOT EXISTS shadow_outcomes (
+    ticker TEXT PRIMARY KEY,
+    observed_at TEXT NOT NULL,
+    outcome INTEGER NOT NULL,
+    synced_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS shadow_outcome_no_update BEFORE UPDATE ON shadow_outcomes
+BEGIN SELECT RAISE(ABORT, 'shadow outcomes are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS shadow_outcome_no_delete BEFORE DELETE ON shadow_outcomes
+BEGIN SELECT RAISE(ABORT, 'shadow outcomes are append-only'); END;
 """
 
 REFIT_SECONDS = 24 * 3600
@@ -120,6 +130,27 @@ def write_ledger(shadow_db, rows):
     return written
 
 
+def sync_outcomes(journal_ro, shadow_db, now):
+    """Copy official outcomes for tickers already in the shadow ledger. Copies only; nothing is inferred."""
+    with sqlite3.connect(shadow_db) as led:
+        led.executescript(SCHEMA)
+        pending = [t for (t,) in led.execute(
+            "SELECT ticker FROM shadow_openings WHERE ticker NOT IN (SELECT ticker FROM shadow_outcomes)")]
+    found = []
+    for ticker in pending:
+        row = journal_ro.execute(
+            "SELECT observed_at, outcome FROM forecast_outcomes WHERE ticker=? AND origin='official' "
+            "AND outcome IN (0, 1)", (ticker,)).fetchone()
+        if row is not None:
+            found.append((ticker, row[0], int(row[1]), now.isoformat()))
+    written = 0
+    with sqlite3.connect(shadow_db) as led:
+        for ticker, observed_at, outcome, synced in found:
+            written += led.execute("INSERT OR IGNORE INTO shadow_outcomes VALUES (?,?,?,?)",
+                                   (ticker, observed_at, outcome, synced)).rowcount
+    return written
+
+
 def genesis(shadow_dir, now, dry_run=False):
     path = Path(shadow_dir) / "genesis.json"
     if path.exists():
@@ -199,7 +230,12 @@ def run(journal, shadow_dir, artifact, now, dry_run=False):
         candidates = unscored_openings(ro, shadow_dir, names, since, now)
     rows = score_openings(candidates, versions, now)
     written = 0 if dry_run else write_ledger(shadow_dir / "shadow_ledger.sqlite3", rows)
-    return {"genesis_at": since.isoformat(), "versions_known": len(versions),
+    synced = 0
+    if not dry_run:
+        with sqlite3.connect(f"file:{Path(journal).resolve()}?mode=ro", uri=True, timeout=30) as ro_outcomes:
+            ro_outcomes.execute("PRAGMA query_only=ON")
+            synced = sync_outcomes(ro_outcomes, shadow_dir / "shadow_ledger.sqlite3", now)
+    return {"outcomes_copied": synced, "genesis_at": since.isoformat(), "versions_known": len(versions),
             "new_version": new_version["sha256"][:12] if new_version else None,
             "new_openings": len(rows), "written": written,
             "decisions": {d: sum(1 for r in rows if r["decision"] == d) for d in ("UP", "DOWN", "WAIT", "NOT_SCORED")}}

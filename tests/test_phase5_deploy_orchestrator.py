@@ -476,7 +476,9 @@ def test_old_service_appearing_during_soak_rolls_back(sim):
     # The new build is never accepted: it is rolled back, or (when the changed old
     # service also blocks the automatic restore's own safety check) handed over to manual recovery.
     assert intruder is not None and status in ("ROLLED_BACK", "MANUAL_RECOVERY_REQUIRED"), result.stdout
-    assert "protected listener identity changed" in result.stdout and "DEPLOY_RESULT=SUCCESS" not in result.stdout
+    # Caught by whichever check runs first: post-install verification or the soak.
+    assert ("pid8767 changed" in result.stdout or "protected listener identity changed" in result.stdout), result.stdout
+    assert "DEPLOY_RESULT=SUCCESS" not in result.stdout
 
 
 def test_preflight_failure_blocks_before_any_change(sim):

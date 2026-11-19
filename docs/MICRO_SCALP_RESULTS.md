@@ -1,5 +1,7 @@
 # Micro-scalp simulator — evaluation results (run 2)
 
+> **Superseded by run 3:** see [`MICRO_SCALP_RESEARCH.md`](MICRO_SCALP_RESEARCH.md) (200 historical contracts, full fresh recording, candidate-strategy study). This file keeps the run-2 results for reference.
+
 **PAPER SIMULATION ONLY.** No order was placed. Simulated results are not live
 profitability, and none of the numbers below is evidence of a live edge.
 

@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper Scalp Simulator</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --ink: #14171c; --muted: #5b6472; --line: #e3e6eb;
+  --up: #0f7b4b; --down: #b42318; --wait: #6b7280; --sell: #9a5b00; --banner: #fff4d6; --banner-ink: #6b4a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1216; --card: #171b21; --ink: #e8ebef; --muted: #9aa4b2; --line: #2a3038;
+    --up: #3ccf8e; --down: #ff6b5e; --wait: #9aa4b2; --sell: #f0b44c; --banner: #2b2410; --banner-ink: #f3d68a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+main { max-width: 1080px; margin: 0 auto; padding: 16px; }
+.banner { background: var(--banner); color: var(--banner-ink); border-radius: 10px; padding: 10px 14px; font-weight: 600; }
+h1 { font-size: 20px; margin: 16px 0 4px; }
+.sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+.hero { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 14px; }
+.label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.call { font-size: 40px; font-weight: 800; margin: 2px 0 6px; }
+.call.up { color: var(--up); } .call.down { color: var(--down); } .call.sell { color: var(--sell); } .call.wait { color: var(--wait); }
+.why { font-size: 15px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+.tile .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tile .h { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.pos { color: var(--up); } .neg { color: var(--down); }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 14px; overflow-x: auto; }
+section h2 { font-size: 15px; margin: 0 0 8px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td.wrap { white-space: normal; min-width: 260px; }
+.muted { color: var(--muted); }
+@media (max-width: 600px) {
+  .call { font-size: 30px; }
+  td.wrap { min-width: 0; white-space: normal; }
+  th, td { padding: 6px 4px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <div class="banner">PAPER TRADING ONLY — simulated money. No real orders can be sent from this page or this program.</div>
+  <h1>Bitcoin 15-minute micro-scalp simulator</h1>
+  <p class="sub" id="feed">Connecting…</p>
+
+  <div class="hero">
+    <div class="label">Scalp decision right now</div>
+    <div class="call wait" id="call">WAIT</div>
+    <div class="why" id="why">Starting up.</div>
+  </div>
+
+  <div class="grid">
+    <div class="tile"><div class="label">Account value</div><div class="v" id="equity">–</div><div class="h" id="cash">cash –</div></div>
+    <div class="tile"><div class="label">Realized P&amp;L</div><div class="v" id="realized">–</div><div class="h">closed trades, after fees</div></div>
+    <div class="tile"><div class="label">Unrealized P&amp;L</div><div class="v" id="unrealized">–</div><div class="h">if sold at current bid</div></div>
+    <div class="tile"><div class="label">Win rate</div><div class="v" id="winrate">–</div><div class="h" id="winci">–</div></div>
+    <div class="tile"><div class="label">Profit factor</div><div class="v" id="pf">–</div><div class="h">wins ÷ losses ($)</div></div>
+    <div class="tile"><div class="label">Total fees</div><div class="v" id="fees">–</div><div class="h">Kalshi taker fees, simulated</div></div>
+    <div class="tile"><div class="label">Max drawdown</div><div class="v" id="dd">–</div><div class="h" id="ddpct">–</div></div>
+    <div class="tile"><div class="label">Orders filled</div><div class="v" id="fills">–</div><div class="h" id="unfilled">–</div></div>
+  </div>
+
+  <section>
+    <h2>Current simulated position</h2>
+    <div id="position" class="muted">No open position.</div>
+  </section>
+
+  <section>
+    <h2>Safety and model status</h2>
+    <div id="risk" class="muted">–</div>
+  </section>
+
+  <section>
+    <h2>Recent decisions</h2>
+    <table><thead><tr><th>Time (UTC)</th><th>Decision</th><th>Why</th></tr></thead><tbody id="decisions"></tbody></table>
+  </section>
+
+  <section>
+    <h2>Recent simulated trades</h2>
+    <table><thead><tr><th>Side</th><th>Contracts</th><th>Entry</th><th>Exit</th><th>Fees</th><th>Net P&amp;L</th><th>Exit reason</th></tr></thead><tbody id="trades"></tbody></table>
+  </section>
+  <p class="sub">Results are simulations under stated assumptions (latency, slippage, partial fills, fees). They are not evidence that a real trading edge exists.</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const usd = v => v == null ? "–" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(2);
+const pct = v => v == null ? "–" : (100 * v).toFixed(1) + "%";
+const time = t => t ? new Date(t * 1000).toISOString().slice(11, 19) : "";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function signed(el, v) { el.textContent = usd(v); el.className = "v " + (v > 0 ? "pos" : v < 0 ? "neg" : ""); }
+async function refresh() {
+  try {
+    const d = await (await fetch("/api/view", {cache: "no-store"})).json();
+    const s = d.summary || {};
+    $("feed").textContent = (d.feed_status || "") + " · strategy: " + d.strategy + " · simulated clock " + time(d.time);
+    const call = d.scalp || "WAIT";
+    $("call").textContent = "SCALP: " + call;
+    $("call").className = "call " + (call.includes("UP") ? "up" : call.includes("DOWN") ? "down" : call === "SELL" ? "sell" : "wait");
+    $("why").textContent = d.explanation;
+    $("equity").textContent = usd(d.equity);
+    $("cash").textContent = "cash " + usd(d.balance_cash) + " · started " + usd(d.starting_balance);
+    signed($("realized"), d.realized_pnl); signed($("unrealized"), d.unrealized_pnl);
+    $("winrate").textContent = pct(s.win_rate);
+    $("winci").textContent = s.win_rate_95ci ? "95% range " + pct(s.win_rate_95ci[0]) + "–" + pct(s.win_rate_95ci[1]) + " · " + s.completed_trades + " trades" : (s.completed_trades || 0) + " trades";
+    $("pf").textContent = s.profit_factor == null ? "–" : (+s.profit_factor).toFixed(2);
+    $("fees").textContent = usd(s.total_fees);
+    $("dd").textContent = usd(s.max_drawdown); $("ddpct").textContent = (s.max_drawdown_pct ?? 0).toFixed(2) + "% of peak";
+    const o = s.orders || {};
+    $("fills").textContent = (o.filled || 0) + (o.partial || 0) + " / " + (o.submitted || 0);
+    $("unfilled").textContent = (o.unfilled || 0) + " unfilled (never counted as trades)";
+    $("position").innerHTML = (d.positions || []).length ? d.positions.map(p =>
+      `<b>${esc(p.side)}</b> × ${p.contracts} on ${esc(p.ticker)} · entry ${(+p.entry_price).toFixed(3)} · exit now ${p.current_exit_price == null ? "–" : (+p.current_exit_price).toFixed(3)} · unrealized ${usd(p.unrealized_pnl)}`).join("<br>") : "No open position.";
+    const r = d.risk_state || {}, m = d.model || {}, oos = m.out_of_sample || {};
+    $("risk").innerHTML = (r.killed ? `<b class="neg">KILL SWITCH ON:</b> ${esc(r.kill_reason)}. Simulated trading stopped.<br>` : "") +
+      (r.daily_halt ? `<b class="neg">Daily loss limit reached</b>; no new trades until the next UTC day.<br>` : "") +
+      `Consecutive losses: ${r.consecutive_losses ?? 0} · Model trained on ${m.labelled_samples ?? 0} past samples · ` +
+      `out-of-sample R² vs no-change: ${oos.r2_vs_zero == null ? "not enough data" : (+oos.r2_vs_zero).toFixed(3)} (n=${oos.n ?? 0})`;
+    $("decisions").innerHTML = (d.recent_decisions || []).slice().reverse().slice(0, 15).map(x =>
+      `<tr><td>${time(x.t)}</td><td>${esc(x.action)}</td><td class="wrap">${esc(x.why)}</td></tr>`).join("");
+    $("trades").innerHTML = (d.recent_trades || []).slice().reverse().map(t =>
+      `<tr><td>${esc(t.side.toUpperCase())}</td><td>${t.contracts}</td><td>${(+t.entry_price).toFixed(3)}</td><td>${(+t.exit_price).toFixed(3)}</td><td>${usd(t.fees)}</td><td class="${t.net_pnl > 0 ? "pos" : "neg"}">${usd(t.net_pnl)}</td><td class="wrap">${esc(t.exit_reason)}</td></tr>`).join("") || `<tr><td colspan="7" class="muted">No completed trades yet.</td></tr>`;
+  } catch (e) { $("feed").textContent = "Dashboard data unavailable: " + e; }
+}
+refresh(); setInterval(refresh, 1000);
+</script>
+</body>
+</html>

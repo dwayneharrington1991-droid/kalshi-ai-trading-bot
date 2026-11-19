@@ -1,0 +1,3 @@
+# Market-data recordings and caches are large and local-only.
+*
+!.gitignore

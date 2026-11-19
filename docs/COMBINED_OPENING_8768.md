@@ -164,3 +164,56 @@ All candidates are scored on identical fresh contracts:
 ### Running it
 
 The Oracle runner now refuses to start any shadow evaluation while another is alive. The specialist evaluation therefore cannot run alongside the combined one. The retrospective history is capped at 1,500 contracts to keep it light.
+
+## 6. Real-data result (8768 journal slice, as-of 2026-11-19 02:33 UTC)
+
+**Data:** 226 settled opening records in total, split as follows:
+
+| Segment | Contracts | Use |
+|---|---|---|
+| Development | 171 (111 with out-of-fold predictions) | Every choice |
+| Previous holdout | 43 | Descriptive only |
+| Fresh unseen | 12 | Graded once |
+
+No retrospective rows could be rebuilt: the journal holds only about 4 days of candles, which isn't enough for a complete 24-hour window. The running model (`opening-candidate/b50b9dc30f6d664c`) produced 158 of the development records and every later one.
+
+**Which candidate wins, by development log loss:** both engines selected the existing AI.
+
+| Candidate | Development log loss |
+|---|---|
+| Existing AI | 0.6609 |
+| Existing + logistic blend | 0.6756 |
+| Five-specialist master without regime | 0.6687 |
+| Full five-specialist master | 0.6701 |
+| Stacked blends | 0.693 |
+
+**Specialist value (development):** the existing AI adds value (+0.0089). Trend, flow, pattern and regime each add no measurable value. Recommendation: leave them out for now.
+
+**Accuracy on every market, development:**
+
+| Model | Correct | Accuracy | Wilson 95% |
+|---|---|---|---|
+| Existing AI | 71/111 | 64.0% | 54.7–72.3% |
+| Logistic | 57/101 | 56.4% | — |
+
+**Accuracy on the fresh unseen markets:**
+
+| Model | Correct | Accuracy | Calls |
+|---|---|---|---|
+| Existing AI, every market | 7/12 | 58.3% | 12 |
+| Existing AI, displayed calls only | 3/4 | 75% | 4 |
+| Logistic | 4/12 | 33.3% | 12 |
+| Five-specialist master | 4/12 | 33.3% | 12 |
+
+**Agreement (development):** when the existing AI and the logistic model agree, accuracy is 38/58 = 65.5%; when they disagree, 22/43 = 51.2%.
+
+**Coverage options for the existing AI (thresholds chosen on development data):**
+
+| Confidence threshold | Development | Fresh |
+|---|---|---|
+| 0.52 | 73 calls, 74.0%, 66% coverage | 6/9, 75% coverage |
+| 0.55 | 32 calls, 81.3%, 29% coverage | 3/4 |
+
+This is the candidate for more UP/DOWN calls. It is not yet verified: the threshold was chosen on development data and confirmed on only 9 fresh calls.
+
+**Decision:** no new model is installed. Neither architecture beats the running AI. Next step: collect fresh markets, about 96 a day, and re-score the 0.52 threshold on at least 100 unseen calls before changing anything live.

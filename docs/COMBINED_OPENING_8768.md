@@ -115,3 +115,52 @@ The family test in the combined report measures, on 8768's own data, which of th
 
 1. **Sample size.** The 8768 journal has about 214 contracts eligible for training. At that size a 90% claim cannot be verified: it needs on the order of 100 calls at about 96% on unseen markets. The fresh segment grows by about 96 markets a day. Retrospective candle rows add training data, but only for candle features.
 2. **The previous holdout (43 markets) was weak:** logistic 25/43, ensemble 21/43. Those numbers can't separate the models from chance. That's why final confirmation uses fresh markets only.
+
+## 5. Five-specialist architecture (`src/signals_display/specialist_opening.py`)
+
+### The specialists
+
+Every frozen opening input belongs to exactly one specialist, so no indicator is counted twice:
+
+| Specialist | Inputs |
+|---|---|
+| Trend and momentum | Returns, acceleration, breakout, EMA distances and gaps, RSI, MACD, VWAP deviation, Bollinger position, volume acceleration. |
+| Order flow and liquidity | CVD, book and flow imbalances, microprice, effective spread, trade intensity, perpetual basis, Kalshi pre-open price. |
+| Historical pattern | Candle shape and relative volume. Also trained on retrospective candle-only history, which is used for training only and never scored. |
+| Volatility and regime | Volatility level and change, ATR expansion, rising or falling regime, and regime × momentum/trend interactions. |
+| Confidence and calibration | Not a direction model. A reliability gate that learns from earlier rows when the master's call tends to be right, using agreement, dispersion, conviction and volatility regime. It turns low-reliability calls into WAIT. It is used only if, in development, it gives more correct calls at no lower accuracy than the plain threshold rule. |
+
+### The master engine
+
+- Every directional specialist uses the statistical opening baseline as its starting point.
+- The master therefore stacks each specialist's change from that baseline, plus one baseline term and the running AI's probability. Without this, the shared baseline would be counted five times.
+- The master's weights are L2-regularised and fitted only on earlier out-of-fold rows.
+
+### What it is compared against
+
+All candidates are scored on identical fresh contracts:
+
+- the existing AI;
+- the standalone logistic model;
+- the combined AI's simple blends;
+- the full master;
+- the master without each input in turn;
+- a two-input master (existing AI plus pattern);
+- a master built from specialists only.
+
+**Selection:** lowest development prequential log loss.
+
+**Specialist value:** a specialist "adds value" only if removing it worsens development log loss by more than 0.002. Otherwise the report recommends leaving it out.
+
+### Tests (synthetic data only)
+
+- No input is shared between specialists.
+- Planted momentum and order-flow signals are found, and the noise-only specialists are flagged for removal.
+- Fresh labels never change a development choice.
+- The master and the gate learn only from earlier rows.
+- Retrospective rows are never scored.
+- Decision latency is about 0.1 ms per contract in-process.
+
+### Running it
+
+The Oracle runner now refuses to start any shadow evaluation while another is alive. The specialist evaluation therefore cannot run alongside the combined one. The retrospective history is capped at 1,500 contracts to keep it light.

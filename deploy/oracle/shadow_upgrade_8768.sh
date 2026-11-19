@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # READ-ONLY shadow evaluation of the experimental 8768 upgrade on Oracle.
 #
-#   shadow_upgrade_8768.sh <commit-sha> [shadow_upgrade|combined_opening]
+#   shadow_upgrade_8768.sh <commit-sha> [shadow_upgrade|combined_opening|specialist_opening]
 #
 # combined_opening (the combined decision engine) is anchored to the first
 # shadow_upgrade report: its holdout start and as-of time fix which contracts
@@ -20,15 +20,15 @@
 set -uo pipefail
 SHA=${1:-}
 MODULE=${2:-shadow_upgrade}
-[[ $SHA =~ ^[0-9a-f]{40}$ && $MODULE =~ ^(shadow_upgrade|combined_opening)$ ]] \
-  || { echo "usage: $0 <40-hex commit sha> [shadow_upgrade|combined_opening]"; exit 2; }
+[[ $SHA =~ ^[0-9a-f]{40}$ && $MODULE =~ ^(shadow_upgrade|combined_opening|specialist_opening)$ ]] \
+  || { echo "usage: $0 <40-hex commit sha> [shadow_upgrade|combined_opening|specialist_opening]"; exit 2; }
 REPO=${SHADOW_REPO:-/home/opc/kalshi-ai-trading-bot}
 ROOT=${SHADOW_RUN_ROOT:-/home/opc/kalshi-research}
 PREVIOUS=${SHADOW_PREVIOUS_REPORT:-$ROOT/shadow-upgrade-e2357e058e67/report.json}
 RUN=$ROOT/${MODULE//_/-}-${SHA:0:12}
 [[ $MODULE == shadow_upgrade ]] && RUN=$ROOT/shadow-upgrade-${SHA:0:12}
 EXTRA=()
-if [[ $MODULE == combined_opening ]]; then
+if [[ $MODULE != shadow_upgrade ]]; then
   [[ -f $PREVIOUS ]] || { echo "BLOCKED: previous shadow report $PREVIOUS not found"; exit 2; }
   EXTRA=(--previous-report "$PREVIOUS")
 fi
@@ -51,6 +51,11 @@ running() { [[ -f $RUN/pid ]] && kill -0 "$(cat "$RUN/pid")" 2>/dev/null; }
 
 if [[ -f $RUN/report.json ]]; then summary; exit 0; fi
 if ! running; then
+  # One evaluation at a time on the shared VM: refuse while any other shadow run is alive.
+  for other in "$ROOT"/*/pid; do
+    [[ -f $other && $other != "$RUN/pid" ]] && kill -0 "$(cat "$other")" 2>/dev/null \
+      && { echo "BLOCKED: another shadow evaluation is still running ($(dirname "$other")); nothing started"; exit 3; }
+  done
   mkdir -p "$RUN"
   free_mib=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
   load1=$(cut -d' ' -f1 /proc/loadavg)

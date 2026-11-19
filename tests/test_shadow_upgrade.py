@@ -89,7 +89,7 @@ def test_cli_reads_journal_read_only_and_refuses_unsafe_output(tmp_path):
 
 def test_live_bot_never_imports_shadow_module():
     for path in (ROOT / "src").rglob("*.py"):
-        if path.name not in ("shadow_upgrade.py", "combined_opening.py"):  # shadow modules only
+        if path.name not in ("shadow_upgrade.py", "combined_opening.py", "specialist_opening.py"):  # shadow modules only
             assert "shadow_upgrade" not in path.read_text(), path
 
 
@@ -152,7 +152,8 @@ def test_oracle_runner_is_read_only_single_job_and_detached():
     assert 'if [[ -f $RUN/report.json ]]; then summary; exit 0; fi' in code   # never a second run
     assert "running ||" in code and "kill -0" in code                       # reattach, not restart
     assert all('rm -rf "$RUN/' in l for l in code.splitlines() if "rm -rf" in l)
-    assert "^(shadow_upgrade|combined_opening)$" in code            # only the two shadow modules can run
+    assert "^(shadow_upgrade|combined_opening|specialist_opening)$" in code   # only shadow modules can run
+    assert "BLOCKED: another shadow evaluation is still running" in code      # never two at once
     assert "SHADOW: running the read-only 8768 audit first" in code   # never silent for minutes
     assert "$MODULE == shadow_upgrade && ! -f $RUN/audit.txt" in code   # combined run skips the duplicate audit
     assert '--previous-report "$PREVIOUS"' in code and "BLOCKED: previous shadow report" in code

@@ -126,7 +126,7 @@ def test_cli_end_to_end_on_real_journal_schema(tmp_path):
 
 def test_live_bot_never_imports_combined_module():
     for path in (ROOT / "src").rglob("*.py"):
-        if path.name not in ("combined_opening.py",):
+        if path.name not in ("combined_opening.py", "specialist_opening.py"):
             assert "combined_opening" not in path.read_text(), path
     code = (ROOT / "src/signals_display/combined_opening.py").read_text()
     assert "mode=ro" in code and "PRAGMA query_only=ON" in code

@@ -238,7 +238,7 @@ def test_historical_conversion_skips_empty_book_and_delays_prints():
 
 # ---------------------------------------------------------------- engine
 def _engine(**kw):
-    s = StrategyConfig(min_train_samples=300, **kw)
+    s = StrategyConfig(**{"min_train_samples": 300, **kw})
     return Engine(s, RiskConfig(starting_balance=1000))
 
 
@@ -360,3 +360,63 @@ def test_duplicate_settlement_records_are_ignored(tmp_path):
     p.write_text("\n".join(_json.dumps(r) for r in rows))
     ev, info = recorded_events(p)
     assert len(ev) == 1 and info["record_counts"]["duplicate_settlement"] == 2
+
+
+def test_recorder_writes_each_settlement_once(tmp_path):
+    import json as _json
+
+    from src.micro_scalp.recorder import Recorder
+
+    class FakeClient:
+        calls = 0
+
+        def kalshi(self, path, params=None):
+            FakeClient.calls += 1
+            return {"market": {"result": "yes"}}
+
+    out = tmp_path / "rec.jsonl"
+    r = Recorder(out, None, client=FakeClient())
+    r.markets["KXBTC15M-OLD"] = {"opens_at": "2020-01-01T00:00:00Z", "closes_at": "2020-01-01T00:15:00Z"}
+    for _ in range(5):
+        r.active()  # closed market -> queued for settlement only if not yet settled
+        for k in r.pending_settlement:
+            r.pending_settlement[k] = 0.0  # skip the 20s poll throttle
+        r.poll_settlements()
+    r.fh.close()
+    rows = [_json.loads(line) for line in out.read_text().splitlines()]
+    assert [x["type"] for x in rows] == ["settlement"]
+    assert FakeClient.calls == 1 and "KXBTC15M-OLD" in r.settled
+
+
+def test_gate_audit_counts_blocked_candidates_and_never_violates():
+    e = _engine(min_oos_samples=10**9)  # gate can never open
+    e.run(predictable_markets(4))
+    assert e.gate_violations == 0
+    assert not any(a["action"].startswith("BUY") for a in e.actions)
+    assert e.gate_blocked_candidates > 0  # it really blocked would-be trades
+    act = summarize(e)["activity"]
+    assert act["active_market_hours"] == pytest.approx(1.0, abs=0.01)
+    assert act["buy_signals_per_hour"] == 0
+
+
+def test_momentum_baseline_trades_without_model_or_gate():
+    e = _engine(policy="momentum", min_train_samples=10**9)
+    e.run(predictable_markets(4))
+    assert not e.model.ready()
+    assert any(a["action"].startswith("BUY") for a in e.actions)
+    assert all("Momentum baseline" in a["why"] for a in e.actions if a["action"].startswith("BUY"))
+
+
+def test_ai_direct_policy_is_silent_without_ai_and_follows_ai_when_present():
+    events = predictable_markets(2)
+    silent = _engine(policy="ai_direct", min_expected_net_edge=-1.0, min_abs_predicted_move=0.01).run(events)
+    assert not any(a["action"].startswith("BUY") for a in silent.actions)
+    with_ai = list(events)
+    for k in range(2):
+        opens = T0 + 900 * k
+        with_ai += [{"kind": "ai", "at": opens + s + 0.7, "ticker": f"KXBTC15M-SYN{k}", "live_up": 0.85,
+                     "opening_up": None, "opening_ticker": None} for s in range(0, 900, 2)]
+    with_ai.sort(key=lambda e: (e["at"], {"market": 0, "quote": 1, "trade": 2, "ai": 3, "settlement": 4}[e["kind"]]))
+    follow = _engine(policy="ai_direct", min_expected_net_edge=-1.0, min_abs_predicted_move=0.01).run(with_ai)
+    buys = [a for a in follow.actions if a["action"].startswith("BUY")]
+    assert buys and all(a["action"] == "BUY UP" for a in buys)

@@ -89,7 +89,16 @@ def main():
     events, info = load_historical(a.historical)
     report["historical_data"] = info
     hist = {}
-    for name, cfg in (("market_only", base), ("DIAGNOSTIC_cost_blind", diagnostic)):
+    momentum = replace(base, policy="momentum")
+    momentum_blind = replace(diagnostic, policy="momentum")
+    ai_direct = replace(base, policy="ai_direct")
+    ai_direct_blind = replace(diagnostic, policy="ai_direct")
+    for name, cfg in (
+        ("market_only", base),
+        ("DIAGNOSTIC_cost_blind", diagnostic),
+        ("BASELINE_momentum", momentum),
+        ("BASELINE_momentum_cost_blind", momentum_blind),
+    ):
         engine, rep = run_historical(events, info, cfg, risk, name)
         hist[name] = (engine, rep)
     report["historical"] = {name: rep for name, (_, rep) in hist.items()}
@@ -116,6 +125,10 @@ def main():
             ("with_existing_ai", replace(base, use_ai=True), warm),
             ("DIAGNOSTIC_cost_blind", diagnostic, warm_diag),
             ("DIAGNOSTIC_cost_blind_with_ai", replace(diagnostic, use_ai=True), warm_diag),
+            ("AI_direct", ai_direct, None),
+            ("AI_direct_cost_blind", ai_direct_blind, None),
+            ("BASELINE_momentum", momentum, None),
+            ("BASELINE_momentum_cost_blind", momentum_blind, None),
         ):
             _, rep = run_fresh(fev, cfg, risk, name, w)
             fresh[name] = rep

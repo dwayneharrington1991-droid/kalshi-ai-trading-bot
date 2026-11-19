@@ -23,6 +23,11 @@ from .safety import PAPER_TRADING_ONLY, PaperOrderGateway
 @dataclass(frozen=True)
 class StrategyConfig:
     horizon_seconds: int = 30
+    # "model": walk-forward ridge forecast (skill-gated).
+    # "momentum": simple baseline; assumes the last 30s mid move repeats.
+    # "ai_direct": assumes the mid moves to the existing AI's live UP
+    #   probability; no signal (0) when that probability is missing or stale.
+    policy: str = "model"
     step_seconds: float = 1.0
     use_ai: bool = False
     min_expected_net_edge: float = 0.01  # $/contract after fees & slippage
@@ -97,6 +102,10 @@ class Engine:
         self.recent = deque(maxlen=200)
         self.last_decision = None
         self.ai_samples = []  # (ticker, t, live_up, mid) for AI evaluation
+        self.active_seconds = 0.0  # simulated time with a live contract
+        self.edge_candidates = 0  # moments the forecast cleared the cost hurdle
+        self.gate_blocked_candidates = 0  # ...but the skill gate said no
+        self.gate_violations = 0  # gated BUY issued without validated skill (must stay 0)
         self.outcomes = {}
 
     # ------------------------------------------------------------------ run
@@ -175,12 +184,14 @@ class Engine:
             for o in self.exchange.cancel_ticker(ticker):
                 self._on_order_done(o)
         m = self._active(t)
+        if m is not None:
+            self.active_seconds += self.s.step_seconds
         self._resolve_labels(t)
         x, info, pred = None, None, None
         if m is not None:
             x, info = features(m, t, self.s.max_quote_age_seconds, self.s.ai_max_age_seconds, self.s.use_ai)
             if x is not None:
-                pred = self.model.predict(x)
+                pred = self._policy_prediction(m, t, x, info)
                 self.samples.append((t, x, info["mid"], pred, m.ticker))
                 if m.ai_live_up is not None and t - m.ai_live_at <= self.s.ai_max_age_seconds and int(t) % 30 == 0:
                     self.ai_samples.append((m.ticker, t, m.ai_live_up, info["mid"]))
@@ -195,6 +206,14 @@ class Engine:
             self.equity_curve.append((t, round(eq, 4)))
         decision = self._decide(t, m, x, info if x is not None else None, pred, eq, info if x is None else None)
         self._record(t, m, decision)
+
+    def _policy_prediction(self, m, t, x, info):
+        if self.s.policy == "momentum":
+            return x[FEATURE_NAMES_MARKET.index("ret_30s")]
+        if self.s.policy == "ai_direct":
+            fresh = m.ai_live_up is not None and t - m.ai_live_at <= self.s.ai_max_age_seconds
+            return (m.ai_live_up - info["mid"]) if fresh else 0.0
+        return self.model.predict(x)
 
     def _resolve_labels(self, t):
         h = self.s.horizon_seconds
@@ -227,14 +246,8 @@ class Engine:
             return {"action": "WAIT", "why": "Risk limit: " + reason + "."}
         if x is None:
             return {"action": "WAIT", "why": "Not enough clean data: " + str(why_not) + "."}
-        if not self.model.ready():
+        if self.s.policy == "model" and not self.model.ready():
             return {"action": "WAIT", "why": f"Model still learning from past data ({self.model.n}/{self.s.min_train_samples} labelled samples)."}
-        skill = self.model.skill()
-        if self.s.require_oos_skill and (
-            skill["r2_vs_zero"] is None or skill["n"] < self.s.min_oos_samples or skill["r2_vs_zero"] <= self.s.min_oos_r2
-        ):
-            r2 = "n/a" if skill["r2_vs_zero"] is None else f"{skill['r2_vs_zero']:.3f}"
-            return {"action": "WAIT", "why": f"The price model has not beaten a no-change forecast out of sample yet (R² {r2}, {skill['n']} scored forecasts, need ≥{self.s.min_oos_samples}), so no edge is assumed."}
         best = None
         for side, sign in (("up", 1.0), ("down", -1.0)):
             bid, ask = q[side]["bid"], q[side]["ask"]
@@ -245,6 +258,15 @@ class Engine:
             cand = {"side": side, "bid": bid, "ask": ask, "spread": spread, "exp_net": exp_net, "pred": sign * pred}
             if best is None or exp_net > best["exp_net"]:
                 best = cand
+        candidate = best["exp_net"] >= 0.01  # clears the standard +1c cost hurdle
+        self.edge_candidates += candidate
+        skill = self.model.skill()
+        validated = skill["r2_vs_zero"] is not None and skill["n"] >= self.s.min_oos_samples and skill["r2_vs_zero"] > self.s.min_oos_r2
+        if self.s.policy == "model" and self.s.require_oos_skill and not validated:
+            self.gate_blocked_candidates += candidate
+            r2 = "n/a" if skill["r2_vs_zero"] is None else f"{skill['r2_vs_zero']:.3f}"
+            return {"action": "WAIT", "why": f"The price model has not beaten a no-change forecast out of sample yet (R² {r2}, {skill['n']} scored forecasts, need ≥{self.s.min_oos_samples}), so no edge is assumed."}
+        self._skill_at_decision = (validated, skill)
         cents = best["exp_net"] * 100
         if abs(best["pred"]) < self.s.min_abs_predicted_move:
             return {"action": "WAIT", "why": f"Predicted move {best['pred']*100:+.1f}¢ is too small to act on."}
@@ -260,8 +282,11 @@ class Engine:
         qty, size_reason = self.risk.size(equity, limit, displayed, exposure, self.ec.fee_multiplier)
         if qty < 1:
             return {"action": "WAIT", "why": "Position size is zero: " + size_reason + "."}
+        if self.s.policy == "model" and self.s.require_oos_skill and not self._skill_at_decision[0]:
+            self.gate_violations += 1  # unreachable by construction; audited in reports
+        label = {"momentum": "Momentum baseline", "ai_direct": "Existing AI (direct)"}.get(self.s.policy, "Model")
         why = (
-            f"Model expects {best['side'].upper()} to gain {best['pred']*100:+.1f}¢ in {self.s.horizon_seconds}s; "
+            f"{label} expects {best['side'].upper()} to gain {best['pred']*100:+.1f}¢ in {self.s.horizon_seconds}s; "
             f"after spread, slippage and fees that is {cents:+.1f}¢/contract. Buying {qty} ({size_reason})."
         )
         return {"action": "BUY " + best["side"].upper(), "side": best["side"], "qty": qty, "quote": best["ask"], "why": why,

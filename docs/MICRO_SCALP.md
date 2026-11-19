@@ -116,6 +116,20 @@ The evaluation runs the same strategy **with and without** these inputs
 of the existing live probability against official outcomes compared with the
 market's own mid-price. No confidence score is created by this package.
 
+Comparison policies (`StrategyConfig.policy`), all run through the identical
+execution, fee and risk model:
+
+* `model` (default): skill-gated walk-forward forecast.
+* `ai_direct`: uses the existing AI alone; expects the mid to move toward its
+  live UP probability, and stays silent when that probability is missing or
+  stale.
+* `momentum`: simple baseline; assumes the last 30s move repeats.
+* The no-trade baseline is always $0.
+
+Every report also lists edge candidates, BUY signals and trades per active
+market-hour, how many would-be trades the skill gate blocked, and a gate
+violation count that must stay 0.
+
 ## 6. Running it
 
 All commands are run from the repository root inside a virtualenv with

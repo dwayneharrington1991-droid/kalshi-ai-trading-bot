@@ -9,6 +9,8 @@ import sys
 
 ROWS = (
     ("Completed trades", "completed_trades", "{}"),
+    ("Wins", "wins", "{}"),
+    ("Losses", "losses", "{}"),
     ("Net P&L (after fees)", "net_pnl", "${:,.2f}"),
     ("Gross P&L before fees", "gross_pnl_before_fees", "${:,.2f}"),
     ("Total fees", "total_fees", "${:,.2f}"),
@@ -42,14 +44,26 @@ def strategy_table(section: dict, names: list[str]) -> str:
     out.append("| P(net ≤ 0) (bootstrap) | " + " | ".join(fmt(((section[n].get("vs_no_trade_baseline") or {}).get("uncertainty") or {}).get("probability_net_pnl_not_above_zero"), "{:.2f}") for n in present) + " | – |")
     out.append("| Orders submitted / filled / partial / unfilled | " + " | ".join(_orders(section[n].get("orders")) for n in present) + " | 0 |")
     out.append("| Model out-of-sample R² vs no-change | " + " | ".join(fmt((section[n].get("model_out_of_sample") or {}).get("r2_vs_zero"), "{:.3f}") for n in present) + " | – |")
+    out.append("| Edge candidates / BUY signals / trades per active hour | " + " | ".join(_act(section[n].get("activity")) for n in present) + " | 0 |")
+    out.append("| Gate-blocked candidates / gate violations | " + " | ".join(_gate(section[n].get("activity")) for n in present) + " | – |")
     out.append("| Direction hit rate (out of sample) | " + " | ".join(fmt((section[n].get("model_out_of_sample") or {}).get("direction_hit_rate"), "{:.1%}") for n in present) + " | – |")
     return "\n".join(out) + "\n"
+
+
+def _act(a):
+    if not a:
+        return "–"
+    return f"{a['edge_candidates_per_hour']} / {a['buy_signals_per_hour']} / {a['completed_trades_per_hour']}"
+
+
+def _gate(a):
+    return f"{a['gate_blocked_candidates']} / {a['gate_violations']}" if a else "–"
 
 
 def _ci(ci, pct=False):
     if not ci:
         return "–"
-    return f"{ci[0]:.1%} – {ci[1]:.1%}" if pct else f"${ci[0]:,.2f} – ${ci[1]:,.2f}"
+    return f"{max(0.0, ci[0]):.1%} – {ci[1]:.1%}" if pct else f"${ci[0]:,.2f} – ${ci[1]:,.2f}"
 
 
 def _orders(o):
@@ -85,7 +99,7 @@ def conditions(rep):
 def render(report: dict) -> str:
     parts = ["## Historical (settled contracts, before the fresh window)\n",
              "Data: " + json.dumps(report.get("historical_data")) + "\n",
-             strategy_table(report["historical"], ["market_only", "DIAGNOSTIC_cost_blind"]),
+             strategy_table(report["historical"], ["market_only", "DIAGNOSTIC_cost_blind", "BASELINE_momentum", "BASELINE_momentum_cost_blind"]),
              "\n### Development vs holdout\n", segments(report["historical"])]
     diag = report["historical"].get("DIAGNOSTIC_cost_blind")
     if diag:
@@ -94,7 +108,9 @@ def render(report: dict) -> str:
                   "\nRisk events: " + json.dumps(diag.get("risk_events")) + "\n"]
     if "fresh" in report:
         parts += ["\n## Fresh, unseen live recording\n", "Data: " + json.dumps(report.get("fresh_data")) + "\n",
-                  strategy_table(report["fresh"], ["market_only", "with_existing_ai", "DIAGNOSTIC_cost_blind", "DIAGNOSTIC_cost_blind_with_ai"])]
+                  strategy_table(report["fresh"], ["market_only", "with_existing_ai", "AI_direct", "BASELINE_momentum"]),
+                  "\n**Cost-blind diagnostics (fresh)**\n",
+                  strategy_table(report["fresh"], ["DIAGNOSTIC_cost_blind", "DIAGNOSTIC_cost_blind_with_ai", "AI_direct_cost_blind", "BASELINE_momentum_cost_blind"])]
         ai = report["fresh"].get("with_existing_ai", {}).get("ai_signal_evaluation")
         if ai:
             parts.append("\n### Existing AI live probability vs outcomes (fresh)\n\n" + "\n".join(f"- {k}: {v}" for k, v in ai.items()) + "\n")

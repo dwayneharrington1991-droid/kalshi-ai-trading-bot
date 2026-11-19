@@ -18,7 +18,7 @@ def wilson(k, n, z=1.96):
     d = 1 + z * z / n
     c = (p + z * z / (2 * n)) / d
     h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
-    return [round(c - h, 4), round(c + h, 4)]
+    return [round(max(0.0, c - h), 4), round(min(1.0, c + h), 4)]
 
 
 def cluster_bootstrap(trades, reps=4000, seed=7):
@@ -120,6 +120,7 @@ def summarize(engine, label=None):
         "top_wait_reasons": engine.wait_reasons.most_common(8),
         "risk_events": [(round(t), e, d) for t, e, d in engine.risk.events],
         "model_out_of_sample": engine.model.skill(),
+        "activity": _activity(engine),
         "vs_no_trade_baseline": {
             "no_trade_net_pnl": 0.0,
             "difference": round(sum(pnl), 2),
@@ -155,6 +156,22 @@ def trade_stats(trades):
         "profit_factor": round(sum(wins) / loss, 3) if loss > 0 else None,
         "closed_trade_max_drawdown": round(dd, 2),
         "vs_no_trade": cluster_bootstrap(trades),
+    }
+
+
+def _activity(engine):
+    hours = engine.active_seconds / 3600
+    buys = sum(v for k, v in engine.decision_counts.items() if k.startswith("BUY"))
+    per = lambda v: round(v / hours, 2) if hours else None
+    return {
+        "active_market_hours": round(hours, 2),
+        "edge_candidates_per_hour": per(engine.edge_candidates),
+        "buy_signals_per_hour": per(buys),
+        "completed_trades_per_hour": per(len(engine.trades)),
+        "edge_candidates": engine.edge_candidates,
+        "gate_blocked_candidates": engine.gate_blocked_candidates,
+        "gate_violations": engine.gate_violations,
+        "definitions": "edge candidate = forecast clears +1c/contract after spread, slippage and fees (before skill gate, spread, price and risk filters); buy signal = BUY issued after all filters",
     }
 
 

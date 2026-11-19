@@ -27,6 +27,7 @@ import argparse
 import base64
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import queue
@@ -36,6 +37,7 @@ import time
 from urllib.parse import urlencode
 from urllib.request import Request, build_opener
 
+LOG = logging.getLogger("phone_alerts")
 QUALIFIED_CONFIDENCE = {"CALIBRATED", "EXPERIMENTAL CALIBRATED CANDIDATE"}
 MAX_CALL_AGE = 120
 MAX_AFTER_OPEN = 300
@@ -159,19 +161,32 @@ def qualified(opening, *, stale, now):
         return False, "call is not new"
     if (generated - opens).total_seconds() > MAX_AFTER_OPEN or now >= closes:
         return False, "market already well past its opening"
+    reason = opening.get("reason")
     return True, {"ticker": opening.get("ticker"), "direction": direction,
                   "confidence": up if direction == "UP" else 1 - up, "threshold": opening.get("threshold"),
+                  "reference": opening.get("reference_price"), "closes_at": closes,
+                  "explanation": " ".join(str(reason).split())[:180] if reason else None,
                   "remaining_s": max(0, int((closes - now).total_seconds())), "status": status}
 
 
+def _usd(value):
+    return f"${value:,.2f}" if type(value) in (int, float) else "n/a"
+
+
 def message(d, dashboard):
-    threshold = d.get("threshold")
-    strike = f"${threshold:,.2f}" if type(threshold) in (int, float) else "n/a"
+    """Only values the immutable opening record actually holds; missing ones show as n/a."""
     mins, secs = divmod(d["remaining_s"], 60)
-    return (f"KALSHI BTC 15m OPENING: {d['direction']}\n{d['ticker']}\n"
-            f"Confidence {d['confidence'] * 100:.1f}% ({d['status'].lower()})\n"
-            f"Opening threshold {strike}\nTime remaining {mins}m {secs:02d}s\n"
-            f"Dashboard: {dashboard}\nSignal only - place any trade manually.")
+    closes = d.get("closes_at")
+    expires = closes.strftime("%H:%M UTC") if hasattr(closes, "strftime") else "n/a"
+    lines = [f"KALSHI BTC 15m OPENING: {d['direction']}", d["ticker"],
+             f"Confidence {d['confidence'] * 100:.1f}% ({d['status'].lower()})",
+             f"Opening threshold {_usd(d.get('threshold'))}",
+             f"BTC reference {_usd(d.get('reference'))}",
+             f"Expires {expires} (time remaining {mins}m {secs:02d}s)"]
+    if d.get("explanation"):
+        lines.append(f"Why: {d['explanation']}")
+    lines += [f"Dashboard: {dashboard}", "Signal only - place any trade manually."]
+    return "\n".join(lines)
 
 
 class OpeningAlerts:
@@ -215,6 +230,7 @@ class OpeningAlerts:
                     sent_any = True
                 except queue.Full:
                     self.counters["dropped"] += 1
+                    LOG.warning("opening alert %s %s via %s: DROPPED_QUEUE_FULL", details["ticker"], details["direction"], channel)
                     self._result(details["ticker"], details["direction"], channel, "DROPPED_QUEUE_FULL")
             return sent_any
         except Exception:
@@ -234,6 +250,9 @@ class OpeningAlerts:
                     result = "FAILED:" + type(exc).__name__
                     time.sleep(2 * (attempt + 1))
             self.counters["sent" if result == "SENT" else "failed"] += 1
+            # Never credentials or message text: ticker, direction, channel and result only.
+            (LOG.info if result == "SENT" else LOG.warning)(
+                "opening alert %s %s via %s: %s", d["ticker"], d["direction"], channel, result)
             try:
                 self._result(d["ticker"], d["direction"], channel, result)
             except sqlite3.Error:

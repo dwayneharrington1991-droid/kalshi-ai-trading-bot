@@ -50,7 +50,7 @@ def test_at_most_one_alert_per_market_and_channel_even_across_restarts(tmp_path)
     b.queue.join()
     assert sorted(ch for ch, _ in sent) == ["sms", "telegram"]
     text = sent[0][1]
-    for part in ("UP", "KXBTC15M-26NOV190315-15", "Confidence 71.0%", "$91,234.50", "Time remaining 14m", "127.0.0.1:18768",
+    for part in ("UP", "KXBTC15M-26NOV190315-15", "Confidence 71.0%", "$91,234.50", "Expires 03:15 UTC (time remaining 14m", "127.0.0.1:18768",
                  "Signal only"):
         assert part in text
     with sqlite3.connect(tmp_path / "a.sqlite3") as db:
@@ -189,3 +189,48 @@ def test_telegram_test_reports_acceptance_and_rejection_reason():
     lines.clear()
     assert pa.run_test({"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}, ["telegram"], send_fn=unauthorized, out=lines.append) == 3
     assert "REJECTED by provider (HTTP 401, code 401): Unauthorized" in lines[0]
+
+
+def test_message_holds_every_requested_field_and_never_invents_missing_ones():
+    ok, d = pa.qualified(opening(reference_price=91300.25, reason="Momentum and order flow lean up;   calibrated model 71%"),
+                         stale=False, now=NOW)
+    text = pa.message(d, "http://127.0.0.1:18768/")
+    for part in ("OPENING: UP", "KXBTC15M-26NOV190315-15", "Confidence 71.0%", "Opening threshold $91,234.50",
+                 "BTC reference $91,300.25", "Expires 03:15 UTC", "Why: Momentum and order flow lean up; calibrated model 71%",
+                 "Dashboard: http://127.0.0.1:18768/", "Signal only"):
+        assert part in text, part
+    ok, d = pa.qualified(opening(threshold=None), stale=False, now=NOW)
+    text = pa.message(d, "x")
+    assert "Opening threshold n/a" in text and "BTC reference n/a" in text and "Why:" not in text
+    for status in ("NO VERIFIED EDGE", "WAIT", None):
+        assert not pa.qualified(opening(confidence={"status": status}), stale=False, now=NOW)[0]
+    assert not pa.qualified(opening(direction="WAIT", up=0.5), stale=False, now=NOW)[0]
+
+
+def test_alert_attempts_are_logged_without_credentials_or_text(tmp_path, caplog, monkeypatch):
+    import logging
+    monkeypatch.setattr(pa.time, "sleep", lambda s: None)
+    caplog.set_level(logging.INFO, logger="phone_alerts")
+    cfg = {"TELEGRAM_BOT_TOKEN": "777:super-secret", "TELEGRAM_CHAT_ID": "-100999"}
+    ok = pa.OpeningAlerts(tmp_path / "a.sqlite3", config_loader=lambda: cfg, sender=lambda ch, c, t: (200, {"ok": True}))
+    ok.consider(opening(), stale=False, now=NOW); ok.queue.join()
+    def down(ch, c, t):
+        raise pa.ProviderRejected(401, 401, "Unauthorized")
+    bad = pa.OpeningAlerts(tmp_path / "b.sqlite3", config_loader=lambda: cfg, sender=down)
+    bad.consider(opening(), stale=False, now=NOW); bad.queue.join()
+    logs = caplog.text
+    assert "opening alert KXBTC15M-26NOV190315-15 UP via telegram: SENT" in logs
+    assert "via telegram: FAILED:ProviderRejected" in logs
+    assert "super-secret" not in logs and "-100999" not in logs and "Confidence" not in logs
+
+
+def test_live_forecast_changes_never_trigger_a_second_alert(tmp_path):
+    sent = []
+    a = pa.OpeningAlerts(tmp_path / "a.sqlite3", config_loader=lambda: {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"},
+                         sender=lambda ch, c, t: sent.append(t) or (200, {}))
+    first = opening()
+    assert a.consider(first, stale=False, now=NOW)
+    for later in range(1, 30):                     # the same immutable opening seen on every later tick
+        a.consider(first, stale=False, now=NOW + timedelta(seconds=later))
+    a.queue.join()
+    assert len(sent) == 1

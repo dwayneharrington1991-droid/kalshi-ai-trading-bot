@@ -25,6 +25,7 @@ import json
 import os
 import sqlite3
 import statistics
+import time
 from datetime import datetime, timedelta, timezone
 
 SOURCE = "Coinbase BTC/USD stream"
@@ -34,6 +35,8 @@ COLUMNS = ["available_at_utc", "event_at_utc", "price", "bid", "ask", "bid_size"
            "source", "row_timestamp_utc"]
 MAX_ROWS = 300000
 GAP_S = 60
+QUERY_TIMEOUT_S = 120          # wall-clock budget for all reads; the query is aborted beyond it
+PROGRESS_EVERY = 10000         # SQLite VM instructions between deadline checks
 
 
 def parse_ts(text):
@@ -91,34 +94,57 @@ def parse_row(row_ts, payload):
     return record, None
 
 
-def export(db_path, since, until, out_dir, max_rows=MAX_ROWS):
+COUNT_SQL = "SELECT COUNT(*) FROM feed_observations WHERE source=? AND timestamp>=? AND timestamp<?"
+ROWS_SQL = ("SELECT timestamp, payload FROM feed_observations "
+            "WHERE source=? AND timestamp>=? AND timestamp<? ORDER BY timestamp")
+
+
+def check_index_plan(db, sql, params):
+    """Refuse unless SQLite searches the (source, timestamp) key. A plain SCAN would read the whole journal."""
+    plan = [row[-1] for row in db.execute("EXPLAIN QUERY PLAN " + sql, params)]
+    if not plan or any(step.startswith("SCAN") for step in plan) or not any("USING" in s and "INDEX" in s for s in plan):
+        raise SystemExit(f"refused: query plan is not an indexed range search: {plan}")
+    return plan
+
+
+def export(db_path, since, until, out_dir, max_rows=MAX_ROWS, query_timeout=QUERY_TIMEOUT_S):
     if os.path.exists(out_dir):
         raise SystemExit("refused: output folder already exists")
+    deadline = time.monotonic() + query_timeout
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
     try:
         db.execute("PRAGMA query_only = 1")
         db.execute("PRAGMA busy_timeout = 5000")
+        db.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, PROGRESS_EVERY)
         pad = (since - timedelta(minutes=2)).isoformat()
         end = (until + timedelta(minutes=2)).isoformat()
-        count = db.execute("SELECT COUNT(*) FROM feed_observations WHERE source=? AND timestamp>=? AND timestamp<?",
-                           (SOURCE, pad, end)).fetchone()[0]
+        args = (SOURCE, pad, end)
+        check_index_plan(db, COUNT_SQL, args)
+        check_index_plan(db, ROWS_SQL, args)
+        try:
+            count = db.execute(COUNT_SQL, args).fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            raise SystemExit(f"refused: read aborted ({exc}); journal left untouched") from exc
         if count > max_rows:
             raise SystemExit(f"refused: {count} rows exceeds the cap of {max_rows}; use a shorter window")
-        cursor = db.execute("SELECT timestamp, payload FROM feed_observations "
-                            "WHERE source=? AND timestamp>=? AND timestamp<? ORDER BY timestamp",
-                            (SOURCE, pad, end))
+        cursor = db.execute(ROWS_SQL, args)
         scanned, rejected, parsed = 0, {}, []
-        for row_ts, payload in cursor:
-            scanned += 1
-            try:
-                record, reason = parse_row(row_ts, payload)
-            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                record, reason = None, "unparseable"
-            if reason:
-                rejected[reason] = rejected.get(reason, 0) + 1
-                continue
-            if since <= record["available_at"] <= until:
-                parsed.append(record)
+        try:
+            for row_ts, payload in cursor:
+                if time.monotonic() > deadline:
+                    raise SystemExit("refused: read exceeded the time budget; journal left untouched")
+                scanned += 1
+                try:
+                    record, reason = parse_row(row_ts, payload)
+                except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    record, reason = None, "unparseable"
+                if reason:
+                    rejected[reason] = rejected.get(reason, 0) + 1
+                    continue
+                if since <= record["available_at"] <= until:
+                    parsed.append(record)
+        except sqlite3.OperationalError as exc:      # the progress handler interrupts the read at the deadline
+            raise SystemExit(f"refused: read aborted ({exc}); journal left untouched") from exc
     finally:
         db.close()
 
@@ -184,12 +210,13 @@ def main(argv=None):
     ap.add_argument("--until", help="ISO UTC; default now")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--max-rows", type=int, default=MAX_ROWS)
+    ap.add_argument("--query-timeout", type=float, default=QUERY_TIMEOUT_S)
     args = ap.parse_args(argv)
     until = parse_ts(args.until) if args.until else datetime.now(timezone.utc)
     since = parse_ts(args.since) if args.since else until - timedelta(hours=args.hours)
     if until <= since or (until - since) > timedelta(days=14):
         raise SystemExit("refused: window must be positive and at most 14 days")
-    export(args.db, since, until, args.out_dir, args.max_rows)
+    export(args.db, since, until, args.out_dir, args.max_rows, args.query_timeout)
 
 
 if __name__ == "__main__":

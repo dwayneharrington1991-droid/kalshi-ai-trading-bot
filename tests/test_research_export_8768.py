@@ -120,3 +120,62 @@ def test_export_csv_contains_only_the_needed_columns(tmp_path):
     header = (out / "coinbase_updates.csv").read_text().splitlines()[0].split(",")
     assert header == ["available_at_utc", "event_at_utc", "price", "bid", "ask", "bid_size", "ask_size",
                       "source", "row_timestamp_utc"]
+
+
+def _load_script():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("research_export_8768", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_query_uses_the_primary_key_index_and_no_full_scan(tmp_path):
+    mod = _load_script()
+    db_path = _journal(tmp_path / "j.db", [_row(T0, 100000.0, received=T0)])
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    args = (SOURCE, iso(T0 - timedelta(minutes=1)), iso(T0 + timedelta(minutes=1)))
+    try:
+        for sql in (mod.COUNT_SQL, mod.ROWS_SQL):
+            plan = mod.check_index_plan(db, sql, args)
+            assert any("USING" in s and "INDEX" in s for s in plan)
+            assert not any(s.startswith("SCAN") for s in plan)
+            assert not any("TEMP B-TREE" in s for s in plan)    # ORDER BY is served by the index
+    finally:
+        db.close()
+
+
+def test_a_table_without_the_key_is_refused_as_a_full_scan(tmp_path):
+    mod = _load_script()
+    path = tmp_path / "noidx.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE feed_observations (source TEXT,timestamp TEXT,payload TEXT)")
+    raw.commit()
+    raw.close()
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            mod.check_index_plan(db, mod.ROWS_SQL, (SOURCE, "a", "b"))
+        assert "not an indexed range search" in str(exc.value)
+    finally:
+        db.close()
+
+
+def test_timeout_aborts_the_read_and_leaves_the_journal_and_output_untouched(tmp_path):
+    rows = [_row(T0 + timedelta(seconds=i), 100000.0 + i, received=T0 + timedelta(seconds=i)) for i in range(200)]
+    db = _journal(tmp_path / "j.db", rows)
+    before = _sha(db)
+    out = tmp_path / "export"
+    result = subprocess.run([sys.executable, "-I", str(SCRIPT), "--db", str(db), "--since", iso(T0 - timedelta(minutes=1)),
+                             "--until", iso(T0 + timedelta(minutes=5)), "--out-dir", str(out),
+                             "--query-timeout", "0"], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "budget" in result.stderr or "aborted" in result.stderr
+    assert not out.exists()
+    assert _sha(db) == before
+
+
+def test_default_budget_and_row_cap_are_the_reviewed_values():
+    mod = _load_script()
+    assert mod.QUERY_TIMEOUT_S == 120
+    assert mod.MAX_ROWS == 300000

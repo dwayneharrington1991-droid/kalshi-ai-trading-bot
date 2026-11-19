@@ -38,7 +38,9 @@ def _ema(values, span):
 def features(bars):
     """Causal feature rows, one per bar index i (rows[i] uses bars[:i+1] only)."""
     closes = [b["close"] for b in bars]
-    vols = [b["volume"] for b in bars]
+    # Volume may be unavailable (price-only feeds). Then the volume feature is 0 and the
+    # report says so; nothing is invented.
+    vols = [b.get("volume") or 0.0 for b in bars]
     ema_f, ema_s = _ema(closes, EMA_FAST), _ema(closes, EMA_SLOW)
     rows = []
     for i in range(len(bars)):
@@ -125,18 +127,31 @@ def binomial_p_greater(k, n, p0=0.5):
     return min(1.0, total)
 
 
+def segment_rows(segments):
+    """Causal features and labels inside each contiguous segment; no label crosses a gap."""
+    X_all, y_all = [], []
+    for seg in segments:
+        X_all.extend(features(seg))
+        y_all.extend(labels(seg))
+    return X_all, y_all
+
+
 def run(bars, train_frac=0.6, val_frac=0.2):
-    """Chronological evaluation. Returns a dict; 'verdict' is the only decision field."""
+    """Chronological evaluation of one contiguous series. Returns a dict; 'verdict' is the decision."""
+    return run_segments([bars], train_frac=train_frac, val_frac=val_frac)
+
+
+def run_segments(segments, train_frac=0.6, val_frac=0.2):
+    """Chronological evaluation over contiguous segments (gaps are never bridged by a label)."""
     t0 = time.perf_counter()
-    X_all = features(bars)
-    y_all = labels(bars)
-    usable = [i for i in range(len(bars)) if y_all[i] is not None]
+    X_all, y_all = segment_rows(segments)
+    usable = [i for i in range(len(y_all)) if y_all[i] is not None]
     n = len(usable)
     a, c = int(n * train_frac), int(n * (train_frac + val_frac))
     tr, va, te = usable[:a], usable[a:c], usable[c:]
     if len(te) < MIN_TEST or len(tr) < 100:
         return {"verdict": "NO_VALIDATED_EDGE", "reason": "insufficient data for a chronological test block",
-                "test_n": len(te)}
+                "test_n": len(te), "usable_n": n}
     X = lambda idx: [X_all[i] for i in idx]
     Y = lambda idx: [y_all[i] for i in idx]
     model = fit_logistic(X(tr), Y(tr))

@@ -63,3 +63,15 @@ def test_8768_audit_is_read_only_and_never_prints_environment_values():
     environ_lines = [line for line in code.splitlines() if "/environ" in line]
     assert environ_lines and all("cut -d= -f1" in line for line in environ_lines)
     assert "j.read()" in code and "AUDIT_8768_COMPLETE" in code
+
+
+def test_tonight_status_is_read_only():
+    path = ROOT / "deploy/oracle/tonight_status_8768.sh"
+    code = _code(path)
+    assert subprocess.run(["bash", "-n", str(path)]).returncode == 0
+    for forbidden in (r"kill -(TERM|KILL|STOP|CONT|9|15|19)", r"\bpkill\b", r"renice -n -?[0-9]+ -p \"?\$W",
+                      r"systemctl", r"\brm\b", r"\bmv\b", r"\bcp\b", r"INSERT\s", r"UPDATE\s", r"DELETE\s",
+                      r"/environ", r"nohup", r"8765.*(stop|restart)"):
+        assert not re.search(forbidden, code), forbidden
+    assert "renice -n 19 -p $$" in code                 # only lowers its OWN priority
+    assert "VERDICT: STARVED" in code and "VERDICT: BLOCKED_ON_DISK" in code

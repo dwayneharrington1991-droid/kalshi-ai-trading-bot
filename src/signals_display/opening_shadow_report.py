@@ -69,12 +69,14 @@ def weekly_report(journal_ro, ledger_path):
     shadow = {}
     if Path(ledger_path).exists():
         with sqlite3.connect(f"file:{Path(ledger_path).resolve()}?mode=ro", uri=True) as led:
-            for ticker, scored_at, decision, inputs_complete, seconds in led.execute(
-                    "SELECT ticker, scored_at, decision, inputs_complete, seconds_after_open FROM shadow_openings"):
-                shadow[ticker] = {"scored_at": scored_at, "decision": decision,
-                                  "complete": inputs_complete, "seconds": seconds}
+            for ticker, generated_at, scored_at, decision, inputs_complete, seconds, sha in led.execute(
+                    "SELECT ticker, generated_at, scored_at, decision, inputs_complete, seconds_after_open, "
+                    "model_sha256 FROM shadow_openings"):
+                shadow[ticker] = {"generated_at": generated_at, "scored_at": scored_at, "decision": decision,
+                                  "complete": inputs_complete, "seconds": seconds, "model": sha}
     weeks = {}
-    timing = {"scored_after_outcome": 0, "scored_late_over_900s": 0}
+    by_model = {}
+    timing = {"scored_after_outcome": 0, "scored_late_over_900s": 0, "excluded_non_prospective": 0}
     for o in openings:
         week = _week(o["opens_at"])
         w = weeks.setdefault(week, {"live": {"calls": 0, "correct": 0, "resolved": 0},
@@ -91,8 +93,20 @@ def weekly_report(journal_ro, ledger_path):
         s = shadow.get(o["ticker"])
         if s and outcome is not None and _ts(s["scored_at"]) > _ts(outcome[0]):
             timing["scored_after_outcome"] += 1
+            prospective_ok = False
+        else:
+            prospective_ok = True
         if s and s["seconds"] is not None and s["seconds"] > 900:
             timing["scored_late_over_900s"] += 1
+        if s and _ts(s["scored_at"]) < _ts(s["generated_at"]):
+            timing["scored_before_generated"] = timing.get("scored_before_generated", 0) + 1
+            prospective_ok = False
+        if s and prospective_ok and s["decision"] in ("UP", "DOWN") and outcome is not None:
+            by_model.setdefault(s["model"], {"resolved": 0, "correct": 0})
+            by_model[s["model"]]["resolved"] += 1
+            by_model[s["model"]]["correct"] += 1 if (s["decision"] == "UP") == (outcome[1] == 1) else 0
+        if s and not prospective_ok:
+            timing["excluded_non_prospective"] = timing.get("excluded_non_prospective", 0) + 1
     report_weeks = {}
     for week in sorted(weeks):
         w = weeks[week]
@@ -105,6 +119,9 @@ def weekly_report(journal_ro, ledger_path):
     return {"generated_at": datetime.now(timezone.utc).isoformat(), "targets": {
                 "accuracy": TARGET_ACCURACY, "coverage": TARGET_COVERAGE, "note": "research targets, not assumed"},
             "timing_checks": timing,
+            "shadow_by_model_version": {k: {**v, "accuracy": round(v["correct"] / v["resolved"], 4) if v["resolved"] else None,
+                                             "accuracy_wilson_95": oc.wilson(v["correct"], v["resolved"])}
+                                        for k, v in by_model.items()},
             "weeks": report_weeks,
             "claim_policy": "no improvement is claimed for a week below the minimum resolved-call sample"}
 

@@ -27,10 +27,10 @@ def _ledger(path, rows):
     sh.write_ledger(path, rows)
 
 
-def _shadow(ticker, decision, scored_at, seconds=1.0):
-    return {"ticker": ticker, "opens_at": T0.isoformat(), "scored_at": scored_at, "seconds_after_open": seconds,
-            "inputs_complete": 1, "probability": 0.6 if decision == "UP" else 0.4, "decision": decision,
-            "model_sha256": "m"}
+def _shadow(ticker, decision, scored_at, seconds=1.0, generated_at=None):
+    return {"ticker": ticker, "opens_at": T0.isoformat(), "generated_at": generated_at or T0.isoformat(),
+            "scored_at": scored_at, "seconds_after_open": seconds, "inputs_complete": 1,
+            "probability": 0.6 if decision == "UP" else 0.4, "decision": decision, "model_sha256": "m"}
 
 
 def test_accuracy_is_over_resolved_calls_and_coverage_over_all_eligible(tmp_path):
@@ -84,3 +84,21 @@ def test_report_states_the_research_targets_and_reads_read_only(tmp_path):
         report = rp.weekly_report(db, tmp_path / "none.sqlite3")
     assert report["targets"]["accuracy"] == 0.85 and report["targets"]["coverage"] == 0.90
     assert "research targets" in report["targets"]["note"]
+
+
+def test_a_replayed_row_scored_after_its_outcome_never_counts_as_prospective(tmp_path):
+    openings = [("A", T0.isoformat(), "UP"), ("B", (T0 + timedelta(minutes=15)).isoformat(), "UP")]
+    outcomes = [("A", (T0 + timedelta(minutes=16)).isoformat(), 1), ("B", (T0 + timedelta(minutes=31)).isoformat(), 1)]
+    journal = tmp_path / "j.db"
+    _journal(journal, openings, outcomes)
+    ledger = tmp_path / "led.sqlite3"
+    _ledger(ledger, [
+        _shadow("A", "UP", (T0 + timedelta(seconds=30)).isoformat()),                       # prospective, correct
+        _shadow("B", "UP", (T0 + timedelta(minutes=40)).isoformat(),                         # replay after outcome
+                generated_at=(T0 + timedelta(minutes=15)).isoformat()),
+    ])
+    with sqlite3.connect(journal) as db:
+        report = rp.weekly_report(db, ledger)
+    assert report["timing_checks"]["excluded_non_prospective"] == 1
+    assert report["shadow_by_model_version"]["m"]["resolved"] == 1          # only A counts
+    assert report["shadow_by_model_version"]["m"]["correct"] == 1

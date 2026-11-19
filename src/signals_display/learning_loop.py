@@ -203,6 +203,13 @@ def read_status(path):
     return value
 
 
+def combined_status(learning_path, lifecycle_path):
+    """Learning status plus the automatic-learning lifecycle status (read-only; NOT_RUN when absent)."""
+    base = read_status(learning_path)
+    base["lifecycle"] = read_status(lifecycle_path)
+    return base
+
+
 def summarize(ledger, patterns, promotion, generated_at):
     displayed = [r for r in ledger if r["displayed"]]
     scored = [r for r in displayed if r["correct"] is not None]

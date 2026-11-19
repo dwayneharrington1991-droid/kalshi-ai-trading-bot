@@ -532,6 +532,15 @@ $('load-market-history').onclick=()=>{marketHistoryBeforeClose=null;marketHistor
       var r = await fetch('/api/learning-status', {cache: 'no-store'});
       var s = await r.json();
       if (s.status !== 'MEASURED') { show('Learning loop: ' + (s.note || 'no run published yet') + ' Live model: UNCHANGED.'); return; }
+      var C = s.lifecycle || {}, CP = C.promotion || {}, CC = C.candidate || {};
+      if (C.status === 'NOT_RUN' || !C.format) { show('AI learning: no cycle published yet. Live model: UNCHANGED. Learning collects every settled market.'); return; }
+      var rb = (C.rollback || {}).status || 'none';
+      var why = (C.reasons && C.reasons.length) ? ' Why: ' + C.reasons.join('; ') + '.' : '';
+      show('AI learning (cycle ' + (C.last_training_cycle || 'n/a') + ', next ~' + (C.next_cycle_after || 'n/a') + '): ' +
+           (C.markets_learned_from || 0) + ' settled markets learned; retrain decision ' + (C.retrain_decision || 'n/a') +
+           '; candidate ' + (CC.checksum || 'none') + ' on ' + (CC.markets_scored || 0) + ' unseen markets; promotion ' +
+           (CP.result || 'n/a') + '; rollback ' + rb + '; activation ' + (C.activation || 'n/a') +
+           '; production model: ' + (C.current_production_model || 'original') + '.' + why);
       var L = s.ledger || {}, P = s.promotion || {};
       var pats = (s.failure_patterns || {}).patterns || [];
       show('Learning loop (as of ' + (s.generated_at || 'n/a') + '): ' + (L.openings_recorded || 0) +

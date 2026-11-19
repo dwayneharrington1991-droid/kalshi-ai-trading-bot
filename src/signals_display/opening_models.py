@@ -17,6 +17,10 @@ from time import perf_counter
 
 from . import learning
 from .features import FEATURES, OPENING_CANDLE_FEATURES
+
+# The production decision threshold. Challengers are evaluated at this fixed value, never at a
+# threshold chosen by training. Changing it needs a separately validated, separately approved change.
+LIVE_DECISION_THRESHOLD = 0.55
 from .model import timestamp
 from .scores import score
 
@@ -631,8 +635,8 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
     if not passed:
         return None, report
     selective = report["selective_signal_evaluation"]
-    decision_threshold = selective.get("selected_threshold")
-    if decision_threshold is None:
+    validation_threshold = selective.get("selected_threshold")
+    if validation_threshold is None:
         report.update(
             status="SELECTIVE_WAIT_POLICY_UNAVAILABLE",
             reason=(
@@ -641,6 +645,9 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
             ),
         )
         return None, report
+    # The challenger is scored at the fixed live threshold. The validation-selected value is kept
+    # for audit only; it is never used as the decision policy.
+    decision_threshold = LIVE_DECISION_THRESHOLD
     fingerprint = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
     created_at = datetime.now(timezone.utc).isoformat()
     return {
@@ -662,8 +669,9 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         "automatic_activation": False,
         "activation_allowed": False,
         "decision_policy": {
-            "kind": "validation_selected_symmetric_abstention",
+            "kind": "fixed_live_threshold",
             "threshold": decision_threshold,
+            "validation_selected_threshold": validation_threshold,
             "selected_before_untouched_test": True,
             "otherwise": "WAIT",
         },
@@ -751,16 +759,19 @@ def validate_artifact(data):
     validate_model(data["model"])
     report = data["report"]
     policy = data.get("decision_policy")
-    if (
-        not isinstance(policy, dict)
-        or policy.get("kind") != "validation_selected_symmetric_abstention"
-        or policy.get("selected_before_untouched_test") is not True
-        or type(policy.get("threshold")) not in (int, float)
-        or not 0.5 < policy["threshold"] < 1
-        or policy.get("otherwise") != "WAIT"
-        or policy["threshold"]
-        != (report.get("selective_signal_evaluation") or {}).get("selected_threshold")
-    ):
+    if not isinstance(policy, dict) or policy.get("selected_before_untouched_test") is not True \
+            or type(policy.get("threshold")) not in (int, float) or policy.get("otherwise") != "WAIT":
+        raise ValueError("Opening artifact lacks a validation-selected WAIT policy")
+    if policy.get("kind") == "fixed_live_threshold":
+        # Challengers use the production threshold exactly; the validation-selected value is audit only.
+        if float(policy["threshold"]) != LIVE_DECISION_THRESHOLD:
+            raise ValueError("Opening artifact threshold differs from the live decision threshold")
+    elif policy.get("kind") == "validation_selected_symmetric_abstention":
+        # Legacy artifacts (including the live model) keep their original, unchanged rule.
+        if not 0.5 < policy["threshold"] < 1 or policy["threshold"] != (
+                report.get("selective_signal_evaluation") or {}).get("selected_threshold"):
+            raise ValueError("Opening artifact lacks a validation-selected WAIT policy")
+    else:
         raise ValueError("Opening artifact lacks a validation-selected WAIT policy")
     counts = report["split_contracts"]
     if (

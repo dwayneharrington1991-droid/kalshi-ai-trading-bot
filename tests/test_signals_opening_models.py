@@ -412,6 +412,7 @@ def test_only_opening_target_artifact_available_before_open_can_be_used():
 
 def test_selective_candidate_decision_is_saved_and_not_repainted():
     candidate = eligible_candidate()
+    candidate["decision_policy"]["kind"] = "validation_selected_symmetric_abstention"  # legacy rule under test
     candidate["decision_policy"]["threshold"] = 0.99
     candidate["report"]["selective_signal_evaluation"]["selected_threshold"] = 0.99
     result = opening(candidate_artifact=candidate)

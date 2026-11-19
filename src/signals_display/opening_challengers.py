@@ -11,12 +11,15 @@ Results are exploratory out-of-fold historical results, not the unseen forward h
 import json
 import math
 from pathlib import Path
+from statistics import NormalDist
 
 CALL_HIGH = 0.55
 CALL_LOW = 0.45
 L2_GRID = (0.01, 0.1, 1.0)
 BLEND_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 Z_95 = 1.96
+EXPERIMENT_VERSION = "opening-challengers-2026-11-19-v2"
+PRUNE_THRESHOLD = 0.98          # pre-registered: drop one of any pair of training-fold inputs with |corr| >= 0.98
 
 
 def production_inputs(artifact):
@@ -110,6 +113,25 @@ def _fit_platt(logits, ys, epochs=400, lr=0.1):
 def _split_inner(train):
     cut = max(1, int(len(train) * 0.75))
     return train[:cut], train[cut:] or train[-1:]
+
+
+def _prune_collinear(train, names, threshold=PRUNE_THRESHOLD):
+    """Greedy: keep a name unless it is strongly correlated with one already kept. Uses training rows only."""
+    means, scales = _standardize(train, names)
+    cols = {n: [(float(r["features"].get(n, 0.0)) - means[n]) / scales[n] for r in train] for n in names}
+    kept = []
+    for n in names:
+        redundant = False
+        for k in kept:
+            a, b = cols[n], cols[k]
+            num = sum(x * y for x, y in zip(a, b))
+            den = math.sqrt(sum(x * x for x in a) * sum(y * y for y in b))
+            if den > 0 and abs(num / den) >= threshold:
+                redundant = True
+                break
+        if not redundant:
+            kept.append(n)
+    return kept
 
 
 def fit_logistic(train, names):
@@ -225,13 +247,15 @@ def by_regime(rows, ps_by_model, ys):
     return out
 
 
-def walk_forward(rows, names, min_train=120, block=30):
+def walk_forward(rows, names, min_train=120, block=30, live_cutoff=None):
     """Expanding-window walk-forward with purging. Every model is scored on the same pooled test openings."""
     rows = sorted(rows, key=lambda r: str(r["timestamp"]))
     pooled_rows = []
-    pooled = {"live": [], "logistic": [], "logistic_calibrated": [], "blend": []}
+    pooled = {"live": [], "logistic": [], "logistic_calibrated": [], "logistic_pruned": [], "blend": []}
     ys = []
     folds = []
+    violations = 0
+    live_in_sample = 0
     start = min_train
     while start < len(rows):
         end = min(start + block, len(rows))
@@ -241,32 +265,76 @@ def walk_forward(rows, names, min_train=120, block=30):
         if len(train) < min_train or not test:
             start = end
             continue
+        # leakage checks: every training label is known before the first test opening; test is strictly later
+        violations += sum(1 for r in train if str(r["label_available_at"]) > str(rows[start]["timestamp"]))
+        violations += sum(1 for r in test if str(r["timestamp"]) <= max(str(t["timestamp"]) for t in train))
+        if live_cutoff is not None:
+            live_in_sample += sum(1 for r in test if str(r["label_available_at"]) <= live_cutoff)
         fitted = fit_logistic(train, names)
+        pruned_names = _prune_collinear(train, names)
+        pruned = fit_logistic(train, pruned_names)
+        pruned_p = predict_logistic(pruned, test, calibrated=True)
         alpha = choose_blend(train, names)
         live_p = [float(r["recorded_up"]) for r in test]
         lr_p = predict_logistic(fitted, test)
         cal_p = predict_logistic(fitted, test, calibrated=True)
+        pooled["logistic_pruned"].extend(pruned_p)
         pooled["live"].extend(live_p)
         pooled["logistic"].extend(lr_p)
         pooled["logistic_calibrated"].extend(cal_p)
         pooled["blend"].extend(alpha * l + (1 - alpha) * p for l, p in zip(live_p, lr_p))
         pooled_rows.extend(test)
         ys.extend(int(r["outcome"]) for r in test)
-        folds.append({"test_start": rows[start]["timestamp"], "test_n": len(test), "l2": fitted["l2"], "blend": alpha})
+        folds.append({"test_start": rows[start]["timestamp"], "test_n": len(test), "l2": fitted["l2"],
+                      "blend": alpha, "pruned_inputs": len(pruned_names)})
         start = end
     if not ys:
-        return {"folds": [], "results": {}, "by_regime": {}, "paired_vs_live": {}}
+        return {"folds": [], "results": {}, "by_regime": {}, "paired_vs_live": {}, "leakage_violations": violations}
     results = {name: score(ps, ys) for name, ps in pooled.items()}
     paired = {name: paired_logloss_gain(pooled["live"], ps, ys) for name, ps in pooled.items() if name != "live"}
+    holm_adjust(paired)
+    fingerprint = _fingerprint([(r["ticker"], str(r["timestamp"]), int(r["outcome"])) for r in pooled_rows])
     return {"folds": folds, "results": results, "paired_vs_live": paired,
-            "by_regime": by_regime(pooled_rows, pooled, ys)}
+            "by_regime": by_regime(pooled_rows, pooled, ys), "leakage_violations": violations,
+            "live_in_sample_test_rows": live_in_sample if live_cutoff is not None else None,
+            "evaluated_rows_fingerprint": fingerprint}
+
+
+def holm_adjust(paired):
+    """Holm step-down adjustment across the challenger comparisons (two-sided normal p-values)."""
+    items = sorted(paired.items(), key=lambda kv: abs(kv[1]["z"]), reverse=True)
+    m = len(items)
+    running = 0.0
+    for rank, (name, stats) in enumerate(items):
+        p = 2 * (1 - NormalDist().cdf(abs(stats["z"])))
+        running = max(running, min(1.0, (m - rank) * p))
+        stats["p_raw"] = round(p, 6)
+        stats["p_holm"] = round(running, 6)
+        stats["comparisons_in_family"] = m
+
+
+def _fingerprint(items):
+    import hashlib
+    return hashlib.sha256(json.dumps(items, sort_keys=True).encode()).hexdigest()
 
 
 def run(snapshot_rows, artifact_path):
-    artifact = json.loads(Path(artifact_path).read_text())
+    import hashlib
+    raw = Path(artifact_path).read_bytes()
+    artifact = json.loads(raw)
     names = production_inputs(artifact)
     present = [n for n in names if any(n in r["features"] for r in snapshot_rows)]
-    result = walk_forward(snapshot_rows, present)
+    live_cutoff = artifact.get("labels_available_through")
+    result = walk_forward(snapshot_rows, present, live_cutoff=live_cutoff)
+    result["reproducibility"] = {
+        "experiment_version": EXPERIMENT_VERSION,
+        "artifact_sha256": hashlib.sha256(raw).hexdigest(),
+        "input_names_sha256": hashlib.sha256(json.dumps(names).encode()).hexdigest(),
+        "live_labels_available_through": live_cutoff,
+        "config": {"min_train": 120, "block": 30, "inner_split": 0.75, "l2_grid": list(L2_GRID),
+                   "blend_grid": list(BLEND_GRID), "prune_threshold": PRUNE_THRESHOLD,
+                   "call_high": CALL_HIGH, "call_low": CALL_LOW, "calibration": "platt_on_inner_block"},
+    }
     result["production_inputs_declared"] = len(names)
     result["production_inputs_present_in_rows"] = len(present)
     result["component_input_counts"] = component_input_counts(artifact)

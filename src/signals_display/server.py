@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from decimal import Decimal
 from pathlib import Path
 import re
@@ -2291,6 +2292,12 @@ def make_handler(monitor):
                     },
                     allow_nan=False,
                 ).encode()
+                content_type = "application/json"
+            elif route == "/api/learning-status":
+                # Read-only: the offline learning run publishes this file; nothing is computed here.
+                from .learning_loop import read_status
+                body = json.dumps(read_status(os.environ.get("LEARNING_STATUS_FILE", "")), allow_nan=False,
+                                  default=str).encode()
                 content_type = "application/json"
             elif route == "/api/learning-summary":
                 report = monitor.quick_learning_report.get()

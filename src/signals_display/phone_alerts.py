@@ -78,12 +78,52 @@ def channels(cfg):
     return out
 
 
+class ProviderRejected(RuntimeError):
+    """The provider answered with an error: ``code`` and ``reason`` are its own (never credentials)."""
+
+    def __init__(self, status, code, reason):
+        super().__init__(f"HTTP {status} code {code}: {reason}")
+        self.status, self.code, self.reason = status, code, reason
+
+
+def _request(url, data=None, headers=None, opener=None):
+    """(HTTP status, JSON body or {}); provider errors raise ProviderRejected."""
+    from urllib.error import HTTPError
+    req = Request(url, data=urlencode(data).encode() if data is not None else None, headers=headers or {},
+                  method="POST" if data is not None else "GET")
+    try:
+        with (opener or build_opener()).open(req, timeout=SEND_TIMEOUT) as resp:
+            raw = resp.read()
+            status = resp.status
+    except HTTPError as exc:
+        try:
+            body = json.loads(exc.read() or b"{}")
+        except ValueError:
+            body = {}
+        raise ProviderRejected(exc.code, body.get("code") or body.get("error_code"),
+                               str(body.get("message") or body.get("description") or "rejected")[:200]) from None
+    if not 200 <= status < 300:
+        raise ProviderRejected(status, None, "unexpected status")
+    try:
+        return status, json.loads(raw or b"{}")
+    except ValueError:
+        return status, {}
+
+
 def _post(url, data, headers=None, opener=None):
-    req = Request(url, data=urlencode(data).encode(), headers=headers or {}, method="POST")
-    with (opener or build_opener()).open(req, timeout=SEND_TIMEOUT) as resp:
-        if not 200 <= resp.status < 300:
-            raise RuntimeError(f"HTTP {resp.status}")
-        return resp.status
+    return _request(url, data, headers, opener)
+
+
+def _twilio_auth(cfg):
+    return {"Authorization": "Basic " + base64.b64encode(
+        f"{cfg['TWILIO_ACCOUNT_SID']}:{cfg['TWILIO_AUTH_TOKEN']}".encode()).decode()}
+
+
+def twilio_status(cfg, message_sid, get=_request):
+    """Twilio's own delivery status for one message (queued/sent/delivered/undelivered/failed)."""
+    _, body = get(f"https://api.twilio.com/2010-04-01/Accounts/{cfg['TWILIO_ACCOUNT_SID']}/Messages/{message_sid}.json",
+                  None, _twilio_auth(cfg))
+    return body.get("status"), body.get("error_code")
 
 
 def send(channel, cfg, text, post=_post):
@@ -91,10 +131,8 @@ def send(channel, cfg, text, post=_post):
         return post(f"https://api.telegram.org/bot{cfg['TELEGRAM_BOT_TOKEN']}/sendMessage",
                     {"chat_id": cfg["TELEGRAM_CHAT_ID"], "text": text, "disable_web_page_preview": "true"})
     if channel == "sms":
-        auth = base64.b64encode(f"{cfg['TWILIO_ACCOUNT_SID']}:{cfg['TWILIO_AUTH_TOKEN']}".encode()).decode()
         return post(f"https://api.twilio.com/2010-04-01/Accounts/{cfg['TWILIO_ACCOUNT_SID']}/Messages.json",
-                    {"From": cfg["TWILIO_FROM"], "To": cfg["ALERT_SMS_TO"], "Body": text},
-                    {"Authorization": "Basic " + auth})
+                    {"From": cfg["TWILIO_FROM"], "To": cfg["ALERT_SMS_TO"], "Body": text}, _twilio_auth(cfg))
     raise ValueError(channel)
 
 
@@ -210,6 +248,52 @@ def from_journal(journal_path):
     return OpeningAlerts(str(journal_path) + ".alerts.sqlite3")
 
 
+def run_test(cfg, found, send_fn=send, status_fn=twilio_status, wait_s=60, poll_s=5, sleep=time.sleep, out=print):
+    """Send one clearly marked TEST message per channel. Exit code: 0 every channel accepted
+    (and Twilio has not reported a failure); 3 a provider rejected it or could not be reached;
+    4 Twilio accepted it but then reported failed/undelivered; 2 nothing configured."""
+    if not found:
+        return 2
+    text = ("TEST ALERT - not a trade signal. Your Kalshi 8768 phone alerts are working. "
+            f"Dashboard: {cfg.get('ALERT_DASHBOARD_URL') or 'http://127.0.0.1:18768/'}")
+    rc = 0
+    for channel in found:
+        name = channel.upper()
+        try:
+            result = send_fn(channel, cfg, text)
+        except ProviderRejected as exc:
+            out(f"TEST_{name}: REJECTED by provider (HTTP {exc.status}, code {exc.code}): {exc.reason}")
+            rc = max(rc, 3)
+            continue
+        except Exception as exc:
+            out(f"TEST_{name}: FAILED to reach provider ({type(exc).__name__})")
+            rc = max(rc, 3)
+            continue
+        body = result[1] if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict) else {}
+        if channel != "sms":
+            out(f"TEST_{name}: ACCEPTED by provider")
+            continue
+        sid, status = body.get("sid"), body.get("status")
+        if not sid:
+            out(f"TEST_{name}: FAILED (Twilio returned no message id)")
+            rc = max(rc, 3)
+            continue
+        out(f"TEST_{name}: ACCEPTED by Twilio (message ...{sid[-6:]}, status {status})")
+        deadline, final = time.monotonic() + wait_s, status
+        while final not in ("delivered", "undelivered", "failed") and time.monotonic() < deadline:
+            sleep(poll_s)
+            try:
+                final, error = status_fn(cfg, sid)
+            except Exception:
+                final, error = final, None
+        if final in ("undelivered", "failed"):
+            out(f"TEST_{name}_STATUS: {final} (Twilio error {error}); the text did not reach the phone")
+            rc = max(rc, 4)
+        else:
+            out(f"TEST_{name}_STATUS: Twilio reports '{final}'; confirm it arrived on the phone")
+    return rc
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Opening phone alerts (signals only)")
     parser.add_argument("--check", action="store_true")
@@ -219,16 +303,8 @@ def main(argv=None):
     found = channels(cfg)
     print("configured channels:", ", ".join(found) or "none (add credentials to " + DEFAULT_FILE + ", mode 600)")
     if args.test:
-        text = ("TEST ALERT - not a trade signal. Your Kalshi 8768 phone alerts are working. "
-                f"Dashboard: {cfg.get('ALERT_DASHBOARD_URL') or 'http://127.0.0.1:18768/'}")
-        for channel in found:
-            try:
-                send(channel, cfg, text)
-                print(f"TEST_{channel.upper()}: SENT (provider accepted it)")
-            except Exception as exc:
-                print(f"TEST_{channel.upper()}: FAILED ({type(exc).__name__})")
-        if not found:
-            raise SystemExit(2)
+        raise SystemExit(run_test(cfg, found))
+    raise SystemExit(0 if found else 2)
 
 
 if __name__ == "__main__":

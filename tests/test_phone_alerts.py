@@ -1,5 +1,6 @@
 """Phone alerts for new calibrated UP/DOWN opening calls. No network: senders are fakes."""
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -108,4 +109,36 @@ def test_module_never_trades():
     for forbidden in ("/portfolio/", "trade-api", "create_order", "cancel_order", "amend", "kalshi_client"):
         assert forbidden not in code.lower()
     hosts = {h for h in ("api.telegram.org", "api.twilio.com") if h in code}
-    assert hosts == {"api.telegram.org", "api.twilio.com"} and code.count("https://") == 2  # only the two providers
+    urls = set(re.findall(r"https://([a-z0-9.\-]+)", code))
+    assert hosts == {"api.telegram.org", "api.twilio.com"} and urls == hosts       # only the two providers
+
+
+def _run(send_fn, statuses=()):
+    seq, lines = list(statuses), []
+    rc = pa.run_test(CFG, ["sms"], send_fn=send_fn, status_fn=lambda cfg, sid: seq.pop(0) if seq else ("sent", None),
+                     wait_s=1, poll_s=0, sleep=lambda s: None, out=lines.append)
+    return rc, "\n".join(lines)
+
+
+def test_sms_test_reports_twilio_acceptance_and_delivery_status_exactly():
+    ok = lambda ch, cfg, text: (201, {"sid": "SM0123456789abcdef", "status": "queued"})
+    rc, text = _run(ok, [("sent", None), ("delivered", None)])
+    assert rc == 0 and "ACCEPTED by Twilio (message ...abcdef, status queued)" in text
+    assert "Twilio reports 'delivered'; confirm it arrived on the phone" in text
+    rc, text = _run(ok, [("undelivered", 30003)])
+    assert rc == 4 and "did not reach the phone" in text and "30003" in text
+
+
+def test_sms_test_failure_exit_codes_and_reasons():
+    def rejected(ch, cfg, text):
+        raise pa.ProviderRejected(401, 20003, "Authenticate")
+    rc, text = _run(rejected)
+    assert rc == 3 and "REJECTED by provider (HTTP 401, code 20003): Authenticate" in text
+    rc, text = _run(lambda ch, cfg, text: (201, {}))
+    assert rc == 3 and "no message id" in text
+    def down(ch, cfg, text):
+        raise TimeoutError()
+    rc, text = _run(down)
+    assert rc == 3 and "FAILED to reach provider (TimeoutError)" in text
+    assert pa.run_test(CFG, [], out=lambda *_: None) == 2
+    assert "tok" not in text and "sec" not in text.replace("seconds", "")

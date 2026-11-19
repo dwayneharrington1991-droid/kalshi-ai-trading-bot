@@ -75,3 +75,13 @@ def test_tonight_status_is_read_only():
         assert not re.search(forbidden, code), forbidden
     assert "renice -n 19 -p $$" in code                 # only lowers its OWN priority
     assert "VERDICT: STARVED" in code and "VERDICT: BLOCKED_ON_DISK" in code
+
+
+def test_live_verification_is_read_only_and_never_prints_credentials():
+    path = ROOT / "deploy/oracle/verify_8768_live.sh"
+    code = _code(path)
+    assert subprocess.run(["bash", "-n", str(path)]).returncode == 0
+    for forbidden in (r"\bkill\b", r"systemctl", r"\brm\b", r"\bmv\b", r"\bcat \"\$CFG\"", r"source ", r"INSERT", r"UPDATE ",
+                      r"DELETE", r"/environ"):
+        assert not re.search(forbidden, code), forbidden
+    assert "mode=ro" in code and "values not shown" in code

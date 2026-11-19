@@ -362,6 +362,13 @@ class Monitor:
         self.market_strip = MarketStrip()
         self.last_proxy_observation = None
         self.runtime_meter = RuntimeMeter()
+        # Phone alerts for NEW calibrated UP/DOWN opening calls (signals only;
+        # no-op without private credentials; never blocks or fails a tick).
+        try:
+            from .phone_alerts import from_journal as _phone_alerts
+            self.phone_alerts = _phone_alerts(journal.path) if getattr(journal, "path", None) else None
+        except Exception:
+            self.phone_alerts = None
         self.worker_lock = threading.Lock()
         self.worker_status = {
             "collector": {"status": "NOT_STARTED", "last_started_at": None,
@@ -1305,6 +1312,11 @@ class Monitor:
                     "reason": "OPENING_GENERATION_ERROR: " + type(exc).__name__
                     + "; no opening call is shown and no probability is invented",
                 }
+            if getattr(self, "phone_alerts", None) is not None and state["mode"] == "PUBLIC MARKET DATA":
+                try:
+                    self.phone_alerts.consider(opening, stale=bool(state.get("stale")), now=utcnow())
+                except Exception as exc:
+                    self.runtime_meter.error("phone_alerts", type(exc).__name__)
             state["prediction_engine"] = engine_view(
                 state, prior, opening, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
             )

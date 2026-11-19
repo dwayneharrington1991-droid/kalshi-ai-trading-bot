@@ -68,6 +68,8 @@ LIMITS = {
     "post_max_cpu_pct": 40.0,
     "post_cpu_sample_s": 60,
 }
+# Old services: observed if present. A port absent at preflight (retired) must stay
+# absent; one present must keep exactly the same process identity throughout.
 PROTECTED = (8765, 8767)
 OBSERVED = (8769,)
 PORT = 8768
@@ -228,7 +230,7 @@ def preflight(out_path, L):
     disk = st.f_bavail * st.f_frsize // 1048576
     if disk < L["min_disk_free_mib"]:
         problems.append(f"disk free {disk} MiB < {L['min_disk_free_mib']}")
-    protected, p = identities(PROTECTED, True); problems += p
+    protected, p = identities(PROTECTED, False); problems += p
     observed, p = identities(OBSERVED, False); problems += p
     old_cpu = None
     try:
@@ -352,7 +354,7 @@ def soak(sha, pre_path, out_path, L):
         if len(pids) != 1 or (first_pid and pids[0] != first_pid):
             stop(f"sample {samples}: 8768 listener changed or not unique ({pids})")
         first_pid = first_pid or pids[0]
-        now, problems = identities(PROTECTED, True)
+        now, problems = identities(PROTECTED, False)
         if problems or now != pre["protected"]:
             stop(f"sample {samples}: protected listener identity changed or unreadable")
         if samples % 6 == 0:
@@ -381,7 +383,7 @@ def soak(sha, pre_path, out_path, L):
 def postflight(sha, pre_path, out_path, L):
     pre = json.load(open(pre_path))
     problems = []
-    now, p = identities(PROTECTED, True)
+    now, p = identities(PROTECTED, False)
     problems += p
     if now != pre["protected"]:
         problems.append("protected listener identity changed")

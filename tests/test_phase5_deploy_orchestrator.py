@@ -442,10 +442,43 @@ def test_success_is_written_only_after_soak_and_postflight(sim):
     assert json.loads((run / "soak.json").read_text())["result"] == "PASS"
 
 
-def test_preflight_failure_blocks_before_any_change(sim):
-    sim["p67"].kill(); sim["p67"].wait()                       # a protected listener is missing
+def test_retired_old_service_absent_before_and_after_does_not_block(sim):
+    sim["p67"].kill(); sim["p67"].wait()                       # 8767 retired before the deployment
     result, status = sim["run"]("deploy", sim["sha"], scenario="success")
-    assert status == "BLOCKED" and "preflight: port 8767" in result.stdout
+    assert status == "SUCCESS", result.stdout
+    assert not sim["listener"](8767) and sim["listener"](8765) == str(sim["p65"].pid)
+
+
+def test_old_service_appearing_during_soak_rolls_back(sim):
+    import threading
+    sim["p67"].kill(); sim["p67"].wait()                       # absent at preflight
+    out = {}
+    worker = threading.Thread(target=lambda: out.update(r=sim["run"]("deploy", sim["sha"], scenario="success",
+                              extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps(LONG_SOAK)})))
+    worker.start()
+    intruder = None
+    try:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and intruder is None:
+            now = sim["listener"](8768)
+            if now and now != str(sim["old"].pid):          # new build took over: verification/soak running
+                intruder = sim["start"](8767, "intruder")
+            time.sleep(0.2)
+        worker.join(180)
+    finally:
+        if intruder:
+            intruder.kill()
+    result, status = out["r"]
+    # The new build is never accepted: it is rolled back, or (when the changed old
+    # service also blocks the automatic restore's own safety check) handed over to manual recovery.
+    assert intruder is not None and status in ("ROLLED_BACK", "MANUAL_RECOVERY_REQUIRED"), result.stdout
+    assert "protected listener identity changed" in result.stdout and "DEPLOY_RESULT=SUCCESS" not in result.stdout
+
+
+def test_preflight_failure_blocks_before_any_change(sim):
+    result, status = sim["run"]("deploy", sim["sha"], scenario="success",
+                                extra_env={"PREVIEW_GATES_TEST_OVERRIDES": json.dumps({**GATE_TEST_OVERRIDES, "max_load1": -1})})
+    assert status == "BLOCKED" and "preflight" in result.stdout
     assert _installs(sim) == 0 and sim["listener"](8768) == str(sim["old"].pid)
 
 

@@ -14,28 +14,47 @@ import json
 import math
 from pathlib import Path
 
+from .features import FEATURES as REGISTRY
+
 CALL_HIGH = 0.55
 CALL_LOW = 0.45
 L2_GRID = (0.01, 0.1, 1.0)
 BLEND_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
+def string_lists(node, path="artifact"):
+    """Every list of strings in the artifact, with its location. Read-only structural walk."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from string_lists(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        if node and all(isinstance(x, str) for x in node):
+            yield path, node
+        else:
+            for index, value in enumerate(node):
+                yield from string_lists(value, f"{path}[{index}]")
+
+
+def inspect_inputs(artifact):
+    """Where feature-name lists live in the artifact, and how many of their names are registered features."""
+    registry = set(REGISTRY)
+    report = []
+    for path, names in string_lists(artifact):
+        in_registry = sum(1 for n in names if n in registry)
+        report.append({"path": path, "length": len(names), "registered_feature_names": in_registry})
+    return report
+
+
 def production_inputs(artifact):
-    """Union of the input names the live artifact's components actually use (their prep names)."""
+    """Feature names the artifact's model is built on: lists whose entries are all registered feature names.
+
+    Lists that mix in other strings (labels, versions, identifiers) are not treated as inputs, so the count can
+    only be understated, never inflated by metadata."""
+    registry = set(REGISTRY)
     names = set()
-
-    def walk(node):
-        if isinstance(node, dict):
-            prep = node.get("prep")
-            if isinstance(prep, dict) and isinstance(prep.get("names"), list):
-                names.update(prep["names"])
-            for value in node.values():
-                walk(value)
-        elif isinstance(node, list):
-            for value in node:
-                walk(value)
-
-    walk(artifact.get("model", artifact))
+    for _path, values in string_lists(artifact):
+        if len(values) >= 5 and all(v in registry for v in values):
+            names.update(values)
     return sorted(names)
 
 

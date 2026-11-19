@@ -189,12 +189,107 @@ def message(d, dashboard):
     return "\n".join(lines)
 
 
+# One message per market opening, carrying the current AI and the research-only shadow AI.
+# "QUALIFIED_ONLY" restores the previous behaviour (alerts only for qualified UP/DOWN calls).
+COMBINED_SCOPE = "EVERY_OPENING"
+COMBINED_KEY = "COMBINED"
+RESEARCH_LABEL = "NEW AI — SHADOW (RESEARCH ONLY · not used for any decision)"
+MESSAGE_LIMIT = 4000
+
+
+def combined_details(opening, *, stale, now):
+    """(True, details) for every new market opening, whatever the live call; else (False, reason)."""
+    if not isinstance(opening, dict):
+        return False, "no opening record"
+    ticker = opening.get("ticker")
+    if not isinstance(ticker, str) or not ticker:
+        return False, "no market ticker"
+    try:
+        generated, opens, closes = _ts(opening["generated_at"]), _ts(opening["opens_at"]), _ts(opening["closes_at"])
+    except (KeyError, TypeError, ValueError):
+        return False, "missing times"
+    if not 0 <= (now - generated).total_seconds() <= MAX_CALL_AGE:
+        return False, "call is not new"
+    if (generated - opens).total_seconds() > MAX_AFTER_OPEN or now >= closes:
+        return False, "market already well past its opening"
+    up = opening.get("up")
+    up_ok = type(up) in (int, float) and 0 <= up <= 1
+    direction = opening.get("direction")
+    if stale:
+        live, no_call = "NO CALL", "market data stale"
+    elif direction in ("UP", "DOWN", "WAIT"):
+        live, no_call = direction, None
+    else:
+        live, no_call = "NO CALL", "no call recorded"
+    confidence = None
+    if live in ("UP", "DOWN") and up_ok:
+        confidence = up if live == "UP" else 1 - up
+    reason = opening.get("reason")
+    return True, {"ticker": ticker, "live_decision": live, "no_call_reason": no_call,
+                  "live_p_up": up if up_ok else None, "confidence": confidence,
+                  "status": (opening.get("confidence") or {}).get("status") or "n/a",
+                  "threshold": opening.get("threshold"), "reference": opening.get("reference_price"),
+                  "closes_at": closes, "generated_at": opening["generated_at"], "opens_at": opening["opens_at"],
+                  "remaining_s": max(0, int((closes - now).total_seconds())),
+                  "explanation": " ".join(str(reason).split())[:180] if reason else None}
+
+
+def agreement(live, shadow_decision):
+    if live in ("UP", "DOWN", "WAIT") and shadow_decision in ("UP", "DOWN", "WAIT"):
+        return "AGREE" if live == shadow_decision else "DISAGREE"
+    return "COMPARISON UNAVAILABLE"
+
+
+def _pct(value):
+    return "n/a" if value is None else f"{float(value) * 100:.1f}%"
+
+
+def combined_message(d, shadow, dashboard):
+    """The existing opening lines are kept word for word; the current and research calls are added around them.
+    Anything missing says so; nothing is invented or substituted."""
+    mins, secs = divmod(d["remaining_s"], 60)
+    closes = d.get("closes_at")
+    expires = closes.strftime("%H:%M UTC") if hasattr(closes, "strftime") else "n/a"
+    live = d["live_decision"]
+    if live in ("UP", "DOWN", "WAIT", "NO CALL"):
+        head = f"KALSHI BTC 15m OPENING: {live}"
+    else:
+        head = "KALSHI BTC 15m OPENING: NO CALL"
+    if live in ("UP", "DOWN"):
+        current = (f"CURRENT AI: {live} · P(UP) {_pct(d['live_p_up'])} · "
+                   f"Confidence {_pct(d['confidence'])} ({str(d['status']).lower()})")
+    elif live == "WAIT":
+        current = f"CURRENT AI: WAIT · P(UP) {_pct(d['live_p_up'])} · no directional call"
+    else:
+        current = f"CURRENT AI: NO CALL ({d.get('no_call_reason') or 'unavailable'})"
+    recorded = shadow.get("status") == "RECORDED"
+    if recorded:
+        when = _ts(shadow["recorded_at"]).strftime("%H:%M:%S UTC") if shadow.get("recorded_at") else "n/a"
+        research = (f"{RESEARCH_LABEL}: {shadow['decision']} · P(UP) {_pct(shadow.get('probability'))} · "
+                    f"recorded {when} before the outcome")
+    else:
+        research = (f"{RESEARCH_LABEL}: {shadow.get('status', 'NO PREDICTION')} — "
+                    f"{shadow.get('reason', 'unavailable')} (no prediction substituted)")
+    lines = [head, d["ticker"], current,
+             f"Opening threshold {_usd(d.get('threshold'))}",
+             f"BTC reference {_usd(d.get('reference'))}",
+             f"Expires {expires} (time remaining {mins}m {secs:02d}s)"]
+    if d.get("explanation"):
+        lines.append(f"Why: {d['explanation']}")
+    lines += [research,
+              f"COMPARISON: {agreement(live, shadow['decision'] if recorded else None)}",
+              f"Dashboard: {dashboard}", "Signal only - place any trade manually."]
+    return "\n".join(lines)[:MESSAGE_LIMIT]
+
+
 class OpeningAlerts:
-    def __init__(self, dedup_path, config_loader=load_config, sender=send, start=True):
+    def __init__(self, dedup_path, config_loader=load_config, sender=send, start=True, shadow_dir=None):
         self.dedup_path = str(dedup_path)
         self.config_loader, self.sender = config_loader, sender
+        self.shadow_dir = None if shadow_dir is None else Path(shadow_dir)
         self.queue = queue.Queue(maxsize=100)
         self.counters = {"sent": 0, "failed": 0, "dropped": 0, "skipped_duplicate": 0}
+        self._handled = set()
         with sqlite3.connect(self.dedup_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS opening_alerts (ticker TEXT, direction TEXT, channel TEXT, "
                        "claimed_at TEXT, result TEXT, PRIMARY KEY(ticker, direction, channel))")
@@ -214,57 +309,115 @@ class OpeningAlerts:
                        (result, ticker, direction, channel))
 
     def consider(self, opening, *, stale, now=None):
-        """Called from the prediction loop; never blocks and never raises outward."""
+        """Called from the prediction loop; never blocks, never waits for any shadow work, never raises outward."""
         try:
-            ok, details = qualified(opening, stale=stale, now=now or datetime.now(timezone.utc))
-            if not ok:
-                return False
-            cfg = self.config_loader()
-            sent_any = False
-            for channel in channels(cfg):
-                if not self._claim(details["ticker"], details["direction"], channel):
-                    self.counters["skipped_duplicate"] += 1
-                    continue
-                try:
-                    self.queue.put_nowait((channel, details, cfg))
-                    sent_any = True
-                except queue.Full:
-                    self.counters["dropped"] += 1
-                    LOG.warning("opening alert %s %s via %s: DROPPED_QUEUE_FULL", details["ticker"], details["direction"], channel)
-                    self._result(details["ticker"], details["direction"], channel, "DROPPED_QUEUE_FULL")
-            return sent_any
+            now = now or datetime.now(timezone.utc)
+            if COMBINED_SCOPE == "EVERY_OPENING":
+                return self._consider_combined(opening, stale=stale, now=now)
+            return self._consider_qualified(opening, stale=stale, now=now)
         except Exception:
             self.counters["failed"] += 1
             return False
 
+    def _consider_combined(self, opening, *, stale, now):
+        """One combined message per opening on Telegram. Other channels keep their existing qualified-only alerts."""
+        ok, details = combined_details(opening, stale=stale, now=now)
+        if not ok:
+            return False
+        ticker = details["ticker"]
+        if ticker in self._handled:
+            self.counters["skipped_duplicate"] += 1
+            return False
+        cfg = self.config_loader()
+        sent_any = False
+        frozen = (opening.get("frozen_features") or {}).get("values")
+        qualified_ok, qualified_details = qualified(opening, stale=stale, now=now)
+        for channel in channels(cfg):
+            if channel == "telegram":
+                payload, key = details, COMBINED_KEY
+                extra = {"key": COMBINED_KEY, "frozen": frozen, "shadow_dir": self.shadow_dir}
+            elif qualified_ok:
+                payload, key = qualified_details, qualified_details["direction"]
+                extra = {"key": key, "frozen": None, "shadow_dir": None, "legacy": True}
+            else:
+                continue
+            if not self._claim(ticker, key, channel):
+                self.counters["skipped_duplicate"] += 1
+                continue
+            try:
+                self.queue.put_nowait((channel, payload, cfg, extra))
+                sent_any = True
+            except queue.Full:
+                self.counters["dropped"] += 1
+                LOG.warning("opening alert %s via %s: DROPPED_QUEUE_FULL", ticker, channel)
+                self._result(ticker, key, channel, "DROPPED_QUEUE_FULL")
+        self._handled.add(ticker)
+        if len(self._handled) > 2000:
+            self._handled = set(list(self._handled)[-1000:])
+        return sent_any
+
+    def _consider_qualified(self, opening, *, stale, now):
+        ok, details = qualified(opening, stale=stale, now=now)
+        if not ok:
+            return False
+        cfg = self.config_loader()
+        sent_any = False
+        for channel in channels(cfg):
+            if not self._claim(details["ticker"], details["direction"], channel):
+                self.counters["skipped_duplicate"] += 1
+                continue
+            try:
+                self.queue.put_nowait((channel, details, cfg, {"key": details["direction"], "frozen": None,
+                                                               "shadow_dir": None, "legacy": True}))
+                sent_any = True
+            except queue.Full:
+                self.counters["dropped"] += 1
+                LOG.warning("opening alert %s %s via %s: DROPPED_QUEUE_FULL", details["ticker"], details["direction"], channel)
+                self._result(details["ticker"], details["direction"], channel, "DROPPED_QUEUE_FULL")
+        return sent_any
+
     def _run(self):
         while True:
-            channel, d, cfg = self.queue.get()
-            result = "FAILED"
-            for attempt in range(2):
-                try:
-                    self.sender(channel, cfg, message(d, cfg.get("ALERT_DASHBOARD_URL") or "http://127.0.0.1:18768/"))
-                    result = "SENT"
-                    break
-                except Exception as exc:
-                    result = "FAILED:" + type(exc).__name__
-                    time.sleep(2 * (attempt + 1))
-            self.counters["sent" if result == "SENT" else "failed"] += 1
-            # Never credentials or message text: ticker, direction, channel and result only.
-            (LOG.info if result == "SENT" else LOG.warning)(
-                "opening alert %s %s via %s: %s", d["ticker"], d["direction"], channel, result)
+            channel, d, cfg, extra = self.queue.get()
             try:
-                self._result(d["ticker"], d["direction"], channel, result)
-            except sqlite3.Error:
-                pass
-            self.queue.task_done()
+                result = "FAILED"
+                key = extra["key"]
+                for attempt in range(2):
+                    try:
+                        dashboard = cfg.get("ALERT_DASHBOARD_URL") or "http://127.0.0.1:18768/"
+                        if extra.get("legacy"):
+                            text = message(d, dashboard)
+                        else:
+                            try:
+                                from .opening_shadow_live import shadow_for_market
+                                shadow = shadow_for_market(extra["shadow_dir"], ticker=d["ticker"], opens_at=d["opens_at"],
+                                                           generated_at=d["generated_at"], frozen_values=extra["frozen"])
+                            except Exception as exc:          # a shadow failure is shown; the alert is still sent
+                                shadow = {"status": "NO PREDICTION", "reason": "shadow error: " + type(exc).__name__}
+                            text = combined_message(d, shadow, dashboard)
+                        self.sender(channel, cfg, text)
+                        result = "SENT"
+                        break
+                    except Exception as exc:
+                        result = "FAILED:" + type(exc).__name__
+                        time.sleep(2 * (attempt + 1))
+                self.counters["sent" if result == "SENT" else "failed"] += 1
+                # Never credentials or message text: ticker, channel and result only.
+                shown = d.get("direction") or d.get("live_decision")
+                (LOG.info if result == "SENT" else LOG.warning)("opening alert %s %s via %s: %s", d["ticker"], shown, channel, result)
+                try:
+                    self._result(d["ticker"], key, channel, result)
+                except sqlite3.Error:
+                    pass
+            finally:
+                self.queue.task_done()
 
 
 def from_journal(journal_path):
     """The live bot's notifier, or None when alerts are disabled (ALERTS_DISABLED=1)."""
     if os.environ.get("ALERTS_DISABLED") == "1":
         return None
-    return OpeningAlerts(str(journal_path) + ".alerts.sqlite3")
+    return OpeningAlerts(str(journal_path) + ".alerts.sqlite3", shadow_dir=Path(journal_path).parent / "shadow")
 
 
 def run_test(cfg, found, send_fn=send, status_fn=twilio_status, wait_s=60, poll_s=5, sleep=time.sleep, out=print):

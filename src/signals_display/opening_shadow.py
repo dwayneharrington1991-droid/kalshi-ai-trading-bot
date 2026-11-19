@@ -20,7 +20,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import opening_challengers as oc
-from . import opening_research as research
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS shadow_openings (
@@ -218,6 +217,7 @@ def unscored_openings(journal_ro, shadow_dir, names_present, since, now, limit=5
 
 
 def run(journal, shadow_dir, artifact, now, dry_run=False):
+    from . import opening_research as research   # imported here so the server can import the light functions
     shadow_dir = Path(shadow_dir)
     shadow_dir.mkdir(parents=True, exist_ok=True)
     since = genesis(shadow_dir, now, dry_run)

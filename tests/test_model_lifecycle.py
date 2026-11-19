@@ -341,6 +341,12 @@ def _journal_with(path, n):
     return journal.path
 
 
+def test_default_trigger_learns_from_every_settlement():
+    assert lc.MIN_NEW_SETTLED == 1
+    # the promotion evidence requirement is unchanged: learning is continuous, promotion is not
+    assert lc.MIN_FRESH_MARKETS >= 100
+
+
 def test_trigger_waits_for_enough_new_settled_markets(tmp_path):
     journal = _journal_with(tmp_path / "j.db", 12)
     status = lc.retrain_cycle(journal, tmp_path / "state", NOW + timedelta(days=5), "t", min_new=50)

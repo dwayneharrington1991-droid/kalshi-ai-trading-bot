@@ -151,3 +151,18 @@ def test_outcome_copy_takes_only_official_outcomes_for_shadow_tickers_and_is_ide
         assert copied == {"KX-A": 1, "KX-B": 0}              # the non-shadow ticker and the 'predicted' origin are absent
         with pytest.raises(sqlite3.DatabaseError):
             led.execute("UPDATE shadow_outcomes SET outcome=0")
+
+
+def test_refits_happen_only_in_the_quiet_window_between_learning_cycles():
+    assert sh.refit_due(datetime(2026, 11, 19, 2, 31, tzinfo=timezone.utc))
+    assert sh.refit_due(datetime(2026, 11, 19, 2, 35, tzinfo=timezone.utc))
+    assert not sh.refit_due(datetime(2026, 11, 19, 2, 37, tzinfo=timezone.utc))   # learning starts at 02:37
+    assert not sh.refit_due(datetime(2026, 11, 19, 3, 1, tzinfo=timezone.utc))    # the old 03:00 slot is gone
+    assert not sh.refit_due(datetime(2026, 11, 19, 2, 16, tzinfo=timezone.utc))
+
+
+def test_version_writes_are_atomic_and_leave_no_partial_file(tmp_path):
+    v = _version(T0)
+    path = sh.write_version(tmp_path, v)
+    assert path.exists() and not list((tmp_path / "versions").glob("*.next"))
+    assert sh.load_versions(tmp_path)[0]["sha256"] == v["sha256"]

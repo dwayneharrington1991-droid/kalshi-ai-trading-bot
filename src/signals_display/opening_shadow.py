@@ -51,7 +51,13 @@ BEGIN SELECT RAISE(ABORT, 'shadow outcomes are append-only'); END;
 """
 
 REFIT_SECONDS = 24 * 3600
-REFIT_HOUR_UTC = 3
+# Refits run only at 02:31-02:35 UTC: after the 02:22 learning cycle has finished and before the 02:37 one starts.
+REFIT_HOUR_UTC = 2
+REFIT_MINUTES = range(30, 36)
+
+
+def refit_due(now):
+    return now.hour == REFIT_HOUR_UTC and now.minute in REFIT_MINUTES
 
 
 def _ts(value):
@@ -175,8 +181,10 @@ def write_version(shadow_dir, payload):
     path = vdir / f"{payload['trained_at'].replace(':', '')}-{payload['sha256'][:12]}.json"
     if path.exists():
         raise FileExistsError("model version already recorded")
-    path.write_text(json.dumps(payload, sort_keys=True))
-    os.chmod(path, 0o600)
+    tmp = path.with_name(path.name + ".next")
+    tmp.write_text(json.dumps(payload, sort_keys=True))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)            # atomic: a version file is either complete or absent
     return path
 
 
@@ -219,7 +227,7 @@ def run(journal, shadow_dir, artifact, now, dry_run=False):
     with sqlite3.connect(f"file:{Path(journal).resolve()}?mode=ro", uri=True, timeout=30) as ro:
         ro.execute("PRAGMA query_only=ON")
         newest = versions[-1] if versions else None
-        if newest is None or (now.hour == REFIT_HOUR_UTC and not model_is_fresh(newest, now)):
+        if newest is None or (refit_due(now) and not model_is_fresh(newest, now)):
             rows = research.load(ro, now)
             fitted = oc.fit_logistic(rows, names)
             cutoff = max((str(r["label_available_at"]) for r in rows), default=None)

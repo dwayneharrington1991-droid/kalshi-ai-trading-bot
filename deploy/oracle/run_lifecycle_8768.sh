@@ -22,7 +22,7 @@ if ! ( cd "$WORK" && "$PY" -c 'import sys; from datetime import datetime,timezon
   echo "LIFECYCLE: inside a 15-minute opening window; nothing done (retried next schedule)"; exit 0
 fi
 ( cd "$WORK" && nice -n 19 ionice -c3 timeout 1500 "$PY" -m src.signals_display.lifecycle_runner \
-    --journal "$J" --state-dir "$STATE" --commit "$SHA" --live-artifact "$LIVE" ) > "$WORK/run.log" 2>&1
+    --journal "$J" --state-dir "$STATE" --commit "$SHA" --live-artifact "$LIVE" ${LIFECYCLE_EXTRA_ARGS:-} ) > "$WORK/run.log" 2>&1
 rc=$?
 if [[ $rc -ne 0 ]]; then echo "LIFECYCLE: cycle failed (exit $rc); live model unchanged; last good status kept"; tail -n 5 "$WORK/run.log"; exit 5; fi
 echo "LIFECYCLE: cycle complete; live model unchanged unless a verified promotion succeeded"

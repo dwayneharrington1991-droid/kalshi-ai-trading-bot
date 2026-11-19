@@ -90,13 +90,33 @@ def test_runner_only_builds_a_guarded_activator_from_a_rehearsal_restart_config(
     cfg = tmp_path / "restart.json"
     args = argparse.Namespace(restart_config=cfg, state_dir=tmp_path, port=8768)
     assert lr.build_guarded(args) is None                        # no config: disabled
-    cfg.write_text(json.dumps({"kind": "production", "port": 28001, "pidfile": "p", "log": "l"}))
-    assert lr.build_guarded(args) is None                        # production restart is never accepted
+    cfg.write_text(json.dumps({"kind": "production", "port": 28001, "argv": ["p", "--artifact", "a"], "cwd": str(tmp_path),
+                               "env_file": str(tmp_path / "e.json"), "log": str(tmp_path / "l")}))
+    act = lr.build_guarded(args)
+    assert act is not None and act.enabled is False              # production without authorization: disabled
     cfg.write_text(json.dumps({"kind": "rehearsal", "port": 8768, "pidfile": "p", "log": "l"}))
     assert lr.build_guarded(args) is None                        # never the live port
     cfg.write_text(json.dumps({"kind": "rehearsal", "port": 28002, "pidfile": str(tmp_path / "p"), "log": str(tmp_path / "l")}))
     act = lr.build_guarded(args)
     assert act is not None and act.enabled is False              # still needs an authorization file
+
+
+def test_production_restart_config_needs_authorization_and_never_uses_retired_ports(tmp_path):
+    import argparse
+    cfg = tmp_path / "restart.json"
+    args = argparse.Namespace(restart_config=cfg, state_dir=tmp_path, port=8768)
+    prod = {"kind": "production", "port": 28010, "argv": ["python", "-m", "x", "--artifact", "a", "--port", "28010"],
+            "cwd": str(tmp_path), "env_file": str(tmp_path / "env.json"), "log": str(tmp_path / "log")}
+    cfg.write_text(json.dumps(dict(prod, port=8765)))
+    assert lr.build_guarded(args) is None                       # retired port: refused
+    cfg.write_text(json.dumps(dict(prod, port=8767)))
+    assert lr.build_guarded(args) is None
+    cfg.write_text(json.dumps(prod))
+    act = lr.build_guarded(args)
+    assert act is not None and act.enabled is False              # no authorization file: disabled
+    config = {"restart": "production-process", "port": 28010, "argv": prod["argv"], "cwd": prod["cwd"]}
+    (tmp_path / "promotion-authorization.txt").write_text(ga.AUTH_PREFIX + ga.activator_checksum(config))
+    assert lr.build_guarded(args).enabled is True                # exact authorization: enabled
 
 
 def test_restarter_never_signals_a_process_it_did_not_start(tmp_path):

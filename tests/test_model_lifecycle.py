@@ -466,3 +466,9 @@ def test_scheduled_minutes_are_outside_the_opening_window_guard():
     assert lc.SCHEDULE_MINUTES == (7, 22, 37, 52)
     assert not lc.opening_window_safe(datetime(2026, 11, 19, 3, 0, 0, tzinfo=timezone.utc))
     assert not lc.opening_window_safe(datetime(2026, 11, 19, 3, 30, 0, tzinfo=timezone.utc))
+
+
+def test_scheduled_wrapper_forwards_the_activator_arguments_only_when_configured():
+    code = (ROOT / "deploy/oracle/run_lifecycle_8768.sh").read_text()
+    assert '${LIFECYCLE_EXTRA_ARGS:-}' in code        # empty by default: the schedule stays disabled-activator
+    assert "--activator guarded" not in code          # never hard-wired on

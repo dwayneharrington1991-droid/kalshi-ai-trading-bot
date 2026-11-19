@@ -140,6 +140,8 @@ def run(journal, state_dir, commit, live_artifact, *, asof, min_new=lc.MIN_NEW_S
     if status.get("decision") == "CANDIDATE_QUALIFIED":
         notify("candidate_qualified", {"candidate_checksum": (status.get("candidate_checksum") or "")[:12]})
     samples = [probe(port)]
+    if hasattr(activator, "bootstrap") and getattr(activator, "enabled", False):
+        activator.bootstrap(live_artifact)          # record the current production model as the rollback reference
     promo = pr.promotion_cycle(state_dir, status, activator, live_artifact_path=live_artifact,
                                health_samples=samples, resources=resources(), telegram_ok=telegram(),
                                seconds_to_opening=seconds_to_opening, notify=notify, now=asof)
@@ -174,20 +176,35 @@ def run(journal, state_dir, commit, live_artifact, *, asof, min_new=lc.MIN_NEW_S
 
 
 def build_guarded(args):
-    """Guarded activator. Refuses anything but a rehearsal restart config: the production service
-    has no verified restart path here, so production stays on the disabled activator."""
+    """Guarded activator from a restart configuration, or None (disabled).
+
+    kind "rehearsal": the isolated stand-in restarter (never the live port).
+    kind "production": the captured live launch (argv, cwd) and a private environment file. Accepted
+    only for ports other than the retired 8765/8767, and only with the authorization file whose
+    checksum covers this exact configuration. Otherwise the activator stays disabled."""
     from . import guarded_activator as ga
     from . import activation_rehearsal as rh
+    from . import production_restart as prs
     if args.restart_config is None or not args.restart_config.is_file():
         return None
     cfg = json.loads(args.restart_config.read_text())
-    if cfg.get("kind") != "rehearsal" or int(cfg.get("port", 0)) == int(args.port):
+    port = int(cfg.get("port", 0))
+    if port in (8765, 8767):
         return None
-    restarter = rh.ProcessRestarter(int(cfg["port"]), cfg["pidfile"], cfg["log"])
-    config = {"restart": "rehearsal-process", "port": int(cfg["port"])}
+    if cfg.get("kind") == "rehearsal":
+        if port == int(args.port):
+            return None
+        restarter = rh.ProcessRestarter(port, cfg["pidfile"], cfg["log"])
+        config = {"restart": "rehearsal-process", "port": port}
+    elif cfg.get("kind") == "production":
+        captured = {"port": port, "argv": cfg["argv"], "cwd": cfg["cwd"]}
+        restarter = prs.ProductionRestarter(captured, cfg["env_file"], cfg["log"])
+        config = {"restart": "production-process", "port": port, "argv": cfg["argv"], "cwd": cfg["cwd"]}
+    else:
+        return None
     return ga.GuardedActivator(args.state_dir, authorization_file=args.state_dir / "promotion-authorization.txt",
                                config=config, restarter=restarter,
-                               probe=lambda: probe_live(int(cfg["port"])))
+                               probe=lambda: probe_live(port))
 
 
 def main(argv=None):

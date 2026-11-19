@@ -52,7 +52,8 @@ def run(journal, status_file, asof, candidate_report=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--journal", type=Path, required=True)
-    parser.add_argument("--status-file", type=Path, required=True)
+    parser.add_argument("--status-file", type=Path, required=True,
+                        help="use <journal>.learning-status.json, the path the live dashboard reads")
     parser.add_argument("--candidate-report", type=Path)
     parser.add_argument("--asof")
     args = parser.parse_args(argv)

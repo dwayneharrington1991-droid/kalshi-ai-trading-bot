@@ -2296,8 +2296,9 @@ def make_handler(monitor):
             elif route == "/api/learning-status":
                 # Read-only: the offline learning run publishes this file; nothing is computed here.
                 from .learning_loop import read_status
-                body = json.dumps(read_status(os.environ.get("LEARNING_STATUS_FILE", "")), allow_nan=False,
-                                  default=str).encode()
+                # Status lives beside the journal, so no environment change is needed on the service.
+                status_path = os.environ.get("LEARNING_STATUS_FILE") or f"{monitor.journal.path}.learning-status.json"
+                body = json.dumps(read_status(status_path), allow_nan=False, default=str).encode()
                 content_type = "application/json"
             elif route == "/api/learning-summary":
                 report = monitor.quick_learning_report.get()

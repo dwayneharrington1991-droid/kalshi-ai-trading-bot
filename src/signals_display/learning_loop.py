@@ -181,12 +181,26 @@ def write_status(path, status):
 
 
 def read_status(path):
-    """Read-only for the live dashboard; missing or unreadable is reported, never invented."""
-    try:
-        return json.loads(Path(path).read_text())
-    except (OSError, ValueError):
+    """Read-only for the live dashboard. Never invents results.
+
+    missing or unset path -> NOT_RUN; present but not valid JSON or not an object ->
+    UNREADABLE (a real problem to investigate); valid -> the published status."""
+    if not path:
         return {"status": "NOT_RUN", "format": FORMAT,
                 "note": "No learning run has been published yet. The live model is unchanged."}
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return {"status": "NOT_RUN", "format": FORMAT,
+                "note": "No learning run has been published yet. The live model is unchanged."}
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        return {"status": "UNREADABLE", "format": FORMAT,
+                "note": "The published learning status is unreadable and was ignored. The live model is unchanged."}
+    return value
 
 
 def summarize(ledger, patterns, promotion, generated_at):

@@ -100,6 +100,7 @@ def test_promotion_eligible_is_never_applied_and_keeps_rollback():
 def test_status_file_is_atomic_private_and_missing_status_is_reported(tmp_path):
     target = tmp_path / "status.json"
     assert ll.read_status(target)["status"] == "NOT_RUN"
+    assert ll.read_status("")["status"] == "NOT_RUN"
     ll.write_status(target, {"status": "MEASURED", "x": 1})
     assert oct(target.stat().st_mode & 0o777) == "0o600"
     assert ll.read_status(target) == {"status": "MEASURED", "x": 1}
@@ -147,3 +148,138 @@ def test_dashboard_panel_is_read_only_text_and_the_route_is_registered():
         assert forbidden not in panel, forbidden
     server = (ROOT / "src/signals_display/server.py").read_text()
     assert '"/api/learning-status"' in server and 'LEARNING_STATUS_FILE' in server
+
+
+def test_malformed_status_is_unreadable_not_missing_and_never_invented(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert ll.read_status(bad)["status"] == "UNREADABLE"
+    arr = tmp_path / "arr.json"
+    arr.write_text("[1, 2]")
+    assert ll.read_status(arr)["status"] == "UNREADABLE"
+    assert ll.read_status(tmp_path / "absent.json")["status"] == "NOT_RUN"
+
+
+def test_live_status_route_over_real_http_for_missing_valid_and_malformed_files(tmp_path, monkeypatch):
+    import threading
+    from http.server import ThreadingHTTPServer
+    from urllib.error import HTTPError
+    from urllib.request import urlopen
+    from src.signals_display.monitor import Journal
+    from src.signals_display.server import Monitor, make_handler
+
+    monitor = Monitor(None, Journal(tmp_path / "http.db"))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}/api/learning-status"
+
+    def get(path_env):
+        if path_env is None:
+            monkeypatch.delenv("LEARNING_STATUS_FILE", raising=False)
+        else:
+            monkeypatch.setenv("LEARNING_STATUS_FILE", str(path_env))
+        with urlopen(base, timeout=5) as r:
+            return r.status, r.headers.get("Content-Type"), json.load(r)
+
+    try:
+        code, ctype, body = get(None)
+        assert code == 200 and ctype == "application/json" and body["status"] == "NOT_RUN"
+        assert "live model is unchanged" in body["note"]
+
+        valid = tmp_path / "valid.json"
+        ll.write_status(valid, {"status": "MEASURED", "generated_at": "2026-11-19T00:00:00+00:00",
+                                "ledger": {"openings_recorded": 292, "displayed_calls": 111},
+                                "promotion": {"decision": "HOLD", "applied": False},
+                                "live_model": "UNCHANGED (learning never replaces it automatically)"})
+        code, _, body = get(valid)
+        assert code == 200 and body["status"] == "MEASURED" and body["ledger"]["openings_recorded"] == 292
+        assert body["promotion"]["applied"] is False
+
+        malformed = tmp_path / "malformed.json"
+        malformed.write_text('{"status": "MEASURED", ')
+        code, _, body = get(malformed)
+        assert code == 200 and body["status"] == "UNREADABLE"
+        assert "ledger" not in body                              # nothing invented from a broken file
+    finally:
+        server.shutdown()
+
+
+def _git_head():
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+
+
+def _wrapper(journal, *extra_env):
+    import os
+    env = {**os.environ, "LEARN_REPO": str(ROOT), "LEARN_PYTHON": sys.executable}
+    return subprocess.run(["bash", str(ROOT / "deploy/oracle/run_learning_8768.sh"), _git_head(), str(journal)],
+                          capture_output=True, text=True, env={**env, **dict(extra_env)}, timeout=900)
+
+
+def test_scheduled_wrapper_keeps_the_last_good_status_when_the_journal_is_missing(tmp_path):
+    journal = tmp_path / "gone.db"
+    status = Path(f"{journal}.learning-status.json")
+    ll.write_status(status, {"status": "MEASURED", "generated_at": "earlier"})
+    run = _wrapper(journal)
+    assert run.returncode == 3 and "previous status kept" in run.stdout
+    assert json.loads(status.read_text())["generated_at"] == "earlier"
+
+
+def _seeded_journal(path, n=40):
+    journal = Journal(path)
+    base, rng = opening(), random.Random(11)
+    with journal.connect() as db:
+        for i in range(n):
+            r = _shift(json.loads(json.dumps(base)), timedelta(minutes=15 * i))
+            r["ticker"] = f"KXBTC15M-WRP{i:03d}"
+            db.execute("INSERT INTO btc_engine_opening VALUES (?,?,?,?,?,?,?,?)",
+                       ("PUBLIC MARKET DATA", r["ticker"], r["generated_at"], r["data_cutoff"], r["closes_at"],
+                        r["up"], r["status"], json.dumps(r)))
+            db.execute("INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+                       (r["ticker"], "official", (NOW + timedelta(minutes=15 * i + 16)).isoformat(), int(rng.random() < 0.5)))
+    return journal.path
+
+
+def test_scheduled_wrapper_publishes_atomically_and_repeats_safely(tmp_path):
+    journal = _seeded_journal(tmp_path / "j.db")
+    before = Path(journal).read_bytes()
+    first = _wrapper(journal)
+    assert first.returncode == 0 and "status published" in first.stdout, first.stdout + first.stderr
+    status = Path(f"{journal}.learning-status.json")
+    assert json.loads(status.read_text())["status"] == "MEASURED"
+    assert oct(status.stat().st_mode & 0o777) == "0o600"
+    second = _wrapper(journal)                                  # repeat: same result, no overlap, no leftovers
+    assert second.returncode == 0 and json.loads(status.read_text())["ledger"]["openings_recorded"] == 40
+    assert not list(tmp_path.glob("*.next")) and not list(tmp_path.glob(".learning-*"))
+    assert Path(journal).read_bytes() == before                 # the journal is never written
+
+
+def test_overlapping_scheduled_runs_are_refused_by_the_lock(tmp_path):
+    import fcntl
+    journal = Journal(tmp_path / "j.db").path
+    lock_path = Path(f"{journal}.learning.lock")
+    held = open(lock_path, "w")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        run = _wrapper(journal)
+        assert run.returncode == 0 and "another run holds the lock" in run.stdout
+    finally:
+        held.close()
+
+
+def test_route_finds_the_status_beside_the_journal_without_any_environment(tmp_path, monkeypatch):
+    import threading
+    from http.server import ThreadingHTTPServer
+    from urllib.request import urlopen
+    from src.signals_display.monitor import Journal
+    from src.signals_display.server import Monitor, make_handler
+    monkeypatch.delenv("LEARNING_STATUS_FILE", raising=False)
+    journal = Journal(tmp_path / "live.db")
+    ll.write_status(Path(f"{journal.path}.learning-status.json"), {"status": "MEASURED", "marker": "beside-journal"})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Monitor(None, journal)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with urlopen(f"http://127.0.0.1:{server.server_port}/api/learning-status", timeout=5) as r:
+            body = json.load(r)
+    finally:
+        server.shutdown()
+    assert body["marker"] == "beside-journal" and body["status"] == "MEASURED"

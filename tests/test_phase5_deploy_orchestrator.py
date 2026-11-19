@@ -550,7 +550,41 @@ def test_production_limits_are_realistic_for_the_single_core_host():
     assert L["max_publish_p95_ms"] <= 3000 and L["max_publish_p99_ms"] <= 4500 and L["max_prediction_p50_ms"] <= 1020
     assert L["min_latency_samples"] >= 100 and L["min_evaluable_share"] >= 0.5 and L["max_age_s"] <= 10
     assert 8.4 < L["max_load1"] <= 12 and 512 <= L["min_mem_available_mib"] <= 2048
-    assert L["post_max_cpu_increase_pts"] <= 10 and L["post_max_cpu_pct"] <= 40
+    assert L["post_max_cpu_increase_pts"] <= 10 and L["post_max_cpu_pct"] <= 40 and L["post_max_cpu_pct_single"] <= 85
+
+
+def _postflight_with(monkeypatch, tmp_path, protected, cpu, base):
+    g = _gates()
+    pre = tmp_path / "pre.json"
+    pre.write_text(json.dumps({"protected": protected, "load1": 1.0, "old_8768_cpu_pct": base}))
+    monkeypatch.setattr(g, "identities", lambda ports, required: (protected, []))
+    monkeypatch.setattr(g, "meminfo", lambda: {"MemAvailable": 10**6, "SwapFree": 10**6})
+    monkeypatch.setattr(g, "swap_rate", lambda s: 0.0)
+    monkeypatch.setattr(g, "load1", lambda: 1.0)
+    monkeypatch.setattr(g, "listener", lambda port: ["123"])
+    monkeypatch.setattr(g, "cpu_share", lambda pid, s: cpu)
+    monkeypatch.setattr(g, "get", lambda path: (200, {"build_commit": "a" * 40, "status": "HEALTHY", "signals_only": True,
+                                                      "workers": {"healthy": True}}))
+    out = tmp_path / "post.json"
+    try:
+        g.postflight("a" * 40, str(pre), str(out), dict(g.LIMITS))
+    except SystemExit:
+        pass
+    return json.loads(out.read_text()) if out.exists() else {}
+
+
+@pytest.mark.parametrize("protected,cpu,base,ok", [
+    ({}, 60.3, 65.5, True),                                   # the real case: old bots retired, lower CPU than before
+    ({}, 76.0, 65.5, False),                                  # +10.5 points: a CPU regression still fails
+    ({}, 86.0, 80.0, False),                                  # above the single-bot headroom cap
+    ({"8765": {"pid": 1, "start": "1"}}, 45.0, 40.0, False),  # old service still running: 40% cap applies
+    ({"8765": {"pid": 1, "start": "1"}}, 38.0, 35.0, True),
+])
+def test_postflight_cpu_cap_depends_on_whether_old_services_still_share_the_core(monkeypatch, tmp_path, protected, cpu, base, ok):
+    result = _postflight_with(monkeypatch, tmp_path, protected, cpu, base)
+    cpu_problem = any("new 8768 CPU" in p for p in result.get("problems", [])) or (
+        result.get("result") == "FAIL" and "new 8768 CPU" in json.dumps(result))
+    assert cpu_problem is (not ok), result
 
 
 def test_soak_requires_exact_40_character_build():

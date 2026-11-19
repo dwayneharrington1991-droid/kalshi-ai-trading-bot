@@ -66,6 +66,10 @@ LIMITS = {
     # its fair share again, so allow +10 points, never above 40% of the core.
     "post_max_cpu_increase_pts": 10.0,
     "post_max_cpu_pct": 40.0,
+    # Once the old services are retired (absent at preflight), 8768 is the only
+    # bot on the core: the absolute cap only has to keep headroom, while the
+    # +10-point regression limit above stays in force either way.
+    "post_max_cpu_pct_single": 85.0,
     "post_cpu_sample_s": 60,
 }
 # Old services: observed if present. A port absent at preflight (retired) must stay
@@ -408,8 +412,12 @@ def postflight(sha, pre_path, out_path, L):
             base = pre.get("old_8768_cpu_pct")
             if not number(base):
                 problems.append("no preflight CPU baseline")
-            elif cpu > base + L["post_max_cpu_increase_pts"] or cpu > L["post_max_cpu_pct"]:
-                problems.append(f"new 8768 CPU {cpu:.1f}% (old {base:.1f}%; limits +{L['post_max_cpu_increase_pts']} pts, {L['post_max_cpu_pct']}%)")
+            else:
+                shared = bool(pre.get("protected"))       # an old service was running at preflight
+                cap = L["post_max_cpu_pct"] if shared else L["post_max_cpu_pct_single"]
+                if cpu > base + L["post_max_cpu_increase_pts"] or cpu > cap:
+                    problems.append(f"new 8768 CPU {cpu:.1f}% (old {base:.1f}%; limits +{L['post_max_cpu_increase_pts']} pts, "
+                                    f"{cap}% {'shared core' if shared else 'single bot on the core'})")
     except (RuntimeError, OSError) as exc:
         problems.append(f"cannot measure 8768 CPU: {exc}")
     hc, h = get("/healthz")

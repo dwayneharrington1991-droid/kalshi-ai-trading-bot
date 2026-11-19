@@ -58,10 +58,11 @@ if ! running; then
   awk -v l="$load1" 'BEGIN{exit !(l <= 10)}' || { echo "BLOCKED: load ${load1} > 10; nothing started"; exit 3; }
   (( $(df -Pk "$RUN" | awk 'NR==2{print $4}') >= 1048576 )) || { echo "BLOCKED: < 1 GiB free for the report"; exit 3; }
   git -C "$REPO" cat-file -e "$SHA^{commit}" 2>/dev/null || { echo "BLOCKED: commit $SHA not fetched"; exit 2; }
-  if [[ ! -f $RUN/audit.txt ]]; then
+  if [[ $MODULE == shadow_upgrade && ! -f $RUN/audit.txt ]]; then   # the combined run reuses the first audit
+    echo "SHADOW: running the read-only 8768 audit first (up to 10 minutes; output follows when done)"
     timeout 600 bash <(git -C "$REPO" show "$SHA:deploy/oracle/audit_8768_readonly.sh") >"$RUN/audit.txt" 2>&1
   fi
-  cat "$RUN/audit.txt"
+  [[ -f $RUN/audit.txt ]] && cat "$RUN/audit.txt"
   rm -rf "$RUN/code.next" && mkdir -p "$RUN/code.next" \
     && git -C "$REPO" archive "$SHA" src | tar -x -C "$RUN/code.next" && rm -rf "$RUN/code" && mv "$RUN/code.next" "$RUN/code" \
     || { echo "BLOCKED: could not extract code"; exit 2; }

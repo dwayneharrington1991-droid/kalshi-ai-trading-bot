@@ -153,4 +153,6 @@ def test_oracle_runner_is_read_only_single_job_and_detached():
     assert "running ||" in code and "kill -0" in code                       # reattach, not restart
     assert all('rm -rf "$RUN/' in l for l in code.splitlines() if "rm -rf" in l)
     assert "^(shadow_upgrade|combined_opening)$" in code            # only the two shadow modules can run
+    assert "SHADOW: running the read-only 8768 audit first" in code   # never silent for minutes
+    assert "$MODULE == shadow_upgrade && ! -f $RUN/audit.txt" in code   # combined run skips the duplicate audit
     assert '--previous-report "$PREVIOUS"' in code and "BLOCKED: previous shadow report" in code

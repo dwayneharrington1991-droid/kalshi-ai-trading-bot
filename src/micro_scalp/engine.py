@@ -26,6 +26,7 @@ class StrategyConfig:
     step_seconds: float = 1.0
     use_ai: bool = False
     min_expected_net_edge: float = 0.01  # $/contract after fees & slippage
+    min_abs_predicted_move: float = 0.0  # used by the cost-blind DIAGNOSTIC variant
     max_spread: float = 0.03
     max_quote_age_seconds: float = 5.0
     ai_max_age_seconds: float = 5.0
@@ -40,6 +41,7 @@ class StrategyConfig:
     exit_before_close_seconds: float = 30.0
     require_oos_skill: bool = True
     min_oos_r2: float = 0.0
+    min_oos_samples: int = 1000  # scored forecasts before the skill gate can open
     min_train_samples: int = 1500
     ridge: float = 1.0
 
@@ -228,9 +230,11 @@ class Engine:
         if not self.model.ready():
             return {"action": "WAIT", "why": f"Model still learning from past data ({self.model.n}/{self.s.min_train_samples} labelled samples)."}
         skill = self.model.skill()
-        if self.s.require_oos_skill and (skill["r2_vs_zero"] is None or skill["r2_vs_zero"] <= self.s.min_oos_r2):
+        if self.s.require_oos_skill and (
+            skill["r2_vs_zero"] is None or skill["n"] < self.s.min_oos_samples or skill["r2_vs_zero"] <= self.s.min_oos_r2
+        ):
             r2 = "n/a" if skill["r2_vs_zero"] is None else f"{skill['r2_vs_zero']:.3f}"
-            return {"action": "WAIT", "why": f"The price model has not beaten a no-change forecast out of sample yet (R² {r2}), so no edge is assumed."}
+            return {"action": "WAIT", "why": f"The price model has not beaten a no-change forecast out of sample yet (R² {r2}, {skill['n']} scored forecasts, need ≥{self.s.min_oos_samples}), so no edge is assumed."}
         best = None
         for side, sign in (("up", 1.0), ("down", -1.0)):
             bid, ask = q[side]["bid"], q[side]["ask"]
@@ -242,6 +246,8 @@ class Engine:
             if best is None or exp_net > best["exp_net"]:
                 best = cand
         cents = best["exp_net"] * 100
+        if abs(best["pred"]) < self.s.min_abs_predicted_move:
+            return {"action": "WAIT", "why": f"Predicted move {best['pred']*100:+.1f}¢ is too small to act on."}
         if best["exp_net"] < self.s.min_expected_net_edge:
             return {"action": "WAIT", "why": f"Best idea ({best['side'].upper()}) expects {cents:+.1f}¢/contract after fees and spread; needs ≥ {self.s.min_expected_net_edge*100:.1f}¢.", "expected_net": best["exp_net"]}
         if best["spread"] > self.s.max_spread + 1e-9:

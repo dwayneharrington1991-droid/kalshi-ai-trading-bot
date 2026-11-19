@@ -37,7 +37,8 @@ the answer is clearly yes.
    a training example only becomes usable after its 30 seconds have passed.
 3. **Out-of-sample skill gate:** every forecast is scored later against what
    actually happened. If, over the last ~3000 forecasts, the model has **not**
-   beaten the naive "price won't change" forecast (R² ≤ 0), the simulator
+   beaten the naive "price won't change" forecast (R² ≤ 0), or fewer than
+   1000 forecasts have been scored, the simulator
    refuses to trade. No edge is assumed.
 4. **Cost hurdle:** expected profit per contract =
    `expected exit bid − (ask + slippage) − entry fee − exit fee`.

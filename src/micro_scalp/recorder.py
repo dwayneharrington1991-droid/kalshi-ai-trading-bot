@@ -89,6 +89,7 @@ class Recorder:
         self.trade_ids: set[str] = set()
         self.last_trade_ts: dict[str, int] = {}
         self.pending_settlement: dict[str, float] = {}
+        self.settled: set[str] = set()
         self.last_discovery = 0.0
         self.errors = 0
         self.failures: dict[str, int] = {}
@@ -130,7 +131,7 @@ class Recorder:
                 continue
             if o <= now < c:
                 out.append(t)
-            elif now >= c and t not in self.pending_settlement:
+            elif now >= c and t not in self.pending_settlement and t not in self.settled:
                 self.pending_settlement[t] = 0.0
         return out
 
@@ -192,6 +193,7 @@ class Recorder:
                     }
                 )
                 del self.pending_settlement[ticker]
+                self.settled.add(ticker)
 
     def _safe(self, name, fn, *args):
         """One failed endpoint never blocks the others; every gap is recorded."""

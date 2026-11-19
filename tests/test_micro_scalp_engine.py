@@ -336,3 +336,27 @@ def test_metrics_profit_factor_and_bootstrap():
     assert s["win_rate"] == 0.5
     b = cluster_bootstrap(trades)
     assert b["contracts"] == 5 and b["net_pnl_95ci"][0] <= 6 <= b["net_pnl_95ci"][1]
+
+
+def test_skill_gate_needs_enough_scored_forecasts():
+    e = _engine(min_oos_samples=1000)
+    e.model.beta = [0.0] * e.model.k  # pretend fitted
+    for _ in range(300):
+        e.model.score(0.01, 0.01)  # perfect but small sample
+    m = MarketState("KXBTC15M-G", T0, T0 + 900)
+    m.on_quote(book(T0 + 100, "KXBTC15M-G", 0.49, 0.50))
+    x, info = features(m, T0 + 101, 5, 5, False)
+    d = e._decide(T0 + 101, m, x, info, 0.2, 1000.0, None)
+    assert d["action"] == "WAIT" and "need ≥1000" in d["why"]
+
+
+def test_duplicate_settlement_records_are_ignored(tmp_path):
+    import json as _json
+
+    from src.micro_scalp.events import recorded_events
+
+    p = tmp_path / "r.jsonl"
+    rows = [{"type": "settlement", "received_at": T0 + i, "ticker": "T", "result": "yes", "outcome": "up"} for i in range(3)]
+    p.write_text("\n".join(_json.dumps(r) for r in rows))
+    ev, info = recorded_events(p)
+    assert len(ev) == 1 and info["record_counts"]["duplicate_settlement"] == 2

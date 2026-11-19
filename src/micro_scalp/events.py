@@ -195,7 +195,7 @@ def record_to_event(r: dict):
 
 
 def recorded_events(path: Path) -> tuple[list[dict], dict]:
-    events, counts = [], {}
+    events, counts, settled = [], {}, set()
     for line in Path(path).read_text().splitlines():
         try:
             r = json.loads(line)
@@ -208,8 +208,14 @@ def recorded_events(path: Path) -> tuple[list[dict], dict]:
         except (KeyError, TypeError, ValueError):
             counts["invalid"] = counts.get("invalid", 0) + 1
             continue
-        if e is not None:
-            events.append(e)
+        if e is None:
+            continue
+        if e["kind"] == "settlement":
+            if e["ticker"] in settled:
+                counts["duplicate_settlement"] = counts.get("duplicate_settlement", 0) + 1
+                continue  # only the first published result counts
+            settled.add(e["ticker"])
+        events.append(e)
     events.sort(key=lambda e: (e["at"], _ORDER[e["kind"]]))
     info = {"source": "recorded_live", "file": str(path), "record_counts": counts, "depth_available": True}
     return events, info

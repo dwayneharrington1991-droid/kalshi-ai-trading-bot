@@ -8,8 +8,9 @@
    the model warm-started from the historical pass.
 3. Variants: no_trade baseline, market_only, with_existing_ai (fresh only:
    historical AI states were never recorded), plus an explicitly labelled
-   DIAGNOSTIC variant without the out-of-sample skill gate, used only to
-   reach a 100+ trade sample of the execution/cost model.
+   cost-blind DIAGNOSTIC variant (no skill gate, no profit-after-fees
+   hurdle), used only to reach a 100+ trade sample of execution costs and
+   directional accuracy.
 
     python -m src.micro_scalp.backtest --historical data/micro_scalp/historical \
         --fresh data/micro_scalp/fresh_live.jsonl --out data/micro_scalp/reports/report.json
@@ -69,9 +70,16 @@ def main():
 
     risk = RiskConfig(starting_balance=a.balance)
     base = StrategyConfig()
-    diagnostic = replace(base, require_oos_skill=False)
+    # DIAGNOSTIC: deliberately cost-blind. Acts on the model's directional view
+    # (|predicted 30s move| >= 1c) without the skill gate or the profit-after-
+    # fees hurdle, to build a 100+ trade sample of real execution costs and
+    # directional accuracy. It is a measurement, not a candidate strategy.
+    diagnostic = replace(
+        base, require_oos_skill=False, min_expected_net_edge=-1.0, min_abs_predicted_move=0.01, cooldown_seconds=60.0
+    )
     report = {
         "paper_trading_only": True,
+        "diagnostic_config": asdict(diagnostic),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "risk_config": risk.to_dict(),
         "strategy_config": asdict(base),
@@ -81,7 +89,7 @@ def main():
     events, info = load_historical(a.historical)
     report["historical_data"] = info
     hist = {}
-    for name, cfg in (("market_only", base), ("DIAGNOSTIC_no_skill_gate", diagnostic)):
+    for name, cfg in (("market_only", base), ("DIAGNOSTIC_cost_blind", diagnostic)):
         engine, rep = run_historical(events, info, cfg, risk, name)
         hist[name] = (engine, rep)
     report["historical"] = {name: rep for name, (_, rep) in hist.items()}
@@ -101,13 +109,13 @@ def main():
             "last": _iso(fev[-1]["at"]) if fev else None,
         }
         warm = hist["market_only"][0].model
-        warm_diag = hist["DIAGNOSTIC_no_skill_gate"][0].model
+        warm_diag = hist["DIAGNOSTIC_cost_blind"][0].model
         fresh = {}
         for name, cfg, w in (
             ("market_only", base, warm),
             ("with_existing_ai", replace(base, use_ai=True), warm),
-            ("DIAGNOSTIC_no_skill_gate", diagnostic, warm_diag),
-            ("DIAGNOSTIC_no_skill_gate_with_ai", replace(diagnostic, use_ai=True), warm_diag),
+            ("DIAGNOSTIC_cost_blind", diagnostic, warm_diag),
+            ("DIAGNOSTIC_cost_blind_with_ai", replace(diagnostic, use_ai=True), warm_diag),
         ):
             _, rep = run_fresh(fev, cfg, risk, name, w)
             fresh[name] = rep

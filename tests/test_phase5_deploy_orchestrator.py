@@ -87,7 +87,7 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
 
 FAKE_SS = r'''#!/bin/bash
 port=$(sed -n 's/.*sport = :\([0-9]*\).*/\1/p' <<<"$*")
-pid=$(pgrep -f "fake_server.py .*--port $port( |$)" | head -1)
+pid=$(pgrep -f "$SIM_DIR/fake_server.py .*--port $port( |$)" | head -1)
 [[ -n $pid ]] && echo "LISTEN 0 5 127.0.0.1:$port 0.0.0.0:* users:((\"python\",pid=$pid,fd=3))"
 exit 0
 '''
@@ -98,7 +98,7 @@ set -u
 sha=$1
 source "$(dirname "$0")/deploy/oracle/preview_deploy_lock.sh"
 preview_deploy_lock || exit 9          # must inherit the orchestrator's lock
-kill_old() { pkill -f "fake_server.py .*--port 8768( |$)"; for _ in $(seq 50); do pgrep -f "fake_server.py .*--port 8768( |$)" >/dev/null || break; sleep 0.1; done; }
+kill_old() { pkill -f "$SIM_DIR/fake_server.py .*--port 8768( |$)"; for _ in $(seq 50); do pgrep -f "$SIM_DIR/fake_server.py .*--port 8768( |$)" >/dev/null || break; sleep 0.1; done; }
 start() { (cd "$SIM_DIR" || exit 1; nohup "$SIM_PY" "$SIM_DIR/fake_server.py" --port 8768 "$@" >/dev/null 2>&1 </dev/null 9>&- &); sleep 0.8; }
 echo "$sha" >>"$SIM_DIR/installs"            # counts installer invocations
 case $SIM_INSTALL in
@@ -210,7 +210,7 @@ def sim(tmp_path):
         return result, (status[-1].split("=", 1)[1] if status else None)
 
     def listener(port):
-        out = subprocess.run(["pgrep", "-f", f"fake_server.py .*--port {port}( |$)"], capture_output=True, text=True)
+        out = subprocess.run(["pgrep", "-f", f"{simdir}/fake_server.py .*--port {port}( |$)"], capture_output=True, text=True)
         return out.stdout.split()[0] if out.stdout.split() else None
 
     def health():
@@ -221,6 +221,10 @@ def sim(tmp_path):
     ctx = dict(run=run, make_env=make_env, repo=repo, sha=sha, listener=listener, health=health, old=old, p65=p65, p67=p67,
                simdir=simdir, state=tmp_path / "state", secret_env=secret_env, start=start)
     yield ctx
+    # Detached jobs and watchdogs deliberately outlive their caller (as on Oracle);
+    # stop THIS test's ones so they can never act on a later test's processes.
+    for script in ("deploy_job_8768.sh", "deploy_preview_8768.sh"):
+        subprocess.run(["pkill", "-f", str(repo / "deploy/oracle" / script)])
     subprocess.run(["pkill", "-f", str(simdir / "fake_server.py")])
     # Wait until every fake service has exited and released its port, so the
     # next test does not see a transiently busy port and skip.

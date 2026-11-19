@@ -76,3 +76,18 @@ No regime shows a clear edge; all intervals are wide (about ±20 points).
 
 - No walk-forward model comparison has been run. The export has 300 rows; a chronological split leaves too few directional calls for a reliable model selection.
 - The fee/spread-aware profitability check needs the executable quote fields, which are not in this export.
+
+## Walk-forward experiment (rejected)
+
+Rule tested: for each eligible opening after the first 60, pick a confidence threshold t from {0, 0.01, 0.02, 0.03, 0.05, 0.08, 0.10} that maximised accuracy on openings that had already settled before this open (strict: closes_at <= opens_at), require at least 20 such calls, then call UP/DOWN from the candidate probability when |p - 0.5| >= t.
+
+| Scope | Calls | Correct | Accuracy | 95% Wilson |
+|---|---|---|---|---|
+| Threshold rule (walk-forward) | 70 | 49 | 70.0% | 58.5–79.5% |
+| Recorded candidate direction, same 70 openings | 70 | 46 | 65.7% | 54.0–75.8% |
+| Threshold rule, first half of its calls | 35 | 27 | 77.1% | |
+| Threshold rule, second half | 35 | 22 | 62.9% | |
+
+Verdict: rejected. The paired gain is 3 calls out of 70, well inside sampling noise. The threshold is chosen from seven options on the same export, and the accuracy falls from 77% to 63% between halves. Not promoted, not deployed.
+
+Constant-DOWN baseline over all 294 eligible openings: 162 correct, 55.1% (49.4–60.7%).

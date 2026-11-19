@@ -30,6 +30,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
+from . import learning
 from . import learning_loop as ll
 from . import opening_models
 from . import opening_research as research
@@ -247,6 +248,41 @@ def state_snapshot(journal, asof):
         return research.load(db, asof)
 
 
+EXPOSED_FILE = "exposed_test_contracts.json"
+SCORED_STATUSES = ("SHADOW_CANDIDATE_PASSED_STATISTICAL_GATES", "EXPERIMENTAL_FALLBACK_RETAINED")
+
+
+def _load_exposed(state_dir, rows):
+    """Contracts whose test periods were already scored. A later test must be a forward block of unseen contracts.
+
+    First run with existing evaluations: those earlier test periods were already scored, so every contract seen
+    so far counts as exposed (conservative). The next scored test then waits for 30 genuinely new contracts."""
+    path = Path(state_dir) / EXPOSED_FILE
+    if path.exists():
+        return set(json.loads(path.read_text())["tickers"])
+    reports = Path(state_dir) / "reports"
+    if reports.exists() and any(reports.glob("report-*.json")):
+        return {r["ticker"] for r in rows}
+    return set()
+
+
+def _record_exposed(state_dir, rows, exposed, report):
+    """Add the test contracts of an evaluation that actually scored a test. Never removes entries."""
+    if report.get("status") not in SCORED_STATUSES:
+        return exposed
+    contract_sets, _info = learning.chronological_contract_partitions([r["ticker"] for r in rows], exposed)
+    if contract_sets is None:
+        return exposed
+    tested = set(exposed) | set(contract_sets[2])
+    path = Path(state_dir) / EXPOSED_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".next")
+    tmp.write_text(json.dumps({"format": "exposed-test-contracts-v1", "tickers": sorted(tested)}, sort_keys=True))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return tested
+
+
 def retrain_cycle(journal, state_dir, asof, commit, last_cutoff=None, min_new=MIN_NEW_SETTLED, candidates_evaluated=0):
     """One scheduled cycle. Writes only new, immutable files under state_dir."""
     state_dir = Path(state_dir)
@@ -259,7 +295,9 @@ def retrain_cycle(journal, state_dir, asof, commit, last_cutoff=None, min_new=MI
     if len(new) < min_new:
         status["decision"] = "SKIPPED_NOT_ENOUGH_NEW_DATA"
         return status
-    candidate, report = opening_models.evaluate(rows)
+    exposed = _load_exposed(state_dir, rows)
+    candidate, report = opening_models.evaluate(rows, used_test_contracts=exposed)
+    exposed = _record_exposed(state_dir, rows, exposed, report)
     status["opening_model_status"] = report.get("status")
     if candidate is None:
         status["decision"] = "NO_CANDIDATE"

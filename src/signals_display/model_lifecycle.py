@@ -302,6 +302,9 @@ def rollback_decision(samples, previous_checksum, consecutive=3, max_quote_age=1
     return {"decision": "OK", "rollback_to": previous_checksum}
 
 
+SCHEDULE_MINUTES = (7, 37)   # every 30 minutes, outside the guarded 15-minute boundary windows
+
+
 def opening_window_safe(now):
     """No model change within 3 minutes after a 15-minute boundary or in the final minute before one."""
     since = (now.minute % 15) * 60 + now.second

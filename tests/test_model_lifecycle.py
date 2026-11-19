@@ -457,3 +457,12 @@ def test_dashboard_panel_names_every_requested_learning_field():
                   "current_production_model", "rollback", "activation", "promotion", "Live model: UNCHANGED", "reasons"):
         assert field in html, field
     assert "innerHTML" not in html[html.index("/* Learning loop status"):html.index("</script>", html.index("/* Learning loop status"))]
+
+
+def test_scheduled_minutes_are_outside_the_opening_window_guard():
+    """Cron must not fire on the 15-minute boundaries, which the guard always refuses."""
+    for minute in lc.SCHEDULE_MINUTES:
+        assert lc.opening_window_safe(datetime(2026, 11, 19, 3, minute, 0, tzinfo=timezone.utc)), minute
+    assert lc.SCHEDULE_MINUTES == (7, 37)
+    assert not lc.opening_window_safe(datetime(2026, 11, 19, 3, 0, 0, tzinfo=timezone.utc))
+    assert not lc.opening_window_safe(datetime(2026, 11, 19, 3, 30, 0, tzinfo=timezone.utc))

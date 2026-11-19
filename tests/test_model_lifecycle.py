@@ -262,7 +262,9 @@ def test_successful_promotion_keeps_a_verified_rollback_checkpoint(tmp_path):
     assert backup.read_bytes() == (tmp_path / "live_artifact.json").read_bytes()    # byte-exact rollback checkpoint
     assert pr.History(state).verify_chain() and "promoted" in notes
     again, _ = controller(tmp_path, status, FakeActivator(live=body["checksum"]))
-    assert again["result"] == "ALREADY_PROMOTED"                                   # never promoted twice
+    # never promoted twice: while the post-promotion watch is open the repeat cycle only watches
+    assert again["result"] in ("WATCHING", "ALREADY_PROMOTED")
+    assert sum(1 for e in pr.History(state).entries() if e["event"] == "PROMOTED") == 1                                   # never promoted twice
 
 
 def test_failed_activation_rolls_back_and_does_not_promote(tmp_path):

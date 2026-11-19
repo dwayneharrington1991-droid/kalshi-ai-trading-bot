@@ -53,12 +53,15 @@ def probe_live(port):
             return exc.code, json.loads(exc.read() or b"{}")
         except Exception:
             return None, {}
+    started = time.monotonic()
     hc, h = get("/healthz")
+    latency_ms = round((time.monotonic() - started) * 1000, 1)
     rc, r = get("/readyz")
     return {"health": h.get("status") if hc in (200, 503) else None,
             "ready": r.get("status") if rc in (200, 503) else None,
             "signals_only": h.get("signals_only") is True, "workers_healthy": (h.get("workers") or {}).get("healthy"),
-            "quote_age_s": None, "model_file_sha": h.get("model_file_sha")}
+            "quote_age_s": None, "model_file_sha": h.get("model_file_sha") if hc in (200, 503) else None,
+            "latency_ms": latency_ms if hc is not None else None}
 
 
 def probe_resources():
@@ -122,6 +125,18 @@ def _publish(path, obj):
     os.replace(tmp, path)
 
 
+def _watch_summary(state_dir):
+    """Public, credential-free view of the post-promotion watch for the dashboard."""
+    from . import post_promotion as pw
+    watch = pw.read_watch(state_dir)
+    if not watch:
+        return {"state": "NONE"}
+    return {"state": watch.get("state"), "promoted_at": watch.get("promoted_at"),
+            "candidate": (watch.get("candidate_checksum") or "")[:12] or None,
+            "previous": (watch.get("previous_checksum") or "")[:12] or None,
+            "reason": watch.get("reason"), "cycles": watch.get("cycles", 0)}
+
+
 def run(journal, state_dir, commit, live_artifact, *, asof, min_new=lc.MIN_NEW_SETTLED, port=8768,
         activator=None, probe=probe_live, resources=probe_resources, notify=None, telegram=telegram_ready,
         seconds_to_opening=None):
@@ -142,9 +157,16 @@ def run(journal, state_dir, commit, live_artifact, *, asof, min_new=lc.MIN_NEW_S
     samples = [probe(port)]
     if hasattr(activator, "bootstrap") and getattr(activator, "enabled", False):
         activator.bootstrap(live_artifact)          # record the current production model as the rollback reference
+    def watch_rows(since_iso):
+        """Only read when a watch is open: point-in-time rows whose labels arrived after the switch."""
+        since = datetime.fromisoformat(since_iso)
+        rows, _excluded = lc.point_in_time_rows(lc.state_snapshot(journal, asof), asof)
+        return [r for r in rows if datetime.fromisoformat(str(r["label_available_at"])) > since]
+
     promo = pr.promotion_cycle(state_dir, status, activator, live_artifact_path=live_artifact,
                                health_samples=samples, resources=resources(), telegram_ok=telegram(),
-                               seconds_to_opening=seconds_to_opening, notify=notify, now=asof)
+                               seconds_to_opening=seconds_to_opening, notify=notify, now=asof,
+                               watch_rows=watch_rows)
     entries = history.entries()
     active = pr._read_active(state_dir)
     rollback = next((e for e in reversed(entries) if e["event"] in ("ROLLED_BACK", "ACTIVATION_FAILED")), None)
@@ -170,6 +192,7 @@ def run(journal, state_dir, commit, live_artifact, *, asof, min_new=lc.MIN_NEW_S
         "activation": "ENABLED" if activator.enabled else "DISABLED (no verified guarded activator configured)",
         "errors": [e["data"].get("error") for e in entries[-5:] if e["event"] == "CONTROLLER_ERROR"],
         "live_probe": samples[0],
+        "watch": _watch_summary(state_dir),
     }
     _publish(Path(f"{journal}{STATUS_SUFFIX}"), out)
     return out

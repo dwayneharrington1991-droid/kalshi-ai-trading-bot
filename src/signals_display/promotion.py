@@ -26,6 +26,7 @@ from pathlib import Path
 
 from . import model_lifecycle as lc
 from . import opening_models
+from . import post_promotion as pw
 
 HISTORY = "history.jsonl"
 ACTIVE = "active.json"
@@ -151,7 +152,7 @@ def _live_healthy(sample):
 
 def promotion_cycle(state_dir, status, activator, *, live_artifact_path, health_samples, resources,
                     telegram_ok, seconds_to_opening, notify=lambda event, data: None, now=None,
-                    post_samples=None):
+                    post_samples=None, watch_rows=None):
     """Run one controller cycle. Returns a result dict; never raises past its own boundary."""
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -163,7 +164,7 @@ def promotion_cycle(state_dir, status, activator, *, live_artifact_path, health_
         return {"result": "LOCKED", "detail": "another controller cycle is running"}
     try:
         return _cycle(state_dir, status, activator, live_artifact_path, health_samples, resources,
-                      telegram_ok, seconds_to_opening, notify, now, post_samples)
+                      telegram_ok, seconds_to_opening, notify, now, post_samples, watch_rows)
     except Exception as exc:  # fail closed: any unexpected error stops promotion and is recorded
         History(state_dir).append("CONTROLLER_ERROR", {"error": type(exc).__name__})
         notify("critical_failure", {"error": type(exc).__name__})
@@ -173,8 +174,47 @@ def promotion_cycle(state_dir, status, activator, *, live_artifact_path, health_
         lock.close()
 
 
+def _advance_watch(state_dir, activator, watch, health_samples, watch_rows, history, notify, now):
+    """One cycle of the post-promotion watch. Only one watch runs at a time; a failed rollback blocks everything."""
+    if watch.get("state") == "ROLLBACK_FAILED":
+        return {"result": "BLOCKED", "detail": "a failed rollback needs manual recovery; promotion is blocked"}
+    promoted = previous = None
+    try:
+        promoted = lc.load_verified(watch["candidate_file"])["artifact"]
+    except (OSError, ValueError, KeyError, TypeError):
+        promoted = None
+    previous = opening_models.load_artifact(watch["backup_file"])[0]
+    rows = watch_rows(watch["promoted_at"]) if callable(watch_rows) else []
+    decision, reason, evidence, updated = pw.evaluate(
+        watch, health_samples, promoted_artifact=promoted, previous_artifact=previous, rows=rows)
+    if decision == "ROLLBACK_REQUIRED":
+        rb = activator.rollback(Path(watch["backup_file"]), watch["previous_checksum"])
+        if rb.get("ok"):
+            active = _read_active(state_dir) or {}
+            _write_active(state_dir, {"candidate_checksum": watch["previous_checksum"],
+                                      "training_cutoff": active.get("training_cutoff"),
+                                      "backup_file": Path(watch["backup_file"]).name,
+                                      "rolled_back_from": watch["candidate_checksum"], "promoted_at": now.isoformat()})
+            pw.finish_watch(state_dir, updated, "ROLLED_BACK", reason)
+            history.append("ROLLED_BACK", {"reason": reason, "rolled_back": True, "evidence": evidence,
+                                           "candidate_checksum": watch["candidate_checksum"],
+                                           "restored_checksum": watch["previous_checksum"]})
+            notify("rollback", {"reason": reason, "previous_checksum": watch["previous_checksum"][:12]})
+            return {"result": "ROLLED_BACK", "detail": reason}
+        pw.finish_watch(state_dir, updated, "ROLLBACK_FAILED", reason)
+        history.append("ROLLBACK_NOT_VERIFIED", {"reason": reason, "evidence": evidence})
+        notify("critical_failure", {"reason": "rollback could not be verified; manual recovery required"})
+        return {"result": "BLOCKED", "detail": "rollback could not be verified; manual recovery required"}
+    if decision == "PASSED":
+        pw.finish_watch(state_dir, updated, "PASSED", reason)
+        history.append("WATCH_PASSED", {"candidate_checksum": watch["candidate_checksum"], "evidence": evidence})
+        return {"result": "WATCH_PASSED", "detail": reason}
+    pw._write_atomic(Path(state_dir) / pw.WATCH_FILE, updated)
+    return {"result": "WATCHING", "detail": reason, "evidence": evidence}
+
+
 def _cycle(state_dir, status, activator, live_artifact_path, health_samples, resources, telegram_ok,
-           seconds_to_opening, notify, now, post_samples=None):
+           seconds_to_opening, notify, now, post_samples=None, watch_rows=None):
     history = History(state_dir)
     if not history.verify_chain():
         notify("critical_failure", {"reason": "history checksum chain is broken"})
@@ -188,6 +228,11 @@ def _cycle(state_dir, status, activator, live_artifact_path, health_samples, res
     if not activator.enabled:
         history.append("PROMOTION_BLOCKED", {"reason": "ACTIVATION_DISABLED"})
         return {"result": "BLOCKED", "detail": "ACTIVATION_DISABLED: no verified guarded activator configured"}
+
+    # 1b one watch at a time: a promoted model is observed across cycles before anything else changes
+    watch = pw.read_watch(state_dir)
+    if watch and watch.get("state") in ("WATCHING", "ROLLBACK_FAILED"):
+        return _advance_watch(state_dir, activator, watch, health_samples, watch_rows, history, notify, now)
 
     if status.get("decision") != "CANDIDATE_QUALIFIED":
         history.append("NOT_PROMOTED", {"decision": status.get("decision"), "reasons": status.get("reasons")})
@@ -278,6 +323,10 @@ def _cycle(state_dir, status, activator, live_artifact_path, health_samples, res
                               "previous_checksum": previous, "backup_file": backup_path.name,
                               "promoted_at": now.isoformat()})
     history.append("PROMOTED", {"candidate_checksum": body["checksum"], "previous_checksum": previous})
+    pw.start_watch(state_dir, candidate_checksum=body["checksum"], candidate_file=cand_path,
+                   promoted_file_sha=lc.sha256_file(cand_path), previous_checksum=previous,
+                   backup_file=backup_path, promoted_at=now.isoformat())
+    history.append("WATCH_STARTED", {"candidate_checksum": body["checksum"], "previous_checksum": previous})
     notify("promoted", {"candidate_checksum": body["checksum"][:12], "previous_checksum": previous[:12]})
     return {"result": "PROMOTED", "detail": body["checksum"][:12]}
 

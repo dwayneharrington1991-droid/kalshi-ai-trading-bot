@@ -99,3 +99,38 @@ def test_slice_refuses_to_overwrite(tmp_path):
     (tmp_path / "slice.db").write_bytes(b"x")
     with pytest.raises(FileExistsError):
         research_slice.export(full, tmp_path / "slice.db", NOW, progress=lambda _m: None)
+
+
+def test_reassembly_verifies_parts_and_hash(tmp_path):
+    import base64, hashlib, re, subprocess, tarfile
+    (tmp_path / "slice.db").write_bytes(b"db-bytes" * 1000)
+    with tarfile.open(tmp_path / "bundle.tgz", "w:gz") as tar:
+        tar.add(tmp_path / "slice.db", arcname="slice.db")
+    data = (tmp_path / "bundle.tgz").read_bytes()
+    text, digest = base64.b64encode(data).decode(), hashlib.sha256(data).hexdigest()
+    half = len(text) // 2
+    parts = []
+    for i, chunk in enumerate((text[:half], text[half:]), 1):
+        p = tmp_path / f"slice.part-0{i}.txt"
+        p.write_text(f"KXSLICE {i} 2 {digest}\n{chunk}")
+        parts.append(p)
+    info = research_slice.reassemble(list(reversed(parts)), tmp_path / "out")      # order-independent
+    assert info["parts"] == 2 and (tmp_path / "out" / "slice.db").read_bytes() == b"db-bytes" * 1000
+    with pytest.raises(ValueError):
+        research_slice.reassemble(parts[:1], tmp_path / "out2")                    # missing part
+    parts[1].write_text(f"KXSLICE 2 2 {digest}\nAAAA")
+    with pytest.raises(ValueError):
+        research_slice.reassemble(parts, tmp_path / "out3")                        # corrupted
+
+
+def test_export_script_never_touches_live_services():
+    import re, subprocess
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "deploy/oracle/export_slice_8768.sh"
+    code = "\n".join(l for l in path.read_text().splitlines() if not l.lstrip().startswith("#"))
+    assert subprocess.run(["bash", "-n", str(path)]).returncode == 0
+    assert "8765" not in code and "8767" not in code and "systemctl" not in code
+    assert re.findall(r"kill -TERM \"\$p\"", code) and "src.signals_display." in code   # only our research runs
+    assert all('rm -rf "$OUT' in l or 'rm -f "$c"' in l or 'rm -f "$OUT/bundle.tgz"' in l
+               for l in code.splitlines() if re.search(r"\brm\b", l))
+    assert "research_slice" in code and "--asof" in code

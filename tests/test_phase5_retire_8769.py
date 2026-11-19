@@ -217,9 +217,16 @@ def _make_rehearsal(tmp_path, *, zombie=False, launcher=None):
                 os.kill(pid, 15)
         for proc in procs:
             proc.terminate()
+        # Sweep every process started from this test's own temp directory (wrapper shells and
+        # server children included), so nothing outlives the test and blocks the next run.
+        subprocess.run(["pkill", "-TERM", "-f", str(tmp_path)], capture_output=True)
         time.sleep(1)
+        subprocess.run(["pkill", "-KILL", "-f", str(tmp_path)], capture_output=True)
         for proc in procs:
-            proc.poll()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         subprocess.run(["git", "worktree", "remove", "--force", str(stage)], cwd=ROOT, capture_output=True)
     return info, cleanup
 

@@ -142,3 +142,50 @@ def test_sms_test_failure_exit_codes_and_reasons():
     assert rc == 3 and "FAILED to reach provider (TimeoutError)" in text
     assert pa.run_test(CFG, [], out=lambda *_: None) == 2
     assert "tok" not in text and "sec" not in text.replace("seconds", "")
+
+
+def test_default_credentials_file_is_found_via_home_and_reread_at_every_alert(tmp_path, monkeypatch):
+    home = tmp_path / "home"; (home / ".config").mkdir(parents=True)
+    cfg_file = home / ".config" / "kalshi-8768-alerts.env"
+    monkeypatch.setenv("HOME", str(home))
+    for key in pa.KEYS + ("KALSHI_ALERTS_FILE",):
+        monkeypatch.delenv(key, raising=False)
+    assert pa.channels(pa.load_config()) == []                         # nothing yet: alerts stay off
+    cfg_file.write_text("TELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID=-100200\n")
+    cfg_file.chmod(0o600)
+    assert pa.channels(pa.load_config()) == ["telegram"]               # same path the live service uses
+    sent = []
+    alerts = pa.OpeningAlerts(tmp_path / "ledger.sqlite3", sender=lambda ch, cfg, text: sent.append((ch, cfg["TELEGRAM_CHAT_ID"])))
+    cfg_file.unlink()
+    assert alerts.consider(opening(), stale=False, now=NOW) is False    # credentials removed -> no alert
+    cfg_file.write_text("TELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID=-100200\n"); cfg_file.chmod(0o600)
+    assert alerts.consider(opening(ticker="KXBTC15M-OTHER"), stale=False, now=NOW) is True   # picked up without restart
+    alerts.queue.join()
+    assert sent == [("telegram", "-100200")]
+
+
+def test_cli_check_reads_the_private_file_from_home_and_never_prints_values(tmp_path):
+    home = tmp_path / "home"; (home / ".config").mkdir(parents=True)
+    f = home / ".config" / "kalshi-8768-alerts.env"
+    f.write_text("TELEGRAM_BOT_TOKEN=999:secret-token\nTELEGRAM_CHAT_ID=4242\n"); f.chmod(0o600)
+    env = {k: v for k, v in os.environ.items() if k not in pa.KEYS and k != "KALSHI_ALERTS_FILE"}
+    run = subprocess.run([sys.executable, "-m", "src.signals_display.phone_alerts", "--check"], cwd=Path(__file__).resolve().parents[1],
+                         capture_output=True, text=True, env={**env, "HOME": str(home)})
+    assert run.returncode == 0 and "configured channels: telegram" in run.stdout
+    assert "secret-token" not in run.stdout + run.stderr and "4242" not in run.stdout + run.stderr
+    f.chmod(0o644)                                                      # readable by others: refused
+    run = subprocess.run([sys.executable, "-m", "src.signals_display.phone_alerts", "--check"], cwd=Path(__file__).resolve().parents[1],
+                         capture_output=True, text=True, env={**env, "HOME": str(home)})
+    assert run.returncode == 2 and "configured channels: none" in run.stdout
+
+
+def test_telegram_test_reports_acceptance_and_rejection_reason():
+    lines = []
+    assert pa.run_test({"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}, ["telegram"],
+                       send_fn=lambda ch, cfg, text: (200, {"ok": True}), out=lines.append) == 0
+    assert lines == ["TEST_TELEGRAM: ACCEPTED by provider"]
+    def unauthorized(ch, cfg, text):
+        raise pa.ProviderRejected(401, 401, "Unauthorized")
+    lines.clear()
+    assert pa.run_test({"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}, ["telegram"], send_fn=unauthorized, out=lines.append) == 3
+    assert "REJECTED by provider (HTTP 401, code 401): Unauthorized" in lines[0]

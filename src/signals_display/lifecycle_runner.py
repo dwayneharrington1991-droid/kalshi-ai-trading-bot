@@ -199,7 +199,7 @@ def build_guarded(args):
     elif cfg.get("kind") == "production":
         captured = {"port": port, "argv": cfg["argv"], "cwd": cfg["cwd"]}
         restarter = prs.ProductionRestarter(captured, cfg["env_file"], cfg["log"])
-        config = {"restart": "production-process", "port": port, "argv": cfg["argv"], "cwd": cfg["cwd"]}
+        config = prs.auth_config(cfg)
     else:
         return None
     return ga.GuardedActivator(args.state_dir, authorization_file=args.state_dir / "promotion-authorization.txt",

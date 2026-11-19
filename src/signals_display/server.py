@@ -248,6 +248,7 @@ class Monitor:
     ):
         startup_update = startup_update or (lambda _stage, _message: None)
         self.feed, self.journal = feed, journal
+        self.opening_model_file_sha = _sha256_or_none(opening_model_artifact)   # the bytes this process loaded
         # Keep the exact most recently collected candle payload on the monitor.
         # PublicFeed owns asynchronous refreshes, but request handlers must not
         # depend on its internal cache timing after a release restart.
@@ -1937,6 +1938,14 @@ class Monitor:
         return state
 
 
+def _sha256_or_none(path):
+    import hashlib
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else None
+    except OSError:
+        return None
+
+
 def make_handler(monitor):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -2343,6 +2352,7 @@ def make_handler(monitor):
                         "state_age_seconds": round(age, 3),
                         "state_version": version,
                         "build_commit": monitor.build_commit,
+                        "model_file_sha": monitor.opening_model_file_sha,
                         "signals_only": True,
                         "workers": workers,
                     }

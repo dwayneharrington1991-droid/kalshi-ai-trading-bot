@@ -130,3 +130,63 @@ def test_capture_cli_writes_private_config_and_refuses_retired_ports(live, tmp_p
                               "--config-out", str(cfg), "--env-out", str(env_out), "--log", str(log)],
                              cwd=ROOT, capture_output=True, text=True, timeout=60)
     assert retired.returncode != 0 and "retired port" in retired.stderr
+
+
+def test_live_launch_with_opening_model_artifact_flag_is_captured_and_switched_exactly(tmp_path):
+    """The real 8768 launch uses --opening-model-artifact; the restart changes only that value."""
+    port = _port()
+    art_a = tmp_path / "qualified-a.json"; art_b = tmp_path / "qualified-b.json"
+    art_a.write_text(json.dumps({"v": "a"})); art_b.write_text(json.dumps({"v": "b"}))
+    argv = [sys.executable, "-m", "src.signals_display.activation_rehearsal", "serve", "--port", str(port),
+            "--opening-model-artifact", str(art_a), "--marker", rh.MARKER]
+    proc = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        import time
+        for _ in range(100):
+            if pr_._listener_pid(port) == proc.pid:
+                break
+            time.sleep(0.05)
+        captured, reason = pr_.capture(port)
+        assert captured is not None, reason
+        assert captured["artifact_flag"] == "--opening-model-artifact" and captured["artifact_path"] == str(art_a)
+        cfg = dict(captured, kind="production")
+        cfg_masked = pr_.auth_config(cfg)
+        assert cfg_masked["argv"][cfg_masked["argv"].index("--opening-model-artifact") + 1] == "{artifact}"
+        env_file = tmp_path / "env.json"; env_file.write_text(json.dumps({"PATH": os.environ["PATH"]}))
+        restarter = pr_.ProductionRestarter(captured, env_file, tmp_path / "log")
+        assert restarter(art_b) is True
+        live = pr_._cmdline(pr_._listener_pid(port))
+        assert live == pr_.expected_argv(captured["argv"], art_b)              # every other argument identical
+        assert lr.probe_live(port)["model_file_sha"] == ga.file_sha(art_b)
+        assert pr_.auth_config(dict(captured, argv=live)) == cfg_masked         # authorization survives the switch
+    finally:
+        for pid in (pr_._listener_pid(port), proc.pid):
+            if pid:
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
+        proc.kill()
+
+
+def test_health_endpoint_reports_the_checksum_of_the_artifact_it_loaded(tmp_path):
+    import threading
+    from http.server import ThreadingHTTPServer
+    from urllib.request import urlopen
+    from src.signals_display.monitor import Journal
+    from src.signals_display.server import Monitor, make_handler
+    art = tmp_path / "loaded.json"
+    art.write_text(json.dumps({"loaded": True}))
+    monitor = Monitor(None, Journal(tmp_path / "h.db"), opening_model_artifact=str(art))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        from urllib.error import HTTPError
+        try:
+            with urlopen(f"http://127.0.0.1:{server.server_port}/healthz", timeout=5) as r:
+                body = json.load(r)
+        except HTTPError as exc:
+            body = json.loads(exc.read())
+    finally:
+        server.shutdown()
+    assert body["model_file_sha"] == ga.file_sha(art)

@@ -114,7 +114,8 @@ def test_production_restart_config_needs_authorization_and_never_uses_retired_po
     cfg.write_text(json.dumps(prod))
     act = lr.build_guarded(args)
     assert act is not None and act.enabled is False              # no authorization file: disabled
-    config = {"restart": "production-process", "port": 28010, "argv": prod["argv"], "cwd": prod["cwd"]}
+    from src.signals_display import production_restart as prs
+    config = prs.auth_config(dict(prod, kind="production"))
     (tmp_path / "promotion-authorization.txt").write_text(ga.AUTH_PREFIX + ga.activator_checksum(config))
     assert lr.build_guarded(args).enabled is True                # exact authorization: enabled
 

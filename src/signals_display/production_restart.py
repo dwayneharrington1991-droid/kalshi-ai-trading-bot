@@ -22,7 +22,7 @@ import subprocess
 import time
 from pathlib import Path
 
-ARTIFACT_FLAG = "--artifact"
+ARTIFACT_FLAGS = ("--opening-model-artifact", "--artifact")
 TERM_WAIT_S = 60
 START_WAIT_S = 30
 
@@ -56,21 +56,36 @@ def _cgroup_is_systemd(pid):
         return True                                   # cannot prove it is not systemd-managed: refuse
 
 
+def artifact_flag_of(argv):
+    """The artifact flag present in a launch command (exactly one), else None."""
+    present = [f for f in ARTIFACT_FLAGS if f in argv]
+    return present[0] if len(present) == 1 else None
+
+
 def expected_argv(template, artifact_path):
-    """The captured template with the artifact argument replaced. Refuses if the flag is absent."""
+    """The captured template with the artifact value replaced. Refuses if no single artifact flag exists."""
+    flag = artifact_flag_of(template)
+    if flag is None or template.index(flag) + 1 >= len(template):
+        raise ValueError("launch template has no single artifact argument")
     argv = list(template)
-    if ARTIFACT_FLAG not in argv or argv.index(ARTIFACT_FLAG) + 1 >= len(argv):
-        raise ValueError("launch template has no artifact argument")
-    argv[argv.index(ARTIFACT_FLAG) + 1] = str(artifact_path)
+    argv[argv.index(flag) + 1] = str(artifact_path)
     return argv
 
 
 def same_launch(live_argv, template):
     """True when the live command line equals the captured template in every position except the artifact value."""
-    if len(live_argv) != len(template) or ARTIFACT_FLAG not in template:
+    flag = artifact_flag_of(template)
+    if flag is None or len(live_argv) != len(template):
         return False
-    skip = template.index(ARTIFACT_FLAG) + 1
+    skip = template.index(flag) + 1
     return all(a == b for i, (a, b) in enumerate(zip(live_argv, template)) if i != skip)
+
+
+def auth_config(cfg):
+    """The configuration an authorization file covers. The artifact VALUE is masked, so promotions do not
+    change the authorization; the flag, port, working directory and every other argument are bound."""
+    template = expected_argv(cfg["argv"], "{artifact}")
+    return {"restart": "production-process", "port": int(cfg["port"]), "argv": template, "cwd": cfg["cwd"]}
 
 
 def capture(port, journal=None):
@@ -81,12 +96,15 @@ def capture(port, journal=None):
     if _cgroup_is_systemd(pid):
         return None, "process is systemd-managed; manual restart is refused"
     argv = _cmdline(pid)
-    if ARTIFACT_FLAG not in argv:
-        return None, "launch command has no artifact argument"
+    if artifact_flag_of(argv) is None:
+        return None, "launch command has no single artifact argument"
     cwd = os.readlink(f"/proc/{pid}/cwd")
     if journal is not None and str(journal) not in " ".join(argv) and "--journal" in argv:
         return None, "launch command names a different journal"
-    return {"port": port, "argv": argv, "cwd": cwd, "pid_at_capture": pid}, "captured"
+    flag = artifact_flag_of(argv)
+    artifact = argv[argv.index(flag) + 1]
+    return {"port": port, "argv": argv, "cwd": cwd, "pid_at_capture": pid,
+            "artifact_flag": flag, "artifact_path": artifact}, "captured"
 
 
 class ProductionRestarter:
@@ -150,6 +168,7 @@ def _main(argv=None):
         json.dump(env, f)
     os.chmod(args.env_out, 0o600)                     # explicit: never rely on the creation mode
     config = {"kind": "production", "port": captured["port"], "argv": captured["argv"], "cwd": captured["cwd"],
+              "artifact_flag": captured["artifact_flag"], "artifact_path": captured["artifact_path"],
               "env_file": str(args.env_out), "log": str(args.log)}
     args.config_out.write_text(json.dumps(config, indent=1, sort_keys=True))
     os.chmod(args.config_out, 0o600)

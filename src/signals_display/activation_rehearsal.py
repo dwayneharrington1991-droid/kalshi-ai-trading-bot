@@ -324,7 +324,7 @@ def main(argv=None):
     r.add_argument("--workdir", type=Path, required=True)
     sv = sub.add_parser("serve")
     sv.add_argument("--port", type=int, required=True)
-    sv.add_argument("--artifact", type=Path, required=True)
+    sv.add_argument("--artifact", "--opening-model-artifact", dest="artifact", type=Path, required=True)
     sv.add_argument("--marker", required=True)
     sv.add_argument("--fail-for")
     args = p.parse_args(argv)

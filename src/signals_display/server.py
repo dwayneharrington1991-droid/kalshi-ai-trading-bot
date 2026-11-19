@@ -6,7 +6,6 @@ from copy import deepcopy
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import os
 from decimal import Decimal
 from pathlib import Path
 import re
@@ -2297,7 +2296,7 @@ def make_handler(monitor):
                 # Read-only: the offline learning run publishes this file; nothing is computed here.
                 from .learning_loop import read_status
                 # Status lives beside the journal, so no environment change is needed on the service.
-                status_path = os.environ.get("LEARNING_STATUS_FILE") or f"{monitor.journal.path}.learning-status.json"
+                status_path = f"{monitor.journal.path}.learning-status.json"
                 body = json.dumps(read_status(status_path), allow_nan=False, default=str).encode()
                 content_type = "application/json"
             elif route == "/api/learning-summary":

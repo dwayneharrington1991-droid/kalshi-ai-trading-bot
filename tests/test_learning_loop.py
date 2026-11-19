@@ -147,7 +147,7 @@ def test_dashboard_panel_is_read_only_text_and_the_route_is_registered():
     for forbidden in ("innerHTML", "method: 'POST'", "method:'POST'", "/api/manual", "fetch('/api/scalp", "outerHTML"):
         assert forbidden not in panel, forbidden
     server = (ROOT / "src/signals_display/server.py").read_text()
-    assert '"/api/learning-status"' in server and 'LEARNING_STATUS_FILE' in server
+    assert '"/api/learning-status"' in server and '.learning-status.json' in server and "import os" not in server
 
 
 def test_malformed_status_is_unreadable_not_missing_and_never_invented(tmp_path):
@@ -163,43 +163,38 @@ def test_malformed_status_is_unreadable_not_missing_and_never_invented(tmp_path)
 def test_live_status_route_over_real_http_for_missing_valid_and_malformed_files(tmp_path, monkeypatch):
     import threading
     from http.server import ThreadingHTTPServer
-    from urllib.error import HTTPError
     from urllib.request import urlopen
     from src.signals_display.monitor import Journal
     from src.signals_display.server import Monitor, make_handler
 
-    monitor = Monitor(None, Journal(tmp_path / "http.db"))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    monkeypatch.delenv("LEARNING_STATUS_FILE", raising=False)
+    journal = Journal(tmp_path / "http.db")
+    status = Path(f"{journal.path}.learning-status.json")      # the only path the service reads
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Monitor(None, journal)))
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_port}/api/learning-status"
+    url = f"http://127.0.0.1:{server.server_port}/api/learning-status"
 
-    def get(path_env):
-        if path_env is None:
-            monkeypatch.delenv("LEARNING_STATUS_FILE", raising=False)
-        else:
-            monkeypatch.setenv("LEARNING_STATUS_FILE", str(path_env))
-        with urlopen(base, timeout=5) as r:
+    def get():
+        with urlopen(url, timeout=5) as r:
             return r.status, r.headers.get("Content-Type"), json.load(r)
 
     try:
-        code, ctype, body = get(None)
+        code, ctype, body = get()                                 # missing
         assert code == 200 and ctype == "application/json" and body["status"] == "NOT_RUN"
         assert "live model is unchanged" in body["note"]
 
-        valid = tmp_path / "valid.json"
-        ll.write_status(valid, {"status": "MEASURED", "generated_at": "2026-11-19T00:00:00+00:00",
-                                "ledger": {"openings_recorded": 292, "displayed_calls": 111},
-                                "promotion": {"decision": "HOLD", "applied": False},
-                                "live_model": "UNCHANGED (learning never replaces it automatically)"})
-        code, _, body = get(valid)
+        ll.write_status(status, {"status": "MEASURED", "generated_at": "2026-11-19T00:00:00+00:00",
+                                 "ledger": {"openings_recorded": 292, "displayed_calls": 111},
+                                 "promotion": {"decision": "HOLD", "applied": False},
+                                 "live_model": "UNCHANGED (learning never replaces it automatically)"})
+        code, _, body = get()                                     # valid
         assert code == 200 and body["status"] == "MEASURED" and body["ledger"]["openings_recorded"] == 292
         assert body["promotion"]["applied"] is False
 
-        malformed = tmp_path / "malformed.json"
-        malformed.write_text('{"status": "MEASURED", ')
-        code, _, body = get(malformed)
+        status.write_text('{"status": "MEASURED", ')              # malformed
+        code, _, body = get()
         assert code == 200 and body["status"] == "UNREADABLE"
-        assert "ledger" not in body                              # nothing invented from a broken file
+        assert "ledger" not in body                               # nothing invented from a broken file
     finally:
         server.shutdown()
 

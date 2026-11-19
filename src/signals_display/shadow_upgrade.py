@@ -186,9 +186,9 @@ def gbdt_raw(model, features):
 # ------------------------------------------------------------ candidate fits
 
 
-def _fit_logistic(train):
-    spec = dict(features=ALL_FEATURES, offset=True)
-    names = [n for n in ALL_FEATURES if any(r["features"].get(n) is not None for r in train)]
+def _fit_logistic(train, features=ALL_FEATURES):
+    spec = dict(features=features, offset=True)
+    names = [n for n in features if any(r["features"].get(n) is not None for r in train)]
     prep = research._preprocess(train, names)
     if not prep["names"]:
         raise ValueError("no usable features")

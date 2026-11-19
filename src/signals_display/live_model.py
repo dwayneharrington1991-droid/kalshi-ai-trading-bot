@@ -25,6 +25,77 @@ PREOPEN_PERSIST_SECONDS = 70  # opening_points uses 65 s; keep a margin
 PATHS = 2000
 
 
+def simulate_paths(rng, paths, initial, sigma, delay, horizon, qs, spreads, caps, slippage, multiplier,
+                   target, stop):
+    """Monte Carlo scalp paths. Exactly the original per-second loop (same seeded
+    draws in the same order, same arithmetic in the same order, same early exits),
+    with loop-invariant work hoisted: the entry fee is computed once per path
+    instead of every second, and seconds before entry only advance the price."""
+    sides = tuple(caps)
+    totals = {
+        s: {"target": 0, "stop": 0, "timeout": 0, "no_entry": 0, "pnl": [],
+            "outcome_pnl": {"target": [], "stop": [], "timeout": []}}
+        for s in sides
+    }
+    gauss, exp, ceil = rng.gauss, math.exp, math.ceil
+    last = delay + horizon
+    for _ in range(paths):
+        value = initial
+        for second in range(1, delay + 1):  # before entry only the price moves
+            value += gauss(0, sigma)
+        # entry second (== delay)
+        p = 1 / (1 + exp(-max(-30, min(30, value))))
+        live = []
+        for side in sides:
+            fair = p if side == "up" else 1 - p
+            q = qs[side]
+            ask = q["ask"] if delay == 0 else min(1, fair + spreads[side])
+            buy = ask + slippage
+            t = totals[side]
+            if buy > caps[side] or buy >= 1:
+                t["no_entry"] += 1
+                t["pnl"].append(0.0)
+                continue
+            live.append((side == "up", buy, fee(buy, multiplier), t, q["bid"], spreads[side]))
+        second = delay
+        k = 0.07 * multiplier  # fee(): ceil(0.07 * m * price * (1 - price) * 100 - 1e-12) / 100
+        while live:
+            if second > delay:
+                v = value
+                v = 30 if v > 30 else (-30 if v < -30 else v)
+                p = 1 / (1 + exp(-v))
+            still = []
+            for item in live:
+                is_up, entry, entry_fee, t, quoted_bid, spread = item
+                fair = p if is_up else 1 - p
+                if second == 0:
+                    raw_bid = quoted_bid
+                else:
+                    raw_bid = fair - spread
+                    raw_bid = raw_bid if raw_bid > 0 else 0
+                bid = raw_bid - slippage
+                bid = bid if bid > 0 else 0
+                net = bid - entry - entry_fee - ceil(k * bid * (1 - bid) * 100 - 1e-12) / 100
+                if second - delay >= horizon:
+                    outcome = "timeout"
+                elif net <= -stop:
+                    outcome = "stop"
+                elif net >= target:
+                    outcome = "target"
+                else:
+                    still.append(item)
+                    continue
+                t[outcome] += 1
+                t["pnl"].append(net)
+                t["outcome_pnl"][outcome].append(net)
+            live = still
+            if not live or second >= last:
+                break
+            second += 1
+            value += gauss(0, sigma)
+    return totals
+
+
 def binary_contract_context(market, remaining, slippage):
     """Cost and boundary diagnostics; never an independent event forecast."""
     quotes = market["quotes"]
@@ -532,59 +603,10 @@ class LiveEstimator:
                 "big",
             )
             rng = random.Random(seed)
-            totals = {
-                s: {
-                    "target": 0,
-                    "stop": 0,
-                    "timeout": 0,
-                    "no_entry": 0,
-                    "pnl": [],
-                    "outcome_pnl": {"target": [], "stop": [], "timeout": []},
-                }
-                for s in caps
-            }
-            for _ in range(PATHS):
-                entries = {s: None for s in caps}
-                resolved = {s: False for s in caps}
-                value = initial
-                for second in range(self.manual_delay + horizon + 1):
-                    if second:
-                        value += rng.gauss(0, sigma)
-                    p = 1 / (1 + math.exp(-max(-30, min(30, value))))
-                    for side in caps:
-                        if resolved[side]:
-                            continue
-                        fair = p if side == "up" else 1 - p
-                        if second < self.manual_delay:
-                            continue
-                        if second == self.manual_delay:
-                            ask = qs[side]["ask"] if second == 0 else min(1, fair + spreads[side])
-                            buy = ask + self.slippage
-                            if buy > caps[side] or buy >= 1:
-                                totals[side]["no_entry"] += 1
-                                totals[side]["pnl"].append(0.0)
-                                resolved[side] = True
-                                continue
-                            entries[side] = buy
-                        raw_bid = qs[side]["bid"] if second == 0 else max(0, fair - spreads[side])
-                        bid = max(0, raw_bid - self.slippage)
-                        entry = entries[side]
-                        net = bid - entry - fee(entry, multiplier) - fee(bid, multiplier)
-                        elapsed = second - self.manual_delay
-                        outcome = None
-                        if elapsed >= horizon:
-                            outcome = "timeout"
-                        elif net <= -stop:
-                            outcome = "stop"
-                        elif net >= target:
-                            outcome = "target"
-                        if outcome:
-                            totals[side][outcome] += 1
-                            totals[side]["pnl"].append(net)
-                            totals[side]["outcome_pnl"][outcome].append(net)
-                            resolved[side] = True
-                    if all(resolved.values()):
-                        break
+            totals = simulate_paths(
+                rng, PATHS, initial, sigma, self.manual_delay, horizon, qs, spreads, caps,
+                self.slippage, multiplier, target, stop,
+            )
             details = {}
             probabilities = {}
             for side, total in totals.items():

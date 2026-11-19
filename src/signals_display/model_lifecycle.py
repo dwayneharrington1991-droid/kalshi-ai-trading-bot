@@ -248,6 +248,29 @@ def state_snapshot(journal, asof):
         return research.load(db, asof)
 
 
+def settlement_intake(journal, asof, last_cutoff):
+    """Official settlements observed after the training cursor, eligible or not, with each reason.
+
+    Read-only. A cycle can report zero new eligible settlements because the newest settlements exist but
+    are ineligible (for example, no probability was recorded). This makes that distinguishable from
+    settlements that have not arrived.
+    """
+    from collections import Counter
+    from . import opening_models
+    reasons = Counter()
+    total = 0
+    with closing(sqlite3.connect(f"file:{Path(journal).resolve()}?mode=ro", uri=True, timeout=30)) as db:
+        db.execute("PRAGMA query_only=ON")
+        for raw in opening_models._opening_rows(db, asof):
+            observed = datetime.fromisoformat(str(raw[6]))
+            if last_cutoff is not None and observed <= last_cutoff:
+                continue
+            total += 1
+            _row, reason = opening_models._assess_opening(raw, asof)
+            reasons[reason] += 1
+    return {"new_official_settlements": total, "new_by_reason": dict(sorted(reasons.items()))}
+
+
 EXPOSED_FILE = "exposed_test_contracts.json"
 SCORED_STATUSES = ("SHADOW_CANDIDATE_PASSED_STATISTICAL_GATES", "EXPERIMENTAL_FALLBACK_RETAINED")
 
@@ -292,6 +315,7 @@ def retrain_cycle(journal, state_dir, asof, commit, last_cutoff=None, min_new=MI
     status = {"format": FORMAT, "generated_at": asof.isoformat(), "commit": commit,
               "settled_markets": len(rows), "new_settled_markets": len(new),
               "live_model": "UNCHANGED", "candidates_evaluated_before": candidates_evaluated}
+    status.update(settlement_intake(journal, asof, last_cutoff))
     if len(new) < min_new:
         status["decision"] = "SKIPPED_NOT_ENOUGH_NEW_DATA"
         return status

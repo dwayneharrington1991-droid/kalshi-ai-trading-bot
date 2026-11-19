@@ -25,7 +25,7 @@ from pathlib import Path
 
 from . import install_guard
 from .engine import Engine, StrategyConfig
-from .events import load_historical, recorded_events
+from .events import historical_index, iter_historical, recorded_events
 from .metrics import ai_signal_evaluation, summarize, trade_stats
 from .risk import RiskConfig
 
@@ -34,9 +34,10 @@ def _iso(t):
     return datetime.fromtimestamp(t, timezone.utc).isoformat() if t else None
 
 
-def run_historical(events, info, strategy, risk, name):
-    engine = Engine(strategy, risk, name=name).run(events)
-    markets = sorted({e["ticker"]: e["opens"] for e in events if e["kind"] == "market"}.values())
+def run_historical(directory, strategy, risk, name):
+    """One chronological streaming pass (bounded memory)."""
+    engine = Engine(strategy, risk, name=name).run(iter_historical(directory))
+    markets = [r["opens"] for r in historical_index(directory)]
     split = markets[len(markets) // 2] if markets else 0
     dev = [t for t in engine.trades if t["entry_time"] < split]
     hold = [t for t in engine.trades if t["entry_time"] >= split]
@@ -47,6 +48,12 @@ def run_historical(events, info, strategy, risk, name):
         "holdout_second_half": trade_stats(hold),
     }
     return engine, report
+
+
+def _historical_job(args):
+    directory, strategy, risk, name = args
+    engine, report = run_historical(directory, strategy, risk, name)
+    return name, report, engine.model  # the model warm-starts the fresh run
 
 
 def run_fresh(events, strategy, risk, name, warm_model=None):
@@ -66,7 +73,9 @@ def main():
     p.add_argument("--fresh", type=Path, default=None)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--balance", type=float, default=1000.0)
+    p.add_argument("--workers", type=int, default=2, help="Parallel processes (CPU safeguard; max 3)")
     a = p.parse_args()
+    a.workers = max(1, min(3, a.workers))
 
     risk = RiskConfig(starting_balance=a.balance)
     base = StrategyConfig()
@@ -86,21 +95,32 @@ def main():
         "profitability_claim": "NONE. Simulated results under stated assumptions; not evidence of a live edge.",
     }
 
-    events, info = load_historical(a.historical)
-    report["historical_data"] = info
-    hist = {}
+    index = historical_index(a.historical)
+    report["historical_data"] = {
+        "source": "historical",
+        "markets": len(index),
+        "first": _iso(index[0]["opens"]) if index else None,
+        "last": _iso(index[-1]["closes"]) if index else None,
+        "depth_available": False,
+        "loader": "streaming (bounded memory); identical event order to the list loader",
+    }
     momentum = replace(base, policy="momentum")
     momentum_blind = replace(diagnostic, policy="momentum")
     ai_direct = replace(base, policy="ai_direct")
     ai_direct_blind = replace(diagnostic, policy="ai_direct")
-    for name, cfg in (
-        ("market_only", base),
-        ("DIAGNOSTIC_cost_blind", diagnostic),
-        ("BASELINE_momentum", momentum),
-        ("BASELINE_momentum_cost_blind", momentum_blind),
-    ):
-        engine, rep = run_historical(events, info, cfg, risk, name)
-        hist[name] = (engine, rep)
+    jobs = [
+        (a.historical, cfg, risk, name)
+        for name, cfg in (
+            ("market_only", base),
+            ("DIAGNOSTIC_cost_blind", diagnostic),
+            ("BASELINE_momentum", momentum),
+            ("BASELINE_momentum_cost_blind", momentum_blind),
+        )
+    ]
+    from concurrent.futures import ProcessPoolExecutor
+
+    with ProcessPoolExecutor(max_workers=a.workers) as pool:
+        hist = {name: (model, rep) for name, rep, model in pool.map(_historical_job, jobs)}
     report["historical"] = {name: rep for name, (_, rep) in hist.items()}
     report["historical"]["no_trade_baseline"] = {"net_pnl": 0.0, "total_fees": 0.0, "max_drawdown": 0.0}
     report["historical"]["with_existing_ai"] = {
@@ -117,8 +137,8 @@ def main():
             "first": _iso(fev[0]["at"]) if fev else None,
             "last": _iso(fev[-1]["at"]) if fev else None,
         }
-        warm = hist["market_only"][0].model
-        warm_diag = hist["DIAGNOSTIC_cost_blind"][0].model
+        warm = hist["market_only"][0]
+        warm_diag = hist["DIAGNOSTIC_cost_blind"][0]
         fresh = {}
         for name, cfg, w in (
             ("market_only", base, warm),

@@ -92,6 +92,9 @@ def test_paper_gateway_never_submits_live():
         ("GET", "https://evil.example.com/trade-api/v2/markets", None),
         ("GET", "http://api.elections.kalshi.com/trade-api/v2/markets", None),
         ("GET", "http://127.0.0.1:8768/api/orders", None),
+        ("GET", "https://api.exchange.coinbase.com/orders", None),
+        ("POST", "https://api.exchange.coinbase.com/products/BTC-USD/trades", None),
+        ("GET", "https://api.exchange.coinbase.com/accounts", None),
     ],
 )
 def test_public_client_rejects_non_public_requests(method, url, headers):
@@ -104,6 +107,7 @@ def test_public_client_allows_public_market_data_and_loopback_state():
     check_request("GET", "https://api.elections.kalshi.com/trade-api/v2/markets/trades")
     check_request("GET", "https://api.elections.kalshi.com/trade-api/v2/series/KXBTC15M/markets/X/candlesticks")
     check_request("GET", "http://127.0.0.1:8790/api/state")
+    check_request("GET", "https://api.exchange.coinbase.com/products/BTC-USD/trades")
 
 
 def test_blocked_request_never_reaches_the_network():

@@ -75,6 +75,8 @@ def extract_ai(state: dict) -> dict:
             "confidence_status": (pe.get("confidence") or {}).get("status"),
         },
         "opening": opening,
+        # BTC reference as published by the signals service (proxy; may be stale).
+        "reference": {k: (state.get("reference") or {}).get(k) for k in ("price", "observed_at", "source")},
         "existing_scalp_call": state.get("scalp"),
         "existing_direction": state.get("direction"),
     }

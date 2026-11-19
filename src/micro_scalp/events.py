@@ -134,6 +134,62 @@ def load_historical(directory: Path, limit: int | None = None) -> tuple[list[dic
     return events, info
 
 
+def historical_index(directory: Path) -> list[dict]:
+    """Chronological [{ticker, opens, closes, file}] (cached in index.json).
+
+    The index holds metadata only. It is rebuilt whenever the set of cached
+    contract files changes."""
+    directory = Path(directory)
+    files = sorted(directory.glob("KXBTC15M-*.json"))
+    idx_path = directory / "index.json"
+    try:
+        cached = json.loads(idx_path.read_text())
+        if sorted(r["file"] for r in cached) == [f.name for f in files]:
+            return cached
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    rows = []
+    for f in files:
+        try:
+            m = json.loads(f.read_text())
+            rows.append({"ticker": m["ticker"], "opens": ts(m["opens_at"]), "closes": ts(m["closes_at"]), "file": f.name})
+        except (OSError, ValueError, KeyError):
+            continue
+    rows.sort(key=lambda r: r["opens"])
+    tmp = idx_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows))
+    tmp.replace(idx_path)
+    return rows
+
+
+def iter_historical(directory: Path, tickers=None):
+    """Stream historical events in exactly the order ``load_historical`` sorts
+    them, holding only about two contracts in memory.
+
+    Before contract i+1 is loaded, every buffered event earlier than its first
+    event (its ``market`` announcement at opens-1) is emitted. Later contracts
+    can never produce an earlier event, so the merged order is unchanged."""
+    import heapq
+
+    directory = Path(directory)
+    rows = historical_index(directory)
+    if tickers is not None:
+        wanted = set(tickers)
+        rows = [r for r in rows if r["ticker"] in wanted]
+    heap, seq = [], 0
+    for r in rows:
+        boundary = r["opens"] - 1.0
+        while heap and (heap[0][0], heap[0][1]) < (boundary, _ORDER["market"]):
+            yield heapq.heappop(heap)[3]
+        m = json.loads((directory / r["file"]).read_text())
+        for e in historical_market_events(m):
+            heapq.heappush(heap, (e["at"], _ORDER[e["kind"]], seq, e))
+            seq += 1
+        del m
+    while heap:
+        yield heapq.heappop(heap)[3]
+
+
 def _depth_from_book(yes_bids, no_bids):
     yes_bids = [(float(p), float(q)) for p, q in yes_bids]
     no_bids = [(float(p), float(q)) for p, q in no_bids]
@@ -243,10 +299,18 @@ def ai_event(r: dict, at: float):
             opening_ticker = opening.get("ticker")
     except (KeyError, TypeError, ValueError):
         opening_up = None
+    btc_price = None
+    try:
+        ref = r.get("reference") or {}
+        if ref.get("price") is not None and 0 <= at - ts(ref["observed_at"]) <= 5:
+            btc_price = float(ref["price"])
+    except (KeyError, TypeError, ValueError):
+        btc_price = None
     return {
         "kind": "ai",
         "at": at,
         "ticker": r.get("ticker"),
+        "btc_price": btc_price,
         "live_up": live_up,
         "opening_up": opening_up,
         "opening_ticker": opening_ticker,

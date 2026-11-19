@@ -420,3 +420,20 @@ def test_ai_direct_policy_is_silent_without_ai_and_follows_ai_when_present():
     follow = _engine(policy="ai_direct", min_expected_net_edge=-1.0, min_abs_predicted_move=0.01).run(with_ai)
     buys = [a for a in follow.actions if a["action"].startswith("BUY")]
     assert buys and all(a["action"] == "BUY UP" for a in buys)
+
+
+def test_streaming_loader_matches_list_loader(tmp_path):
+    import json as _json
+
+    from src.micro_scalp.events import iter_historical, load_historical
+
+    for k in range(3):
+        opens = T0 + 900 * k
+        m = {"ticker": f"KXBTC15M-ST{k}", "opens_at": opens, "closes_at": opens + 900, "result": "yes" if k % 2 else "no",
+             "settlement_ts": opens + 900 + 400,  # settles after the next contract opens
+             "candles": [{"end_period_ts": opens + 60 * i, "yes_bid": {"close_dollars": "0.40"}, "yes_ask": {"close_dollars": "0.42"}} for i in range(1, 15)],
+             "trades_compact": [[opens + s, "0.41", "2", "yes" if s % 3 else "no"] for s in range(0, 870, 7)]}
+        (tmp_path / f"KXBTC15M-ST{k}.json").write_text(_json.dumps(m))
+    listed, _ = load_historical(tmp_path)
+    streamed = list(iter_historical(tmp_path))
+    assert streamed == listed

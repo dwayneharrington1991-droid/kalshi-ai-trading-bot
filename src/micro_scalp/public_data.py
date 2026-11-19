@@ -21,6 +21,9 @@ KALSHI_BASE = f"https://{KALSHI_HOST}/trade-api/v2"
 ALLOWED_KALSHI_PREFIXES = ("/trade-api/v2/markets", "/trade-api/v2/series/", "/trade-api/v2/events")
 FORBIDDEN_FRAGMENTS = ("portfolio", "order", "login", "logout", "api_keys", "transfer", "withdraw", "deposit")
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# Public BTC-USD market data (trade tape / candles) used as the BTC reference.
+COINBASE_HOST = "api.exchange.coinbase.com"
+ALLOWED_COINBASE_PREFIXES = ("/products/btc-usd/trades", "/products/btc-usd/candles", "/products/btc-usd/ticker")
 # Ports owned by the user's existing deployments. The simulator never serves on
 # them; it may only *read* from a loopback dashboard the operator points it to.
 PROTECTED_PORTS = {8765, 8767, 8768}
@@ -43,6 +46,8 @@ def check_request(method: str, url: str, headers: dict | None = None) -> None:
             raise LiveOrderSubmissionBlocked(f"PAPER-ONLY: Kalshi path '{parts.path}' is not allowlisted")
         return
     if host in LOOPBACK_HOSTS and parts.scheme == "http" and path.startswith("/api/state"):
+        return
+    if host == COINBASE_HOST and parts.scheme == "https" and path.startswith(ALLOWED_COINBASE_PREFIXES):
         return
     raise LiveOrderSubmissionBlocked(f"PAPER-ONLY: host '{host}' / path '{parts.path}' is not allowlisted")
 

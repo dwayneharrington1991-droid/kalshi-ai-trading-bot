@@ -59,6 +59,30 @@ OPENING_INPUT_GRACE_SECONDS = 120
 PREOPEN_PERSIST_SECONDS = 70
 # Same limit context24 applies to an opening's candle receipt.
 CANDLE_CACHE_STALE_SECONDS = 150
+# KXBTC15M contracts open on quarter-hour boundaries. Measured 2026-11-20 from
+# public listings: the new contract is active with its published threshold
+# within about one second of the boundary. Polling faster only in this short
+# window lets the immutable opening appear sooner; inputs stay cut off at open.
+CONTRACT_PERIOD_SECONDS = 900
+ROLLOVER_FAST_POLL_WINDOW_SECONDS = 6.0
+ROLLOVER_FAST_POLL_SECONDS = 0.25
+
+
+def collector_wait_seconds(now_epoch, elapsed, poll_seconds):
+    """Seconds the public collector waits before its next poll.
+
+    Normally ``poll_seconds - elapsed``. In the first seconds after a
+    quarter-hour boundary the wait is capped at 0.25 s, and a wait that would
+    cross the next boundary is shortened to wake just after it. Never negative.
+    """
+    wait = max(0.0, poll_seconds - elapsed)
+    since = now_epoch % CONTRACT_PERIOD_SECONDS
+    if since < ROLLOVER_FAST_POLL_WINDOW_SECONDS:
+        wait = min(wait, ROLLOVER_FAST_POLL_SECONDS)
+    until_next = CONTRACT_PERIOD_SECONDS - since
+    if until_next < wait:
+        wait = until_next + 0.05
+    return max(0.0, wait)
 
 
 def candle_integrity_report(source, observed_at):
@@ -2811,7 +2835,9 @@ def main():
                 elapsed = perf_counter() - timer
                 mailbox.put((payload, started, utcnow(), elapsed * 1000))
                 monitor.worker_event("collector", "completed", failure)
-                stop.wait(max(0, args.poll_seconds - elapsed))
+                stop.wait(
+                    collector_wait_seconds(utcnow().timestamp(), elapsed, args.poll_seconds)
+                )
         except BaseException as exc:
             monitor.worker_event("collector", "stopped", exc)
             raise

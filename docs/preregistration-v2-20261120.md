@@ -24,7 +24,7 @@ About ten models were tried, so the best point estimate is biased upward. Only u
 decide.
 
 ## Frozen definitions (`scripts/forward_eval_v2.py`, model code in `scripts/research_opening_v2.py`)
-- Candidates: `ensemble`, `gbm`, `stable_ridge`, refit every 12 openings on every opening settled at
+- Candidates: `ensemble`, `gbm`, `stable_ridge`, and `blend` (0.5 x live P(UP) + 0.5 x ensemble; pre-freeze Brier 0.2415 vs live 0.2425, CI -0.0033 to +0.0013), refit every 12 openings on every opening settled at
   least 30 minutes before.
 - Only openings with `opens_at >= 2026-11-21T00:00Z` count. At least 200 are required (about
   2026-11-23 02:00 UTC).

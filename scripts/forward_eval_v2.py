@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import research_opening_v2 as rv  # noqa: E402
 
 FREEZE_V2 = datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc)
-CANDIDATES = ("ensemble", "gbm", "stable_ridge")
+CANDIDATES = ("ensemble", "gbm", "stable_ridge", "blend")   # blend = 0.5 x live P(UP) + 0.5 x ensemble
 MIN_FORWARD = 200
 
 
@@ -31,6 +31,9 @@ def run(old, new, artifact):
     if not idx:
         report["decision"] = "NOT ENOUGH FORWARD DATA"
         return report
+    live_all = np.array([r["live"] if r["live"] is not None else np.nan for r in rows])
+    P = dict(P)
+    P["blend"] = 0.5 * live_all + 0.5 * P["ensemble"]
     ev = rv.evaluate(rows, idx, {k: P[k] for k in CANDIDATES})
     report["evaluation"] = ev
     # Secondary (descriptive, pre-registered): live UP/DOWN calls that the ensemble agrees with.

@@ -55,3 +55,9 @@ def test_live_connection_fields_come_from_the_served_snapshot():
     route = SERVER[SERVER.index('route == "/api/accuracy-health"'):]
     route = route[:route.index("elif route ==")]
     assert "monitor.snapshot()" in route and 'state.get("feed_health")' in route
+
+
+def test_panel_fits_narrow_screens():
+    rule = HTML[HTML.index("main>#accuracy-health-card{display:block!important"):]
+    rule = rule[:rule.index("}")]
+    assert "box-sizing:border-box" in rule and "calc(100vw - 24px)" in rule and "overflow-wrap:anywhere" in rule

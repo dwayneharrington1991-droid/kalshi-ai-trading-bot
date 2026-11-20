@@ -44,6 +44,7 @@ def test_openings_at_or_after_the_frozen_test_are_never_loaded(tmp_path):
 
 
 def test_walk_forward_predictions_never_use_later_outcomes(tmp_path, monkeypatch):
+    pytest.importorskip("sklearn")                                   # research-only dependency
     start = datetime(2026, 11, 10, tzinfo=timezone.utc)
     monkeypatch.setattr(rv, "FREEZE", datetime(2100, 1, 1, tzinfo=timezone.utc))
     _export(tmp_path / "a.json", start, 260)

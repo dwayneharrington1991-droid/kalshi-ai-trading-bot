@@ -21,7 +21,9 @@ Deployment categories:
 | L8 | 11-20 | Flow summary scanned 20,000 records per source each update | Full list filters | `test_advanced_flow_equivalence.py` (identical output) | `0fbff05` | A | 9a9a6ea |
 | L9 | 11-20 | Opening froze a 120 s-old candle history (4/442) | Refresh landed before the just-closed minute was published; next refresh after the open | `test_candle_refresh_after_boundary.py` | `9a9a6ea` | A | 9a9a6ea |
 | L10 | 11-20 | Accuracy Health panel invisible | `main>:not(#minimal-opening){display:none!important}` hid it | `test_dashboard_accuracy_health.py::test_panel_is_not_hidden_by_the_minimal_layout` | `14ddedd` | A | c3e92a5 |
-| L11 | 11-20 | Panel showed Kalshi/Coinbase as n/a | `feed_health` exists only in `monitor.snapshot()` | `test_live_connection_fields_come_from_the_served_snapshot` | `ca2cbe6` | A | pending (8c087de) |
+| L11 | 11-20 | Panel showed Kalshi/Coinbase as n/a | `feed_health` exists only in `monitor.snapshot()` | `test_live_connection_fields_come_from_the_served_snapshot` | `ca2cbe6` | A | 8c087de |
+
+| L12 | 11-20 | Main card did not say which settlement it predicts or how the last locked call scored | Display gap | `test_dashboard_opening_goal.py` | `b1469ea` | A | b1469ea |
 
 ## Open items (not defects, or awaiting data/approval)
 

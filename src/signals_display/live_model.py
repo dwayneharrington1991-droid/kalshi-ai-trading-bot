@@ -175,7 +175,11 @@ class LiveEstimator:
     def __init__(self, manual_delay=3, slippage=0.01):
         self.manual_delay = manual_delay
         self.slippage = slippage
-        self.reference = deque(maxlen=1800)
+        # One continuous live series per exchange. Coinbase and Kraken ticks arrive
+        # interleaved; a single buffer cleared on every source change never covered
+        # the final 60 s averaging window. Estimates read only the series of the
+        # current reference source, so exchanges are never mixed.
+        self.reference_series = {}
         # Receipt audit used only for as-of-opening selection. Unlike the live
         # volatility buffer, a reconnect/gap must not erase observations that
         # were genuinely received before the contract opened.
@@ -186,6 +190,24 @@ class LiveEstimator:
         self.quotes = {}
         self.reference_source = None
         self.developing = DevelopingCandle()
+
+    @property
+    def reference(self):
+        """The live series of the current reference source (empty if none yet)."""
+        if self.reference_source is None:
+            return deque(maxlen=1800)
+        return self.reference_series.setdefault(self.reference_source, deque(maxlen=1800))
+
+    def _append_live(self, source, when, price):
+        series = self.reference_series.setdefault(source, deque(maxlen=1800))
+        if series and when < series[-1][0]:
+            return False
+        if series and (when - series[-1][0]).total_seconds() > MAX_GAP:
+            series.clear()
+        if not series or when > series[-1][0]:
+            series.append((when, price))
+            return True
+        return None
 
     def restore(self, states):
         """Recover only observed inputs, never probabilities or fabricated paths."""
@@ -207,16 +229,8 @@ class LiveEstimator:
             price = number(reference["price"], 0.000001, 1e12)
             if 0 <= (now - when).total_seconds() <= MAX_GAP:
                 self._audit_reference(source, when, price)
-                if source != self.reference_source:
-                    self.reference.clear()
-                    self.reference_source = source
-                if self.reference and (
-                    when < self.reference[-1][0]
-                    or (when - self.reference[-1][0]).total_seconds() > MAX_GAP
-                ):
-                    self.reference.clear()
-                if not self.reference or when > self.reference[-1][0]:
-                    self.reference.append((when, price))
+                self.reference_source = source
+                self._append_live(source, when, price)
         except (KeyError, ValueError, TypeError, AttributeError):
             pass
         for market in payload.get("markets", []):
@@ -316,16 +330,9 @@ class LiveEstimator:
             if not 0 <= (now - received).total_seconds() <= 65:
                 return False
             self._audit_reference(source, received, price)
-            if source != self.reference_source:
-                self.reference.clear()
+            if self.reference_source is None:
                 self.reference_source = source
-            if self.reference and received < self.reference[-1][0]:
-                return False
-            if self.reference and (received - self.reference[-1][0]).total_seconds() > MAX_GAP:
-                self.reference.clear()
-            if not self.reference or received > self.reference[-1][0]:
-                self.reference.append((received, price))
-                return True
+            return self._append_live(source, received, price)
         except (KeyError, TypeError, ValueError, AttributeError):
             return False
         return False

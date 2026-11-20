@@ -2340,7 +2340,30 @@ def make_handler(monitor):
                 if getattr(monitor, "accuracy_health_report", None) is None:
                     artifact = monitor.opening_artifact if isinstance(getattr(monitor, "opening_artifact", None), dict) else None
                     monitor.accuracy_health_report = CachedReport(monitor.journal.path, artifact)
-                body = json.dumps(monitor.accuracy_health_report.get(), allow_nan=False, default=str).encode()
+                state = getattr(monitor, "state", None) or {}
+                feed = state.get("feed_health") or {}
+                intel = ((state.get("model") or {}).get("market_intelligence") or {}).get("sources") or {}
+
+                def stream(name):
+                    item = intel.get(name) or {}
+                    return {"status": item.get("status"), "data_age_seconds": item.get("data_age_seconds"),
+                            "window_resets_since_start": item.get("reconnection_or_gap_resets"),
+                            "rejected_updates": item.get("rejected_updates")}
+                live = {
+                    "release": monitor.build_commit,
+                    "opening_model_id": (monitor.opening_artifact or {}).get("model_id")
+                    if isinstance(getattr(monitor, "opening_artifact", None), dict) else None,
+                    "kalshi": {"status": feed.get("kalshi_connection"), "age_seconds": feed.get("kalshi_age_seconds")},
+                    "btc_reference": {"source": feed.get("btc_source"), "age_seconds": feed.get("btc_age_seconds")},
+                    "coinbase_websocket": {"status": feed.get("coinbase_websocket_status"),
+                                           "reconnects_since_start": feed.get("websocket_reconnects"),
+                                           **{k: v for k, v in stream("Coinbase BTC/USD stream").items() if k != "status"}},
+                    "kraken_spot": stream("Kraken BTC/USD stream"),
+                    "kraken_futures": stream("Kraken futures stream"),
+                    "last_processing_completed_at": feed.get("last_processing_completed_at"),
+                }
+                body = json.dumps({**monitor.accuracy_health_report.get(), "live_process": live},
+                                  allow_nan=False, default=str).encode()
                 content_type = "application/json"
             elif route == "/api/shadow-opening":
                 # Read-only view of the independent shadow ledger. It never computes, substitutes or feeds live output.

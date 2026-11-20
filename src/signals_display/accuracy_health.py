@@ -136,6 +136,34 @@ def _technical(db, now, input_names):
     return out
 
 
+def _final_minute(db, now, contracts=8):
+    """Share of recently closed contracts with at least one live prediction in their final 60 s."""
+    try:
+        rows = db.execute("SELECT ticker, timestamp, closes_at FROM btc_engine_predictions "
+                          "ORDER BY rowid DESC LIMIT 6000").fetchall()
+    except sqlite3.Error:
+        return {"contracts": 0, "with_final_minute_prediction": 0, "share": None, "status": "UNAVAILABLE"}
+    seen = {}
+    for ticker, ts, closes in rows:
+        try:
+            close, at = _ts(closes), _ts(ts)
+        except (TypeError, ValueError):
+            continue
+        if close > now:
+            continue
+        entry = seen.setdefault(ticker, {"close": close, "final_minute": 0, "earliest": at})
+        entry["earliest"] = min(entry["earliest"], at)
+        if 0 <= (close - at).total_seconds() < 60:
+            entry["final_minute"] += 1
+    # Only contracts whose whole final minute lies inside the sampled rows count.
+    full = [e for e in seen.values() if (e["close"] - e["earliest"]).total_seconds() >= 60]
+    recent = sorted(full, key=lambda e: e["close"])[-contracts:]
+    if not recent:
+        return {"contracts": 0, "with_final_minute_prediction": 0, "share": None}
+    hit = sum(1 for e in recent if e["final_minute"] > 0)
+    return {"contracts": len(recent), "with_final_minute_prediction": hit, "share": hit / len(recent)}
+
+
 def _scoreboards(db):
     """Both call populations, with every exclusion counted. Nothing is hidden or removed."""
     rows = db.execute(
@@ -281,6 +309,7 @@ def assess(journal, *, now=None, artifact=None):
     with closing(sqlite3.connect(f"file:{journal}?mode=ro", uri=True, timeout=30)) as db:
         db.execute("PRAGMA query_only=ON")
         technical = _technical(db, now, names)
+        technical["final_minute_live_predictions"] = _final_minute(db, now)
         predictive = _predictive(db, model_id)
         scoreboards = _scoreboards(db)
         drift = _input_drift(db, artifact) if artifact else None

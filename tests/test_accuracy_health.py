@@ -150,3 +150,21 @@ def test_cached_report_recomputes_at_most_once_per_minute(tmp_path, monkeypatch)
 def test_cached_report_never_raises(tmp_path):
     out = ah.CachedReport(tmp_path / "missing.db").get()
     assert out["status"] == "UNAVAILABLE"
+
+
+def test_final_minute_coverage_counts_closed_contracts(tmp_path):
+    path = _journal(tmp_path)
+    db = sqlite3.connect(path)
+    db.execute("DROP TABLE btc_engine_predictions")
+    db.execute("CREATE TABLE btc_engine_predictions (ticker TEXT, timestamp TEXT, recorded_at TEXT, closes_at TEXT)")
+    for c in range(4):
+        close = NOW - timedelta(minutes=15 * (3 - c)) - timedelta(minutes=1)
+        for s in range(0, 900, 2):
+            at = close - timedelta(seconds=900 - s)
+            if c < 2 and (close - at).total_seconds() < 60:
+                continue                                   # the first two contracts lost their final minute
+            db.execute("INSERT INTO btc_engine_predictions VALUES (?,?,?,?)", (f"C{c}", at.isoformat(), at.isoformat(), close.isoformat()))
+    db.commit()
+    db.close()
+    fm = ah._final_minute(sqlite3.connect(path), NOW)
+    assert fm == {"contracts": 4, "with_final_minute_prediction": 2, "share": 0.5}

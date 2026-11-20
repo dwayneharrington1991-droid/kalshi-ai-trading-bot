@@ -51,6 +51,7 @@ half's positive result is not evidence that the second half will recover.
 | Gradient boosting, 12 features | 0.2571 | -0.008 to +0.029 | 125 | 57.6% | +0.021 |
 | Platt recalibration of live P(UP) | 0.2466 | -0.007 to +0.007 | 104 | 57.7% | +0.020 |
 | Live P(UP) shrunk halfway to 0.5 | 0.2475 | -0.004 to +0.005 | 17 | 52.9% | -0.041 |
+| Volatility-scaled returns + flow, logistic C=0.05 | 0.2554 | -0.007 to +0.025 | 106 | 55.7% | - |
 
 **None is credibly better than the live model, so all are rejected.** The lifecycle's own retrain
 also returns NO_CANDIDATE every cycle. That is correct with this little data.
@@ -58,6 +59,7 @@ also returns NO_CANDIDATE every cycle. That is correct with this little data.
 ## Recommendations (not implemented; each needs your approval)
 
 1. Treat the live calls as unproven. Recent evidence shows no edge after costs.
-2. Research scale-free inputs (returns and flow divided by recent realized volatility) so a volatility
-   regime change does not inflate confidence. Validate in shadow mode only.
+2. A first scale-free challenger (returns divided by 1h realized volatility) was worse than the live
+   model (table above). A rebuilt full ensemble with clipped or rank-transformed inputs is the next
+   experiment. It must run in shadow mode until it beats the live model out of sample.
 3. Collect more data. About 100 calls per 4 days cannot separate a 5-point accuracy edge from luck.

@@ -471,7 +471,13 @@ case $cmd in
     printf '%s\n' "$TARGET_HEAD" >"$S/commit" || die "capture failed: commit"
     printf '%s\n' "$PORT" >"$S/port" || die "capture failed: port"
     identity "$TARGET_PID" >"$S/identity" || die "capture failed: identity"
-    stat -c '%n %i %s %Y' -- "${JOURNAL_FILES[@]}" >"$S/journal-files" || die "capture failed: journal files"
+    # SQLite may delete -wal/-shm between the journal gate and this capture (last
+    # connection closed or checkpointed). Record the files that still exist; the
+    # main journal itself is required.
+    [[ -f $TARGET_JOURNAL ]] || die "capture failed: journal $TARGET_JOURNAL disappeared"
+    present=()
+    for f in "${JOURNAL_FILES[@]}"; do [[ -e $f ]] && present+=("$f"); done
+    stat -c '%n %i %s %Y' -- "${present[@]}" >"$S/journal-files" || die "capture failed: journal files"
     printf '%s\n' "$PROTECTED_BEFORE" >"$S/protected-before" || die "capture failed: protected snapshot"
     if [[ -n $PARENT_LAUNCHER ]]; then
       cp -- "/proc/$PARENT_LAUNCHER/cmdline" "$S/launcher-argv" || die "capture failed: launcher argv"

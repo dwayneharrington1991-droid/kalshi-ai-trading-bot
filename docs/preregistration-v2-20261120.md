@@ -31,3 +31,9 @@ decide.
 - Pass rule: the 95% bootstrap interval of (candidate Brier minus live Brier) is entirely below zero.
   Passing makes a candidate eligible for a separate promotion review. Nothing is deployed
   automatically.
+- Secondary, descriptive: accuracy of live UP/DOWN calls that the ensemble agrees with, against all
+  live calls. Exploratory pre-freeze result: 68.7% on 83 confirmed calls vs 65.1% on all 106. This was
+  chosen after seeing that data, so it is only a hypothesis for the forward period.
+- Live-model accuracy by confidence on the pre-freeze out-of-sample period: 42.6% (|P-0.5| < 0.02,
+  n=94), 58.9% (0.02–0.05, n=112), 64.4% (0.05–0.08, n=59), 66.0% (>= 0.08, n=47). The ranking is
+  informative but the probabilities are too timid (calibration slope 1.63).

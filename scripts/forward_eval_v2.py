@@ -33,6 +33,19 @@ def run(old, new, artifact):
         return report
     ev = rv.evaluate(rows, idx, {k: P[k] for k in CANDIDATES})
     report["evaluation"] = ev
+    # Secondary (descriptive, pre-registered): live UP/DOWN calls that the ensemble agrees with.
+    y = np.array([rows[i]["y"] for i in idx])
+    live = np.array([rows[i]["live"] if rows[i]["live"] is not None else np.nan for i in idx])
+    ens = P["ensemble"][idx]
+    calls = (live >= 0.55) | (live <= 0.45)
+    agree = calls & (np.sign(ens - 0.5) == np.sign(live - 0.5))
+    report["secondary_confirmed_live_calls"] = {
+        "all_live_calls": int(calls.sum()),
+        "all_live_accuracy": float(((live >= 0.5) == (y == 1))[calls].mean()) if calls.any() else None,
+        "confirmed_calls": int(agree.sum()),
+        "confirmed_accuracy": float(((live >= 0.5) == (y == 1))[agree].mean()) if agree.any() else None,
+        "note": "descriptive only; selected from pre-freeze data (68.7% on 83 confirmed vs 65.1% on 106), so only forward data can confirm it",
+    }
     passed = [k for k in CANDIDATES
               if len(idx) >= MIN_FORWARD and ev["models"][k]["brier_minus_live_ci95"][1] < 0]
     report["passed_preregistered_rule"] = passed

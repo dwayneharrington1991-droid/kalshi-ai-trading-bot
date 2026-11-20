@@ -27,3 +27,12 @@ Branch: fix/opening-selection-learning
 - Full suite on eb8747d: 1828 passed, 9 skipped, 0 failed (966 s).
 - The intermittent deploy-test hang did not recur in this run; root cause still not established.
 - 0431cbf (UNCLEAR→WAIT engine change) broke test_previously_valid_openings_are_computed_exactly_as_before and test_per_input_status_is_metadata_only_versus_the_approved_base. It was reverted in eb8747d. The headline dashboard card already maps non-UP/DOWN openings to WAIT, so the immutable record keeps its original label.
+
+## Second session (local Windows workstation, Opus 5.5), started 2026-11-20 00:05 UTC
+Two sessions are pushing to this branch. Always fetch and rebase before pushing; never force-push.
+- e8e8808 ROOT CAUSE of the 21:30-22:15 withheld openings (read-only journal on Oracle): candle 21:19 UTC missing from both Coinbase candle APIs; trade recovery failed because RFC3339 start/end returns HTTP 500 (Unix seconds work) and the minute had 2,477 trades (> one page). Fixed with paged Unix-second recovery + tests.
+- b3c8c3d CI: per-test timeout 300 s, job limit 40 min (full suite takes ~16 min, which exceeded the old 15-minute job limit).
+- a081878 Dashboard display-only WAIT mapping (market history, predictions table, settlement outlook). Records unchanged.
+- 2bc07b1 Collector polls every 0.25 s for 6 s after each quarter-hour boundary (probe: Kalshi publishes the threshold within ~1 s; live delay was 2-3 s).
+- Draft PR #4 exists only to run Linux CI. PR-triggered "Deploy Oracle production" runs are test-only (production job requires workflow_dispatch on main) but share the oracle-production concurrency group, so they were cancelled.
+- Model evidence: live candidate over 281 out-of-sample openings Brier 0.2418 vs past-only base rate 0.2505 (CI of difference just excludes 0); second half shows no edge (0.2462 vs 0.2467). Fresh retrain on latest 61-contract block loses to the train prior; gate correctly keeps NO_CANDIDATE. Nothing promoted.

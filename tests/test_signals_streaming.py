@@ -98,10 +98,10 @@ def test_heartbeat_and_trade_do_not_refresh_old_quote_timestamps():
     hub = StreamHub(autostart=False)
     hub.process_coinbase(ticker(), NOW, 1)
     after = NOW + timedelta(seconds=6)
-    heartbeat = {"channel": "heartbeats", "sequence_num": 0, "events": []}
+    heartbeat = {"channel": "heartbeats", "sequence_num": 1, "events": []}  # connection-wide numbering
     hub.process_coinbase(heartbeat, after, 7)
     assert hub.snapshot(after)["reference"] is None
-    hub.process_coinbase(trade(at=after), after, 7)
+    hub.process_coinbase(trade(2, at=after), after, 7)
     feed = hub.snapshot(after)["feeds"]["Coinbase BTC/USD stream"]
     assert feed["status"] == "LIVE" and feed["data"]["bid"] is None and feed["data"]["ask"] is None
 
@@ -115,7 +115,7 @@ def test_bad_or_incomplete_source_data_is_rejected_and_reference_disabled(change
     elif change == "future":
         packet = ticker(1, NOW + timedelta(milliseconds=1))
     elif change == "unknown_side":
-        packet = trade(side="UNKNOWN")
+        packet = trade(1, side="UNKNOWN")
     elif change == "crossed":
         packet = ticker(1)
         packet["events"][0]["tickers"][0]["best_bid"] = "100100"
@@ -158,7 +158,7 @@ def test_reconnect_requires_fresh_data_and_cannot_reuse_previous_quote():
 def test_delayed_cross_channel_trade_does_not_rewind_latest_reference():
     hub = StreamHub(autostart=False)
     hub.process_coinbase(ticker(at=NOW, price="100005"), NOW, 1)
-    hub.process_coinbase(trade(at=NOW - timedelta(milliseconds=100)), NOW, 1)
+    hub.process_coinbase(trade(1, at=NOW - timedelta(milliseconds=100)), NOW, 1)
     assert hub.snapshot(NOW)["reference"]["price"] == 100005
     assert len(hub.drain_observations()) == 2  # Real trade still retained for flow.
 

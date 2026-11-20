@@ -12,7 +12,7 @@ jobs:
   test:
     name: Tests (no credentials — live tests are skipped)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +31,9 @@ jobs:
       # automatically (tests/conftest.py) — a plain pytest run never touches
       # the real Kalshi API or places orders.
       - name: Run test suite
-        run: pytest -v
+        # A per-test timeout turns a hung test into a named failure with a
+        # thread dump instead of a silently cancelled job.
+        run: pytest -q -rfE --timeout=300 --durations=40
 
   secret-scan:
     name: Secret scan (gitleaks)

@@ -1,5 +1,5 @@
 """Past-only 24h context and forward-recorded contract forecasts, not execution."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import math
 from statistics import mean, pstdev, median
@@ -31,6 +31,24 @@ def direction_label(probability, unavailable="UNCLEAR"):
         if displayed < 50
         else "NEUTRAL"
     )
+
+
+def recorded_opening_direction(opening):
+    """Preserve the original selective decision instead of reconstructing it."""
+    if isinstance(opening, dict):
+        saved = opening.get("direction")
+        # WAIT/UNCLEAR is itself the immutable decision.  Directional labels
+        # from the new selective candidate are also frozen.  Older records
+        # predate an explicit abstention policy, so retain their historical
+        # probability-derived scoring (including neutral display ties).
+        selective = (
+            str(opening.get("model", "")).startswith("opening-candidate/")
+            or opening.get("decision_policy") is not None
+            or opening.get("model_selection", {}).get("status") == "EXPERIMENTAL_OPENING_CANDIDATE"
+        )
+        if saved in {"WAIT", "UNCLEAR"} or (selective and saved in {"UP", "DOWN", "NEUTRAL"}):
+            return saved
+    return direction_label((opening or {}).get("up"))
 
 
 def opening_diagnostics(opening, model_info=None):
@@ -88,8 +106,18 @@ def opening_diagnostics(opening, model_info=None):
         ),
         "raw_probability_up": opening.get("up"),
         "displayed_probabilities": displayed,
-        "display_direction": direction_label(opening.get("up")),
+        "display_direction": recorded_opening_direction(opening),
         "saved_direction": opening.get("direction"),
+        "confidence": opening.get("confidence"),
+        "selective_decision_policy": opening.get("decision_policy"),
+        "directional_threshold": (opening.get("decision_policy") or {}).get("threshold"),
+        "model_selection_status": selection.get("status"),
+        "model_loaded_at": selection.get("loaded_at"),
+        "model_available_at": selection.get("available_at"),
+        "labels_available_through": selection.get("labels_available_through"),
+        "opening_timestamp": opening.get("opens_at"),
+        "prediction_timestamp": opening.get("generated_at"),
+        "input_data_cutoff": opening.get("data_cutoff"),
         "direction_policy": DIRECTION_POLICY,
         "near_neutral_reason": (
             "Both probabilities round to 50.0% at the displayed 0.1-percentage-point precision; direction is NEUTRAL. The unrounded estimate is preserved."
@@ -126,6 +154,188 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     )
     closes = [float(b["close"]) for b in bars]
     returns = [math.log(b / a) for a, b in zip(closes, closes[1:])]
+    from .features import OPENING_WINDOWS
+
+    window_minutes = {
+        "15m": 15,
+        "30m": 30,
+        "1h": 60,
+        "2h": 120,
+        "4h": 240,
+        "6h": 360,
+        "12h": 720,
+        "24h": 1440,
+    }
+    window_returns = {}
+    for label in OPENING_WINDOWS:
+        count = window_minutes[label]
+        if len(bars) < count:
+            continue
+        group = bars[-count:]
+        first, last = group[0], group[-1]
+        o, c = float(first["open"]), float(last["close"])
+        high = max(float(b["high"]) for b in group)
+        low = min(float(b["low"]) for b in group)
+        span = max(high - low, 1e-12)
+        minute_returns = [
+            math.log(float(b["close"]) / float(a["close"])) for a, b in zip(group, group[1:])
+        ]
+        true_ranges = [
+            max(
+                float(b["high"]) - float(b["low"]),
+                abs(float(b["high"]) - float(a["close"])),
+                abs(float(b["low"]) - float(a["close"])),
+            )
+            for a, b in zip(group, group[1:])
+        ]
+        latest_o, latest_h, latest_l, latest_c = (
+            float(last[k]) for k in ("open", "high", "low", "close")
+        )
+        latest_span = max(latest_h - latest_l, 1e-12)
+        body = latest_c - latest_o
+        previous = group[-2] if len(group) > 1 else last
+        previous_o, previous_h, previous_l, previous_c = (
+            float(previous[k]) for k in ("open", "high", "low", "close")
+        )
+        directions = [
+            1
+            if float(b["close"]) > float(b["open"])
+            else -1
+            if float(b["close"]) < float(b["open"])
+            else 0
+            for b in group
+        ]
+        streak = 0
+        for value in reversed(directions):
+            if not value or (streak and (streak > 0) != (value > 0)):
+                break
+            streak += value
+        half = max(1, len(group) // 2)
+        older, newer = group[:half], group[half:]
+        older_high = max(float(b["high"]) for b in older)
+        older_low = min(float(b["low"]) for b in older)
+        newer_high = max(float(b["high"]) for b in newer)
+        newer_low = min(float(b["low"]) for b in newer)
+        structure = 0
+        if newer:
+            if newer_high > older_high and newer_low > older_low:
+                structure = 1
+            elif newer_high < older_high and newer_low < older_low:
+                structure = -1
+        structure_strength = ((newer_high - older_high) + (newer_low - older_low)) / (
+            2 * max(o, 1e-12)
+        )
+        prior = group[:-1]
+        breakout = 0
+        if prior:
+            resistance = max(float(b["high"]) for b in prior)
+            support = min(float(b["low"]) for b in prior)
+            breakout = (
+                1
+                if latest_c > resistance
+                else -1
+                if latest_c < support
+                else (-0.5 if latest_h > resistance else 0.5 if latest_l < support else 0)
+            )
+        volumes = [float(b["volume"]) for b in group if b.get("volume") is not None]
+        prior_volume = mean(volumes[:-1]) if len(volumes) > 1 else None
+        relative_volume = volumes[-1] / prior_volume if prior_volume else None
+        third = max(1, len(minute_returns) // 3)
+        recent_momentum = mean(minute_returns[-third:]) if minute_returns else 0.0
+        prior_momentum = (
+            mean(minute_returns[-2 * third : -third]) if len(minute_returns) >= 2 * third else 0.0
+        )
+        momentum_acceleration = recent_momentum - prior_momentum
+        trend_sign = 1 if c > o else -1 if c < o else 0
+        momentum_exhaustion = trend_sign * (abs(prior_momentum) - abs(recent_momentum))
+        old_returns = minute_returns[:half]
+        new_returns = minute_returns[-half:]
+        old_variance = mean([r * r for r in old_returns]) if old_returns else None
+        new_variance = mean([r * r for r in new_returns]) if new_returns else None
+        volatility_expansion = (
+            new_variance / old_variance if old_variance and new_variance is not None else None
+        )
+        upper_wick = (latest_h - max(latest_o, latest_c)) / latest_span
+        lower_wick = (min(latest_o, latest_c) - latest_l) / latest_span
+        body_fraction = body / latest_span
+        compression_ratio = span / max(o, 1e-12)
+        prefix = f"opening_{label}_"
+        window_returns[label] = c / o - 1
+        values.update(
+            {
+                prefix + "return": window_returns[label],
+                prefix + "body_fraction": body_fraction,
+                prefix + "directional_strength": body_fraction,
+                prefix + "upper_wick_fraction": upper_wick,
+                prefix + "lower_wick_fraction": lower_wick,
+                prefix + "wick_asymmetry": lower_wick - upper_wick,
+                prefix
+                + "realized_volatility": math.sqrt(
+                    sum(r * r for r in minute_returns) / len(minute_returns)
+                )
+                if minute_returns
+                else None,
+                prefix + "atr_fraction": mean(true_ranges) / latest_c if true_ranges else None,
+                prefix + "relative_volume": relative_volume,
+                prefix + "volume_spike": max(relative_volume - 1, 0)
+                if relative_volume is not None
+                else None,
+                prefix + "price_volume_divergence": trend_sign * (1 - relative_volume)
+                if relative_volume is not None
+                else None,
+                prefix + "doji": int(abs(body) / latest_span <= 0.1),
+                prefix
+                + "bullish_engulfing": int(
+                    body > 0
+                    and previous_c < previous_o
+                    and latest_o <= previous_c
+                    and latest_c >= previous_o
+                ),
+                prefix
+                + "bearish_engulfing": int(
+                    body < 0
+                    and previous_c > previous_o
+                    and latest_o >= previous_c
+                    and latest_c <= previous_o
+                ),
+                prefix + "hammer_score": lower_wick - upper_wick - abs(body_fraction),
+                prefix + "shooting_star_score": upper_wick - lower_wick - abs(body_fraction),
+                prefix + "inside_bar": int(latest_h <= previous_h and latest_l >= previous_l),
+                prefix + "outside_bar": int(latest_h >= previous_h and latest_l <= previous_l),
+                prefix + "rejection_direction": 1
+                if (min(latest_o, latest_c) - latest_l) > 2 * abs(body)
+                else -1
+                if (latest_h - max(latest_o, latest_c)) > 2 * abs(body)
+                else 0,
+                prefix + "consecutive_direction": streak,
+                prefix + "momentum_acceleration": momentum_acceleration,
+                prefix + "momentum_exhaustion": momentum_exhaustion,
+                prefix + "structure": structure,
+                prefix + "structure_strength": structure_strength,
+                prefix + "breakout_state": breakout,
+                prefix + "support_rejection": lower_wick
+                if latest_l <= min(float(b["low"]) for b in prior or group)
+                else 0.0,
+                prefix + "resistance_rejection": upper_wick
+                if latest_h >= max(float(b["high"]) for b in prior or group)
+                else 0.0,
+                prefix + "volatility_expansion": volatility_expansion,
+                prefix + "consolidation": int(compression_ratio < 0.003),
+                prefix + "compression_ratio": compression_ratio,
+            }
+        )
+    if len(window_returns) == len(OPENING_WINDOWS):
+        signs = [
+            1 if window_returns[label] > 0 else -1 if window_returns[label] < 0 else 0
+            for label in OPENING_WINDOWS
+        ]
+        values["opening_multitimeframe_alignment"] = sum(signs) / len(signs)
+        values["opening_multitimeframe_conflict_rate"] = sum(
+            a != b for a, b in zip(signs, signs[1:])
+        ) / (len(signs) - 1)
+        values["opening_short_long_return_divergence"] = (
+            window_returns["15m"] - window_returns["24h"]
+        )
     for minutes in (1, 3, 5, 15, 30, 60):
         if len(closes) > minutes:
             values[f"return_{minutes}m"] = math.log(closes[-1] / closes[-minutes - 1])
@@ -148,6 +358,51 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     )
     old_volume = mean(float(b["volume"]) for b in bars[-21:-1])
     values["relative_volume"] = float(latest["volume"]) / old_volume if old_volume else None
+    # EMA distances (9/21/50/200 on closed pre-open 1-minute closes) and volume
+    # acceleration. Each EMA needs four periods of history to settle; shorter
+    # history leaves the feature unavailable rather than guessed.
+    def settled_ema(period):
+        return ema(closes, period)[-1] if len(closes) >= 4 * period else None
+
+    ema9, ema21, ema50, ema200 = (settled_ema(p) for p in (9, 21, 50, 200))
+    values.update(
+        opening_ema9_distance=close / ema9 - 1 if ema9 else None,
+        opening_ema9_21_gap=ema9 / ema21 - 1 if ema9 and ema21 else None,
+        opening_ema50_distance=close / ema50 - 1 if ema50 else None,
+        opening_ema200_distance=close / ema200 - 1 if ema200 else None,
+    )
+    recent_volume = sum(float(b["volume"]) for b in bars[-5:])
+    prior_volume = sum(float(b["volume"]) for b in bars[-10:-5])
+    values["opening_volume_acceleration"] = (
+        recent_volume / prior_volume - 1 if len(bars) >= 10 and prior_volume > 0 else None
+    )
+    # Same candle definitions as features.extract, from closed pre-open bars only.
+    true_ranges = [
+        max(
+            float(cur["high"]) - float(cur["low"]),
+            abs(float(cur["high"]) - float(prev["close"])),
+            abs(float(cur["low"]) - float(prev["close"])),
+        )
+        for prev, cur in zip(bars, bars[1:])
+    ]
+    prior_ranges = true_ranges[-21:-1]
+    range_mean = sum(prior_ranges) / 20 if len(prior_ranges) == 20 else None
+    range_std = (
+        math.sqrt(sum((r - range_mean) ** 2 for r in prior_ranges) / 20)
+        if range_mean is not None else None
+    )
+    atr_zscore = (
+        (true_ranges[-1] - range_mean) / range_std
+        if true_ranges and range_std and range_std > 0 else None
+    )
+    values.update(
+        candle_body_range_ratio=abs(close - o) / span,
+        candle_close_range_position=(close - low) / span,
+        candle_volume_weighted_move=(close / o - 1) * (float(latest["volume"]) / old_volume)
+        if old_volume else None,
+        candle_atr_zscore_20=atr_zscore,
+        candle_unusual_expansion=int(atr_zscore > 1.5) if atr_zscore is not None else None,
+    )
     intervals = [(b[0] - a[0]).total_seconds() for a, b in zip(points, points[1:])]
     observed_span = (points[-1][0] - points[0][0]).total_seconds()
     if observed_span >= 55 and intervals and all(0 < v <= 5 for v in intervals):
@@ -158,6 +413,10 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     receipts = [timestamp(history["received_at"]), points[-1][0]]
     optional_status = "UNAVAILABLE: no frozen microstructure context"
     optional_receipts = {}
+    excluded = {}
+    # Diagnostic metadata only (Phase 5): why each attempted optional input is
+    # or is not in the frozen vector. It never changes a value or probability.
+    feature_status = {}
     if frozen_context:
         try:
             context_cutoff = timestamp(frozen_context["cutoff"])
@@ -168,68 +427,145 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
                 and timestamp(frozen_context["max_input_received_at"]) > opened
             ):
                 raise ValueError("POST_OPENING_CONTEXT_INPUT_EXCLUDED")
-            optional_values = {}
-            feature_receipts = {}
-            sources = frozen_context.get("sources", {})
-            primary = sources.get(frozen_context.get("primary_source"), {})
+        except (KeyError, ValueError, TypeError, AttributeError):
+            optional_status = "POST_OPENING_OR_UNVERIFIABLE_CONTEXT_EXCLUDED"
+            frozen_context = None
+    if frozen_context:
+        optional_values = {}
+        feature_receipts = {}
+        sources = frozen_context.get("sources", {})
+        primary = sources.get(frozen_context.get("primary_source"), {})
 
-            def receipt_for(name, raw):
-                receipt = timestamp(raw)
-                if receipt > context_cutoff or receipt > opened:
-                    raise ValueError("POST_OPENING_SOURCE_RECEIPT_EXCLUDED")
-                feature_receipts[name] = {"received_at": receipt.isoformat()}
-                return receipt
+        def receipt_for(name, raw):
+            receipt = timestamp(raw)
+            if receipt > context_cutoff or receipt > opened:
+                raise ValueError("POST_OPENING_SOURCE_RECEIPT_EXCLUDED")
+            feature_receipts[name] = {"received_at": receipt.isoformat()}
+            return receipt
 
-            for name, value in frozen_context.get("candidate_features", {}).items():
-                if name in values and value is not None and name.startswith("micro_"):
-                    window_label = name.split("_", 2)[1]
-                    window = primary.get("windows", {}).get(window_label, {})
-                    if window.get("status") == "READY" and window.get("last_received_at"):
-                        receipt_for(name, window["last_received_at"])
-                        optional_values[name] = number(value, -1e15, 1e15)
-            spot = sources.get("Kraken BTC/USD stream", {})
-            if spot.get("status") == "LIVE":
-                window = spot.get("windows", {}).get("5s", {})
-                if window.get("status") == "READY":
-                    imbalance = window.get("features", {}).get("depth_imbalance")
-                    if imbalance is not None and window.get("last_received_at"):
-                        receipt_for("spot_depth_imbalance", window["last_received_at"])
-                        optional_values["spot_depth_imbalance"] = number(imbalance, -1, 1)
-            perpetual = sources.get("Kraken futures stream", {})
-            if (
-                perpetual.get("status") == "LIVE"
-                and perpetual.get("latest_price") is not None
-                and perpetual.get("data_age_seconds") is not None
-            ):
-                age = number(perpetual["data_age_seconds"], 0, 5)
-                receipt_for(
-                    "derivatives_basis", (context_cutoff - timedelta(seconds=age)).isoformat()
-                )
-                optional_values["derivatives_basis"] = (
-                    number(perpetual["latest_price"], 0.000001, 1e12) / points[-1][1] - 1
-                )
-            advanced = frozen_context.get("advanced_features", {})
-            if advanced:
-                if timestamp(advanced["cutoff"]) > opened:
-                    raise ValueError("POST_OPENING_ADVANCED_CONTEXT_EXCLUDED")
-                for name, value in advanced.get("candidate_features", {}).items():
-                    if name not in values or not name.startswith("advanced_") or value is None:
-                        continue
+        def admit(name, compute):
+            # Each optional value must prove its own pre-opening receipt. One
+            # late or malformed value is excluded alone; it never discards the
+            # other receipt-proven values.
+            try:
+                value = compute()
+            except (KeyError, ValueError, TypeError, AttributeError) as exc:
+                feature_receipts.pop(name, None)
+                reason = str(exc) if str(exc).isupper() else type(exc).__name__
+                excluded[reason] = excluded.get(reason, 0) + 1
+                feature_status[name] = "EXCLUDED:" + reason
+                return
+            if value is not None:
+                optional_values[name] = value
+                feature_status[name] = "PRESENT"
+            else:
+                feature_status[name] = "ABSENT_SOURCE_NOT_LIVE_OR_EMPTY"
+
+        for name, value in frozen_context.get("candidate_features", {}).items():
+            if name in values and value is not None and name.startswith("micro_"):
+                window = primary.get("windows", {}).get(name.split("_", 2)[1], {})
+                if window.get("status") == "READY" and window.get("last_received_at"):
+                    admit(name, lambda name=name, value=value, window=window: (
+                        receipt_for(name, window["last_received_at"]),
+                        number(value, -1e15, 1e15),
+                    )[1])
+        spot = sources.get("Kraken BTC/USD stream", {})
+        window = spot.get("windows", {}).get("5s", {}) if spot.get("status") == "LIVE" else {}
+        imbalance = window.get("features", {}).get("depth_imbalance") if window.get("status") == "READY" else None
+        if imbalance is not None and window.get("last_received_at"):
+            admit("spot_depth_imbalance", lambda: (
+                receipt_for("spot_depth_imbalance", window["last_received_at"]),
+                number(imbalance, -1, 1),
+            )[1])
+        perpetual = sources.get("Kraken futures stream", {})
+        if (
+            perpetual.get("status") == "LIVE"
+            and perpetual.get("latest_price") is not None
+            and perpetual.get("data_age_seconds") is not None
+        ):
+            admit("derivatives_basis", lambda: (
+                receipt_for("derivatives_basis", (
+                    context_cutoff - timedelta(seconds=number(perpetual["data_age_seconds"], 0, 5))
+                ).isoformat()),
+                number(perpetual["latest_price"], 0.000001, 1e12) / points[-1][1] - 1,
+            )[1])
+        advanced = frozen_context.get("advanced_features", {})
+        advanced_ok = bool(advanced)
+        if advanced_ok:
+            try:
+                advanced_ok = timestamp(advanced["cutoff"]) <= opened
+            except (KeyError, ValueError, TypeError, AttributeError):
+                advanced_ok = False
+            if not advanced_ok:
+                excluded["POST_OPENING_ADVANCED_CONTEXT_EXCLUDED"] = 1
+        if advanced_ok:
+            for name, value in advanced.get("candidate_features", {}).items():
+                if name not in values or not name.startswith("advanced_") or value is None:
+                    continue
+
+                def advanced_value(name=name, value=value):
                     proof = advanced.get("candidate_feature_sources", {}).get(name, {})
                     receipt_for(name, proof["received_at"])
                     if proof.get("event_at") and timestamp(proof["event_at"]) > opened:
                         raise ValueError("POST_OPENING_ADVANCED_EVENT_EXCLUDED")
-                    optional_values[name] = number(value, -1e15, 1e15)
-            values.update(optional_values)
-            receipts.extend(timestamp(item["received_at"]) for item in feature_receipts.values())
-            optional_receipts["microstructure"] = {
-                "cutoff": context_cutoff.isoformat(),
-                "features": feature_receipts,
-                "cutoff_note": "Analysis boundary, not an observation receipt timestamp",
-            }
-            optional_status = "AS_OF_OPENING_CONTEXT: actual used source receipts recorded; analysis cutoff never refreshes an observation"
-        except (KeyError, ValueError, TypeError, AttributeError):
-            optional_status = "POST_OPENING_OR_UNVERIFIABLE_CONTEXT_EXCLUDED"
+                    return number(value, -1e15, 1e15)
+
+                admit(name, advanced_value)
+        # Kraken public order flow observed at or before the opening (at most
+        # 5 s old): same definitions as the live feature extractor.
+        flow = frozen_context.get("order_flow") or {}
+
+        def flow_item(key):
+            item = flow.get(key) or {}
+            if item.get("status") != "LIVE":
+                return None
+            observed = timestamp(item["observed_at"])
+            if observed > opened:
+                raise ValueError("POST_OPENING_ORDER_FLOW_EXCLUDED")
+            if (opened - observed).total_seconds() > 5:
+                raise ValueError("STALE_PRE_OPENING_ORDER_FLOW_EXCLUDED")
+            return item
+
+        for venue, feature in (("spot", "spot_cvd_delta_fraction"), ("perpetual", "perpetual_cvd_delta_fraction")):
+            def cvd(venue=venue, feature=feature):
+                item = flow_item(venue)
+                if item is None:
+                    return None
+                receipt_for(feature, item["observed_at"])
+                absorption = item.get("passive_sell_absorption_candidate")
+                if type(absorption) is bool:
+                    optional_values[venue + "_absorption_candidate"] = int(absorption)
+                dem = item.get("delta_efficiency_3m") or {}
+                if dem.get("status") == "LIVE" and dem.get("delta_efficiency") is not None:
+                    optional_values[venue + "_delta_efficiency_3m"] = number(dem["delta_efficiency"], -1e15, 1e15)
+                return number(item["delta_fraction_60s"], -1, 1)
+
+            admit(feature, cvd)
+
+        def book():
+            item = flow_item("spot_book")
+            if item is None:
+                return None
+            receipt_for("spot_book_dominance", item["observed_at"])
+            ratio = number(item["bid_ask_ratio"], 0, 1e12)
+            if item.get("order_book_imbalance_top3") is not None:
+                optional_values["spot_book_imbalance_top3"] = number(item["order_book_imbalance_top3"], -1, 1)
+            if item.get("micro_price_deviation") is not None:
+                optional_values["spot_micro_price_deviation"] = number(item["micro_price_deviation"], -1, 1)
+            return (ratio - 1) / (ratio + 1)
+
+        admit("spot_book_dominance", book)
+        values.update({k: v for k, v in optional_values.items() if k in values})
+        receipts.extend(timestamp(item["received_at"]) for item in feature_receipts.values())
+        optional_receipts["microstructure"] = {
+            "cutoff": context_cutoff.isoformat(),
+            "features": feature_receipts,
+            "cutoff_note": "Analysis boundary, not an observation receipt timestamp",
+        }
+        optional_status = (
+            "AS_OF_OPENING_CONTEXT: actual used source receipts recorded; analysis cutoff never refreshes an observation"
+            + ("; individually excluded: " + ", ".join(f"{k}={v}" for k, v in sorted(excluded.items())) if excluded else "")
+        )
     values = {
         name: (float(value) if type(value) in (float, int) and math.isfinite(value) else None)
         for name, value in values.items()
@@ -252,6 +588,8 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
         },
         "closed_history_bars": day["closed_bars"],
         "optional_context_status": optional_status,
+        "optional_context_available": bool(frozen_context),
+        "optional_feature_status": feature_status,
         "target_metadata_received_at": market.get(
             "metadata_received_at", market.get("observed_at")
         ),
@@ -293,6 +631,43 @@ def aggregate(bars, minutes):
 
 
 def context24(data, now):
+    """context24 with exact reuse while the candle content and the window
+    cutoff are unchanged (see candle_memo for the correctness contract).
+
+    After its two clock checks, the original depends on ``now`` only through
+    ``cutoff`` (the latest complete minute received by ``now``). Both checks and
+    the cutoff are recomputed here exactly as in the original on every call;
+    only READY results are reused, keyed by (candle content, cutoff).
+    """
+    from . import candle_memo
+
+    try:
+        fp = candle_memo.fingerprint(data)
+        received = timestamp(data["received_at"]) if fp is not None else None
+        stamp = now.timestamp()
+        starts = [int(row[0]) for row in fp[2]] if fp is not None else None
+    except Exception:
+        fp = None
+    if fp is None or not 0 <= (now - received).total_seconds() <= 150:
+        candle_memo.bypass()
+        return _context24_uncached(data, now)
+    limit = min(stamp, received.timestamp())
+    available = [start + 60 for start in starts if start + 60 <= limit]
+    cutoff = max(available) if available else int(stamp) // 60 * 60
+    if not 0 <= stamp - cutoff <= 120:
+        candle_memo.bypass()
+        return _context24_uncached(data, now)
+    key = ("context24", fp, cutoff)
+    hit = candle_memo.get(key)
+    if hit is not None:
+        return candle_memo.copy(hit)
+    value = _context24_uncached(data, now)
+    if value.get("status") == "READY":
+        candle_memo.put(key, candle_memo.copy(value))
+    return value
+
+
+def _context24_uncached(data, now):
     result = {
         "status": "INSUFFICIENT DATA",
         "reason": "Need 1440 contiguous closed one-minute candles",
@@ -333,8 +708,18 @@ def context24(data, now):
             if start in bars:
                 raise ValueError("Duplicate candle interval")
             bars[start] = b
-        if sorted(bars) != list(range(cutoff - 86400, cutoff, 60)):
-            raise ValueError(f"Incomplete 24h window: {len(bars)}/1440 closed bars")
+        expected = list(range(cutoff - 86400, cutoff, 60))
+        if sorted(bars) != expected:
+            missing = [stamp for stamp in expected if stamp not in bars]
+            label = ", ".join(
+                datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+                for stamp in missing[:5]
+            )
+            suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+            raise ValueError(
+                f"Incomplete 24h window: {len(bars)}/1440 closed bars; "
+                f"missing UTC intervals: {label or 'unknown'}{suffix}"
+            )
         rows = [bars[t] for t in sorted(bars)]
         closes = [b["close"] for b in rows]
         returns = [b - a for a, b in zip(closes, closes[1:])]
@@ -370,12 +755,11 @@ def context24(data, now):
         for minutes in (1, 3, 5, 15, 30, 60):
             grouped = rows if minutes == 1 else aggregate(rows, minutes)
             recent = rows[-minutes:]
-            prior = rows[-2 * minutes:-minutes]
+            prior = rows[-2 * minutes : -minutes]
             recent_volume = sum(bar["volume"] for bar in recent)
             prior_volume = sum(bar["volume"] for bar in prior)
             trailing_return = (
-                closes[-1] / closes[-minutes - 1] - 1
-                if len(closes) > minutes else None
+                closes[-1] / closes[-minutes - 1] - 1 if len(closes) > minutes else None
             )
             frames[str(minutes) + "m"] = {
                 "closed_bars": len(grouped),
@@ -385,13 +769,18 @@ def context24(data, now):
                 else None,
                 "latest_volume": grouped[-1]["volume"] if grouped else None,
                 "trailing_return": trailing_return,
-                "direction": "UP" if trailing_return is not None and trailing_return > 0
-                else "DOWN" if trailing_return is not None and trailing_return < 0
-                else "FLAT" if trailing_return == 0 else "UNAVAILABLE",
+                "direction": "UP"
+                if trailing_return is not None and trailing_return > 0
+                else "DOWN"
+                if trailing_return is not None and trailing_return < 0
+                else "FLAT"
+                if trailing_return == 0
+                else "UNAVAILABLE",
                 "rolling_volume": recent_volume,
                 "prior_rolling_volume": prior_volume if len(prior) == minutes else None,
                 "volume_ratio": recent_volume / prior_volume
-                if len(prior) == minutes and prior_volume > 0 else None,
+                if len(prior) == minutes and prior_volume > 0
+                else None,
                 "as_of": cutoff,
                 "input_policy": "Closed one-minute proxy candles only; rolling window ending at the latest verified close",
             }
@@ -399,8 +788,11 @@ def context24(data, now):
             "closed_bars": len(rows),
             "latest_close": closes[-1],
             "trailing_return": features["return_24h"],
-            "direction": "UP" if features["return_24h"] > 0 else "DOWN"
-            if features["return_24h"] < 0 else "FLAT",
+            "direction": "UP"
+            if features["return_24h"] > 0
+            else "DOWN"
+            if features["return_24h"] < 0
+            else "FLAT",
             "rolling_volume": volume,
             "as_of": cutoff,
             "input_policy": "Exactly 1,440 contiguous closed one-minute proxy candles",
@@ -609,6 +1001,16 @@ def create(db, *, migrate_contract_summaries=True):
             VALUES(NEW.mode,NEW.ticker,NEW.closes_at,0,NULL);
         END;
     """
+    )
+    db.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS btc_engine_opening_no_update
+            BEFORE UPDATE ON btc_engine_opening BEGIN
+            SELECT RAISE(ABORT,'Opening predictions are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS btc_engine_opening_no_delete
+            BEFORE DELETE ON btc_engine_opening BEGIN
+            SELECT RAISE(ABORT,'Opening predictions are immutable'); END;
+        """
     )
     if migrate_contract_summaries:
         backfill_contract_summaries(db)
@@ -1091,6 +1493,17 @@ def opening_forecast(
 
     opened = timestamp(market["opens_at"])
     closed = timestamp(market["closes_at"])
+    cutoff_candidates = []
+    try:
+        history_received = timestamp(history["received_at"])
+        if history_received < opened:
+            cutoff_candidates.append(history_received)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        pass
+    cutoff_candidates.extend(
+        when for when, _price in reference_points if when < opened
+    )
+    input_cutoff = max(cutoff_candidates) if cutoff_candidates else None
     result = dict(
         ticker=market["ticker"],
         opens_at=market["opens_at"],
@@ -1098,7 +1511,19 @@ def opening_forecast(
         timestamp=generated_at.isoformat(),
         generated_at=generated_at.isoformat(),
         data_cutoff=opened.isoformat(),
+        input_data_cutoff=input_cutoff.isoformat() if input_cutoff else None,
         opening_delay_seconds=max(0, (generated_at - opened).total_seconds()),
+        timing_diagnostic={
+            "forecast_computation_delay_seconds": max(0, (generated_at - opened).total_seconds()),
+            "data_cutoff_integrity": "PREOPEN_ONLY",
+            "threshold_metadata_received_at": market.get(
+                "metadata_received_at", market.get("observed_at")
+            ),
+            "note": (
+                "A positive delay records when the immutable forecast became "
+                "displayable. Every price input remains cut off at contract open."
+            ),
+        },
         up=None,
         down=None,
         direction="UNCLEAR",
@@ -1114,6 +1539,7 @@ def opening_forecast(
         threshold_received_at=market.get("metadata_received_at", market.get("observed_at")),
         regime="unavailable",
         model="opening24h-zero-drift-final-average-v1",
+        score_cohort="verified-opening-policy-v2",
         direction_policy=DIRECTION_POLICY,
         model_selection={
             "opening_ensemble_active": False,
@@ -1156,7 +1582,7 @@ def opening_forecast(
             raise ValueError(day["reason"])
         by_time = {}
         for t, raw_price in reference_points:
-            if not opened - timedelta(seconds=65) <= t <= opened:
+            if not opened - timedelta(seconds=65) <= t < opened:
                 continue
             price = number(raw_price, 0.000001, 1e12)
             if t in by_time and by_time[t] != price:
@@ -1249,7 +1675,9 @@ def opening_forecast(
             and interval[1] < 0.60
         )
         result["opening_quality_guard"] = {
-            "status": "INSUFFICIENT_PREDICTIVE_CONFIDENCE" if weak_fallback else "COLLECTING_EVIDENCE",
+            "status": "INSUFFICIENT_PREDICTIVE_CONFIDENCE"
+            if weak_fallback
+            else "COLLECTING_EVIDENCE",
             "past_only_evidence": forward,
             "rule": "After at least 20 past official directional openings, suppress the fallback direction when the 95% Wilson upper accuracy bound is below 60%; probabilities remain recorded unchanged",
             "probability_changed": False,
@@ -1263,7 +1691,11 @@ def opening_forecast(
             result["reason"] += "; opening direction withheld by past-only quality guard"
         result["baseline_probability_up"] = p
         if candidate_artifact is not None:
-            from .opening_models import eligible_at_opening, predict as candidate_predict
+            from .opening_models import (
+                decision as candidate_decision,
+                eligible_at_opening,
+                predict as candidate_predict,
+            )
 
             if eligible_at_opening(candidate_artifact, opened):
                 candidate_p = number(
@@ -1278,11 +1710,12 @@ def opening_forecast(
                 result.update(
                     up=candidate_p,
                     down=1 - candidate_p,
-                    direction=direction_label(candidate_p),
+                    direction=candidate_decision(candidate_artifact, candidate_p),
                     displayed_probabilities=display_probability_pair(candidate_p),
                     model="opening-candidate/" + candidate_artifact["model_id"],
                     reason="Explicitly configured opening-only candidate passed chronological probabilistic gates; frozen as-of-opening features only; experimental, edge unverified",
                 )
+                result["decision_policy"] = candidate_artifact["decision_policy"]
                 result["model_selection"].update(
                     status="EXPERIMENTAL_OPENING_CANDIDATE",
                     opening_ensemble_active=candidate_artifact["model"]["kind"]
@@ -1297,7 +1730,7 @@ def opening_forecast(
                 )
                 result["confidence"] = {
                     "status": "EXPERIMENTAL CALIBRATED CANDIDATE",
-                    "reason": "Validation-only calibration and opening-only held-out statistical gates passed; live calibration, model/basis error and profitable edge remain unverified",
+                    "reason": "Validation-selected UP/DOWN/WAIT threshold and opening-only held-out probabilistic gates passed; live accuracy and profitable edge remain unverified",
                 }
                 result["settlement_price_estimate"][
                     "label"
@@ -1331,31 +1764,75 @@ def opening_forecast(
                 )
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         result["reason"] = str(exc)
+    # The zero-drift distribution is retained as an independently scored
+    # baseline, but it is not a validated directional classifier.  Freezing a
+    # raw probability is useful for later learning; presenting its sign as an
+    # actionable opening call is not.  Historical rows are never rewritten.
+    if (
+        result.get("up") is not None
+        and str(result.get("model", "")).startswith("opening24h-zero-drift")
+    ):
+        prior_guard = result.get("opening_quality_guard", {})
+        weak_evidence = prior_guard.get("status") == "INSUFFICIENT_PREDICTIVE_CONFIDENCE"
+        result["direction"] = "UNCLEAR"
+        if not weak_evidence:
+            result["confidence"] = {
+                "status": "NO VERIFIED EDGE",
+                "reason": (
+                    "The zero-drift opening estimate is an uncalibrated shadow "
+                    "baseline. UP/DOWN is withheld until an opening-only model "
+                    "passes chronological validation and is explicitly configured."
+                ),
+            }
+        result["reason"] += "; uncalibrated fallback retained for scoring, directional call withheld"
+        result["opening_quality_guard"] = {
+            **prior_guard,
+            "status": prior_guard.get("status")
+            if weak_evidence
+            else "WAIT_UNCALIBRATED_FALLBACK",
+            "direction_policy_status": "WAIT_UNCALIBRATED_FALLBACK",
+            "probability_changed": False,
+            "historical_predictions_rewritten": False,
+        }
     shadow = [
-        "RSI", "MACD", "VWAP", "EMA", "Bollinger Bands", "volume",
-        "order flow", "order-book imbalance", "CVD", "market microstructure",
+        "RSI",
+        "MACD",
+        "VWAP",
+        "EMA",
+        "Bollinger Bands",
+        "volume",
+        "order flow",
+        "order-book imbalance",
+        "CVD",
+        "market microstructure",
     ]
     if str(result.get("model", "")).startswith("opening-candidate/"):
         active = [
-            name for name, value in result.get("frozen_features", {}).get("values", {}).items()
+            name
+            for name, value in result.get("frozen_features", {}).get("values", {}).items()
             if value is not None
         ]
         model_role = "chronologically eligible experimental opening-only candidate"
     else:
-        active = [
-            "latest pre-opening proxy price",
-            "official contract threshold",
-            "proxy-to-threshold opening basis anchor",
-            "24-hour realized volatility",
-            "contract duration and final-60-second averaging rule",
-            "zero expected drift",
-        ] if result.get("up") is not None else []
+        active = (
+            [
+                "latest pre-opening proxy price",
+                "official contract threshold",
+                "proxy-to-threshold opening basis anchor",
+                "24-hour realized volatility",
+                "contract duration and final-60-second averaging rule",
+                "zero expected drift",
+            ]
+            if result.get("up") is not None
+            else []
+        )
         model_role = "experimental zero-drift statistical fallback"
     result["feature_usage"] = {
         "model_role": model_role,
         "active_probability_inputs": active,
         "available_shadow_features": [
-            name for name, value in result.get("frozen_features", {}).get("values", {}).items()
+            name
+            for name, value in result.get("frozen_features", {}).get("values", {}).items()
             if value is not None
         ],
         "inactive_directional_feature_groups": shadow,
@@ -1419,7 +1896,7 @@ def save_opening(db, mode, opening, wall_now):
             "kind": "opening",
             "threshold": saved.get("threshold"),
             "baseline_up": saved.get("baseline_probability_up", saved["up"]),
-            "direction": direction_label(saved["up"]),
+            "direction": recorded_opening_direction(saved),
             "direction_policy": DIRECTION_POLICY,
             "opens_at": saved.get("opens_at"),
             "data_quality": saved.get("data_quality", {}),

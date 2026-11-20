@@ -10,6 +10,7 @@ from bisect import bisect_left
 from datetime import datetime, timezone
 import math
 import threading
+from itertools import islice
 
 from .model import number, timestamp
 
@@ -429,17 +430,55 @@ class AdvancedFlow:
             units_policy="Per-source native quantities; no spot/derivative pooling",
         )
 
+    @staticmethod
+    def _eligible(records, cutoff):
+        """Records available by the cutoff, identical to filtering every record.
+
+        observe() appends in non-decreasing receipt order and rejects any event
+        after its receipt, so "received <= cutoff" alone decides eligibility and
+        the eligible records are a prefix. When everything is eligible (the live
+        case) the full scan is skipped.
+        """
+        n = len(records)
+        if n == 0 or records[-1]["received"] <= cutoff:
+            return list(records)
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if records[mid]["received"] <= cutoff:
+                lo = mid + 1
+            else:
+                hi = mid
+        return list(islice(records, 0, lo))
+
+    @staticmethod
+    def _suffix_from(records, keep):
+        """Shortest suffix of an ordered list whose members satisfy keep(); keep is monotone along the list."""
+        lo, hi = 0, len(records)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keep(records[mid]):
+                hi = mid
+            else:
+                lo = mid + 1
+        return records[lo:]
+
+    @classmethod
+    def _generation_block(cls, records, generation):
+        """Members with exactly this generation (a contiguous block: generations never decrease)."""
+        tail = cls._suffix_from(records, lambda x: x["generation"] >= generation)
+        lo, hi = 0, len(tail)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if tail[mid]["generation"] > generation:
+                hi = mid
+            else:
+                lo = mid + 1
+        return tail[:lo]
+
     def _summary(self, state, cutoff, threshold, source_name):
-        eligible_trades = [
-            x
-            for x in state.trades
-            if x["received"] <= cutoff and (x["event"] is None or x["event"] <= cutoff)
-        ]
-        eligible_quotes = [
-            x
-            for x in state.quotes
-            if x["received"] <= cutoff and (x["event"] is None or x["event"] <= cutoff)
-        ]
+        eligible_trades = self._eligible(state.trades, cutoff)
+        eligible_quotes = self._eligible(state.quotes, cutoff)
         latest = max(
             eligible_trades[-1:] + eligible_quotes[-1:], key=lambda x: x["received"], default=None
         )
@@ -457,8 +496,9 @@ class AdvancedFlow:
                 reason="Sequence gap/reconnect requires a fresh valid snapshot",
                 active_contribution=False,
             )
-        trades = [x for x in eligible_trades if x["generation"] == generation]
-        quotes = [x for x in eligible_quotes if x["generation"] == generation]
+        # Generations only increase along each list, so the current one is a suffix.
+        trades = self._generation_block(eligible_trades, generation)
+        quotes = self._generation_block(eligible_quotes, generation)
         receipt_latest = latest
         # Quote and trade channels have independent event clocks. A delayed
         # execution must contribute its actual volume without rewinding a newer
@@ -470,8 +510,8 @@ class AdvancedFlow:
                 x["event"] if x["event"] is not None else x["received"],
             ),
         )
-        recent = [x for x in trades if x["received"] >= cutoff - self.window_seconds]
-        recent_quotes = [x for x in quotes if x["received"] >= cutoff - 60]
+        recent = self._suffix_from(trades, lambda x: x["received"] >= cutoff - self.window_seconds)
+        recent_quotes = self._suffix_from(quotes, lambda x: x["received"] >= cutoff - 60)
         age = cutoff - receipt_latest["received"]
         status = "STALE" if age > 5 else "READY"
         base = dict(

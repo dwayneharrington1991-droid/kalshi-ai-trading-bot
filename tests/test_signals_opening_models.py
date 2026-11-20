@@ -45,6 +45,31 @@ def test_real_direction_and_complementary_rounding_remain_visible():
     assert engine.display_probability_pair(float("nan"))["up"] is None
 
 
+def test_opening_diagnostics_exposes_wait_probability_policy_and_asof_times():
+    saved = {
+        "model": "opening-candidate/test-model", "up": 0.61, "direction": "WAIT",
+        "opens_at": "2026-11-16T12:00:00+00:00",
+        "generated_at": "2026-11-16T12:00:01+00:00",
+        "data_cutoff": "2026-11-16T12:00:00+00:00",
+        "confidence": {"status": "EXPERIMENTAL CALIBRATED CANDIDATE"},
+        "decision_policy": {"threshold": 0.65, "otherwise": "WAIT"},
+        "model_selection": {
+            "status": "EXPERIMENTAL_OPENING_CANDIDATE",
+            "opening_ensemble_active": True,
+            "loaded_at": "2026-11-16T11:00:00+00:00",
+            "available_at": "2026-11-16T10:00:00+00:00",
+            "labels_available_through": "2026-11-15T00:00:00+00:00",
+        },
+    }
+    audit = engine.opening_diagnostics(saved)
+    assert audit["raw_probability_up"] == 0.61
+    assert audit["display_direction"] == "WAIT"
+    assert audit["directional_threshold"] == 0.65
+    assert audit["model_selection_status"] == "EXPERIMENTAL_OPENING_CANDIDATE"
+    assert audit["model_loaded_at"] < audit["opening_timestamp"]
+    assert audit["input_data_cutoff"] == audit["opening_timestamp"]
+
+
 def test_opening_fallback_explains_model_and_feature_role_not_constant_probability():
     result = opening(
         audit_context={
@@ -63,6 +88,24 @@ def test_opening_fallback_explains_model_and_feature_role_not_constant_probabili
     assert result["up"] == pytest.approx(
         0.5 * (1 + math.erf(result["probability_inputs"]["z_score"] / math.sqrt(2)))
     )
+    assert result["direction"] == "UNCLEAR"
+    assert result["confidence"]["status"] == "NO VERIFIED EDGE"
+    assert result["opening_quality_guard"]["status"] == "WAIT_UNCALIBRATED_FALLBACK"
+    assert engine.recorded_opening_direction(result) == "UNCLEAR"
+
+
+def test_unvalidated_fallback_wait_does_not_hide_legacy_directional_results():
+    current = opening()
+    assert current["direction"] == "UNCLEAR"
+    # Historical rows without an explicit saved WAIT retain their original
+    # probability-derived scoring.  This prevents the new policy from erasing
+    # or reclassifying prior losses.
+    legacy = {
+        "model": "opening24h-zero-drift-final-average-v1",
+        "up": 0.7,
+        "direction": "UP",
+    }
+    assert engine.recorded_opening_direction(legacy) == "UP"
 
 
 def test_frozen_features_exclude_future_reference_and_microstructure_context():
@@ -84,6 +127,39 @@ def test_frozen_features_exclude_future_reference_and_microstructure_context():
         == "POST_OPENING_OR_UNVERIFIABLE_CONTEXT_EXCLUDED"
     )
     assert future["frozen_features"]["max_input_received_at"] <= NOW.isoformat()
+
+
+def test_multi_hour_candlestick_features_are_frozen_from_closed_history_only():
+    data = history(NOW - timedelta(minutes=1), NOW - timedelta(seconds=1))
+    result = engine.opening_forecast(market(), data, points(), NOW + timedelta(seconds=2))
+    values = result["frozen_features"]["values"]
+    for window in ("15m", "30m", "1h", "2h", "4h", "6h", "12h", "24h"):
+        prefix = f"opening_{window}_"
+        assert values[prefix + "return"] is not None
+        assert values[prefix + "body_fraction"] is not None
+        assert values[prefix + "wick_asymmetry"] is not None
+        assert values[prefix + "realized_volatility"] is not None
+        assert values[prefix + "relative_volume"] is not None
+        assert values[prefix + "momentum_acceleration"] is not None
+        assert values[prefix + "structure_strength"] is not None
+        assert values[prefix + "compression_ratio"] is not None
+        assert values[prefix + "breakout_state"] in {-1.0, -0.5, 0.0, 0.5, 1.0}
+    assert -1 <= values["opening_multitimeframe_alignment"] <= 1
+    assert 0 <= values["opening_multitimeframe_conflict_rate"] <= 1
+    assert values["opening_short_long_return_divergence"] is not None
+    changed = deepcopy(data)
+    changed["candles"].append(
+        {
+            "start": int(NOW.timestamp()),
+            "open": 1,
+            "high": 1_000_000,
+            "low": 1,
+            "close": 1_000_000,
+            "volume": 1_000_000,
+        }
+    )
+    future = engine.opening_forecast(market(), changed, points(), NOW + timedelta(seconds=2))
+    assert future["frozen_features"]["values"] == values
 
 
 def test_asof_microstructure_is_recorded_as_candidate_not_probability_boost():
@@ -159,12 +235,15 @@ def test_opening_dataset_uses_only_frozen_feature_records_and_official_outcomes(
     )
     with journal.read() as db:
         rows = opening_models.dataset(db, NOW + timedelta(minutes=17))
+        coverage = opening_models.dataset_coverage(db, NOW + timedelta(minutes=17))
     assert len(rows) == 1 and rows[0]["features"] == {
         name: value
         for name, value in original["frozen_features"]["values"].items()
         if value is not None
     }
     assert rows[0]["market"] is None and rows[0]["timestamp"] == original["generated_at"]
+    assert coverage["newest_eligible_contract"] == original["ticker"]
+    assert coverage["recent_official_eligibility"][-1]["status"] == "ELIGIBLE"
     candidate, report = opening_models.evaluate(rows)
     assert candidate is None and report["status"] == "INSUFFICIENT_OPENING_LABELS"
     assert not report["active_model_changed"] and not report["promotion_allowed"]
@@ -263,7 +342,20 @@ def test_opening_selection_is_frozen_before_untouched_test_outcomes():
     assert report["test"]["selected_candidate"] != future["test"]["selected_candidate"]
     assert not report["promotion_allowed"]
     _, blocked = opening_models.evaluate(rows, used_test_contracts=report["test_contracts"])
-    assert blocked["status"] == "HOLDOUT_REUSE_BLOCKED"
+    assert blocked["status"] == "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT"
+    assert blocked["unseen_forward_contracts"] == 0
+    assert blocked["required_unseen_forward_contracts"] == 30
+    assert blocked["additional_unseen_contracts_needed"] == 30
+
+    candidate, forward = opening_models.evaluate(
+        synthetic_rows(230), used_test_contracts=report["test_contracts"]
+    )
+    assert forward["evaluation_mode"] == "FORWARD_UNSEEN_HOLDOUT"
+    # Label-availability purging removes the boundary contract from each
+    # development partition; the untouched forward block remains complete.
+    assert forward["split_contracts"] == [159, 39, 30]
+    assert set(forward["test_contracts"]).isdisjoint(report["test_contracts"])
+    assert candidate is not None
 
 
 def test_gradient_boosting_is_bounded_and_shadow_only():
@@ -316,6 +408,58 @@ def test_only_opening_target_artifact_available_before_open_can_be_used():
         opening(candidate_artifact=incompatible)["model"]
         == "opening24h-zero-drift-final-average-v1"
     )
+
+
+def test_selective_candidate_decision_is_saved_and_not_repainted():
+    candidate = eligible_candidate()
+    candidate["decision_policy"]["kind"] = "validation_selected_symmetric_abstention"  # legacy rule under test
+    candidate["decision_policy"]["threshold"] = 0.99
+    candidate["report"]["selective_signal_evaluation"]["selected_threshold"] = 0.99
+    result = opening(candidate_artifact=candidate)
+    assert result["direction"] == "WAIT"
+    assert result["decision_policy"]["threshold"] == 0.99
+    changed = {**result, "up": 0.999}
+    assert engine.recorded_opening_direction(changed) == "WAIT"
+
+
+def test_read_only_opening_audit_scores_immutable_official_records(tmp_path):
+    from src.signals_display.opening_accuracy_audit import audit
+
+    journal = Journal(tmp_path / "audit.db")
+    result = opening()
+    journal.opening_record(
+        result["ticker"], "PUBLIC MARKET DATA", result, NOW + timedelta(seconds=2)
+    )
+    journal.settle(
+        result["ticker"], "yes", "PUBLIC MARKET DATA", (NOW + timedelta(minutes=16)).isoformat()
+    )
+    with journal.read() as db:
+        report = audit(db, NOW + timedelta(minutes=17))
+    assert report["read_only"] is True
+    assert report["scored_probability_records"] == 1
+    assert report["duplicate_opening_tickers"] == 0
+    assert report["duplicate_official_outcome_tickers"] == 0
+    assert report["integrity"]["future_inputs_accepted"] == 0
+    assert len(report["records"]) == 1
+    forensic = report["records"][0]
+    assert forensic["ticker"] == result["ticker"]
+    assert forensic["model"] == "opening24h-zero-drift-final-average-v1"
+    assert forensic["direction"] == "UNCLEAR"
+    assert forensic["correct"] is None
+    assert forensic["closed_history_bars"] == 1440
+    assert forensic["preopening_inputs_verified"] is True
+    assert forensic["max_input_received_at"] < forensic["opens_at"]
+    assert report["by_model"][forensic["model"]]["wait"] == 1
+    assert report["saved_statistical_baseline_metrics"]["samples"] == 1
+
+
+def test_forensic_confidence_bands_are_fixed_before_outcomes():
+    from src.signals_display.opening_accuracy_audit import _confidence_band
+
+    assert _confidence_band(0.50) == "50%-55%"
+    assert _confidence_band(0.79) == "75%-80%"
+    assert _confidence_band(0.85) == "80%-90%"
+    assert _confidence_band(0.95) == "90%-100%"
 
 
 def test_selected_candidate_keeps_independent_baseline_for_future_training(tmp_path):

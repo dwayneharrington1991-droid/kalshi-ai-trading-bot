@@ -127,3 +127,16 @@ def test_multi_asset_worker_reports_failure_without_blocking_cached_state():
     assert cached["markets"] == []
     assert cached["diagnostics"]["status"] == "ERROR"
     assert cached["diagnostics"]["error_type"] == "ValueError"
+
+
+def test_empty_auxiliary_discovery_does_not_contradict_primary_market():
+    """The optional strip cannot claim the active primary contract is absent."""
+    from src.signals_display.monitor import PublicFeed
+
+    feed = PublicFeed(lambda *_args, **_kwargs: None, multi_venue=False)
+    feed._read = lambda url: {"markets": [], "cursor": None}
+    result = feed._load_multi_assets(NOW)
+    diagnostic = result["diagnostics"]
+    assert diagnostic["scope"] == "ADDITIONAL_MARKETS_ONLY"
+    assert diagnostic["status"] == "NO_ADDITIONAL_COMPATIBLE_MARKETS"
+    assert "primary KXBTC15M contract is monitored separately" in diagnostic["reason"]

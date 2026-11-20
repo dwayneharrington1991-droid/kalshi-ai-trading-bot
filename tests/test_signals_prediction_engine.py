@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import timedelta
 import math
+import sqlite3
 import pytest
 from src.signals_display import prediction_engine as engine
 from src.signals_display.market_health import diagnose, selection_summary
@@ -74,8 +75,35 @@ def test_24h_context_tracks_live_rolling_timeframes_and_ignores_future_bars():
         dict(start=int(NOW.timestamp()), open=1, high=1, low=1, close=1, volume=100)
     )
     assert engine.context24(data, NOW) == a
-    data["candles"].pop(500)
+    missing = data["candles"].pop(500)["start"]
+    incomplete = engine.context24(data, NOW)
+    assert incomplete["status"] == "INSUFFICIENT DATA"
+    assert "1439/1440" in incomplete["reason"]
+    assert __import__("datetime").datetime.fromtimestamp(
+        missing, __import__("datetime").timezone.utc
+    ).isoformat() in incomplete["reason"]
+
+
+def test_strict_window_recovers_when_unavailable_minute_rolls_out_without_lookahead():
+    data = history()
+    data["candles"].pop(0)
     assert engine.context24(data, NOW)["status"] == "INSUFFICIENT DATA"
+
+    next_close = int(NOW.timestamp()) // 60 * 60
+    prior = data["candles"][-1]
+    data["candles"].append({
+        "start": next_close,
+        "open": prior["close"],
+        "high": prior["close"] + 2,
+        "low": prior["close"] - 2,
+        "close": prior["close"] + 1,
+        "volume": 1,
+    })
+    later = NOW + timedelta(minutes=1)
+    data["received_at"] = later.isoformat()
+    recovered = engine.context24(data, later)
+    assert recovered["status"] == "READY"
+    assert recovered["last_close"] == next_close + 60
 
 
 def test_opening_forecast_uses_only_preopen_received_data_and_reports_delay():
@@ -86,6 +114,7 @@ def test_opening_forecast_uses_only_preopen_received_data_and_reports_delay():
         first["status"] == "DELAYED"
         and first["up"] is not None
         and first["data_cutoff"] == NOW.isoformat()
+        and timestamp(first["input_data_cutoff"]) < NOW
     )
     assert first["opening_delay_seconds"] == 3
     later = points() + [(NOW + timedelta(seconds=1), 999999)]
@@ -154,6 +183,17 @@ def test_opening_is_immutable_and_survives_restart(tmp_path):
     b = {**opening, "up": 0.99, "generated_at": (NOW + timedelta(seconds=20)).isoformat()}
     assert j.opening_record(m["ticker"], "PUBLIC MARKET DATA", b, NOW + timedelta(seconds=20)) == a
     assert Journal(tmp_path / "j.db").opening_record(m["ticker"], "PUBLIC MARKET DATA") == a
+    with j.connect() as db:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "UPDATE btc_engine_opening SET up=0.99 WHERE mode=? AND ticker=?",
+                ("PUBLIC MARKET DATA", m["ticker"]),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "DELETE FROM btc_engine_opening WHERE mode=? AND ticker=?",
+                ("PUBLIC MARKET DATA", m["ticker"]),
+            )
 
 
 def test_actual_contract_rules_are_required_and_no_opening_data_means_unavailable():
@@ -170,12 +210,23 @@ def test_persisted_opening_snapshot_excludes_future_receipts_and_survives_time(t
     opened = timestamp(contract["opens_at"])
     before = (opened - timedelta(seconds=1), 100000)
     after = (opened + timedelta(milliseconds=1), 200000)
+    with pytest.raises(ValueError, match="before contract start"):
+        journal.freeze_opening_snapshot(
+            contract, "PUBLIC MARKET DATA", history(), [before],
+            "Coinbase BTC/USD proxy", opened - timedelta(milliseconds=1), finalized=True,
+        )
+    with pytest.raises(ValueError, match="final immutable"):
+        journal.freeze_opening_snapshot(
+            contract, "PUBLIC MARKET DATA", history(), [before],
+            "Coinbase BTC/USD proxy", opened, finalized=False,
+        )
     first = journal.freeze_opening_snapshot(
         contract, "PUBLIC MARKET DATA", history(), [before, after],
         "Coinbase BTC/USD proxy", opened + timedelta(seconds=1), finalized=True,
     )
     assert first["reference_points"] == [[before[0].isoformat(), before[1]]]
     assert first["data_cutoff"] == opened.isoformat()
+    assert timestamp(first["input_data_cutoff"]) < opened
     much_later = journal.opening_snapshot(contract["ticker"], "PUBLIC MARKET DATA")
     assert much_later == first
     replacement = journal.freeze_opening_snapshot(
@@ -183,6 +234,17 @@ def test_persisted_opening_snapshot_excludes_future_receipts_and_survives_time(t
         opened + timedelta(minutes=10), finalized=True,
     )
     assert replacement == first
+    with journal.connect() as db:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "UPDATE opening_input_snapshots SET finalized=0 WHERE mode=? AND ticker=?",
+                ("PUBLIC MARKET DATA", contract["ticker"]),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "DELETE FROM opening_input_snapshots WHERE mode=? AND ticker=?",
+                ("PUBLIC MARKET DATA", contract["ticker"]),
+            )
 
 
 def test_one_hundred_consecutive_openings_get_distinct_immutable_snapshots(tmp_path):
@@ -250,19 +312,33 @@ def test_monitor_preloads_complete_history_before_rollover_and_keeps_opening_imm
     )
     monitor.tick((before, preopen, preopen, 0))
     snapshot = journal.opening_snapshot(contract["ticker"], "PUBLIC MARKET DATA")
-    assert snapshot is not None
-    assert timestamp(snapshot["captured_at"]) < opened
-    assert engine.context24(snapshot["history"], opened)["status"] == "READY"
+    assert snapshot is None
 
     at_open = deepcopy(before)
     at_open.update(now=opened.isoformat(), clock=opened.isoformat(), stream_observations=[])
+    # A boundary refresh received after opening must not replace the complete
+    # receipt-proven pre-opening payload with zero history.
+    at_open["btc_candles"] = {
+        "source": candles["source"],
+        "received_at": (opened + timedelta(milliseconds=1)).isoformat(),
+        "diagnostics": {"status": "WARMING_UP", "missing_bars": 1440},
+        "candles": [],
+    }
     at_open["markets"][0]["observed_at"] = opened.isoformat()
     at_open["reference"] = {**at_open["reference"], "observed_at": opened.isoformat()}
     clock[0] = opened
     monitor.tick((at_open, opened, opened, 0))
+    snapshot = journal.opening_snapshot(contract["ticker"], "PUBLIC MARKET DATA")
+    assert snapshot is not None
+    assert timestamp(snapshot["captured_at"]) == opened
+    assert timestamp(snapshot["data_cutoff"]) == opened
+    assert timestamp(snapshot["input_data_cutoff"]) < opened
+    assert snapshot["finalized"] is True
+    assert engine.context24(snapshot["history"], opened)["status"] == "READY"
     original = journal.opening_record(contract["ticker"], "PUBLIC MARKET DATA")
     assert original and original["up"] is not None
     assert timestamp(original["data_cutoff"]) == opened
+    assert timestamp(original["input_data_cutoff"]) < opened
     assert timestamp(original["history_received_at"]) <= opened
 
     later = deepcopy(at_open)
@@ -274,6 +350,41 @@ def test_monitor_preloads_complete_history_before_rollover_and_keeps_opening_imm
     later["markets"][0]["observed_at"] = later_time.isoformat()
     monitor.tick((later, later_time, later_time, 0))
     assert journal.opening_record(contract["ticker"], "PUBLIC MARKET DATA") == original
+
+
+def test_incomplete_preopening_receipt_never_resets_to_zero_at_rollover(tmp_path):
+    opened = NOW
+    before_open = opened - timedelta(seconds=1)
+    contract = market()
+    incomplete = history(opened - timedelta(minutes=1), before_open)
+    missing_start = int(opened.timestamp()) - 3600
+    incomplete["candles"] = [
+        bar for bar in incomplete["candles"] if int(bar["start"]) != missing_start
+    ]
+    assert len(incomplete["candles"]) == 1439
+    monitor = Monitor(None, Journal(tmp_path / "rollover.db"))
+    before = frame()
+    before.update(
+        markets=[contract], btc_candles=incomplete,
+        now=before_open.isoformat(), clock=before_open.isoformat(),
+    )
+    monitor.remember_preopening_histories(before, before_open)
+
+    boundary = deepcopy(before)
+    boundary.update(now=opened.isoformat(), clock=opened.isoformat())
+    boundary["btc_candles"] = {
+        "source": incomplete["source"],
+        "received_at": (opened + timedelta(milliseconds=1)).isoformat(),
+        "candles": [],
+    }
+    monitor.remember_preopening_histories(boundary, opened)
+
+    retained = monitor.preopening_histories[contract["ticker"]]
+    assert len(retained["candles"]) == 1439
+    context = engine.context24(retained, opened)
+    assert context["status"] == "INSUFFICIENT DATA"
+    assert "1439/1440" in context["reason"]
+    assert "missing UTC intervals" in context["reason"]
 
 
 def test_recording_revisions_and_official_scoring_do_not_backfill_or_duplicate(tmp_path):
@@ -435,9 +546,9 @@ def test_opening_panel_reports_supported_price_and_uncalibrated_quality_without_
     opening = engine.opening_forecast(
         m, h, points(), NOW + timedelta(seconds=2), reference_source="Mock Coinbase spot"
     )
-    assert opening["direction"] in ("UP", "DOWN", "UNCLEAR")
+    assert opening["direction"] == "UNCLEAR"
     assert opening["up"] + opening["down"] == pytest.approx(1)
-    assert opening["confidence"]["status"] == "UNCALIBRATED"
+    assert opening["confidence"]["status"] == "NO VERIFIED EDGE"
     assert opening["data_quality"]["closed_history_bars"] == 1440
     assert opening["reference_source"] == "Mock Coinbase spot"
     assert opening["settlement_price_estimate"]["mean"] == pytest.approx(

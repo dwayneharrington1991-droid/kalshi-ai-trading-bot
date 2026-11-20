@@ -50,7 +50,10 @@ class StreamHub:
         self.pending = deque(maxlen=max_pending)
         self.feeds = {}
         self.sessions = {}
-        self.channel_sequences = {}
+        # Coinbase Advanced Trade numbers messages once per connection, across
+        # all channels (including subscription confirmations); see
+        # tests/test_coinbase_connection_sequence.py.
+        self.connection_sequence = None
         self.seen_ids = set()
         self.trade_ids = deque(maxlen=10000)
         self.kraken_ids = {}
@@ -88,7 +91,7 @@ class StreamHub:
         with self.condition:
             self.sessions[venue] = self.sessions.get(venue, 0) + 1
             if venue == "coinbase":
-                self.channel_sequences.clear()
+                self.connection_sequence = None
                 self.seen_ids.clear()
                 self.trade_ids.clear()
                 self._last_utc = self._last_monotonic = None
@@ -152,13 +155,14 @@ class StreamHub:
                 if data.get("type") == "error":
                     raise ValueError("Public subscription rejected")
                 channel = data.get("channel")
-                if channel not in {"ticker", "market_trades", "heartbeats"}:
-                    return False
+                # The sequence is connection-wide, so it is checked for every
+                # message, before the channel filter (subscription confirmations
+                # consume numbers too).
                 seq = data.get("sequence_num")
                 if seq is not None:
                     if type(seq) is not int or seq < 0:
                         raise ValueError("Invalid source sequence")
-                    previous = self.channel_sequences.get(channel)
+                    previous = self.connection_sequence
                     if previous is not None:
                         if seq == previous:
                             return False
@@ -167,7 +171,9 @@ class StreamHub:
                         if seq != previous + 1:
                             self.metrics["missing_updates"] += seq - previous - 1
                             raise ValueError("Source sequence gap; reconnect required")
-                    self.channel_sequences[channel] = seq
+                    self.connection_sequence = seq
+                if channel not in {"ticker", "market_trades", "heartbeats"}:
+                    return False
                 if channel == "heartbeats":
                     self.metrics["last_heartbeat_received_at"] = received_at.isoformat()
                     return False

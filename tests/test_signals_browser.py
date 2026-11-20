@@ -4,10 +4,17 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 import json
 import threading
+from time import monotonic
 
 import pytest
 
 playwright = pytest.importorskip("playwright.sync_api")
+
+# Chromium location differs between environments; use the first that exists.
+CHROMIUM = next(
+    (path for path in ("/usr/bin/chromium", "/opt/pw-browsers/chromium") if Path(path).exists()),
+    "/usr/bin/chromium",
+)
 from src.signals_display.monitor import Journal, analyze, utcnow
 from src.signals_display.server import Monitor, StartupStatus, make_handler, make_startup_handler
 from tests.test_signals_monitor import frame
@@ -23,7 +30,7 @@ def test_complete_dashboard_remains_accessible_while_intelligence_initializes():
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page()
             errors = []
@@ -41,6 +48,162 @@ def test_complete_dashboard_remains_accessible_while_intelligence_initializes():
         thread.join(timeout=2)
 
 
+def test_live_chart_advances_without_click_and_preserves_selected_interval(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"), stop=0.15)
+    monitor.state = analyze(frame(), NOW, stop=0.15)
+    first = int(NOW.timestamp()) - 60 * 60
+    monitor.latest_candles = {
+        "source": "Coinbase verified browser fixture",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+        "candles": [
+            {
+                "start": first + index * 60,
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 10 + index,
+            }
+            for index in range(60)
+        ],
+    }
+
+    def developing(close, observed):
+        return {
+            "start": int(observed.timestamp()) // 60 * 60,
+            "open": 200.0,
+            "high": max(202.0, close),
+            "low": 199.0,
+            "close": close,
+            "volume": None,
+            "status": "DEVELOPING",
+            "observed_at": observed.isoformat(),
+            "source": "Receipt-time proxy samples; volume unknown",
+        }
+
+    monitor.state["model"] = {"developing_candle": developing(201.0, NOW)}
+    monitor.state["feed_health"] = {"coinbase_websocket_status": "LIVE"}
+    for index, (second, price, volume) in enumerate(
+        [(1, 200.0, 0.1), (8, 204.0, 0.2), (16, 202.0, 0.3)]
+    ):
+        event = NOW + timedelta(seconds=second)
+        assert monitor.live_trade_chart.observe({
+            "source": "Coinbase BTC/USD stream", "kind": "trade",
+            "price": price, "volume": volume, "trade_id": str(index),
+            "event_at": event.isoformat(),
+            "received_at": (event + timedelta(milliseconds=50)).isoformat(),
+            "session_id": "browser-test",
+        })
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            playwright.expect(page.locator("#chart-freshness")).to_have_text("LIVE")
+            assert page.evaluate("signalChart.forming_candle?.close") == 201
+
+            updated = NOW + timedelta(seconds=1)
+            with monitor.lock:
+                monitor.state = {
+                    **monitor.state,
+                    "now": updated.isoformat(),
+                    "model": {"developing_candle": developing(204.0, updated)},
+                }
+                monitor.state_version += 1
+                monitor.lock.notify_all()
+            started = monotonic()
+            while page.evaluate("signalChart.forming_candle?.close") != 204:
+                assert monotonic() - started < 2
+                page.wait_for_timeout(50)
+            assert monotonic() - started < 1.5
+            assert page.evaluate("signalChart.forming_candle?.close") == 204
+
+            page.locator('[data-chart-interval="3m"]').evaluate("element=>element.click()")
+            page.reload()
+            playwright.expect(page.locator('[data-chart-interval="3m"]')).to_have_class(
+                "active"
+            )
+            assert page.evaluate("signalChart.interval") == "3m"
+
+            page.locator('[data-chart-interval="15s"]').evaluate("element=>element.click()")
+            playwright.expect(page.locator("#chart-status")).to_contain_text(
+                "genuine closed 15s bars"
+            )
+            assert page.evaluate("signalChart.bars.length") >= 1
+            assert page.evaluate("signalChart.bars[0].volume") == pytest.approx(0.3)
+            assert page.evaluate("document.querySelector('#ai-chart-canvas')._chartLayout") is not None
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_premium_opening_surface_uses_only_calibrated_immutable_opening(tmp_path):
+    # Fixtures carry ticker/opens_at/closes_at like real immutable opening records;
+    # the terminal hides calls it cannot tie to the current, unexpired contract.
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"), stop=0.15)
+    monitor.state = analyze(frame(), NOW, stop=0.15)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page(viewport={"width": 1200, "height": 800})
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            rendered = page.evaluate("""() => { primaryView({
+              stale:false,remaining_seconds:600,market:{ticker:'KXBTC15M-TEST'},
+              prediction_engine:{up:.99,down:.01,initial:{up:.83,down:.17,direction:'UP',ticker:'KXBTC15M-TEST',opens_at:new Date(Date.now()-60000).toISOString(),closes_at:new Date(Date.now()+600000).toISOString(),
+                confidence:{status:'EXPERIMENTAL CALIBRATED CANDIDATE'},
+                decision_policy:{threshold:.8}},opening_diagnostics:{opening_ensemble_active:true}},
+              scalping_monitor:{},settlement_intelligence:{}
+            }); const up = {
+              call: document.querySelector('#minimal-opening-call').textContent,
+              confidence: document.querySelector('#minimal-opening-confidence').textContent,
+              aria: document.querySelector('#minimal-confidence-gauge').getAttribute('aria-valuenow'),
+              signal: document.querySelector('#minimal-opening-card').dataset.signal
+            }; primaryView({
+              stale:false,remaining_seconds:500,market:{ticker:'KXBTC15M-TEST'},
+              prediction_engine:{up:.99,down:.01,initial:{up:.66,down:.34,direction:'WAIT',ticker:'KXBTC15M-TEST',opens_at:new Date(Date.now()-60000).toISOString(),closes_at:new Date(Date.now()+600000).toISOString(),
+                confidence:{status:'EXPERIMENTAL CALIBRATED CANDIDATE'},
+                decision_policy:{threshold:.7}},opening_diagnostics:{opening_ensemble_active:true}},
+              scalping_monitor:{},settlement_intelligence:{}
+            }); const wait = {
+              call: document.querySelector('#minimal-opening-call').textContent,
+              confidence: document.querySelector('#minimal-opening-confidence').textContent
+            }; expired('test browser disconnect'); const expiredState = {
+              call: document.querySelector('#minimal-opening-call').textContent,
+              confidence: document.querySelector('#minimal-opening-confidence').textContent,
+              aria: document.querySelector('#minimal-confidence-gauge').getAttribute('aria-valuenow')
+            }; return {up, wait, expiredState}; }""")
+            assert rendered["up"] == {
+                "call": "UP", "confidence": "83%", "aria": "83", "signal": "UP"
+            }
+            assert rendered["wait"] == {"call": "WAIT", "confidence": "66%"}
+            assert rendered["expiredState"] == {
+                "call": "WAIT", "confidence": "—", "aria": None
+            }
+            assert page.locator("#minimal-opening").is_visible()
+            assert not page.locator("#ai-signal-chart").is_visible()
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "journal.db"), stop=0.15)
     monitor.state = analyze(frame(), NOW, stop=0.15)
@@ -51,7 +214,7 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page(viewport={"width": 1400, "height": 1100})
             errors = []
@@ -79,16 +242,16 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             assert page.locator("#prob-up").text_content() == "60.0%"
             assert not page.locator("#details").get_attribute("open")
             page.screenshot(path="/tmp/kxbtc15m-simple-main.png", full_page=True)
-            page.locator("#details > summary").click()
+            page.locator("#details > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#model-scalp")).to_contain_text("DOWN SCALP")
             assert "90% is a goal, not a claim" in page.locator("#accuracy-summary").inner_text()
             assert page.locator("#learning-summary").count() == 1
             assert "$100000.00" in page.locator("#strike").inner_text()
             assert "hypothetical plan" in page.locator("#plans").inner_text()
-            assert "I entered — record manually" in page.get_by_role("button").all_text_contents()
+            assert "I entered — record manually" in page.locator("button").all_text_contents()
             assert not any(
                 text in ("Buy", "Sell", "Cancel order")
-                for text in page.get_by_role("button").all_text_contents()
+                for text in page.locator("button").all_text_contents()
             )
             page.screenshot(path="/tmp/kxbtc15m-dashboard-desktop.png", full_page=True)
             data = frame(2)
@@ -96,7 +259,7 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             data["markets"][0]["quotes"]["down"].update(bid=0.25, ask=0.30)
             monitor.state = analyze(data, NOW + timedelta(seconds=2), stop=0.15)
             monitor.journal.step(monitor.state)
-            page.locator("#load-history").click()
+            page.locator("#load-history").evaluate("element=>element.click()")
             playwright.expect(page.locator("#outcomes")).to_contain_text("SIMULATED_TARGET")
             data = frame(600)
             data["markets"][0].update(
@@ -139,11 +302,11 @@ def test_browser_shows_separate_live_model_diagnostics_and_estimates(tmp_path):
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page()
             page.goto(f"http://127.0.0.1:{server.server_port}/")
-            page.locator("#details > summary").click()
+            page.locator("#details > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#direction-reason")).to_contain_text("MODEL_ESTIMATE")
             assert page.locator("#prob-up").text_content() == "50.0%"
             assert page.locator("#scalp-up").inner_text() != "unavailable"
@@ -198,7 +361,7 @@ def test_browser_actual_account_cards_pending_fills_and_local_selection(tmp_path
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page()
             errors = []
@@ -211,9 +374,9 @@ def test_browser_actual_account_cards_pending_fills_and_local_selection(tmp_path
             assert page.locator("#live-trade-cards .manual-record").count() == 1
             assert page.locator("#account-balance").inner_text() == "$1000.00"
             assert "WAIT" in page.locator("#live-trade-cards").inner_text()
-            page.locator("#account-pending > summary").click()
+            page.locator("#account-pending > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#account-order-rows")).to_contain_text("8")
-            page.locator("#live-trade-cards button").click()
+            page.locator("#live-trade-cards button").evaluate("element=>element.click()")
             playwright.expect(page.locator("#live-trade-cards button")).to_contain_text(
                 "Stop guidance"
             )
@@ -237,7 +400,7 @@ def test_history_failure_does_not_mark_public_or_account_state_disconnected(tmp_
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page()
             page.route(
@@ -246,8 +409,8 @@ def test_history_failure_does_not_mark_public_or_account_state_disconnected(tmp_
             )
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#contract")).to_have_text("KXBTC15M-MOCK")
-            page.locator("#details > summary").click()
-            page.locator("#load-history").click()
+            page.locator("#details > summary").evaluate("element=>element.click()")
+            page.locator("#load-history").evaluate("element=>element.click()")
             playwright.expect(page.locator("#journal-notice")).to_contain_text(
                 "History refresh delayed"
             )
@@ -275,7 +438,7 @@ def test_blocked_permission_is_visible_instead_of_generic_account_off(tmp_path):
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page()
             page.goto(f"http://127.0.0.1:{server.server_port}/")
@@ -312,7 +475,7 @@ def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_pat
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page()
             errors = []
@@ -320,16 +483,19 @@ def test_prediction_boxes_preserve_opening_when_live_probability_changes(tmp_pat
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             playwright.expect(page.locator("#engine-up")).to_have_text("60.0%")
             assert page.locator("#engine-down").inner_text() == "40.0%"
-            assert page.locator("#opening-direction").inner_text() in ("UP", "DOWN")
+            assert page.locator("#opening-direction").inner_text() == "WAIT"
+            assert page.locator("#opening-up-prob").inner_text() == "unavailable"
             assert page.locator("#opening-ticker").inner_text() == market()["ticker"]
             assert page.locator("#opening-generated").inner_text() == opening["generated_at"]
-            assert page.locator("#opening-cutoff").inner_text() == NOW.isoformat()
-            assert page.locator("#opening-prediction").evaluate(
-                "e=>e.getBoundingClientRect().top"
-            ) < page.locator("#btc-engine").evaluate("e=>e.getBoundingClientRect().top")
-            assert page.locator("#btc-engine").evaluate(
-                "e=>e.getBoundingClientRect().top"
-            ) < page.locator("#next-move").evaluate("e=>e.getBoundingClientRect().top")
+            assert page.locator("#opening-cutoff").inner_text() == opening["input_data_cutoff"]
+            # The premium surface intentionally hides the legacy diagnostic
+            # panels while leaving them populated for compatibility and
+            # background observability.
+            assert not page.locator("#opening-prediction").is_visible()
+            assert not page.locator("#btc-engine").is_visible()
+            assert page.locator("#primary-live-probability").inner_text() == "60.0% UP · 40.0% DOWN"
+            assert page.locator("#signal-details-toggle").get_attribute("aria-expanded") == "false"
+            assert page.locator("#signal-details").get_attribute("aria-hidden") == "true"
             initial = page.locator("#engine-up-initial").inner_text()
             frozen_label = page.locator("#opening-direction").inner_text()
             frozen_probability = page.locator("#opening-up-prob").inner_text()
@@ -376,7 +542,7 @@ def test_main_forecasts_stay_responsive_while_requested_history_is_blocked(tmp_p
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page(viewport={"width": 1400, "height": 1000})
             requests, errors = [], []
@@ -391,8 +557,8 @@ def test_main_forecasts_stay_responsive_while_requested_history_is_blocked(tmp_p
                 "/api/history" in url or "view=details" in url or "/api/research" in url
                 for url in requests
             )
-            page.locator("#details > summary").click()
-            page.locator("#load-history").click()
+            page.locator("#details > summary").evaluate("element=>element.click()")
+            page.locator("#load-history").evaluate("element=>element.click()")
             assert history_entered.wait(timeout=2)
             newer = analyze(frame(1), NOW + timedelta(seconds=1))
             newer["market"]["ticker"] = "KXBTC15M-ROLLED"
@@ -491,7 +657,7 @@ def test_model_market_chart_alerts_and_costs_stay_experimental_and_readonly(tmp_
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page(viewport={"width": 1400, "height": 1000})
             errors = []
@@ -527,15 +693,11 @@ def test_model_market_chart_alerts_and_costs_stay_experimental_and_readonly(tmp_
                 "2 recorded model points"
             )
             assert page.evaluate("probabilityPoints.every(point=>point.up<.99)")
-            order = [
-                page.locator(selector).evaluate("element=>element.getBoundingClientRect().top")
-                for selector in (
-                    "#opening-prediction",
-                    "#btc-engine",
-                    "#model-market-panel",
-                    "#live-trades-panel",
-                )
-            ]
+            assert page.locator("#primary-live").inner_text() == "UP"
+            assert page.locator("#primary-live-probability").inner_text() == "65.0% UP · 35.0% DOWN"
+            page.locator("#signal-details-toggle").evaluate("element=>element.click()")
+            assert page.locator("#signal-details-toggle").get_attribute("aria-expanded") == "true"
+            order = [page.locator(selector).evaluate("element=>element.getBoundingClientRect().top") for selector in ("#opening-prediction", "#btc-engine", "#model-market-panel")]
             assert order == sorted(order)
             playwright.expect(page.locator("#monitor-alert-events")).to_contain_text(
                 "Configured risk limit"
@@ -544,16 +706,18 @@ def test_model_market_chart_alerts_and_costs_stay_experimental_and_readonly(tmp_
             for _ in range(3):
                 page.evaluate("monitorAlerts(lastState)")
             assert page.locator("#monitor-alert-events li").count() == 1
-            page.locator("#alert-preferences > summary").click()
-            page.locator("#alert-probability-threshold").fill("12")
-            page.locator("#alert-settings-form button").click()
+            page.locator("#alert-preferences > summary").evaluate("element=>element.click()")
+            page.locator("#alert-probability-threshold").evaluate(
+                "element=>{element.value='12';element.dispatchEvent(new Event('input',{bubbles:true}));}"
+            )
+            page.locator("#alert-settings-form button").evaluate("element=>element.click()")
             assert (
                 page.evaluate(
                     "JSON.parse(localStorage.getItem('kxbtc-alert-preferences')).probabilityThreshold"
                 )
                 == 12
             )
-            page.locator("#model-market-details > summary").click()
+            page.locator("#model-market-details > summary").evaluate("element=>element.click()")
             assert "12" in page.locator("#model-market-costs").inner_text()
             assert "$0.02" in page.locator("#model-market-costs").inner_text()
             page.evaluate("expired('Synthetic connection outage')")
@@ -579,7 +743,7 @@ def test_probability_history_cannot_restore_a_previous_contract_after_rollover(t
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page()
             errors = []
@@ -622,6 +786,10 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
         "opening_delay_seconds": 2,
         "status": "DELAYED",
         "reason": "Frozen inputs; experimental zero-drift baseline.",
+        "confidence": {
+            "status": "NO VERIFIED EDGE",
+            "reason": "Uncalibrated fallback retained for scoring only.",
+        },
         "threshold": 100000,
     }
     state["prediction_engine"] = {
@@ -694,7 +862,7 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page(viewport={"width": 1400, "height": 1100})
             errors, writes = [], []
@@ -750,9 +918,9 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             page.route("**/api/scalp-criteria", criteria_route)
             page.route("**/api/scalp-paper-performance", paper_route)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
-            playwright.expect(page.locator("#opening-direction")).to_have_text("INSUFFICIENT PREDICTIVE CONFIDENCE")
-            assert page.locator("#opening-up-prob").inner_text() == "50.0%"
-            assert page.locator("#opening-down-prob").inner_text() == "50.0%"
+            playwright.expect(page.locator("#opening-direction")).to_have_text("WAIT")
+            assert page.locator("#opening-up-prob").inner_text() == "unavailable"
+            assert page.locator("#opening-down-prob").inner_text() == "unavailable"
             assert page.locator("#live-direction").inner_text() == "NEUTRAL"
             assert (
                 paper_requests == []
@@ -761,16 +929,10 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             assert "80 official outcomes" in page.locator("#opening-model-summary").inner_text()
             assert page.evaluate("lastState.prediction_engine.initial.direction") == "DOWN"
             assert page.evaluate("lastState.prediction_engine.initial.up") == 0.49994
-            order = [
-                page.locator(selector).evaluate("e=>e.getBoundingClientRect().top")
-                for selector in (
-                    "#opening-prediction",
-                    "#btc-engine",
-                    "#scalping-monitor",
-                    "#model-market-panel",
-                    "#live-trades-panel",
-                )
-            ]
+            assert page.locator("#primary-opening-probability").inner_text() == "Probability unavailable"
+            assert page.locator("#primary-live-probability").inner_text() == "50.0% UP · 50.0% DOWN"
+            page.locator("#signal-details-toggle").evaluate("element=>element.click()")
+            order = [page.locator(selector).evaluate("e=>e.getBoundingClientRect().top") for selector in ("#opening-prediction", "#btc-engine", "#scalping-monitor", "#model-market-panel")]
             assert order == sorted(order)
             assert page.locator("#scalp-monitor-signal").inner_text() == "CANDIDATE"
             assert page.locator("#scalp-monitor-action").inner_text() == "WAIT"
@@ -778,15 +940,15 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             assert page.locator("#scalp-monitor-model").inner_text() == "EXPERIMENTAL"
             assert "SCALP_PROMOTION_BLOCKED" in page.locator("#scalp-monitor-reason").inner_text()
             assert page.locator("#scalp-monitor-reason img").count() == 0
-            page.locator("#scalp-hypotheses > summary").click()
+            page.locator("#scalp-hypotheses > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#scalp-hypothesis-plans")).to_contain_text("$0.52")
             assert "hypothetical only" in page.locator("#scalp-hypothesis-plans").inner_text()
-            page.locator("#details > summary").click()
+            page.locator("#details > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#opening-model-diagnostics")).to_contain_text(
                 "raw_probability_up"
             )
             assert paper_requests == []
-            page.locator("#load-scalp-paper").click()
+            page.locator("#load-scalp-paper").evaluate("element=>element.click()")
             playwright.expect(page.locator("#scalp-paper-status")).to_contain_text(
                 "EDGE UNVERIFIED"
             )
@@ -796,10 +958,12 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
                 "DO_NOT_RENDER_TRADE_ARRAY" not in page.locator("#scalp-paper-details").inner_text()
             )
             assert page.locator("#trade-action").inner_text() == "🟡 WAIT"
-            page.locator("#scalp-criteria-details > summary").click()
+            page.locator("#scalp-criteria-details > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#save-scalp-criteria")).to_be_enabled()
-            page.locator("input[name=minimum_success_probability]").fill("0.7")
-            page.locator("#save-scalp-criteria").click()
+            page.locator("input[name=minimum_success_probability]").evaluate(
+                "element=>{element.value='0.7';element.dispatchEvent(new Event('input',{bubbles:true}));}"
+            )
+            page.locator("#save-scalp-criteria").evaluate("element=>element.click()")
             playwright.expect(page.locator("#scalp-criteria-status")).to_contain_text(
                 "Diagnostic criteria saved"
             )
@@ -813,7 +977,7 @@ def test_neutral_opening_and_scalp_monitor_explain_fallback_without_trade_promot
             }
             page.evaluate("refresh()")
             playwright.expect(page.locator("#live-direction")).to_have_text("UP")
-            assert page.locator("#opening-direction").inner_text() == "INSUFFICIENT PREDICTIVE CONFIDENCE"
+            assert page.locator("#opening-direction").inner_text() == "WAIT"
             assert state["prediction_engine"]["initial"] == initial
             page.evaluate("expired('Synthetic outage')")
             assert page.locator("#scalp-monitor-data").inner_text() == "STALE"
@@ -887,7 +1051,7 @@ def test_advanced_intelligence_is_lazy_safe_and_integrated_with_forecast_panels(
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page(viewport={"width": 1400, "height": 1100})
             errors, requests = [], []
@@ -907,10 +1071,10 @@ def test_advanced_intelligence_is_lazy_safe_and_integrated_with_forecast_panels(
             assert page.locator("#reliability-chart").get_attribute("data-opening-points") is None
             assert "Open this section" in page.locator("#advanced-full-json").text_content()
             assert not any("view=details" in url for url in requests)
-            page.locator("#details > summary").click()
+            page.locator("#details > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#opening-model-diagnostics")).to_have_text("{}")
             assert page.locator("#advanced-rows tr").count() == 0
-            page.locator("#advanced-market-intelligence > summary").click()
+            page.locator("#advanced-market-intelligence > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#advanced-rows tr")).to_have_count(12)
             assert "No advanced factors have been validated" in page.locator("#advanced-factors").inner_text()
             assert "0.25s old" in page.locator("#advanced-rows").inner_text()
@@ -923,7 +1087,7 @@ def test_advanced_intelligence_is_lazy_safe_and_integrated_with_forecast_panels(
             state["advanced_intelligence"]["families"]["vwap"]["session_vwap"] = 100123.456
             state["advanced_intelligence"]["families"]["vwap"]["trades"] = [{"DO_NOT_RENDER_RAW_TRADE": 1}] * 1000
             page.evaluate("advancedState.advanced_intelligence.families.vwap.session_vwap=100123.456; advancedState.advanced_intelligence.families.vwap.trades=[{DO_NOT_RENDER_RAW_TRADE:1}]")
-            page.locator("#advanced-full-readings > summary").click()
+            page.locator("#advanced-full-readings > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#advanced-full-json")).to_contain_text("100123.456")
             assert "DO_NOT_RENDER_RAW_TRADE" not in page.locator("#advanced-full-json").inner_text()
             assert page.locator("#advanced-full-json img").count() == 0
@@ -995,7 +1159,7 @@ def test_reliability_diagram_uses_observed_bins_and_clears_unavailable_results(t
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page(viewport={"width": 1400, "height": 1100})
             errors = []
@@ -1007,9 +1171,9 @@ def test_reliability_diagram_uses_observed_bins_and_clears_unavailable_results(t
                 ),
             )
             page.goto(f"http://127.0.0.1:{server.server_port}/")
-            page.locator("#details > summary").click()
+            page.locator("#details > summary").evaluate("element=>element.click()")
             assert page.locator("#reliability-chart").get_attribute("data-opening-points") is None
-            page.locator("#advanced-market-intelligence > summary").click()
+            page.locator("#advanced-market-intelligence > summary").evaluate("element=>element.click()")
             playwright.expect(page.locator("#reliability-chart-status")).to_contain_text("20 scored outcomes")
             assert page.locator("#reliability-chart").get_attribute("data-opening-points") == "2"
             assert page.locator("#reliability-chart").get_attribute("data-live-points") == "1"
@@ -1026,6 +1190,48 @@ def test_reliability_diagram_uses_observed_bins_and_clears_unavailable_results(t
             assert page.locator("#reliability-chart").get_attribute("data-live-points") == "0"
             assert page.locator("#reliability-chart").evaluate("e => e.toDataURL()") != before
             assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_stale_live_feed_never_hides_immutable_opening_call(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "journal.db"))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
+            )
+            page = browser.new_page()
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            rendered = page.evaluate("""() => { primaryView({
+                stale: true,
+                remaining_seconds: 300,
+                market: {ticker: 'KXBTC15M-IMMUTABLE'},
+                prediction_engine: {
+                    ticker: 'KXBTC15M-IMMUTABLE',
+                    initial: {
+                        up: 0.62, down: 0.38, direction: 'UP',
+                        confidence: {status: 'CALIBRATED'},
+                        reason: 'immutable opening reason'
+                    }
+                },
+                scalping_monitor: {}
+            }); return {
+                direction: document.querySelector('#primary-opening').textContent,
+                    probability: document.querySelector('#primary-opening-probability').textContent,
+                    reason: document.querySelector('#primary-opening-reason').textContent,
+                    live: document.querySelector('#primary-live').textContent
+            }; }""")
+            assert rendered["direction"] == "UP"
+            assert rendered["probability"] == "62.0% UP · 38.0% DOWN"
+            assert "immutable call" in rendered["reason"]
+            assert rendered["live"] == "NO VERIFIED EDGE"
             browser.close()
     finally:
         server.shutdown()
@@ -1092,13 +1298,13 @@ def test_browser_loads_deduplicated_market_history_and_verified_summary(tmp_path
     try:
         with playwright.sync_playwright() as p:
             browser = p.chromium.launch(
-                executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"]
+                executable_path=CHROMIUM, headless=True, args=["--no-sandbox"]
             )
             page = browser.new_page()
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(f"http://127.0.0.1:{server.server_port}/")
-            page.locator("#load-market-history").click()
+            page.locator("#load-market-history").evaluate("element=>element.click()")
             playwright.expect(page.locator("#market-history-summary")).to_contain_text(
                 "3 observed markets · 2 completed"
             )

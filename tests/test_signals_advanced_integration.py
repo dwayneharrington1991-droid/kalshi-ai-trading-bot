@@ -355,17 +355,41 @@ def test_main_http_stays_thin_and_details_are_lazy_and_read_only(tmp_path):
         close_monitor(monitor)
 
 
-def test_cached_technical_readings_expire_inside_the_same_thirty_second_bucket():
+def test_cached_technical_readings_expire_without_waiting_for_a_new_candle():
     advanced = AdvancedIntelligence()
     data = history()
     at_limit = advanced.summarize(NOW + timedelta(seconds=120), candles=data)
     assert at_limit["families"]["rsi"]["status"] == "READY"
     assert at_limit["families"]["rsi"]["age_seconds"] == 120
-    # 120s and 130s share a cache bucket. Aging must still invalidate the
-    # readings instead of returning an indefinitely READY cached indicator.
+    # Aging must invalidate readings even though the candle identity is stable.
     expired = advanced.summarize(NOW + timedelta(seconds=130), candles=data)
     assert expired["families"]["rsi"]["status"] == "UNAVAILABLE"
     assert expired["candidate_features"]["advanced_1m_wilder_rsi14"] is None
+
+
+def test_technical_snapshot_is_reused_until_verified_candle_identity_changes(monkeypatch):
+    from src.signals_display import advanced as advanced_module
+
+    calls = 0
+    original = advanced_module.technical_snapshot
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(advanced_module, "technical_snapshot", counted)
+    intelligence = AdvancedIntelligence()
+    data = history()
+    intelligence.summarize(NOW, candles=data)
+    intelligence.summarize(NOW + timedelta(seconds=10), candles=data)
+    intelligence.summarize(NOW + timedelta(seconds=20), candles=data)
+    assert calls == 1
+
+    changed = deepcopy(data)
+    changed["received_at"] = (NOW + timedelta(seconds=21)).isoformat()
+    intelligence.summarize(NOW + timedelta(seconds=21), candles=changed)
+    assert calls == 2
 
 
 def test_cached_snapshot_ages_advanced_diagnostics_and_withholds_contribution(

@@ -47,6 +47,43 @@ def test_candle_preload_then_only_missing_minutes_are_requested(monkeypatch):
     assert second["candles"][-1]["start"] != first["candles"][-1]["start"]
 
 
+def test_overlapping_provider_revision_does_not_discard_complete_candle_window(monkeypatch):
+    from src.signals_display import monitor as module
+
+    clock = [NOW]
+    calls = [0]
+
+    def get(url, **_kwargs):
+        query = parse_qs(urlsplit(url).query)
+        left, right = int(query["start"][0]), int(query["end"][0])
+        calls[0] += 1
+        bars = []
+        for stamp in range(left, right, 60):
+            # After the initial preload, revise overlapping boundary bars.
+            close = "100009" if calls[0] > 5 and stamp < int(clock[0].timestamp()) // 60 * 60 - 60 else "100001"
+            bars.append(
+                dict(start=str(stamp), open="100000", high="100010", low="99999", close=close, volume="1")
+            )
+        return httpx.Response(200, json={"candles": bars}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(module, "utcnow", lambda: clock[0])
+    feed = PublicFeed(get)
+    first = feed.candles(clock[0])
+    clock[0] += timedelta(minutes=1)
+    second = feed.candles(clock[0])
+
+    assert len(second["candles"]) == 1440
+    assert second["diagnostics"]["status"] == "READY"
+    assert second["diagnostics"]["missing_bars"] == 0
+    assert second["diagnostics"]["conflicting_duplicate_intervals"] >= 1
+    assert second.get("error") is None
+    # Existing accepted history is immutable; only the new minute is appended.
+    first_by_start = {bar["start"]: bar for bar in first["candles"]}
+    second_by_start = {bar["start"]: bar for bar in second["candles"]}
+    overlap = set(first_by_start) & set(second_by_start)
+    assert all(first_by_start[start] == second_by_start[start] for start in overlap)
+
+
 def test_missing_coinbase_minutes_are_gap_filled_without_interpolation(monkeypatch):
     from src.signals_display import monitor as module
 
@@ -85,6 +122,177 @@ def test_missing_coinbase_minutes_are_gap_filled_without_interpolation(monkeypat
         "Coinbase Exchange BTC-USD one-minute gap fill"
     ] == 2
     assert any("api.exchange.coinbase.com" in url for url in calls)
+
+
+def test_primary_provider_backoff_does_not_block_independent_candle_fallback(monkeypatch):
+    """A 429/backoff on brokerage history must not abort Exchange recovery."""
+    from src.signals_display import monitor as module
+
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    calls = []
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        query = parse_qs(urlsplit(url).query)
+        if "api.exchange.coinbase.com" in url:
+            left = int(__import__("datetime").datetime.fromisoformat(query["start"][0]).timestamp())
+            right = int(__import__("datetime").datetime.fromisoformat(query["end"][0]).timestamp())
+            rows = [
+                [t, "99", "102", "100", "101", "1"]
+                for t in range(left, right, 60)
+            ]
+            return httpx.Response(200, json=rows, request=httpx.Request("GET", url))
+        return httpx.Response(
+            429, headers={"Retry-After": "30"}, json={},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    feed = PublicFeed(get)
+    result = feed.candles(NOW)
+
+    assert result["diagnostics"]["status"] == "READY"
+    assert len(result["candles"]) == 1440
+    assert [bar["start"] for bar in result["candles"]] == list(
+        range(cutoff - 86400, cutoff, 60)
+    )
+    attempts = result["diagnostics"]["provider_attempts"]
+    assert attempts[0]["provider"] == "Coinbase Advanced Trade candles"
+    assert attempts[0]["status"] == "UNAVAILABLE"
+    assert any(
+        item["provider"] == "Coinbase Exchange candles" and item["status"] == "OK"
+        for item in attempts
+    )
+    assert result["diagnostics"]["provider_backoffs"][0]["root_failure"] == "HTTP_STATUS_429"
+    assert result["diagnostics"]["next_retry_at"] is not None
+
+
+def test_all_provider_backoffs_report_retry_without_freezing_rolling_window(monkeypatch):
+    from src.signals_display import monitor as module
+
+    clock = [100.0]
+
+    def unavailable(url, **_kwargs):
+        return httpx.Response(
+            429, headers={"Retry-After": "20"}, json={},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    feed = PublicFeed(unavailable)
+    first = feed.candles(NOW)
+    assert first["diagnostics"]["status"] == "INCOMPLETE"
+    assert first["diagnostics"]["missing_intervals"][0].endswith("+00:00")
+    assert first["diagnostics"]["next_retry_at"] is not None
+    assert len(first["diagnostics"]["provider_backoffs"]) == 3
+
+    # Five seconds later the cache window advances even while all endpoints
+    # remain inside their independent provider cooldowns.
+    clock[0] += 5
+    later = NOW + timedelta(minutes=1)
+    second = feed.candles(later)
+    assert second["diagnostics"]["last_attempt_at"] == later.isoformat()
+    assert second["diagnostics"]["status"] == "INCOMPLETE"
+    assert second["diagnostics"]["next_retry_at"] is not None
+
+
+def test_shared_candle_gap_recovers_only_from_exact_timestamped_market_trades(monkeypatch):
+    from src.signals_display import monitor as module
+
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    absent = cutoff - 300
+    trade_request = {}
+
+    def get(url, **kwargs):
+        query = parse_qs(urlsplit(url).query)
+        if url.startswith(module.COINBASE_MARKET_TRADES):
+            trade_request.update(query=query, timeout=kwargs.get("timeout"))
+            # Unix-second strings: the live endpoint answers RFC3339 with HTTP 500.
+            assert query["start"] == [str(absent)]
+            assert query["end"] == [str(absent + 60)]
+            return httpx.Response(200, json={"trades": [
+                {"trade_id": "three", "time": __import__("datetime").datetime.fromtimestamp(absent + 50, __import__("datetime").timezone.utc).isoformat(), "price": "101", "size": "0.3"},
+                {"trade_id": "one", "time": __import__("datetime").datetime.fromtimestamp(absent + 5, __import__("datetime").timezone.utc).isoformat(), "price": "100", "size": "0.1"},
+                {"trade_id": "two", "time": __import__("datetime").datetime.fromtimestamp(absent + 30, __import__("datetime").timezone.utc).isoformat(), "price": "99", "size": "0.2"},
+            ]}, request=httpx.Request("GET", url))
+        if "api.exchange.coinbase.com" in url:
+            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+        left, right = int(query["start"][0]), int(query["end"][0])
+        return httpx.Response(200, json={"candles": [
+            dict(start=str(t), open="100", high="102", low="99", close="101", volume="1")
+            for t in range(left, right, 60) if t != absent
+        ]}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    result = PublicFeed(get).candles(NOW)
+    recovered = next(bar for bar in result["candles"] if bar["start"] == absent)
+    assert (recovered["open"], recovered["high"], recovered["low"], recovered["close"]) == (
+        100.0, 101.0, 99.0, 101.0
+    )
+    assert recovered["volume"] == pytest.approx(0.6)
+    assert "market trades" in recovered["source"]
+    assert result["diagnostics"]["status"] == "READY"
+    assert result["diagnostics"]["trade_recovery"] == [{
+        "start": absent,
+        "status": "RECOVERED_FROM_VERIFIED_TRADES",
+        "trades": 3,
+    }]
+    assert trade_request["timeout"] == 10
+
+
+def test_market_trade_history_failure_remains_explicit_and_fail_closed(monkeypatch):
+    from src.signals_display import monitor as module
+
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    absent = cutoff - 300
+
+    def get(url, **_kwargs):
+        query = parse_qs(urlsplit(url).query)
+        if url.startswith(module.COINBASE_MARKET_TRADES):
+            raise httpx.ReadTimeout("historical REST timed out")
+        if "api.exchange.coinbase.com" in url:
+            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+        left, right = int(query["start"][0]), int(query["end"][0])
+        return httpx.Response(200, json={"candles": [
+            dict(start=str(t), open="100", high="102", low="99", close="101", volume="1")
+            for t in range(left, right, 60) if t != absent
+        ]}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(module, "utcnow", lambda: NOW)
+    result = PublicFeed(get).candles(NOW)
+
+    assert result["diagnostics"]["status"] == "INCOMPLETE"
+    assert result["diagnostics"]["missing_intervals"] == [
+        __import__("datetime").datetime.fromtimestamp(
+            absent, __import__("datetime").timezone.utc
+        ).isoformat()
+    ]
+    assert result["diagnostics"]["trade_recovery"] == [{
+        "start": absent,
+        "status": "UNAVAILABLE",
+        "reason": "ReadTimeout: historical REST timed out",
+    }]
+    assert "MISSING_CANDLES" in result["error"]
+
+
+@pytest.mark.parametrize("trades", [
+    [
+        {"trade_id": "duplicate", "time": NOW.isoformat(), "price": "100", "size": "1"},
+        {"trade_id": "duplicate", "time": NOW.isoformat(), "price": "100", "size": "1"},
+    ],
+    [
+        {"trade_id": "future", "time": (NOW + timedelta(minutes=2)).isoformat(), "price": "100", "size": "1"},
+    ],
+])
+def test_trade_recovery_rejects_duplicate_or_out_of_window_receipts(trades):
+    start = int(NOW.timestamp()) // 60 * 60
+
+    def get(url, **_kwargs):
+        return httpx.Response(200, json={"trades": trades}, request=httpx.Request("GET", url))
+
+    with pytest.raises(ValueError):
+        PublicFeed(get)._candle_from_market_trades(start, start + 60)
 
 
 def test_unrecoverable_candle_gap_is_explicitly_incomplete(monkeypatch):

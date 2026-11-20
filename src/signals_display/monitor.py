@@ -42,6 +42,7 @@ CANDLE_WINDOW = 1440
 CANDLE_SECONDS = 60
 TRADE_RECOVERY_LIMIT = 1000
 TRADE_RECOVERY_MAX_MINUTES = 5
+TRADE_RECOVERY_MAX_PAGES = 10  # bounded: at most 10 x 1000 trades for one minute
 # A minute the trade endpoint CONFIRMED to contain no trades cannot be filled
 # (no bar is ever invented). Re-check it at most this often instead of on
 # every 5-second retry for up to 24 hours.
@@ -749,36 +750,56 @@ class PublicFeed:
         end = start + CANDLE_SECONDS
         if start % CANDLE_SECONDS or end > int(cutoff):
             raise ValueError("Trade recovery requires one aligned closed minute")
-        # Unlike the candle endpoint, Get Market Trades documents its range
-        # as RFC3339 timestamps. Sending Unix integers makes the service ignore
-        # or reject the historical range, commonly returning current trades
-        # that our exact-minute guard then (correctly) discards.
-        url = COINBASE_MARKET_TRADES + "?" + urlencode({
-            "start": datetime.fromtimestamp(start, timezone.utc).isoformat().replace("+00:00", "Z"),
-            "end": datetime.fromtimestamp(end, timezone.utc).isoformat().replace("+00:00", "Z"),
-            "limit": TRADE_RECOVERY_LIMIT,
-        })
-        # Historical public REST is outside the one-second quote path. Give it
-        # a bounded ten seconds without delaying live contract collection.
-        value = self._read(url, timeout=10)
-        trades = value.get("trades")
-        if not isinstance(trades, list):
-            raise ValueError("Unsupported Coinbase market-trades schema")
-        if len(trades) >= TRADE_RECOVERY_LIMIT:
+        # Verified against the live endpoint on 2026-11-20: RFC3339 start/end
+        # return HTTP 500 on every request, while Unix-second strings return
+        # trades bounded to [start, end) in descending time order. A busy BTC
+        # minute holds more than one page (2,477 trades at 2026-11-19 21:19
+        # UTC), so the minute is read newest-first in pages: each next page
+        # ends one second after the oldest trade seen, the overlapping second is
+        # de-duplicated by trade id, and the minute is complete only when a page
+        # comes back shorter than the limit. A page that cannot advance, a
+        # conflicting duplicate, or running out of pages fails closed.
+        by_id = {}
+        page_end = end
+        for _page in range(TRADE_RECOVERY_MAX_PAGES):
+            url = COINBASE_MARKET_TRADES + "?" + urlencode({
+                "start": str(start),
+                "end": str(page_end),
+                "limit": TRADE_RECOVERY_LIMIT,
+            })
+            # Historical public REST is outside the one-second quote path. Give
+            # it a bounded ten seconds without delaying live contract collection.
+            value = self._read(url, timeout=10)
+            trades = value.get("trades")
+            if not isinstance(trades, list):
+                raise ValueError("Unsupported Coinbase market-trades schema")
+            page_ids = set()
+            oldest = None
+            for raw in trades:
+                identifier = str(raw["trade_id"])
+                if identifier in page_ids:
+                    raise ValueError("Duplicate market trade identifier")
+                page_ids.add(identifier)
+                observed = timestamp(raw["time"])
+                if not start <= observed.timestamp() < min(end, page_end):
+                    raise ValueError("Market trade outside requested minute")
+                price = number(float(raw["price"]), 0.000001, 1e15)
+                size = number(float(raw["size"]), 0.000000000000001, 1e15)
+                row = (observed, identifier, price, size)
+                prior = by_id.get(identifier)
+                if prior is not None and prior != row:
+                    raise ValueError("Conflicting market trade receipts for one identifier")
+                by_id[identifier] = row
+                oldest = observed if oldest is None or observed < oldest else oldest
+            if len(trades) < TRADE_RECOVERY_LIMIT:
+                break
+            next_end = int(oldest.timestamp()) + 1
+            if next_end >= page_end:
+                raise ValueError("Market-trades response may be truncated")
+            page_end = next_end
+        else:
             raise ValueError("Market-trades response may be truncated")
-        parsed = []
-        identifiers = set()
-        for raw in trades:
-            identifier = str(raw["trade_id"])
-            if identifier in identifiers:
-                raise ValueError("Duplicate market trade identifier")
-            identifiers.add(identifier)
-            observed = timestamp(raw["time"])
-            if not start <= observed.timestamp() < end:
-                raise ValueError("Market trade outside requested minute")
-            price = number(float(raw["price"]), 0.000001, 1e15)
-            size = number(float(raw["size"]), 0.000000000000001, 1e15)
-            parsed.append((observed, identifier, price, size))
+        parsed = list(by_id.values())
         if not parsed:
             return None
         parsed.sort(key=lambda item: (item[0], item[1]))

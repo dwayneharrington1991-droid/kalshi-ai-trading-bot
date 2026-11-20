@@ -208,16 +208,9 @@ def test_shared_candle_gap_recovers_only_from_exact_timestamped_market_trades(mo
         query = parse_qs(urlsplit(url).query)
         if url.startswith(module.COINBASE_MARKET_TRADES):
             trade_request.update(query=query, timeout=kwargs.get("timeout"))
-            assert query["start"] == [
-                __import__("datetime").datetime.fromtimestamp(
-                    absent, __import__("datetime").timezone.utc
-                ).isoformat().replace("+00:00", "Z")
-            ]
-            assert query["end"] == [
-                __import__("datetime").datetime.fromtimestamp(
-                    absent + 60, __import__("datetime").timezone.utc
-                ).isoformat().replace("+00:00", "Z")
-            ]
+            # Unix-second strings: the live endpoint answers RFC3339 with HTTP 500.
+            assert query["start"] == [str(absent)]
+            assert query["end"] == [str(absent + 60)]
             return httpx.Response(200, json={"trades": [
                 {"trade_id": "three", "time": __import__("datetime").datetime.fromtimestamp(absent + 50, __import__("datetime").timezone.utc).isoformat(), "price": "101", "size": "0.3"},
                 {"trade_id": "one", "time": __import__("datetime").datetime.fromtimestamp(absent + 5, __import__("datetime").timezone.utc).isoformat(), "price": "100", "size": "0.1"},

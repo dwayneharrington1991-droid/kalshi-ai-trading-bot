@@ -46,3 +46,10 @@ Two sessions are pushing to this branch. Always fetch and rebase before pushing;
 - 3ce9071: CI runner shutdowns were caused by retire_old_bots.sh disabling the runner's own systemd unit (fixed; also protects crond.service).
 - GitHub Actions full suite on 3ce9071: 1843 passed, 14 skipped, 0 failed (17m45s).
 - Release report and the one deploy command: docs/release-20261120.md. Deploy NOT run.
+
+## Post-release session (2026-11-20, after 3ce9071 went live on 8768)
+- 3ce9071 deployed 04:19Z (soak PASS). Opening delay: 04:30 +1.60 s, 04:45 +1.77 s (old build +3.1 to +3.5 s).
+- cfa7706: activator refuses a promotion before touching the pointer when the captured launch is stale.
+  Context: the lifecycle cron on Oracle (pinned to 5a88d1a, --activator guarded) still holds a restart
+  capture for a269d08, so any promotion would fail safe but report "RESTORE NOT VERIFIED". Not changed on Oracle.
+- Edge-decay research: docs/research-20261120-edge-decay.md. No challenger beat the live model; none promoted.

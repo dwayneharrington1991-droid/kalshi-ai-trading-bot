@@ -48,3 +48,10 @@ def test_panel_shows_beginner_labels_for_every_required_section():
     for label in ("Data health", "Prediction edge", "Connections", "Inputs", "Speed", "Final-minute live probability",
                   "Recent opening results", "Scoreboards", "Not in the dashboard scoreboard", "Model and release"):
         assert label in block
+
+
+def test_live_connection_fields_come_from_the_served_snapshot():
+    """Deployed c3e92a5 showed Kalshi/Coinbase as n/a: feed_health exists only in monitor.snapshot()."""
+    route = SERVER[SERVER.index('route == "/api/accuracy-health"'):]
+    route = route[:route.index("elif route ==")]
+    assert "monitor.snapshot()" in route and 'state.get("feed_health")' in route

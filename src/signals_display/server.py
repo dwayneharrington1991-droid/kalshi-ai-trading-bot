@@ -2340,7 +2340,8 @@ def make_handler(monitor):
                 if getattr(monitor, "accuracy_health_report", None) is None:
                     artifact = monitor.opening_artifact if isinstance(getattr(monitor, "opening_artifact", None), dict) else None
                     monitor.accuracy_health_report = CachedReport(monitor.journal.path, artifact)
-                state = getattr(monitor, "state", None) or {}
+                # Same read-only view /api/state serves (feed health is built per snapshot).
+                state = monitor.snapshot() or {}
                 feed = state.get("feed_health") or {}
                 intel = ((state.get("model") or {}).get("market_intelligence") or {}).get("sources") or {}
 

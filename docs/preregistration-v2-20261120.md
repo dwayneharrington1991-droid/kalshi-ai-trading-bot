@@ -37,3 +37,14 @@ decide.
 - Live-model accuracy by confidence on the pre-freeze out-of-sample period: 42.6% (|P-0.5| < 0.02,
   n=94), 58.9% (0.02–0.05, n=112), 64.4% (0.05–0.08, n=59), 66.0% (>= 0.08, n=47). The ranking is
   informative but the probabilities are too timid (calibration slope 1.63).
+
+## Also tested in round v2 and rejected (not registered)
+- Regime-aware core16 (inputs split by 24 h volatility above or below the training median): Brier 0.2430
+  vs live 0.2425 (CI -0.0048 to +0.0058).
+- Mean-reversion ridge on inputs selected on development data only: 0.2450 (CI -0.0047 to +0.0096).
+- Platt-recalibrated core16: 0.2493 (worse).
+- Momentum baseline: 0.2485 (worse than the past UP rate).
+- Inference cost: linear models about 7 µs per opening; GBM a few ms. Speed is not a constraint.
+
+## How to score v2 (after about 2026-11-23 02:00 UTC)
+`powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\kalshi-bot-dev\repo\scripts\Run-ForwardEvalV2.ps1"`

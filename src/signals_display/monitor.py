@@ -292,10 +292,19 @@ class PublicFeed:
         )
         return re.sub(r"\W+", "_", code).strip("_") or type(exc).__name__
 
-    def _candle_retry_seconds(self, retained):
+    def _candle_retry_seconds(self, retained, now=None):
         """60 s when complete, or when every still-missing minute was confirmed
-        empty by the trade endpoint (retrying sooner cannot fill it); else 5 s."""
+        empty by the trade endpoint (retrying sooner cannot fill it); else 5 s.
+        A complete history whose newest closed bar ends before the current
+        minute boundary (fetched before the provider published the just-closed
+        minute) also retries after 5 s, so an opening does not freeze a history
+        that is a minute staler than necessary."""
         complete = retained >= 1440 and not (self.candle_cache or {}).get("error")
+        if complete and now is not None:
+            starts = [int(b["start"]) for b in (self.candle_cache or {}).get("candles", []) if "start" in b]
+            boundary = int(now.timestamp()) // CANDLE_SECONDS * CANDLE_SECONDS
+            if starts and max(starts) + CANDLE_SECONDS < boundary:
+                return 5
         return 60 if complete or self.only_confirmed_empty_missing else 5
 
     def sampled_candles(self, now):
@@ -319,7 +328,7 @@ class PublicFeed:
                 }
             self.candle_job = None
         retained = len((self.candle_cache or {}).get("candles", []))
-        retry_seconds = self._candle_retry_seconds(retained)
+        retry_seconds = self._candle_retry_seconds(retained, now)
         if self.candle_job is None and (
             self.candle_started is None
             or (now - self.candle_started).total_seconds() >= retry_seconds
@@ -457,7 +466,7 @@ class PublicFeed:
     def candles(self, now):
         self.candle_diagnostics["last_attempt_at"] = now.isoformat()
         retained = len((self.candle_cache or {}).get("candles", []))
-        retry_seconds = self._candle_retry_seconds(retained)
+        retry_seconds = self._candle_retry_seconds(retained, now)
         if (
             self.candles_checked is not None
             and (now - self.candles_checked).total_seconds() < retry_seconds

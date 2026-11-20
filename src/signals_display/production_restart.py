@@ -142,6 +142,16 @@ class ProductionRestarter:
             time.sleep(0.1)
         return False                                   # no force-kill: refuse and report
 
+    def can_restart(self):
+        """Read-only: True only when the port's single listener is exactly the captured launch."""
+        pid = _listener_pid(self.config["port"])
+        if pid is None:
+            return False
+        try:
+            return not _cgroup_is_systemd(pid) and same_launch(_cmdline(pid), self.config["argv"])
+        except OSError:
+            return False
+
     def __call__(self, artifact_path):
         pid = _listener_pid(self.config["port"])
         if pid is None:

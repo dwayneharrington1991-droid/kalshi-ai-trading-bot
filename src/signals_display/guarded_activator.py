@@ -133,6 +133,13 @@ class GuardedActivator(pr.Activator):
         previous = self._read_pointer()
         if previous is None:
             return {"ok": False, "detail": "no verified rollback reference (bootstrap missing)"}
+        can_restart = getattr(self.restarter, "can_restart", None)
+        if can_restart is not None and not can_restart():
+            # Checked before the pointer is touched: a restart that is certain to be refused (for example
+            # after a deployment changed the live launch) must not swap the pointer and then report a
+            # failed restore. Nothing is changed; the capture must be redone and re-authorized.
+            return {"ok": False, "detail": "RESTART_TEMPLATE_STALE: the live process does not match the "
+                    "captured launch; nothing was changed (recapture and re-authorize the restart)"}
         new = {"checksum": checksum, "file_sha": file_sha(artifact_path), "artifact": str(artifact_path)}
         if self._switch_to(new):
             return {"ok": True, "detail": f"switched to {checksum[:12]} (verified model file)"}

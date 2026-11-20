@@ -36,3 +36,8 @@ Two sessions are pushing to this branch. Always fetch and rebase before pushing;
 - 2bc07b1 Collector polls every 0.25 s for 6 s after each quarter-hour boundary (probe: Kalshi publishes the threshold within ~1 s; live delay was 2-3 s).
 - Draft PR #4 exists only to run Linux CI. PR-triggered "Deploy Oracle production" runs are test-only (production job requires workflow_dispatch on main) but share the oracle-production concurrency group, so they were cancelled.
 - Model evidence: live candidate over 281 out-of-sample openings Brier 0.2418 vs past-only base rate 0.2505 (CI of difference just excludes 0); second half shows no edge (0.2462 vs 0.2467). Fresh retrain on latest 61-contract block loses to the train prior; gate correctly keeps NO_CANDIDATE. Nothing promoted.
+
+## Release verification (merged head)
+- Head: ce5680d (includes djhalyze commits e8e8808, b3c8c3d, a081878, 2bc07b1 rebased under the checkpoint).
+- Full suite on ce5680d: 1840 passed, 9 skipped, 0 failed (960 s).
+- Production build on 8768 is a269d08 (ancestor of this head).

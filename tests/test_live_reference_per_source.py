@@ -66,3 +66,28 @@ def test_a_real_gap_still_resets_that_source_only():
     model.observe({"reference": {"source": CB, "observed_at": later.isoformat(), "price": 100500}},
                   later + timedelta(seconds=0.2))
     assert [p for _, p in model.reference] == [100500]
+
+
+def test_four_hours_with_outages_recover_and_stay_bounded():
+    """Deterministic long-run replay: 1 Hz interleaved ticks, a 20 s outage every 37 minutes."""
+    model = LiveEstimator()
+    recovered_after = []
+    outage_end = None
+    for s in range(4 * 3600):
+        at = NOW + timedelta(seconds=s)
+        if s % 2220 < 20:                                   # both exchanges silent
+            outage_end = s + (20 - s % 2220)
+            continue
+        _tick(model, CB, at, 100000 + (s % 500))
+        _tick(model, KR, at + timedelta(milliseconds=400), 99990 + (s % 500))
+        model.observe({"reference": {"source": CB, "observed_at": at.isoformat(), "price": 100000 + (s % 500)}},
+                      at + timedelta(milliseconds=500))
+        series = model.reference
+        span = (series[-1][0] - series[0][0]).total_seconds()
+        if outage_end is not None and span >= 120:
+            recovered_after.append(s - outage_end)
+            outage_end = None
+    assert recovered_after and max(recovered_after) <= 121          # continuity returns 2 min after each outage
+    assert all(len(d) <= 1800 for d in model.reference_series.values())
+    assert all(len(h) <= 20000 for h in model.opening_references.values())
+    assert set(model.reference_series) == {"Coinbase BTC/USD proxy", "Kraken BTC/USD proxy"}

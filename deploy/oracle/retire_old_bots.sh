@@ -120,6 +120,7 @@ run() {
   mkdir -p "$root" && chmod 700 "$STATE_ROOT" "$root"
   crontab -l >"$root/crontab.before" 2>/dev/null || : >"$root/crontab.before"
   declare -A PID START UNIT SCOPE JOURNAL
+  local SELF_UNIT; SELF_UNIT=$(grep -oE '[^/]+\.service' "/proc/$$/cgroup" | grep -vE '^(user@[0-9]+|session-[0-9]+)\.service$' | tail -n1 || true)
   for p in "${OLD[@]}"; do
     local ids; ids=$(pids_on "$p")
     if [[ -z $ids ]]; then say "$p: no listener (already retired)"; continue; fi
@@ -128,6 +129,13 @@ run() {
     cwd=$(readlink -f "/proc/$pid/cwd"); j=$(flag_of "$pid" --journal); j=$(abs "$j" "$cwd"); [[ -n $j ]] && j=$(readlink -f "$j")
     [[ -n $j && $j == "$keep_journal" ]] && die "$p uses the SAME journal as $KEEP; refusing"
     unit=$(grep -oE '[^/]+\.service' "/proc/$pid/cgroup" | grep -vE '^(user@[0-9]+|session-[0-9]+)\.service$' | tail -n1)
+    if [[ -n $unit && $unit == "$SELF_UNIT" ]]; then
+      # The listener shares THIS script's own service unit (e.g. a CI runner or
+      # a cron job inside crond.service). Disabling that unit would stop this
+      # script and its caller, never just the old bot: stop the process alone.
+      say "$p: shares this script's own unit $unit; the unit is never stopped, only the process"
+      unit=""
+    fi
     if [[ -n $unit ]]; then grep -q 'user@[0-9]*\.service' "/proc/$pid/cgroup" && scope=--user || scope=system; fi
     mkdir -p "$b"
     cp "/proc/$pid/cmdline" "$b/argv.nul"; printf '%s\n' "$cwd" >"$b/cwd"; printf '%s\n' "$j" >"$b/journal"

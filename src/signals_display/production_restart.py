@@ -49,11 +49,27 @@ def _exited(pid):
     return state == "Z"
 
 
+def _service_units(text):
+    return set(re.findall(r"([^/\s]+\.service)", text))
+
+
 def _cgroup_is_systemd(pid):
+    """True when the process is managed by a systemd service other than our own.
+
+    A process inside the caller's own service unit (for example every process
+    of a CI runner, or of a cron job inside crond.service) is not separately
+    managed: treating that unit as the target's manager would make a restart
+    act on the caller itself.
+    """
     try:
-        return bool(re.search(r"\.service", Path(f"/proc/{pid}/cgroup").read_text()))
+        target = _service_units(Path(f"/proc/{pid}/cgroup").read_text())
     except OSError:
         return True                                   # cannot prove it is not systemd-managed: refuse
+    try:
+        own = _service_units(Path("/proc/self/cgroup").read_text())
+    except OSError:
+        own = set()
+    return bool(target - own)
 
 
 def artifact_flag_of(argv):

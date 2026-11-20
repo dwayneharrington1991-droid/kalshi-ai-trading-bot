@@ -23,8 +23,10 @@ if ($LASTEXITCODE -ne 0) { throw "The frozen evaluator differs from $FreezeCommi
 
 $dump = Join-Path $Out 'journal_dump.json'
 $art = Join-Path $Out 'live_artifact.json'
-cmd /c "ssh -i `"$Key`" -o BatchMode=yes $Server `"nice -n 19 /home/opc/kalshi-ai-trading-bot/.venv/bin/python -`" < `"$Repo\scripts\export_opening_research.py`" > `"$dump`" 2>nul"
-if ($LASTEXITCODE -ne 0 -or (Get-Item $dump).Length -lt 1000) { throw "Read-only export failed (exit $LASTEXITCODE)." }
+. (Join-Path $Repo 'scripts\ForwardEvalCommon.ps1')
+# Compressed, chunked and verified download (long single transfers from this PC were being cut off).
+Get-RemoteExport -Key $Key -Server $Server -RemotePython '/home/opc/kalshi-ai-trading-bot/.venv/bin/python' `
+    -ScriptFile "$Repo\scripts\export_opening_research.py" -Arguments '' -Destination $dump
 cmd /c "ssh -i `"$Key`" -o BatchMode=yes $Server `"cat $ArtifactRemote`" > `"$art`" 2>nul"
 if ((Get-FileHash $art).Hash -ne $ArtifactSha) {
     Write-Host "WARNING: the live artifact changed since the freeze; the comparison is against a different live model." -ForegroundColor Yellow

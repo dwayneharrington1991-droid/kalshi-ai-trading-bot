@@ -41,3 +41,8 @@ Two sessions are pushing to this branch. Always fetch and rebase before pushing;
 - Head: ce5680d (includes djhalyze commits e8e8808, b3c8c3d, a081878, 2bc07b1 rebased under the checkpoint).
 - Full suite on ce5680d: 1840 passed, 9 skipped, 0 failed (960 s).
 - Production build on 8768 is a269d08 (ancestor of this head).
+
+## Release candidate (second session, 2026-11-20 01:15 UTC)
+- 3ce9071: CI runner shutdowns were caused by retire_old_bots.sh disabling the runner's own systemd unit (fixed; also protects crond.service).
+- GitHub Actions full suite on 3ce9071: 1843 passed, 14 skipped, 0 failed (17m45s).
+- Release report and the one deploy command: docs/release-20261120.md. Deploy NOT run.

@@ -24,6 +24,8 @@ MISSING_DEGRADED = 31       # above the 28 stream-dependent micro/spot inputs, w
 MIN_EVIDENCE = 50           # settled live-model openings needed before judging the edge
 WINDOW = 100                # most recent settled live-model openings scored
 FEE_RATE = 0.07
+DISPLAYABLE_CONFIDENCE = {"CALIBRATED", "EXPERIMENTAL CALIBRATED CANDIDATE"}   # same rule as the scoreboard
+CACHE_SECONDS = 60
 
 
 def _ts(value):
@@ -97,6 +99,13 @@ def _technical(db, now, input_names):
                          "reference_age_at_open_seconds": (p.get("data_quality") or {}).get("reference_age_at_open_seconds"),
                          "reference_source": p.get("reference_source")})
     out["recent_openings"] = openings[:4]
+    delays = sorted(o["delay_seconds"] for o in openings if isinstance(o["delay_seconds"], (int, float)))
+    out["opening_delay_median_seconds"] = round(delays[len(delays) // 2], 2) if delays else None
+    sources = [o["reference_source"] for o in openings if o["reference_source"]]
+    out["reference_source_switches_recent"] = sum(a != b for a, b in zip(sources, sources[1:]))
+    if rows:
+        latest_payload = json.loads(rows[0][3]) if rows[0][3] else {}
+        out["latest_closed_history_bars"] = (latest_payload.get("data_quality") or {}).get("closed_history_bars")
     latest = openings[0] if openings else None
     out["latest_opening"] = latest
     heavy = [o for o in openings if o["missing_inputs"] is not None and o["missing_inputs"] >= MISSING_HEAVY]
@@ -125,6 +134,69 @@ def _technical(db, now, input_names):
             out["reasons"].append(f"latest opening generated {latest['delay_seconds']:.1f} s after the open")
     out["status"] = status
     return out
+
+
+def _scoreboards(db):
+    """Both call populations, with every exclusion counted. Nothing is hidden or removed."""
+    rows = db.execute(
+        """SELECT o.ticker, o.up, o.payload, f.outcome FROM btc_engine_opening o
+        LEFT JOIN forecast_outcomes f ON f.ticker=o.ticker AND f.origin='official'
+        WHERE o.mode='PUBLIC MARKET DATA' ORDER BY o.generated_at"""
+    ).fetchall()
+    dash = {"calls": 0, "correct": 0}
+    every = {"calls": 0, "correct": 0}
+    excluded = {}
+    for _ticker, up, payload, outcome in rows:
+        p = json.loads(payload) if payload else {}
+        direction = p.get("direction")
+        if direction not in ("UP", "DOWN") or outcome not in (0, 1):
+            continue
+        right = (direction == "UP") == (outcome == 1)
+        every["calls"] += 1
+        every["correct"] += right
+        status = (p.get("confidence") or {}).get("status")
+        if status in DISPLAYABLE_CONFIDENCE and isinstance(up, (int, float)) and (direction == "UP") == (up >= 0.5):
+            dash["calls"] += 1
+            dash["correct"] += right
+        else:
+            reason = f"confidence status {status!r} not displayable ({p.get('model') or 'unrecorded model'})"
+            entry = excluded.setdefault(reason, {"calls": 0, "correct": 0})
+            entry["calls"] += 1
+            entry["correct"] += right
+    for d in (dash, every):
+        d["accuracy"] = d["correct"] / d["calls"] if d["calls"] else None
+        d["accuracy_ci95"] = _wilson(d["correct"], d["calls"])
+    return {"dashboard_scoreboard": dash, "all_directional_calls": every,
+            "excluded_from_dashboard_scoreboard": excluded,
+            "note": "The dashboard scoreboard counts only calls whose confidence was displayable; the other "
+                    "directional records are listed here with their results, never removed."}
+
+
+def _input_drift(db, artifact, n=50):
+    """Mean standardized shift of recent present inputs from the model's training statistics."""
+    try:
+        prep = artifact["model"]["components"][0]["preprocessor"]
+        names, means, scales = prep["names"], prep["means"], prep["scales"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    rows = db.execute("SELECT payload FROM btc_engine_opening WHERE mode='PUBLIC MARKET DATA' "
+                      "ORDER BY generated_at DESC LIMIT ?", (n,)).fetchall()
+    sums = {}
+    for (payload,) in rows:
+        values = ((json.loads(payload) if payload else {}).get("frozen_features") or {}).get("values") or {}
+        for name, mean, scale in zip(names, means, scales):
+            v = values.get(name)
+            if isinstance(v, (int, float)) and math.isfinite(v) and scale:
+                total, count = sums.get(name, (0.0, 0))
+                sums[name] = (total + (v - mean) / scale, count + 1)
+    shifts = {name: abs(t / c) for name, (t, c) in sums.items() if c >= 10}
+    if not shifts:
+        return None
+    top = sorted(shifts.items(), key=lambda kv: -kv[1])[:5]
+    return {"openings": len(rows), "inputs_compared": len(shifts),
+            "mean_abs_standardized_shift": sum(shifts.values()) / len(shifts),
+            "largest": [{"input": k, "shift_sd": round(v, 2)} for k, v in top],
+            "status": "DRIFTED" if sum(shifts.values()) / len(shifts) > 0.5 else "WITHIN TRAINING RANGE"}
 
 
 def _predictive(db, artifact_model_id=None):
@@ -170,6 +242,7 @@ def _predictive(db, artifact_model_id=None):
     calls = [r for r in window if r["direction"] in ("UP", "DOWN")]
     correct = sum((r["direction"] == "UP") == (r["y"] == 1) for r in calls)
     out["calls"] = len(calls)
+    out["coverage"] = len(calls) / len(window)
     out["call_accuracy"] = correct / len(calls) if calls else None
     out["call_accuracy_ci95"] = _wilson(correct, len(calls))
     pnl = []
@@ -209,7 +282,10 @@ def assess(journal, *, now=None, artifact=None):
         db.execute("PRAGMA query_only=ON")
         technical = _technical(db, now, names)
         predictive = _predictive(db, model_id)
+        scoreboards = _scoreboards(db)
+        drift = _input_drift(db, artifact) if artifact else None
     predictive["model_id"] = model_id
+    predictive["input_drift"] = drift
     predictive["training_labels_age_days"] = round(model_age, 2) if model_age is not None else None
     if technical["status"] != "HEALTHY":
         recommendation = "WAIT: data are " + technical["status"].lower() + " (" + "; ".join(technical["reasons"]) + ")"
@@ -218,8 +294,27 @@ def assess(journal, *, now=None, artifact=None):
     else:
         recommendation = "Data healthy and recent edge supported (not a guarantee of future results)"
     return {"generated_at": now.isoformat(), "technical_data_health": technical,
-            "predictive_edge": predictive, "recommendation": recommendation,
+            "predictive_edge": predictive, "scoreboards": scoreboards, "recommendation": recommendation,
             "note": "Diagnostic only; it never changes a live signal, threshold, model or alert."}
+
+
+class CachedReport:
+    """At most one assessment per CACHE_SECONDS for the dashboard endpoint (read-only, bounded cost)."""
+
+    def __init__(self, journal, artifact=None, clock=lambda: datetime.now(timezone.utc)):
+        self.journal, self.artifact, self.clock = journal, artifact, clock
+        self.value, self.at = None, None
+
+    def get(self):
+        now = self.clock()
+        if self.value is None or (now - self.at).total_seconds() >= CACHE_SECONDS:
+            try:
+                self.value = assess(self.journal, now=now, artifact=self.artifact)
+            except Exception as exc:                      # a diagnostic failure never affects live signals
+                self.value = {"generated_at": now.isoformat(), "status": "UNAVAILABLE",
+                              "reason": type(exc).__name__}
+            self.at = now
+        return self.value
 
 
 def main(argv=None):

@@ -104,3 +104,49 @@ def test_calibration_slope_detects_underconfidence():
         ps.append(0.5 + (true - 0.5) / 2)                  # probabilities squeezed toward 0.5
         ys.append(1 if rng.random() < true else 0)
     assert 1.7 < ah._calibration_slope(ps, ys) < 2.5
+
+
+def test_both_scoreboard_populations_are_reported_with_exclusions(tmp_path):
+    path = _journal(tmp_path)
+    db = sqlite3.connect(path)
+    # Two directional records whose confidence was not displayable (like the 2026-11-16 fallback calls).
+    for i, (d, y) in enumerate((("UP", 0), ("DOWN", 1))):
+        payload = {"opens_at": "2026-11-16T18:00:00+00:00", "model": "opening24h-zero-drift-final-average-v1",
+                   "direction": d, "confidence": {"status": "EXPERIMENTAL"}}
+        db.execute("INSERT INTO btc_engine_opening VALUES ('PUBLIC MARKET DATA',?,?,?,?,?,?,?)",
+                   (f"F{i}", f"2026-11-16T18:0{i}:00+00:00", None, None, 0.51 if d == "UP" else 0.49, "DELAYED", json.dumps(payload)))
+        db.execute("INSERT INTO forecast_outcomes VALUES (?, 'official', 'x', ?)", (f"F{i}", y))
+    db.execute("UPDATE btc_engine_opening SET payload=json_set(payload,'$.confidence.status','EXPERIMENTAL CALIBRATED CANDIDATE') WHERE ticker LIKE 'T%'")
+    db.commit()
+    db.close()
+    boards = ah.assess(path, now=NOW, artifact=ARTIFACT)["scoreboards"]
+    dash, every = boards["dashboard_scoreboard"], boards["all_directional_calls"]
+    assert every["calls"] == dash["calls"] + 2
+    assert every["correct"] == dash["correct"]                     # both excluded calls were wrong
+    (reason, entry), = boards["excluded_from_dashboard_scoreboard"].items()
+    assert entry == {"calls": 2, "correct": 0} and "EXPERIMENTAL" in reason
+
+
+def test_input_drift_flags_inputs_far_from_training(tmp_path):
+    art = json.loads(json.dumps(ARTIFACT))
+    art["model"]["components"][0]["preprocessor"].update(means=[0.1] * 40, scales=[1.0] * 40)
+    assert ah.assess(_journal(tmp_path), now=NOW, artifact=art)["predictive_edge"]["input_drift"]["status"] == "WITHIN TRAINING RANGE"
+    art["model"]["components"][0]["preprocessor"].update(means=[5.0] * 40)
+    other = tmp_path / "drifted"
+    other.mkdir()
+    assert ah.assess(_journal(other), now=NOW, artifact=art)["predictive_edge"]["input_drift"]["status"] == "DRIFTED"
+
+
+def test_cached_report_recomputes_at_most_once_per_minute(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ah, "assess", lambda *a, **k: calls.append(1) or {"ok": len(calls)})
+    clock = [NOW]
+    cache = ah.CachedReport(tmp_path / "j.db", clock=lambda: clock[0])
+    cache.get(); cache.get()
+    clock[0] = NOW + timedelta(seconds=61)
+    assert cache.get() == {"ok": 2} and len(calls) == 2
+
+
+def test_cached_report_never_raises(tmp_path):
+    out = ah.CachedReport(tmp_path / "missing.db").get()
+    assert out["status"] == "UNAVAILABLE"

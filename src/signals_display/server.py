@@ -2333,6 +2333,15 @@ def make_handler(monitor):
                 lifecycle_path = f"{monitor.journal.path}.lifecycle-status.json"
                 body = json.dumps(combined_status(status_path, lifecycle_path), allow_nan=False, default=str).encode()
                 content_type = "application/json"
+            elif route == "/api/accuracy-health":
+                # Read-only diagnostic: data health and predictive edge, both scoreboard populations.
+                # Cached for 60 s; it never changes a signal, threshold, model or alert.
+                from .accuracy_health import CachedReport
+                if getattr(monitor, "accuracy_health_report", None) is None:
+                    artifact = monitor.opening_artifact if isinstance(getattr(monitor, "opening_artifact", None), dict) else None
+                    monitor.accuracy_health_report = CachedReport(monitor.journal.path, artifact)
+                body = json.dumps(monitor.accuracy_health_report.get(), allow_nan=False, default=str).encode()
+                content_type = "application/json"
             elif route == "/api/shadow-opening":
                 # Read-only view of the independent shadow ledger. It never computes, substitutes or feeds live output.
                 from .opening_shadow_view import ledger_view, shadow_ledger_path

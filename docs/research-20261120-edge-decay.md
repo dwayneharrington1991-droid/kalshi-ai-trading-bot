@@ -23,10 +23,15 @@ half's positive result is not evidence that the second half will recover.
 - **Discrimination decayed while confidence rose.** Correlation between the model's P(UP) and the
   outcome by 60-opening block: +0.31, +0.23, +0.26, +0.16, +0.02. Over the same blocks the spread of
   P(UP) grew (sd 0.052 to 0.069), so coverage rose from about 30% to 50% and accuracy fell.
-- **Inputs moved outside the training range.** Mean absolute standardized value of the 15 most heavily
-  weighted logistic inputs rose between halves, for example `micro_30s_return_fraction` 0.39 to 0.80,
-  `micro_30s_velocity` 0.33 to 0.66, and `advanced_trade_intensity`, whose contribution sd grew about
-  4x (0.040 to 0.158). Larger inputs push probabilities further from 0.5 without adding information.
+- **Inputs became larger than in training** (computed with the model's own transform, where a missing
+  input is neutral plus a missing flag). The logistic component's logit spread grew from 0.42 to 0.56
+  between halves. Largest contributors: `distance_scaled` (mean |z| 0.57 to 1.15), the 5 s, 15 s and
+  30 s micro returns and velocities (about 0.4 to 0.7), and `return_30m`. `distance_scaled` stayed
+  predictive (correlation with UP +0.18 early, +0.16 late). The micro inputs lost most of their
+  relationship with the outcome, so their larger values added confidence without information.
+- **Missing inputs.** The microstructure stream is often empty at the open: 169 of 320 openings lacked 10 or
+  more of the 87 inputs (04:00 to 04:30 today: 28 to 30 missing, on both builds). The model handles this
+  correctly (neutral value plus a missing flag), but those openings rely on fewer real inputs.
 - **Base rate moved.** UP settled 37% of the time in the last 60 openings (about 2 SE below 50%).
   The model's mean P(UP) stayed near 0.50.
 
@@ -52,8 +57,12 @@ half's positive result is not evidence that the second half will recover.
 | Platt recalibration of live P(UP) | 0.2466 | -0.007 to +0.007 | 104 | 57.7% | +0.020 |
 | Live P(UP) shrunk halfway to 0.5 | 0.2475 | -0.004 to +0.005 | 17 | 52.9% | -0.041 |
 | Volatility-scaled returns + flow, logistic C=0.05 | 0.2554 | -0.007 to +0.025 | 106 | 55.7% | - |
+| `distance_scaled` only, logistic | 0.2393 | -0.023 to +0.009 | 115 | 62.6% | - |
+| `distance_scaled` + `return_30m` | 0.2419 | -0.022 to +0.014 | 123 | 61.8% | - |
 
-**None is credibly better than the live model, so all are rejected.** The lifecycle's own retrain
+**None is credibly better than the live model, so all are rejected.** The one-input `distance_scaled`
+model has the best point estimate, but its interval includes zero, and it was the best of several
+variants tried, so its advantage is probably overstated. It is the most promising shadow candidate. The lifecycle's own retrain
 also returns NO_CANDIDATE every cycle. That is correct with this little data.
 
 ## Recommendations (not implemented; each needs your approval)

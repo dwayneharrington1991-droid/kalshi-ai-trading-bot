@@ -108,3 +108,18 @@ uses only openings settled before it.
 
 Accuracy does not rise with confidence; the intervals only widen. No threshold change is recommended,
 and none would be made without approval.
+
+## Research round v2 (2026-11-20 evening): larger training data
+
+- The live model was promoted on a test block of only 31 contracts; 952 of its 1,124 development
+  contracts had been used in earlier tests.
+- Adding its training-period journal (1,186 openings) made challengers competitive but not credibly
+  better. Details and the new pre-registration are in docs/preregistration-v2-20261120.md.
+- Inputs with a consistent direction in every period are 5-minute mean-reversion signals
+  (`advanced_5m_bollinger_percent_b`, `advanced_5m_ema9_distance`,
+  `advanced_5m_macd_standard_histogram`, `return_60m`; all negative). 19 inputs flip sign between
+  periods, mostly the 15 s to 1 m micro inputs and flow/VWAP deviation, so they mostly add noise.
+- A ridge model on inputs selected for consistency on development data only scored 0.2450 (vs live
+  0.2425, CI -0.005 to +0.010): rejected.
+- R10 (micro tracker rejects delayed Coinbase trades) affects only micro trade-flow inputs, which
+  carry no stable signal; there is no evidence it damages predictions.

@@ -25,7 +25,11 @@ def export(journal):
     out = {}
     with closing(sqlite3.connect(f"file:{journal}?mode=ro", uri=True, timeout=30)) as db:
         db.execute("PRAGMA query_only=ON")
+        present = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         for name, query in TABLES.items():
+            if name not in present:                 # older journals predate opening_quote_snapshots
+                out[name] = {"cols": [], "rows": [], "missing": True}
+                continue
             cols = [r[1] for r in db.execute(f"PRAGMA table_info({name})")]
             out[name] = {"cols": cols, "rows": db.execute(query).fetchall()}
     return out

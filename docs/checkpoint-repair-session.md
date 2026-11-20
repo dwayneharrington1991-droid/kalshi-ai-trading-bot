@@ -22,3 +22,8 @@ Branch: fix/opening-selection-learning
 - Model improvement: the only threshold rule tested did not beat the recorded direction (rejected, docs/live-export-analysis-20261119.md).
 - Persistent worker: not established (no SSH key, no attached computer folder).
 - Installer command: not prepared; blocked on a green full suite and a release commit pushed to origin.
+
+## Latest verification (current head)
+- Full suite on eb8747d: 1828 passed, 9 skipped, 0 failed (966 s).
+- The intermittent deploy-test hang did not recur in this run; root cause still not established.
+- 0431cbf (UNCLEAR→WAIT engine change) broke test_previously_valid_openings_are_computed_exactly_as_before and test_per_input_status_is_metadata_only_versus_the_approved_base. It was reverted in eb8747d. The headline dashboard card already maps non-UP/DOWN openings to WAIT, so the immutable record keeps its original label.

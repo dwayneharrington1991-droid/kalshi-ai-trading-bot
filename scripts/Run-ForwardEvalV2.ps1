@@ -7,7 +7,7 @@ param(
     [string]$Server = "opc@129.146.120.195"
 )
 $ErrorActionPreference = 'Stop'
-$FreezeCommit = 'cc1e621'
+$FreezeCommit = '2d4d007'
 $ArtifactRemote = '/home/opc/.kalshi-deploy/preview-8768/models/qualified-20261116T210122Z.json'
 $Repo = Join-Path $Root 'repo'
 $Py = Join-Path $Root 'venv\Scripts\python.exe'

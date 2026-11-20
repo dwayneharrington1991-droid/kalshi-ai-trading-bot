@@ -72,3 +72,27 @@ also returns NO_CANDIDATE every cycle. That is correct with this little data.
    model (table above). A rebuilt full ensemble with clipped or rank-transformed inputs is the next
    experiment. It must run in shadow mode until it beats the live model out of sample.
 3. Collect more data. About 100 calls per 4 days cannot separate a 5-point accuracy edge from luck.
+
+## Follow-up (06:00 UTC export, 392 settled openings)
+
+Evaluated on the same 113 openings (2026-11-18 22:30 to 2026-11-20 05:30, UP rate 45%). Each prediction
+uses only openings settled before it.
+
+| Model | Brier | Diff vs live (95% CI) | 0.55-rule trades | P&L per contract |
+|---|---|---|---|---|
+| Live candidate | 0.2489 | - | 46 | +0.058 |
+| Past-only base rate | 0.2488 | -0.013 to +0.013 | 32 | +0.029 |
+| `distance_scaled` only | 0.2442 | -0.025 to +0.017 | 84 | +0.007 |
+| Live price_core 16 inputs, strong L2 | 0.2390 | -0.032 to +0.013 | 87 | -0.001 |
+| All 87 inputs + missing flags, strong L2 | 0.2436 | -0.021 to +0.011 | 78 | +0.017 |
+| Chosen at each opening from past results only | 0.2404 | -0.032 to +0.015 | 89 | -0.003 |
+
+- Choosing the challenger at each opening from past results only removes the "best of many" bias.
+  It lowers Brier but does not improve P&L after costs. No candidate is credibly better.
+- Kalshi's opening price vs the live model, refit before each opening (n=181): the market price alone
+  scored 0.2435 and the market price plus the live model 0.2497 (difference CI -0.010 to +0.023).
+  The live model adds no measurable information beyond the price you would pay.
+- An edge-based rule (trade only when the model probability beats the ask plus fee by 3 cents) did
+  not help any model. The live model went from +0.058 to +0.018.
+- Next step: the pre-registered forward test in docs/preregistration-20261120.md (frozen 06:15 UTC,
+  decision after 200 new openings).

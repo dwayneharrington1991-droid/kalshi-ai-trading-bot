@@ -53,3 +53,5 @@ Two sessions are pushing to this branch. Always fetch and rebase before pushing;
   Context: the lifecycle cron on Oracle (pinned to 5a88d1a, --activator guarded) still holds a restart
   capture for a269d08, so any promotion would fail safe but report "RESTORE NOT VERIFIED". Not changed on Oracle.
 - Edge-decay research: docs/research-20261120-edge-decay.md. No challenger beat the live model; none promoted.
+- 2026-11-20 06:45Z: forward test frozen at c08fb8c (freeze 06:15Z). Resume with scripts/Run-ForwardEval.ps1
+  after 2026-11-22 ~08:16Z. Oracle auto-promotion disabled 05:47Z (backup /home/opc/.kalshi-deploy/lifecycle-disable-20261120T054712Z).

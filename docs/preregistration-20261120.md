@@ -34,3 +34,38 @@ happened when the candidates were fixed.
    `python scripts/forward_eval_openings.py --export journal_dump.json --artifact <live artifact json>`.
 
 The script prints the report and writes nothing else.
+
+## Resuming after 2026-11-22 (no deployment, no running session needed)
+The running 8768 bot (3ce9071) records everything this test needs at every opening: the immutable opening
+record with its frozen inputs (`btc_engine_opening`), the official settlement (`forecast_outcomes`)
+and the Kalshi quotes near the open (`opening_quote_snapshots`). No code on the branch or on Oracle
+deletes from these tables. Automatic promotion is disabled, so the live model compared against stays
+`b50b9dc30f6d664c`.
+
+The 200th forward opening is 2026-11-22 08:00 UTC and settles about 08:16, if none is missing.
+Run any time after that, from Windows PowerShell on this PC:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\kalshi-bot-dev\repo\scripts\Run-ForwardEval.ps1"
+```
+
+What it does:
+1. Refuses to run if `scripts/forward_eval_openings.py` differs from the freeze commit `c08fb8c`.
+2. Exports the three tables read-only over SSH (`scripts/export_opening_research.py`, SQLite mode=ro,
+   nice 19).
+3. Copies the live artifact read-only and warns if its sha256 is not `934d490a…302b`.
+4. Prints and saves `report.json` under `kalshi-bot-dev\forward\<UTC time>\`.
+
+Reading the result:
+- `NOT ENOUGH FORWARD DATA` means rerun later.
+- `NO CANDIDATE PASSED` means the challengers are rejected; the live model stays.
+- `ELIGIBLE FOR A SEPARATE PROMOTION REVIEW` means a candidate passed. Nothing is deployed; promotion
+  needs a separate, explicit approval.
+
+Verified 2026-11-20 06:45 UTC: the full path ran end to end (1 forward opening, NOT ENOUGH FORWARD DATA),
+and the script refused to run after a deliberate edit to the frozen evaluator.
+
+What could interrupt collection:
+- 8768 stopped or redeployed. Openings missed while it is down are simply absent; the report counts
+  only openings that exist.
+- A change of live model. The script warns about this.

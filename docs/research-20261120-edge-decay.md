@@ -96,3 +96,15 @@ uses only openings settled before it.
   not help any model. The live model went from +0.058 to +0.018.
 - Next step: the pre-registered forward test in docs/preregistration-20261120.md (frozen 06:15 UTC,
   decision after 200 new openings).
+
+## Stricter call thresholds (descriptive, pre-freeze openings only, n=312)
+
+| Threshold | Calls (coverage) | Accuracy (95% CI) | After-fee P&L per contract |
+|---|---|---|---|
+| 0.55 (live) | 106 (34%) | 65.1% (55.6–73.5) | +0.095 (n=103) |
+| 0.58 | 47 (15%) | 66.0% (51.7–77.8) | +0.101 (n=46) |
+| 0.60 | 25 (8%) | 64.0% (44.5–79.8) | +0.062 (n=25) |
+| 0.62 | 10 (3%) | 70.0% (39.7–89.2) | +0.132 (n=10) |
+
+Accuracy does not rise with confidence; the intervals only widen. No threshold change is recommended,
+and none would be made without approval.

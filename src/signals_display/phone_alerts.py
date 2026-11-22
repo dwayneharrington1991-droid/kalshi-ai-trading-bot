@@ -413,9 +413,14 @@ class OpeningAlerts:
                 self.queue.task_done()
 
 
+OWNER_MARKER = Path.home() / "dual-ai-alerts" / "OWNS_OPENING_ALERTS"
+
+
 def from_journal(journal_path):
-    """The live bot's notifier, or None when alerts are disabled (ALERTS_DISABLED=1)."""
-    if os.environ.get("ALERTS_DISABLED") == "1":
+    """The live bot's notifier, or None when alerts are disabled (ALERTS_DISABLED=1) or when the three-line
+    alert service owns opening alerts (marker file ~/dual-ai-alerts/OWNS_OPENING_ALERTS), so each market
+    gets one opening message. Deleting the marker and restarting restores this notifier."""
+    if os.environ.get("ALERTS_DISABLED") == "1" or OWNER_MARKER.exists():
         return None
     return OpeningAlerts(str(journal_path) + ".alerts.sqlite3", shadow_dir=Path(journal_path).parent / "shadow")
 

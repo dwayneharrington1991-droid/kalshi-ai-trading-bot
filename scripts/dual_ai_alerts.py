@@ -88,25 +88,14 @@ def opening(state, challenger, now):
 
 
 def message(kind, d):
-    hm = lambda t: t.strftime("%H:%M UTC")
-    lines = ["KALSHI BTC 15m - THREE AI OPENING CALLS", d["ticker"],
-             f"Opened {hm(d['opens'])} - Expires {hm(d['closes'])}",
-             f"AI #1 LIVE: {d['live']} - P(UP) {d['live_up'] * 100:.1f}%"]
-    if kind == "READY":
-        c, cd = d["combined_up"], d["combined"]
-        conf = f"{(1 - c) * 100:.1f}% DOWN" if cd == "DOWN" else f"{c * 100:.1f}% UP" if cd == "UP" else f"P(UP) {c * 100:.1f}%"
-        lines += [f"AI #2 CHALLENGER: {d['challenger']} - P(UP) {d['challenger_up'] * 100:.1f}%",
-                  f"The two AIs {'AGREE' if d['challenger'] == d['live'] else 'DISAGREE'}",
-                  f"COMBINED AI: {cd} - consensus {conf}",
-                  f"Combined passes 55% threshold: {'YES' if cd in ('UP', 'DOWN') else 'NO'}",
-                  COMBINED_LABEL]
-    else:
-        lines += [f"AI #2 CHALLENGER: UNAVAILABLE ({d['challenger_reason']}) - no call substituted",
-                  "Comparison unavailable", "COMBINED AI: UNAVAILABLE (needs both calls) - no call substituted"]
-    lines += [LABEL,
-              f"All calls frozen {d['generated'].strftime('%H:%M:%S UTC')} for this same market, before the outcome.",
-              "Signal only - place any trade manually."]
-    return "\n".join(lines)
+    """Same four-line layout as the dashboard (src/signals_display/four_lines.py); minute-6 comes later."""
+    from src.signals_display import four_lines
+    ready = kind == "READY"
+    body = four_lines.lines(live=(d["live"], d["live_up"]),
+                            challenger=(d["challenger"], d["challenger_up"]) if ready else (None, None),
+                            combined=(d["combined"], d["combined_up"]) if ready else (None, None))
+    head = [f"{d['ticker']} · locked at open · expires {d['closes'].strftime('%H:%M UTC')}"]
+    return "\n".join(head + body + [four_lines.FOOTER])
 
 
 class Ledger:

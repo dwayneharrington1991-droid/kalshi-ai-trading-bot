@@ -145,7 +145,11 @@ class Minute6Runner:
         self.db.commit()
         if cur.rowcount != 1:
             return "ALREADY LOCKED"
-        text = self.message(m, r, a, b, c, q, closes, thr, now)
+        if not self.valid(r):                  # recorded, but no phone update for an invalid reading
+            self.log(json.dumps({"at": now.isoformat(), "minute6": m["ticker"], "direction": r["direction"],
+                                 "status": "NOT SENT (fewer than two eligible components)"}))
+            return "RECORDED"
+        text = self.message(m, r, q, now)
         status, mid, err = "FAILED", None, None
         for i in range(3):
             try:
@@ -165,24 +169,22 @@ class Minute6Runner:
         return status
 
     @staticmethod
-    def message(m, r, a, b, c, q, closes, thr, now):
-        pct = lambda v: "n/a" if v is None else f"{v * 100:.1f}%"
-        def comp(name, x, val):
-            return f"{name} {x.get('direction')} {val}" if x.get("status") == "ELIGIBLE" else f"{name} INELIGIBLE ({x.get('reason')})"
-        lines = ["KALSHI BTC 15m - MINUTE-6 RESEARCH - NOT VALIDATED", m["ticker"],
-                 f"Locked {now.strftime('%H:%M:%S UTC')} (minute 6) - Expires {m['closes'].strftime('%H:%M UTC')}",
-                 f"MINUTE-6 CONSENSUS: {r['direction']} - avg P(UP) of A and C {pct(r['consensus_p_up_average'])}",
-                 "Components: " + " | ".join([comp("A price/distance", a, pct(a.get("p_up"))),
-                                              comp("B momentum", b, "n/a" if b.get("score") is None else f"{b['score']:+.2f}"),
-                                              comp("C engine", c, pct(c.get("p_up")))]),
-                 f"Components agree: {'YES' if r['components_agree'] else 'NO'}" + ("" if r["direction"] != "WAIT" else f" - WAIT: {r['reason']}")]
-        if closes and thr:
-            lines.append(f"Coinbase BTC {closes[-1]:,.2f} vs Kalshi threshold {thr:,.2f} ({closes[-1] - thr:+,.2f})")
-        if q.get("up_ask") is not None or q.get("down_ask") is not None:
-            lines.append(f"Kalshi asks at lock: UP {q.get('up_ask')} / DOWN {q.get('down_ask')}")
-        lines += ["Dev history of this rule: ~91-94% right when it calls, but Kalshi prices already reflect most of it - no verified edge.",
-                  "Separate from the opening calls and their scoreboard. Signal only - place any trade manually."]
-        return "\n".join(lines)
+    def valid(r):
+        return r.get("eligible", 0) >= 2 and r.get("direction") in ("UP", "DOWN", "WAIT")
+
+    def message(self, m, r, q, now):
+        """Same four lines as the dashboard: the three locked opening calls of THIS market, then minute-6."""
+        from src.signals_display import four_lines
+        o = self.db.execute("SELECT live, live_up, challenger, challenger_up, combined, combined_up FROM openings "
+                            "WHERE ticker=?", (m["ticker"],)).fetchone() if self._has_openings() else None
+        o = o or (None,) * 6
+        body = four_lines.lines((o[0], o[1]), (o[2], o[3]), (o[4], o[5]),
+                                minute6=(r["direction"], r["consensus_p_up_average"], q))
+        head = [f"{m['ticker']} · minute-6 update · expires {m['closes'].strftime('%H:%M UTC')}"]
+        return "\n".join(head + body + [four_lines.FOOTER])
+
+    def _has_openings(self):
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE name='openings'").fetchone() is not None
 
     def scoreboard(self, now_mono):
         if self.history is None:
@@ -236,8 +238,14 @@ class Minute6Runner:
             row = self.db.execute("SELECT locked_at, direction, components_agree, reason, payload FROM minute6 WHERE ticker=?",
                                   (m["ticker"],)).fetchone()
             if row:
+                reading = json.loads(row[4])
                 out.update(status="LOCKED", locked_at=row[0], direction=row[1], components_agree=bool(row[2]),
-                           reason=row[3], reading=json.loads(row[4]))
+                           reason=row[3], reading=reading, valid=self.valid(reading))
+                if out["valid"]:
+                    from src.signals_display import four_lines
+                    q = dict(zip(("up_ask", "down_ask"), self.db.execute(
+                        "SELECT up_ask, down_ask FROM minute6 WHERE ticker=?", (m["ticker"],)).fetchone()))
+                    out["line"] = four_lines.minute6_line(row[1], reading.get("consensus_p_up_average"), q)
             else:
                 out["status"] = "WAITING FOR MINUTE 6" if now < m["opens"] + timedelta(seconds=m6.DECISION_LATEST_S) \
                     else "NO READING (service was not running at minute 6; nothing substituted)"

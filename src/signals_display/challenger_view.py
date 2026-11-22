@@ -9,7 +9,7 @@ model, threshold or records.
 import json
 from pathlib import Path
 
-from . import feature_alignment
+from . import feature_alignment, four_lines
 from .consensus import combine
 from .opening_models import predict
 
@@ -32,6 +32,17 @@ class ChallengerView:
         self.cache = {}
 
     def call(self, opening):
+        """The challenger reading plus `lines`: the three dashboard/phone lines built by four_lines (one format)."""
+        r = dict(self._call(opening))
+        live = (opening or {}).get("up")
+        live_ok = isinstance(live, (int, float)) and r.get("status") != "WAITING"
+        ready = r.get("status") == "READY"
+        r["lines"] = four_lines.lines(live=(_direction(float(live)), float(live)) if live_ok else (None, None),
+                                      challenger=(r["direction"], r["up"]) if ready else (None, None),
+                                      combined=(r["combined"], r["combined_up"]) if ready else (None, None))
+        return r
+
+    def _call(self, opening):
         opening = opening or {}
         ticker = opening.get("ticker")
         base = {"label": LABEL, "ticker": ticker, "forward_test": "v4 (decides after 200 openings from 2026-11-22 03:30 UTC)"}

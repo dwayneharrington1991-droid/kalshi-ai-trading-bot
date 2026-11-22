@@ -40,9 +40,8 @@ def test_both_calls_same_market_one_message(tmp_path, monkeypatch):
     assert dual.step(led, s, {}, _state(), _ch(), now + timedelta(seconds=5), log=lambda x: None) == "DUPLICATE"
     assert len(s.calls) == 1
     t = s.calls[0]
-    for part in ("KX-A", "Opened 17:45 UTC", "Expires 18:00 UTC", "AI #1 LIVE: UP - P(UP) 62.0%",
-                 "AI #2 CHALLENGER: WAIT - P(UP) 50.0%", "DISAGREE", "COMBINED AI: WAIT - consensus P(UP) 56.0%",
-                 "passes 55% threshold: NO", "EXPERIMENTAL CONSENSUS - NOT VALIDATED"):
+    for part in ("KX-A · locked at open · expires 18:00 UTC", "AI #1: UP 🟢 — 62%",
+                 "AI #2: WAIT 🟡 — 50% UP", "COMBINED CALL: WAIT 🟡 — 56% UP", "Manual trading only"):
         assert part in t
 
 
@@ -51,7 +50,7 @@ def test_mismatched_market_is_never_paired(tmp_path):
     assert k == "WAITING"
     k, d = dual.opening(_state(), _ch(live=0.61), OPEN + timedelta(seconds=120))
     assert k == "CHALLENGER_UNAVAILABLE"
-    assert "UNAVAILABLE" in dual.message(k, d) and "no call substituted" in dual.message(k, d)
+    assert "AI #2: WAIT 🟡 — N/A" in dual.message(k, d) and "COMBINED CALL: WAIT 🟡 — N/A" in dual.message(k, d)
 
 
 def test_no_live_call_or_late_or_stale_record_sends_nothing():
@@ -83,7 +82,7 @@ def test_down_consensus_message_shows_down_confidence(tmp_path, monkeypatch):
     s = Sender()
     assert dual.step(dual.Ledger(tmp_path / "s.db"), s, {}, _state(up=0.40), _ch(live=0.40, up=0.30),
                      OPEN + timedelta(seconds=10), log=lambda x: None) == "SENT"
-    assert "COMBINED AI: DOWN - consensus 65.0% DOWN" in s.calls[0] and "threshold: YES" in s.calls[0]
+    assert "COMBINED CALL: DOWN 🔴 — 65%" in s.calls[0] and "AI #2: DOWN 🔴 — 70%" in s.calls[0]
 
 
 def test_stored_calls_are_immutable_and_legacy_markets_not_resent(tmp_path, monkeypatch):
@@ -103,3 +102,14 @@ def test_stored_calls_are_immutable_and_legacy_markets_not_resent(tmp_path, monk
         led.db.execute("UPDATE openings SET combined='UP'")
     with pytest.raises(sqlite3.DatabaseError):
         led.db.execute("DELETE FROM deliveries")
+
+
+def test_builtin_notifier_steps_aside_only_when_the_service_marker_exists(tmp_path, monkeypatch):
+    from src.signals_display import phone_alerts
+    monkeypatch.delenv("ALERTS_DISABLED", raising=False)
+    marker = tmp_path / "OWNS_OPENING_ALERTS"
+    monkeypatch.setattr(phone_alerts, "OWNER_MARKER", marker)
+    monkeypatch.setattr(phone_alerts.OpeningAlerts, "__init__", lambda self, *a, **k: None)
+    assert phone_alerts.from_journal(tmp_path / "j.db") is not None
+    marker.write_text("three-line service")
+    assert phone_alerts.from_journal(tmp_path / "j.db") is None

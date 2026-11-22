@@ -119,6 +119,6 @@ def test_terminal_behaviour_in_a_real_browser(tmp_path):
                        "term-call-qualifier", "term-confidence-qualifier",
                        "primary-contract", "primary-time", "score-correct", "score-wrong",
                        "score-accuracy", "score-sample", "score-title", "score-acc", "score-line",
-                       "I"} | {
+                       "I", "ai-lock-note", "ai1-line", "ai2-line", "ai3-line"} | {
         v for v in visible if v.startswith(("green", "red", "amber", "term-qual"))
     }

@@ -65,7 +65,8 @@ def test_runner_locks_once_sends_once_and_is_immutable(tmp_path, monkeypatch):
     assert r.step(_state(), now=OPEN + timedelta(seconds=300), now_mono=0) == "OUTSIDE WINDOW"
     assert r.step(_state(), now=OPEN + timedelta(seconds=366), now_mono=1) == "SENT"
     assert r.step(_state(), now=OPEN + timedelta(seconds=380), now_mono=2) == "ALREADY LOCKED"
-    assert len(s.calls) == 1 and "MINUTE-6 RESEARCH - NOT VALIDATED" in s.calls[0] and "KX-M" in s.calls[0]
+    assert len(s.calls) == 1 and "MINUTE-6: " in s.calls[0] and "KX-M" in s.calls[0]
+    assert "AI #1: WAIT 🟡 — N/A" in s.calls[0]                 # no opening row stored for KX-M: nothing invented
     with pytest.raises(sqlite3.DatabaseError):
         r.db.execute("UPDATE minute6 SET direction='DOWN'")
     r.board = (0.0, None)                                  # force a scoreboard refresh
@@ -158,8 +159,10 @@ def test_missing_candle_at_the_deadline_locks_ineligible_not_invented(tmp_path, 
     monkeypatch.setattr("minute6_runner.time.sleep", lambda s: None)
     r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {},
                       candles=lambda: _candles(upto=O + 240), log=lambda x: None)
-    assert r.step(_state(), now=OPEN + timedelta(seconds=412), now_mono=0) == "SENT"
-    assert r.db.execute("SELECT a_dir, direction FROM minute6").fetchone() == (None, "WAIT")
+    s = Sender()
+    r.send = s
+    assert r.step(_state(), now=OPEN + timedelta(seconds=412), now_mono=0) == "RECORDED"   # stored, not sent
+    assert r.db.execute("SELECT a_dir, direction FROM minute6").fetchone() == (None, "WAIT") and not s.calls
 
 
 def test_merge_bars_uses_final_15s_bar_and_skips_unfinished_minutes():

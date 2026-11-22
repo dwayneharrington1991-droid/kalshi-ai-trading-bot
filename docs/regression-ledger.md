@@ -30,10 +30,12 @@ Deployment categories:
 
 ## Open items (not defects, or awaiting data/approval)
 
-- R10: the micro tracker uses one event clock for quotes and trades, rejecting delayed Coinbase
-  trades (~1.3 M rejected updates per day). Candidate fix `MarketIntelligence(per_kind_event_clock=True)`
-  is implemented and tested but OFF in production (changes micro inputs: category B, needs approval and a
-  model trained on inputs computed that way).
+- R10: measured on the live Coinbase feed 2026-11-22 (2 min): 0 duplicates, 0 stale, 0 future-dated, yet
+  935/1,384 valid trades (68%) rejected. Two causes: quotes are stamped with message time and trades with
+  (earlier) execution time on one shared clock, and market_trades batches arrive newest-first. Candidate
+  fix = `MarketIntelligence(per_kind_event_clock=True)` + `StreamHub(sort_trade_batches=True)`: 661/661
+  valid trades kept (per-kind clock alone 673/1,384; ordering alone 424/661). OFF in production: it
+  changes micro inputs (category B) and the live model was trained without it.
 - Exchange choice for the opening reference (latest tick wins): measured effect 0.024 sigma, no
   change.
 - Model edge: the frozen forward test (`c08fb8c`) decides after 200 openings (about 2026-11-22

@@ -31,6 +31,11 @@ def numeric(value, low=0, high=1e15):
     return number(float(value), low, high)
 
 
+def _trade_order(trade):
+    tid = str(trade.get("trade_id", ""))
+    return (str(trade.get("time", "")), int(tid) if tid.isdigit() else -1, tid)
+
+
 class StreamHub:
     """Latest-value publication plus a bounded observation queue.
 
@@ -39,9 +44,15 @@ class StreamHub:
     do not refresh prices. No network starts when autostart=False (offline tests).
     """
 
-    def __init__(self, *, order_flow=None, autostart=True, connector=None, max_pending=2048):
+    def __init__(self, *, order_flow=None, autostart=True, connector=None, max_pending=2048,
+                 sort_trade_batches=False):
         if not 1 <= max_pending <= 100000:
             raise ValueError("Bounded pending capacity required")
+        # R10 (candidate only, default off = production behaviour): Coinbase market_trades batches
+        # arrive newest-first; publishing them oldest-first keeps valid trades in exchange-time order.
+        # Measured 2026-11-22: with this and MarketIntelligence(per_kind_event_clock=True) 661/661 valid
+        # trades are kept, versus about a third today. Changes micro inputs: needs explicit approval.
+        self.sort_trade_batches = bool(sort_trade_batches)
         self.order_flow = order_flow
         self.connector = connector
         self.condition = threading.Condition(threading.RLock())
@@ -188,7 +199,10 @@ class StreamHub:
                             self._publish_coinbase(observation)
                             accepted = True
                     else:
-                        for trade in event.get("trades", []):
+                        trades = event.get("trades", [])
+                        if self.sort_trade_batches:
+                            trades = sorted(trades, key=_trade_order)
+                        for trade in trades:
                             if trade.get("product_id") != "BTC-USD":
                                 continue
                             identifier = str(trade["trade_id"])

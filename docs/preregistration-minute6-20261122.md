@@ -52,3 +52,21 @@ The prices above are the implied mid, not the ask, so the real EV is lower.
   the mean estimated net per contract at the lock-time ask (fee 0.07·p·(1−p) plus 1¢ slippage) has a 95%
   bootstrap CI above 0.
 - Nothing from this test is used to change the minute-0 opening model or the v1–v5 frozen tests.
+
+## Exploratory follow-ups (2026-11-22, after freezing; not used to change the frozen rule)
+Component comparison (same splits; calls / accuracy / coverage):
+
+| Rule | Fit (325) | Check (140) | Holdout (175, already viewed) |
+|---|---|---|---|
+| A price/distance alone ≥ 0.80 | 104, 91.3%, 32% | 51, 90.2%, 36% | 51, 90.2%, 29% |
+| A + B | 90, 92.2%, 28% | 47, 91.5%, 34% | 44, 90.9%, 25% |
+| A + B + C (frozen) | 86, 93.0%, 26% | 46, 91.3%, 33% | 33, 93.9%, 19% |
+| B momentum alone | 250, 71.6%, 77% | 122, 74.6%, 87% | 146, 65.1%, 83% |
+| C engine alone | 109, 86.2%, 34% | 71, 81.7%, 51% | 50, 94.0%, 29% |
+| Sign of price − threshold (always call) | 73.8% | 74.3% | 69.1% |
+
+- No duplicate markets. All 649 outcomes are `official`.
+- Component A is calibrated: readings with stated confidence 0.95–0.97 were right 93–100% of the time.
+- Dropping C (whose dev timing allowed a reading up to 40 s after 6:00) leaves about 91%. So the accuracy is not driven by that lookahead.
+
+**Hour-of-day volatility adjustment (rejected).** The volatility blend σ = w·σ₆₀ₘ + (1 − w)·σ_hour used an hour table from fit markets only. It was selected on fit for maximum coverage with Wilson low ≥ 0.85, which gave w = 0, t = 0.75. It did not hold on the clean check set: 69/86 = 80.2% (Wilson low 0.71), against the baseline 46/51 = 90.2%. The extra coverage came from genuinely uncertain markets. The rule is kept unchanged.

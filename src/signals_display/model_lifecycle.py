@@ -285,7 +285,17 @@ def _load_exposed(state_dir, rows):
         return set(json.loads(path.read_text())["tickers"])
     reports = Path(state_dir) / "reports"
     if reports.exists() and any(reports.glob("report-*.json")):
-        return {r["ticker"] for r in rows}
+        # Persist the conservative baseline once. Without this the set was recomputed from the CURRENT rows every
+        # cycle, so each newly settled contract counted as exposed and no forward block could ever form
+        # (NO_CANDIDATE forever since 2026-11-19; ledger L24).
+        baseline = {r["ticker"] for r in rows}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".next")
+        tmp.write_text(json.dumps({"format": "exposed-test-contracts-v1", "tickers": sorted(baseline),
+                                   "baseline": "all contracts seen before the registry existed"}, sort_keys=True))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return baseline
     return set()
 
 

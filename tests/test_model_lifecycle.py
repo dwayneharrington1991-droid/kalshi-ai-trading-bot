@@ -486,3 +486,14 @@ def test_routine_training_cycles_send_no_phone_message():
     code = (ROOT / "src/signals_display/lifecycle_runner.py").read_text()
     assert 'notify("training_completed"' not in code
     assert 'notify("candidate_qualified"' in code
+
+
+def test_exposed_baseline_is_persisted_so_later_contracts_count_as_unseen(tmp_path):
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "report-old.json").write_text("{}")
+    first = [{"ticker": f"T{i:03d}"} for i in range(10)]
+    assert lc._load_exposed(tmp_path, first) == {r["ticker"] for r in first}
+    later = first + [{"ticker": f"T{i:03d}"} for i in range(10, 15)]
+    exposed = lc._load_exposed(tmp_path, later)
+    assert exposed == {r["ticker"] for r in first}          # the 5 new contracts are unseen, not exposed
+    assert (tmp_path / lc.EXPOSED_FILE).exists()

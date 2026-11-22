@@ -23,6 +23,7 @@ Deployment categories:
 | L10 | 11-20 | Accuracy Health panel invisible | `main>:not(#minimal-opening){display:none!important}` hid it | `test_dashboard_accuracy_health.py::test_panel_is_not_hidden_by_the_minimal_layout` | `14ddedd` | A | c3e92a5 |
 | L11 | 11-20 | Panel showed Kalshi/Coinbase as n/a | `feed_health` exists only in `monitor.snapshot()` | `test_live_connection_fields_come_from_the_served_snapshot` | `ca2cbe6` | A | 8c087de |
 | L12 | 11-20 | Main card did not say which settlement it predicts or how the last locked call scored | Display gap | `test_dashboard_opening_goal.py` | `b1469ea` | A | b1469ea |
+| L13 | 11-22 | Live model fed out-of-distribution inputs since 9a9a6ea; ensemble shifted toward UP (logistic component mean P(UP) 0.50 -> 0.61) | Training data recorded the 30 micro/flow inputs under the reconnect-loop computation (37-59% missing, reset windows); L6/L7 fixes changed their distribution | `test_forward_eval_v3.py` (candidate reproduction) | Not fixed in production: candidates pre-registered (v3); needs approval | C | no
 
 ## Open items (not defects, or awaiting data/approval)
 
@@ -32,3 +33,5 @@ Deployment categories:
   change.
 - Model edge: the frozen forward test (`c08fb8c`) decides after 200 openings (about 2026-11-22
   08:16 UTC).
+- L13 input skew: forward test v3 (`docs/preregistration-v3-20261122.md`) decides after 200 openings from
+  2026-11-22 01:00 UTC (about 2026-11-24 03:00 UTC).

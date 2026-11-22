@@ -40,8 +40,9 @@ def test_both_calls_same_market_one_message(tmp_path, monkeypatch):
     assert dual.step(led, s, {}, _state(), _ch(), now + timedelta(seconds=5), log=lambda x: None) == "DUPLICATE"
     assert len(s.calls) == 1
     t = s.calls[0]
-    for part in ("KX-A", "Opened 17:45 UTC", "Expires 18:00 UTC", "LIVE AI: UP - P(UP) 62.0%",
-                 "CHALLENGER AI: WAIT - P(UP) 50.0%", "DISAGREE", "NOT VALIDATED"):
+    for part in ("KX-A", "Opened 17:45 UTC", "Expires 18:00 UTC", "AI #1 LIVE: UP - P(UP) 62.0%",
+                 "AI #2 CHALLENGER: WAIT - P(UP) 50.0%", "DISAGREE", "COMBINED AI: WAIT - consensus P(UP) 56.0%",
+                 "passes 55% threshold: NO", "EXPERIMENTAL CONSENSUS - NOT VALIDATED"):
         assert part in t
 
 
@@ -66,4 +67,39 @@ def test_retry_then_failure_is_recorded(tmp_path, monkeypatch):
     assert dual.step(led, Sender(fail=1), {}, _state(), _ch(), OPEN + timedelta(seconds=10), log=lambda x: None) == "SENT"
     led2 = dual.Ledger(tmp_path / "t.db")
     assert dual.step(led2, Sender(fail=9), {}, _state(), _ch(), OPEN + timedelta(seconds=10), log=lambda x: None) == "FAILED"
-    assert led2.db.execute("select status, error from sent").fetchone()[0] == "FAILED"
+    assert led2.db.execute("select status, error from deliveries").fetchone()[0] == "FAILED"
+
+
+def test_consensus_rule():
+    assert dual.combine(0.60, 0.58)[1] == "UP" and dual.combine(0.40, 0.42)[1] == "DOWN"
+    assert dual.combine(0.70, 0.54)[1] == "WAIT"          # average 0.62 but challenger did not call UP
+    assert dual.combine(0.30, 0.46)[1] == "WAIT"
+    assert dual.combine(0.62, 0.40)[1] == "WAIT"
+    assert abs(dual.combine(0.62, 0.50)[0] - 0.56) < 1e-12
+
+
+def test_down_consensus_message_shows_down_confidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(dual.time, "sleep", lambda s: None)
+    s = Sender()
+    assert dual.step(dual.Ledger(tmp_path / "s.db"), s, {}, _state(up=0.40), _ch(live=0.40, up=0.30),
+                     OPEN + timedelta(seconds=10), log=lambda x: None) == "SENT"
+    assert "COMBINED AI: DOWN - consensus 65.0% DOWN" in s.calls[0] and "threshold: YES" in s.calls[0]
+
+
+def test_stored_calls_are_immutable_and_legacy_markets_not_resent(tmp_path, monkeypatch):
+    import sqlite3
+    import pytest
+    monkeypatch.setattr(dual.time, "sleep", lambda s: None)
+    path = tmp_path / "s.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE sent(ticker TEXT PRIMARY KEY)")
+    old.execute("INSERT INTO sent VALUES ('KX-OLD')")
+    old.commit()
+    led, s = dual.Ledger(path), Sender()
+    now = OPEN + timedelta(seconds=10)
+    assert dual.step(led, s, {}, _state(ticker="KX-OLD"), _ch(ticker="KX-OLD"), now, log=lambda x: None) == "DUPLICATE"
+    assert dual.step(led, s, {}, _state(), _ch(), now, log=lambda x: None) == "SENT" and len(s.calls) == 1
+    with pytest.raises(sqlite3.DatabaseError):
+        led.db.execute("UPDATE openings SET combined='UP'")
+    with pytest.raises(sqlite3.DatabaseError):
+        led.db.execute("DELETE FROM deliveries")

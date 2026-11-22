@@ -1,4 +1,5 @@
-"""Time-boxed Telegram alert with BOTH frozen opening calls (live AI + v4 challenger), one per market opening.
+"""Telegram alert with the frozen opening calls of LIVE AI, CHALLENGER AI (v4) and their EXPERIMENTAL CONSENSUS,
+one message per market opening (supervised service: deploy/oracle/kalshi-dual-ai-alerts.service).
 
 Runs beside the server (never inside it) and reads only the read-only HTTP API on 127.0.0.1:8768, so it holds
 no journal file open and cannot change the live call, the existing alerts, the model, records or orders.
@@ -10,7 +11,8 @@ Rules:
     generated within GENERATED_MAX_S of the open, and the market must still have > OUTCOME_GUARD_S to run;
   * if the challenger is unavailable for a genuine live call, the message says so (nothing is substituted);
   * one message per ticker: claimed in a local SQLite table (PRIMARY KEY ticker) before sending;
-  * the run ends by itself after --hours.
+  * the consensus is computed once from the two frozen calls and stored immutably (append-only triggers);
+  * --hours 0 runs until stopped (the service); otherwise the run ends by itself after --hours.
 
   python scripts/dual_ai_alerts.py --release /home/opc/kalshi-preview-repair-<sha7> --db ~/dual-ai-alerts/sent.sqlite3
 """
@@ -27,7 +29,8 @@ THRESHOLD = 0.55
 GENERATED_MAX_S = 150          # opening record must be made within 150 s of the market open
 CHALLENGER_WAIT_S = 90         # how long after the open to wait for the challenger before reporting it unavailable
 OUTCOME_GUARD_S = 60           # never send in the last minute of a market
-LABEL = "CHALLENGER is EXPERIMENTAL and NOT VALIDATED (research only). LIVE AI is the official call."
+LABEL = "CHALLENGER and COMBINED are EXPERIMENTAL and NOT VALIDATED (research only). LIVE AI is the official call."
+COMBINED_LABEL = "EXPERIMENTAL CONSENSUS - NOT VALIDATED (average of two AIs, not a calibrated probability or a third model)"
 
 
 def _ts(v):
@@ -38,6 +41,16 @@ def direction(p):
     if not isinstance(p, (int, float)):
         return None
     return "UP" if p >= THRESHOLD else "DOWN" if p <= 1 - THRESHOLD else "WAIT"
+
+
+def combine(live_up, challenger_up):
+    """(consensus P(UP), direction). UP/DOWN only when both AIs independently call it and the average agrees."""
+    c = (live_up + challenger_up) / 2
+    if live_up >= THRESHOLD and challenger_up >= THRESHOLD and c >= THRESHOLD:
+        return c, "UP"
+    if live_up <= 1 - THRESHOLD and challenger_up <= 1 - THRESHOLD and c <= 1 - THRESHOLD:
+        return c, "DOWN"
+    return c, "WAIT"
 
 
 def fetch_json(path, base=BASE):
@@ -63,7 +76,9 @@ def opening(state, challenger, now):
     same = ch.get("ticker") == ticker and isinstance(ch.get("live_up"), (int, float)) \
         and abs(ch["live_up"] - live) < 1e-9 and _ts(ch.get("generated_from")) == generated
     if ch.get("status") == "READY" and same and isinstance(ch.get("up"), (int, float)):
-        return "READY", {**d, "challenger_up": float(ch["up"]), "challenger": direction(ch["up"])}
+        cp, cd = combine(float(live), float(ch["up"]))
+        return "READY", {**d, "challenger_up": float(ch["up"]), "challenger": direction(ch["up"]),
+                         "combined_up": cp, "combined": cd}
     if now - opens < timedelta(seconds=CHALLENGER_WAIT_S):
         return "WAITING", d
     reason = ch.get("reason") or ("challenger is for a different market" if ch.get("ticker") != ticker
@@ -73,39 +88,66 @@ def opening(state, challenger, now):
 
 def message(kind, d):
     hm = lambda t: t.strftime("%H:%M UTC")
-    lines = ["KALSHI BTC 15m - BOTH AI OPENING CALLS", d["ticker"],
+    lines = ["KALSHI BTC 15m - THREE AI OPENING CALLS", d["ticker"],
              f"Opened {hm(d['opens'])} - Expires {hm(d['closes'])}",
-             f"LIVE AI: {d['live']} - P(UP) {d['live_up'] * 100:.1f}%"]
+             f"AI #1 LIVE: {d['live']} - P(UP) {d['live_up'] * 100:.1f}%"]
     if kind == "READY":
-        lines += [f"CHALLENGER AI: {d['challenger']} - P(UP) {d['challenger_up'] * 100:.1f}%",
-                  f"The two AIs {'AGREE' if d['challenger'] == d['live'] else 'DISAGREE'}"]
+        c, cd = d["combined_up"], d["combined"]
+        conf = f"{(1 - c) * 100:.1f}% DOWN" if cd == "DOWN" else f"{c * 100:.1f}% UP" if cd == "UP" else f"P(UP) {c * 100:.1f}%"
+        lines += [f"AI #2 CHALLENGER: {d['challenger']} - P(UP) {d['challenger_up'] * 100:.1f}%",
+                  f"The two AIs {'AGREE' if d['challenger'] == d['live'] else 'DISAGREE'}",
+                  f"COMBINED AI: {cd} - consensus {conf}",
+                  f"Combined passes 55% threshold: {'YES' if cd in ('UP', 'DOWN') else 'NO'}",
+                  COMBINED_LABEL]
     else:
-        lines += [f"CHALLENGER AI: UNAVAILABLE ({d['challenger_reason']}) - no call substituted",
-                  "Comparison unavailable"]
+        lines += [f"AI #2 CHALLENGER: UNAVAILABLE ({d['challenger_reason']}) - no call substituted",
+                  "Comparison unavailable", "COMBINED AI: UNAVAILABLE (needs both calls) - no call substituted"]
     lines += [LABEL,
-              f"Both calls frozen {d['generated'].strftime('%H:%M:%S UTC')} for this same market, before the outcome.",
+              f"All calls frozen {d['generated'].strftime('%H:%M:%S UTC')} for this same market, before the outcome.",
               "Signal only - place any trade manually."]
     return "\n".join(lines)
 
 
 class Ledger:
+    """openings: one immutable row per ticker (the frozen calls and consensus); deliveries: append-only log."""
+
     def __init__(self, path):
         self.db = sqlite3.connect(path)
-        self.db.execute("CREATE TABLE IF NOT EXISTS sent(ticker TEXT PRIMARY KEY, claimed_at TEXT, kind TEXT, "
-                        "live TEXT, live_up REAL, challenger TEXT, challenger_up REAL, status TEXT, "
-                        "message_id INTEGER, error TEXT, text TEXT)")
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS openings(ticker TEXT PRIMARY KEY, opens_at TEXT, closes_at TEXT,
+                generated_at TEXT, claimed_at TEXT, kind TEXT, live TEXT, live_up REAL, challenger TEXT,
+                challenger_up REAL, combined TEXT, combined_up REAL, text TEXT);
+            CREATE TABLE IF NOT EXISTS deliveries(id INTEGER PRIMARY KEY, ticker TEXT, at TEXT, status TEXT,
+                message_id INTEGER, error TEXT);
+            CREATE TRIGGER IF NOT EXISTS openings_immutable BEFORE UPDATE ON openings
+                BEGIN SELECT RAISE(ABORT, 'opening calls are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS openings_no_delete BEFORE DELETE ON openings
+                BEGIN SELECT RAISE(ABORT, 'opening calls are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS deliveries_append_only BEFORE UPDATE ON deliveries
+                BEGIN SELECT RAISE(ABORT, 'delivery log is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS deliveries_no_delete BEFORE DELETE ON deliveries
+                BEGIN SELECT RAISE(ABORT, 'delivery log is append-only'); END;""")
         self.db.commit()
 
+    def _legacy(self, ticker):            # the time-boxed run's table: never resend a market it already sent
+        try:
+            return self.db.execute("SELECT 1 FROM sent WHERE ticker=?", (ticker,)).fetchone() is not None
+        except sqlite3.OperationalError:
+            return False
+
     def claim(self, kind, d, text, now):
-        cur = self.db.execute("INSERT OR IGNORE INTO sent(ticker, claimed_at, kind, live, live_up, challenger, "
-                              "challenger_up, status, text) VALUES (?,?,?,?,?,?,?,'CLAIMED',?)",
-                              (d["ticker"], now.isoformat(), kind, d["live"], d["live_up"], d.get("challenger"),
-                               d.get("challenger_up"), text))
+        if self._legacy(d["ticker"]):
+            return False
+        cur = self.db.execute("INSERT OR IGNORE INTO openings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                              (d["ticker"], d["opens"].isoformat(), d["closes"].isoformat(), d["generated"].isoformat(),
+                               now.isoformat(), kind, d["live"], d["live_up"], d.get("challenger"),
+                               d.get("challenger_up"), d.get("combined"), d.get("combined_up"), text))
         self.db.commit()
         return cur.rowcount == 1
 
-    def result(self, ticker, status, message_id=None, error=None):
-        self.db.execute("UPDATE sent SET status=?, message_id=?, error=? WHERE ticker=?", (status, message_id, error, ticker))
+    def result(self, ticker, status, message_id=None, error=None, now=None):
+        self.db.execute("INSERT INTO deliveries(ticker, at, status, message_id, error) VALUES (?,?,?,?,?)",
+                        (ticker, (now or datetime.now(timezone.utc)).isoformat(), status, message_id, error))
         self.db.commit()
 
 
@@ -141,7 +183,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--release", required=True)
     ap.add_argument("--db", required=True)
-    ap.add_argument("--hours", type=float, default=2.0)
+    ap.add_argument("--hours", type=float, default=0.0, help="0 = run until stopped")
     ap.add_argument("--poll", type=float, default=5.0)
     a = ap.parse_args(argv)
     sys.path.insert(0, a.release)
@@ -149,7 +191,8 @@ def main(argv=None):
     cfg = phone_alerts.load_config()
     if "telegram" not in phone_alerts.channels(cfg):
         print("telegram not configured; nothing sent"); return 2
-    ledger, end = Ledger(a.db), datetime.now(timezone.utc) + timedelta(hours=a.hours)
+    ledger = Ledger(a.db)
+    end = datetime.max.replace(tzinfo=timezone.utc) if a.hours <= 0 else datetime.now(timezone.utc) + timedelta(hours=a.hours)
     print(json.dumps({"started": datetime.now(timezone.utc).isoformat(), "ends": end.isoformat()}), flush=True)
     while datetime.now(timezone.utc) < end:
         try:

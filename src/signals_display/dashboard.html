@@ -943,6 +943,7 @@ $('load-market-history').onclick=()=>{marketHistoryBeforeClose=null;marketHistor
   var el = {}; for (var i = 0; i < ids.length; i++) { el[ids[i]] = document.getElementById(ids[i]); if (!el[ids[i]]) { return; } }
   function pct(x) { return typeof x === 'number' ? (100 * x).toFixed(1) + '%' : 'n/a'; }
   function usd(x) { return typeof x === 'number' ? (x < 0 ? '-$' : '$') + Math.abs(x).toLocaleString(undefined, { maximumFractionDigits: 0 }) : 'n/a'; }
+  function bps(x) { return typeof x === 'number' ? (x >= 0 ? '+' : '') + (10000 * x).toFixed(1) + ' bp' : 'n/a'; }
   function hm(x) { var t = Date.parse(x); return Number.isFinite(t) ? new Date(t).toISOString().slice(11, 19) + ' UTC' : 'n/a'; }
   function load() {
     fetch('/api/minute6', { cache: 'no-store' })
@@ -963,7 +964,7 @@ $('load-market-history').onclick=()=>{marketHistoryBeforeClose=null;marketHistor
         el['minute6-measured'].textContent = a.status === 'READY'
           ? 'MEASURED: BTC ' + usd(m.price) + ' vs Kalshi threshold ' + usd(m.threshold) + ' (' + m.side_now + ' by ' + usd(Math.abs(m.distance_usd)) +
             ') · reverse needs ' + usd(m.move_to_reverse_usd) + (typeof m.move_per_minute_usd === 'number' ? ' (' + usd(m.move_per_minute_usd) + '/min)' : '') +
-            ' · mom 1m ' + pct(m.momentum_1m) + ' 5m ' + pct(m.momentum_5m) + ' · EMA9 ' + usd(m.ema9) + ' EMA21 ' + usd(m.ema21) + ' VWAP ' + usd(m.vwap_15m)
+            ' · mom 1m ' + bps(m.momentum_1m) + ' 5m ' + bps(m.momentum_5m) + ' · EMA9 ' + usd(m.ema9) + ' EMA21 ' + usd(m.ema21) + ' VWAP ' + usd(m.vwap_15m)
           : 'Live analytics unavailable';
         el['minute6-history'].textContent = a.status === 'READY'
           ? 'HISTORICAL: volatility ' + (h.volatility_vs_typical || 0).toFixed(2) + 'x typical for this hour · typical 15m move ' + pct(h.move_15m_fraction.median) +

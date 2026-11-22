@@ -33,6 +33,7 @@ Deployment categories:
 | L20 | 11-22 | Only one AI call visible; the challenger (v4) call for the same market was not shown | Display gap | `test_challenger_view.py` | this commit: CHALLENGER AI card + `/api/challenger-opening` (recomputed from the immutable opening record, reproducibility-checked, fixed per market, labelled NOT VALIDATED) | A (research display) | 92d054a (2026-11-22 06:40Z) |
 | L21 | 11-22 | CI failed on f7b29f1..6ff74df (never deployed) | R10 kill switch added `import os` to server.py, which two guard tests forbid | existing guards `test_write_access_is_absent_from_public_adapter_and_server`, `test_dashboard_panel_is_read_only_text_and_the_route_is_registered` | `cfc4b89` (switch read in `r10_shadow.from_journal`) | A | 92d054a (2026-11-22 06:40Z) |
 | L22 | 11-22 | Market pulse called SELLING PRESSURE from Coinbase's 1-level ticker book (imbalance -0.999 on 0.0003 BTC) | Coinbase stream provides top of book only | `test_market_pulse.py::test_top_of_book_only_venues_are_shown_but_not_used` | `98f66ff` | A | 98f66ff (2026-11-22 07:55Z) |
+| L23 | 11-22 | First minute-6 lock (20:06 UTC) had price/momentum components INELIGIBLE | Coinbase public candles endpoint publishes ~150 s late, after the 7:00 lock deadline | `test_minute6.py::test_waits_for_the_late_minute6_candle_then_uses_it`, `test_merge_bars_*`; minute closes from the server's own 15 s trade bars (4e42efd) |
 
 ## Open items (not defects, or awaiting data/approval)
 

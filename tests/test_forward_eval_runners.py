@@ -16,3 +16,12 @@ def test_runners_use_chunked_verified_export():
 def test_runners_still_refuse_an_edited_frozen_evaluator():
     assert "git -C $Repo diff --quiet $FreezeCommit -- scripts/forward_eval_openings.py" in (S / "Run-ForwardEval.ps1").read_text(encoding="utf-8")
     assert "scripts/forward_eval_v2.py scripts/research_opening_v2.py" in (S / "Run-ForwardEvalV2.ps1").read_text(encoding="utf-8")
+
+
+def test_each_runner_scores_its_own_evaluator():
+    for runner, evaluator in (("Run-ForwardEvalV2.ps1", "forward_eval_v2.py"), ("Run-ForwardEvalV3.ps1", "forward_eval_v3.py"),
+                              ("Run-ForwardEvalV4.ps1", "forward_eval_v4.py")):
+        text = (S / runner).read_text(encoding="utf-8")
+        assert "scripts\\" + evaluator in text
+        others = {"forward_eval_v2.py", "forward_eval_v3.py", "forward_eval_v4.py"} - {evaluator}
+        assert not any("scripts\\" + o in text for o in others)

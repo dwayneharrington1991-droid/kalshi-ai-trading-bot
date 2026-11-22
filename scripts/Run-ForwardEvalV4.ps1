@@ -22,7 +22,7 @@ $art = Join-Path $Out 'live_artifact.json'
 Invoke-Ssh -Key $Key -Server $Server -Command "cat $ArtifactRemote" -OutFile $art | Out-Null
 $env:PYTHONPATH = $Repo
 Push-Location $Repo
-try { $report = & $Py scripts\forward_eval_v3.py --journal $dump --artifact $art } finally { Pop-Location }
+try { $report = & $Py scripts\forward_eval_v4.py --journal $dump --artifact $art } finally { Pop-Location }
 $report | Set-Content -Encoding utf8 (Join-Path $Out 'report.json')
 $report
 Write-Host "Saved in $Out"

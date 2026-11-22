@@ -814,7 +814,7 @@ $('load-market-history').onclick=()=>{marketHistoryBeforeClose=null;marketHistor
   }
   function venues(v, key) {
     return Object.keys(v || {}).map(function (k) {
-      var x = v[k]; return k.replace(' BTC/USD stream', '').replace(' stream', '') + ' ' + (x.status === 'LIVE' ? n(x[key], 2) : 'stale/unavailable');
+      var x = v[k]; return k.replace(' BTC/USD stream', '').replace(' stream', '') + ' ' + (x.status === 'LIVE' ? n(x[key], 2) : String(x.status || 'unavailable').toLowerCase());
     }).join(' · ');
   }
   function render(d) {

@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 STALE_SECONDS = 5.0
 HORIZONS = (5, 15, 30, 60, 120)
 LEAN = 0.15                     # |imbalance| needed to call a side
+MIN_BOOK_LEVELS = 5             # depth levels required before a book counts as order-book pressure
 VALIDATION_MIN = 500            # scored forecasts before a horizon can be called supported
 LABEL_MEASURED = "LIVE MEASURED (descriptive, not a forecast)"
 LABEL_EXPERIMENTAL = "EXPERIMENTAL (research only, NOT VALIDATED)"
@@ -64,7 +65,15 @@ def order_book(snapshot):
             venues[name] = {"status": "STALE OR UNAVAILABLE"}
             continue
         imb = _num(book.get("multi_level_imbalance"))
-        venues[name] = {"status": "LIVE", "imbalance": imb, "top_of_book_imbalance": _num(book.get("top_of_book_imbalance")),
+        levels = book.get("depth_levels")
+        if not isinstance(levels, int) or levels < MIN_BOOK_LEVELS:
+            # A 1-level "book" (e.g. Coinbase ticker best bid/ask) swings between -1 and +1 on tiny size;
+            # it is shown but never used for the pressure reading.
+            venues[name] = {"status": "TOP OF BOOK ONLY (not used)", "levels": levels,
+                            "bid_depth": _num(book.get("bid_depth")), "ask_depth": _num(book.get("ask_depth")),
+                            "age_seconds": _num(book.get("age_seconds"))}
+            continue
+        venues[name] = {"status": "LIVE", "imbalance": imb, "levels": levels, "top_of_book_imbalance": _num(book.get("top_of_book_imbalance")),
                         "bid_depth": _num(book.get("bid_depth")), "ask_depth": _num(book.get("ask_depth")),
                         "spread": _num(book.get("spread")), "depth_change": _num(micro.get("bid_ask_depth_change")),
                         "liquidity_deterioration": _num(micro.get("liquidity_deterioration_fraction")),

@@ -10,7 +10,7 @@ T0 = datetime(2026, 11, 22, 5, 0, tzinfo=timezone.utc)
 
 def _src(book=0.3, flow=0.25, age=0.5, status="READY"):
     return {"order_book": {"status": status, "age_seconds": age, "multi_level_imbalance": book, "bid_depth": 3,
-                           "ask_depth": 2, "spread": 0.1, "top_of_book_imbalance": 0.1},
+                           "ask_depth": 2, "spread": 0.1, "top_of_book_imbalance": 0.1, "depth_levels": 20},
             "microstructure": {"bid_ask_depth_change": -1, "liquidity_deterioration_fraction": 0.2},
             "order_flow": {"status": status, "age_seconds": age, "imbalance": flow, "aggressive_buy_volume": 5,
                            "aggressive_sell_volume": 3, "large_trade_count": 1, "trades_per_second": 1.5,
@@ -97,3 +97,11 @@ def test_dashboard_panel_is_visible_text_only_and_labelled():
     assert "innerHTML" not in block and "EXPERIMENTAL" in block and "LIVE MEASURED" in block
     src = (ROOT / "src/signals_display/server.py").read_text(encoding="utf-8")
     assert 'route == "/api/market-pulse"' in src and "validated_probability=False" in src
+
+
+def test_top_of_book_only_venues_are_shown_but_not_used():
+    s = _snap()
+    s["advanced_intelligence"]["sources"]["Coinbase BTC/USD stream"]["order_book"].update(depth_levels=1, multi_level_imbalance=-0.99)
+    r = mp.order_book(s)
+    assert r["venues"]["Coinbase BTC/USD stream"]["status"].startswith("TOP OF BOOK ONLY")
+    assert r["indicator"] == "BUYING PRESSURE" and r["cross_exchange"] == "SINGLE SOURCE"

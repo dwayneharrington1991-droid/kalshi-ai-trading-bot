@@ -28,6 +28,20 @@ MIN_CONTRACTS = learning.MIN_CONTRACTS
 BOOST_MIN_CONTRACTS = 500
 PROTOCOL = "opening-frozen-linear-ensemble-stumps-shadow-v2"
 FEATURE_VERSION = "opening-asof-features-v2"
+# Regression ledger L13: how the stream-derived micro/flow inputs were computed. Deployment 9a9a6ea
+# (first live 2026-11-20 20:21:50 UTC) fixed the reconnect loops, which changed those inputs'
+# distribution without changing FEATURE_VERSION. Records made later carry "stream_computation";
+# older unstamped records are classified by their opening time.
+STREAM_COMPUTATION = "full-window-v1"
+LEGACY_STREAM_COMPUTATION = "reset-window-legacy"
+STREAM_FIX_LIVE_AT = datetime(2026, 11, 20, 20, 21, 50, tzinfo=timezone.utc)
+
+
+def stream_computation(frozen, opened):
+    stamped = frozen.get("stream_computation") if isinstance(frozen, dict) else None
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    return STREAM_COMPUTATION if opened >= STREAM_FIX_LIVE_AT else LEGACY_STREAM_COMPUTATION
 
 PRICE_CORE = {
     "distance_scaled",
@@ -155,6 +169,7 @@ def _assess_opening(raw, asof):
             remaining=(closed - opened).total_seconds(),
             opening_delay_seconds=(generated - opened).total_seconds(),
             regime=opening.get("regime", "unavailable"),
+            stream_computation=stream_computation(frozen, opened),
         ),
         "ELIGIBLE",
     )
@@ -196,13 +211,18 @@ def dataset_coverage(db, asof=None):
     }
 
 
-def dataset(db, asof=None):
-    """Small immutable opening records joined to observed official outcomes only."""
+def dataset(db, asof=None, stream_computation=None):
+    """Small immutable opening records joined to observed official outcomes only.
+
+    ``stream_computation`` (optional) keeps only records whose micro/flow inputs were computed the
+    same way (L13), so a model is never trained on one computation and served another. The default
+    None keeps every eligible record (unchanged behaviour).
+    """
     asof = asof or datetime.now(timezone.utc)
     rows = []
     for raw in _opening_rows(db, asof):
         row, _reason = _assess_opening(raw, asof)
-        if row is not None:
+        if row is not None and (stream_computation is None or row["stream_computation"] == stream_computation):
             rows.append(row)
     return rows
 

@@ -31,6 +31,7 @@ for name, ctx in (("none", None), ("live", _context(order_flow=_flow(NOW - timed
     o = opening(frozen_context=ctx) if ctx is not None else opening()
     o["frozen_features"].pop("optional_feature_status", None)
     o["frozen_features"].pop("optional_context_available", None)
+    o["frozen_features"].pop("stream_computation", None)   # L13 provenance stamp (metadata only)
     out[name] = o
 print(json.dumps(out, sort_keys=True, default=str))
 """

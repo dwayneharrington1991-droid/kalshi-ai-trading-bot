@@ -572,6 +572,7 @@ def _opening_features(history, points, market, day, basis, opened, frozen_contex
     }
     return {
         "version": "opening-asof-features-v2",
+        "stream_computation": "full-window-v1",   # L13 provenance stamp; metadata only
         "status": "FROZEN_AS_OF_OPENING",
         "cutoff": opened.isoformat(),
         "max_input_received_at": max(receipts).isoformat(),

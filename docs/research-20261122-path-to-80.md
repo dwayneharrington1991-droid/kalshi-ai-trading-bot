@@ -55,3 +55,14 @@ Data: live immutable calls with opens_at >= 2026-11-22 06:00 UTC. Decision at >=
 03-13 window: supported only if (a) its accuracy's Wilson 95% lower bound exceeds 0.60 and (b) a
 two-proportion test against the other hours gives p < 0.05. If supported, a session-aware WAIT rule
 becomes a v5/v6 candidate (never a live change without its own pre-registered pass and approval).
+
+## Recalibration and market stacking of the live model (non-reserved, walk-forward, 192 openings)
+
+| Variant | Brier | vs live 95% CI | Calls | Accuracy |
+|---|---|---|---|---|
+| live | 0.2453 | - | 68/192 | 61.8% |
+| Platt recalibration (refit on past only) | 0.2442 | [-0.0083, +0.0058] | 115/192 | 56.5% |
+| logistic stack live + Kalshi mid | 0.2446 | [-0.0085, +0.0072] | 122/192 | 57.4% |
+| 50/50 live + Kalshi mid | 0.2444 | [-0.0058, +0.0041] | 62/192 | 62.9% |
+
+No credible gain; recalibration widens coverage and lowers accuracy. Not added to the bot.

@@ -162,11 +162,38 @@ def step(ledger, send, cfg, state, challenger, now, log=print):
     text = message(kind, d)
     if not ledger.claim(kind, d, text, now):
         return "DUPLICATE"
+    try:                                       # model version per opening, so results can be split by version
+        model = (((state or {}).get("prediction_engine") or {}).get("initial") or {}).get("model")
+        ledger.db.execute("CREATE TABLE IF NOT EXISTS opening_models(ticker TEXT PRIMARY KEY, model TEXT, recorded_at TEXT)")
+        ledger.db.execute("INSERT OR IGNORE INTO opening_models VALUES (?,?,?)",
+                          (d["ticker"], json.dumps(model, default=str)[:300], now.isoformat()))
+        ledger.db.commit()
+    except Exception:
+        pass
     status, mid, err = deliver(send, cfg, text)
     ledger.result(d["ticker"], status, mid, err)
     log(json.dumps({"at": now.isoformat(), "ticker": d["ticker"], "kind": kind, "status": status,
                     "message_id": mid, "error": err}))
     return status
+
+
+def market_history(pages=3, fetch=None):
+    """Recent settled markets from the read-only API, following its cursor (3 pages ~ 15 h, enough to ride out
+    a service restart)."""
+    from urllib.parse import urlencode
+    fetch = fetch or fetch_json
+    markets, query = [], ""
+    for _ in range(pages):
+        try:
+            d = fetch("/api/market-history" + query)
+        except Exception:
+            break
+        markets += d.get("markets") or []
+        p = d.get("pagination") or {}
+        if not p.get("has_more") or not p.get("next_before_close"):
+            break
+        query = "?" + urlencode({"before_close": p["next_before_close"], "before_ticker": p.get("next_before_ticker") or ""})
+    return {"markets": markets}
 
 
 def main(argv=None):
@@ -188,7 +215,7 @@ def main(argv=None):
         from minute6_runner import Minute6Runner, server_candles
         runner = Minute6Runner(a.db, str(Path(a.db).with_name("minute6_latest.json")), phone_alerts.send, cfg,
                                candles=lambda: server_candles(fetch_json),
-                               history=lambda: fetch_json("/api/market-history"), log=lambda s: print(s, flush=True))
+                               history=market_history, log=lambda s: print(s, flush=True))
     except Exception as exc:
         print(json.dumps({"minute6": "disabled", "error": type(exc).__name__}), flush=True)
     end =datetime.max.replace(tzinfo=timezone.utc) if a.hours <= 0 else datetime.now(timezone.utc) + timedelta(hours=a.hours)

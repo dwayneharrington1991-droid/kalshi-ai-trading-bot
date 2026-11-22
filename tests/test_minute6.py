@@ -183,3 +183,15 @@ def test_latest_json_carries_pending_then_unavailable_lines(tmp_path):
     assert json.loads((tmp_path / "m6.json").read_text())["line"] == "MINUTE-6: PENDING 🟡"
     r.write_latest(_state(), OPEN + timedelta(seconds=500), 1)
     assert json.loads((tmp_path / "m6.json").read_text())["line"] == "MINUTE-6: WAIT 🟡 — N/A"
+
+
+def test_latest_json_carries_scoreboard7_not_started_then_running(tmp_path):
+    import scoreboard7
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {}, candles=_candles,
+                      history=lambda: {"markets": []}, log=lambda x: None)
+    r.write_latest(_state(), OPEN + timedelta(seconds=120), 0)
+    assert json.loads((tmp_path / "m6.json").read_text())["scoreboard7"] == {"status": "NOT STARTED"}
+    scoreboard7.start_window(tmp_path / "score_window.json", now=OPEN)
+    r.write_latest(_state(), OPEN + timedelta(seconds=130), 1)
+    sb7 = json.loads((tmp_path / "m6.json").read_text())["scoreboard7"]
+    assert sb7["status"] == "RUNNING" and sb7["models"]["MINUTE-6"]["accuracy"] is None

@@ -113,3 +113,15 @@ def test_builtin_notifier_steps_aside_only_when_the_service_marker_exists(tmp_pa
     assert phone_alerts.from_journal(tmp_path / "j.db") is not None
     marker.write_text("three-line service")
     assert phone_alerts.from_journal(tmp_path / "j.db") is None
+
+
+def test_market_history_follows_the_api_cursor():
+    pages = {"/api/market-history": {"markets": [{"ticker": "A"}], "pagination": {"has_more": True,
+             "next_before_close": "2026-11-22T18:45:00+00:00", "next_before_ticker": "A"}}}
+    seen = []
+
+    def fetch(path):
+        seen.append(path)
+        return pages.get(path, {"markets": [{"ticker": "B"}], "pagination": {"has_more": False}})
+    out = dual.market_history(pages=3, fetch=fetch)
+    assert [m["ticker"] for m in out["markets"]] == ["A", "B"] and "before_close=2026-11-22T18%3A45%3A00%2B00%3A00" in seen[1]

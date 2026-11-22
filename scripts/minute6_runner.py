@@ -11,10 +11,13 @@ import json
 import os
 import sqlite3
 import time
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 
 from src.signals_display import minute6 as m6
+
+import scoreboard7
 
 CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60"
 FEE_RATE, SLIPPAGE = 0.07, 0.01
@@ -186,13 +189,27 @@ class Minute6Runner:
     def _has_openings(self):
         return self.db.execute("SELECT 1 FROM sqlite_master WHERE name='openings'").fetchone() is not None
 
+    def scoreboard7(self, now):
+        """Seven-day test of all four predictions (scripts/scoreboard7.py); NOT STARTED until the window file exists."""
+        path = Path(self.out_path).with_name("score_window.json")
+        if not path.exists():
+            return {"status": "NOT STARTED"}
+        try:
+            scoreboard7.ensure_tables(self.db)
+            return {"status": "RUNNING", **scoreboard7.compute(self.db, json.loads(path.read_text()), now)}
+        except Exception as exc:
+            return {"status": "UNAVAILABLE", "reason": type(exc).__name__}
+
     def scoreboard(self, now_mono):
         if self.history is None:
             return None
         if now_mono - self.board[0] < 120 and self.board[1] is not None:
             return self.board[1]
         try:                                   # keep official settlements locally: the API pages only recent markets
-            for x in (self.history() or {}).get("markets", []):
+            markets = (self.history() or {}).get("markets", [])
+            scoreboard7.ensure_tables(self.db)
+            scoreboard7.record_outcomes(self.db, markets)
+            for x in markets:
                 if x.get("outcome_status") == "VERIFIED_OFFICIAL" and x.get("final_outcome") in ("UP", "DOWN"):
                     self.db.execute("INSERT OR IGNORE INTO minute6_outcomes VALUES (?,?,?)",
                                     (x["ticker"], x["final_outcome"], datetime.now(timezone.utc).isoformat()))
@@ -255,6 +272,7 @@ class Minute6Runner:
                     else "NO READING (service was not running at minute 6; nothing substituted)"
                 out["line"] = four_lines.PENDING if pending else four_lines.UNAVAILABLE
         out["scoreboard"] = self.scoreboard(now_mono)
+        out["scoreboard7"] = self.scoreboard7(now)
         tmp = self.out_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(out, f, default=str)

@@ -164,5 +164,5 @@ def latest_body(path=None, now=None):
         age = None
     if age is None or age > 90:
         data = {"status": "STALE", "label": LABEL, "reason": "minute-6 research service is not updating",
-                "age_seconds": age, "scoreboard": data.get("scoreboard")}
+                "age_seconds": age, "scoreboard": data.get("scoreboard"), "scoreboard7": data.get("scoreboard7")}
     return json.dumps(data, default=str).encode()

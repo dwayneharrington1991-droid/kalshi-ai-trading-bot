@@ -8,7 +8,7 @@ def test_runners_use_chunked_verified_export():
     common = (S / "ForwardEvalCommon.ps1").read_text(encoding="utf-8")
     assert "gzip -9" in common and "tail -c +" in common and "head -c" in common and "rm -f $tmp" in common
     assert "Length -eq $want" in common                      # every chunk's size is verified
-    for name in ("Run-ForwardEval.ps1", "Run-ForwardEvalV2.ps1", "Run-ForwardEvalV3.ps1"):
+    for name in ("Run-ForwardEval.ps1", "Run-ForwardEvalV2.ps1", "Run-ForwardEvalV3.ps1", "Run-ForwardEvalV4.ps1"):
         text = (S / name).read_text(encoding="utf-8")
         assert "Get-RemoteExport" in text and "ForwardEvalCommon.ps1" in text
 

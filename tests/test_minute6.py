@@ -175,3 +175,11 @@ def test_merge_bars_uses_final_15s_bar_and_skips_unfinished_minutes():
     assert out[600][4] == 5.0                          # close of the bar starting at 600+45
     assert out[660][4] == 8.0 and out[660][3] == 5 and abs(out[660][5] - 2.0) < 1e-12
     assert 720 not in out
+
+
+def test_latest_json_carries_pending_then_unavailable_lines(tmp_path):
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {}, candles=_candles, log=lambda x: None)
+    r.write_latest(_state(), OPEN + timedelta(seconds=120), 0)
+    assert json.loads((tmp_path / "m6.json").read_text())["line"] == "MINUTE-6: PENDING 🟡"
+    r.write_latest(_state(), OPEN + timedelta(seconds=500), 1)
+    assert json.loads((tmp_path / "m6.json").read_text())["line"] == "MINUTE-6: WAIT 🟡 — N/A"

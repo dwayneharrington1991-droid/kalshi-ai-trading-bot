@@ -249,8 +249,11 @@ class Minute6Runner:
                 else:
                     out["line"] = four_lines.UNAVAILABLE
             else:
-                out["status"] = "WAITING FOR MINUTE 6" if now < m["opens"] + timedelta(seconds=m6.DECISION_LATEST_S) \
+                from src.signals_display import four_lines
+                pending = now < m["opens"] + timedelta(seconds=m6.DECISION_LATEST_S)
+                out["status"] = "WAITING FOR MINUTE 6" if pending \
                     else "NO READING (service was not running at minute 6; nothing substituted)"
+                out["line"] = four_lines.PENDING if pending else four_lines.UNAVAILABLE
         out["scoreboard"] = self.scoreboard(now_mono)
         tmp = self.out_path + ".tmp"
         with open(tmp, "w") as f:

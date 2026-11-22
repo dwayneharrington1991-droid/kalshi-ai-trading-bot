@@ -35,3 +35,23 @@ accuracy at meaningful coverage. All numbers below are out-of-sample.
 ## What will NOT be done
 - Raising the threshold or hiding losses to show a higher number; using reserved forward-test outcomes
   for tuning; deploying a model without a pre-registered pass.
+
+## Regime scan (non-reserved, live calls, 2026-11-16 21:45 .. 11-20 06:00; 12 slices, exploratory)
+
+| Slice | Accuracy on calls [95% CI] | Coverage |
+|---|---|---|
+| All | 69/106 = 65% [56, 73] | 106/312 |
+| Opening 03-13 UTC (Asia/Europe) | 25/32 = 78% [61, 89] | 32/125 |
+| Opening 21-03 UTC (US evening) | 21/33 = 64% [47, 78] | 33/91 |
+| Opening 13-21 UTC (US day) | 23/41 = 56% [41, 70] | 41/96 |
+| Volatility tercile low / mid / high | 58% / 72% / 66% | - |
+| Distance to threshold low / mid / high | 69% / 64% / 60% | - |
+
+With 12 slices one large deviation is expected by chance; none is significant after correction.
+
+### Pre-registered hypothesis H-session (frozen 2026-11-22 05:00 UTC)
+Live opening calls made at 03:00-12:59 UTC are more accurate than calls at other hours.
+Data: live immutable calls with opens_at >= 2026-11-22 06:00 UTC. Decision at >= 120 calls in the
+03-13 window: supported only if (a) its accuracy's Wilson 95% lower bound exceeds 0.60 and (b) a
+two-proportion test against the other hours gives p < 0.05. If supported, a session-aware WAIT rule
+becomes a v5/v6 candidate (never a live change without its own pre-registered pass and approval).

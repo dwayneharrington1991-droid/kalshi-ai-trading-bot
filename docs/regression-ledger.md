@@ -30,7 +30,9 @@ Deployment categories:
 ## Open items (not defects, or awaiting data/approval)
 
 - R10: the micro tracker uses one event clock for quotes and trades, rejecting delayed Coinbase
-  trades. A fix changes how micro inputs are computed: category B, measure first.
+  trades (~1.3 M rejected updates per day). Candidate fix `MarketIntelligence(per_kind_event_clock=True)`
+  is implemented and tested but OFF in production (changes micro inputs: category B, needs approval and a
+  model trained on inputs computed that way).
 - Exchange choice for the opening reference (latest tick wins): measured effect 0.024 sigma, no
   change.
 - Model edge: the frozen forward test (`c08fb8c`) decides after 200 openings (about 2026-11-22

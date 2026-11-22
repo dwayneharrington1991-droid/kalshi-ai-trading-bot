@@ -121,6 +121,7 @@ class _Source:
         self.session = None
         self.last_received = None
         self.last_event = None
+        self.last_event_by_kind = {}
         self.event_lag = None
         self.processing_ms = None
         self.reset_count = 0
@@ -134,6 +135,7 @@ class _Source:
         if self.last_received is not None:
             self.reset_count += 1
         self.last_event = None
+        self.last_event_by_kind = {}
         self.ids.clear()
         self.seen.clear()
 
@@ -146,10 +148,14 @@ class MarketIntelligence:
     restarts continuity; retained old bins cannot silently fill the missing path.
     """
 
-    def __init__(self, *, max_sources=8):
+    def __init__(self, *, max_sources=8, per_kind_event_clock=False):
         if type(max_sources) is not int or not 1 <= max_sources <= 32:
             raise ValueError("Source count must be 1..32")
         self.max_sources = max_sources
+        # R10 (candidate only, default off = production behaviour): one exchange-time clock per
+        # observation kind, so a trade whose exchange time trails the latest quote is not rejected.
+        # Turning it on changes micro inputs (category B) and needs explicit approval.
+        self.per_kind_event_clock = bool(per_kind_event_clock)
         self.sources = {}
         self.lock = threading.RLock()
 
@@ -254,7 +260,9 @@ class MarketIntelligence:
             key = (identity, str(trade_id)) if kind == "trade" and trade_id is not None else None
             if key is not None and key in state.seen:
                 return False
-            if event and state.last_event is not None and event.timestamp() < state.last_event:
+            clock = (state.last_event_by_kind.get(item["kind"]) if self.per_kind_event_clock
+                     else state.last_event)
+            if event and clock is not None and event.timestamp() < clock:
                 state.rejected += 1
                 raise ValueError("Out-of-order exchange timestamp")
             if kind == "trade" and trade_id is None:
@@ -284,6 +292,8 @@ class MarketIntelligence:
                 collection[-1].add(item)
             state.last_received = receipt
             state.last_event = event.timestamp() if event else state.last_event
+            if event:
+                state.last_event_by_kind[kind] = max(event.timestamp(), state.last_event_by_kind.get(kind, -1e18))
             state.event_lag = (at - event).total_seconds() if event else None
             state.processing_ms = processing
             state.latest = {

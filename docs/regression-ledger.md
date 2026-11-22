@@ -30,6 +30,7 @@ Deployment categories:
 | L17 | 11-22 | R10: 68% of valid Coinbase trades rejected by the micro tracker and advanced flow; no corrected data existed to train on | Shared quote/trade clock + newest-first batches | `test_r10_shadow.py`, `test_micro_event_clock_r10.py` | this commit: isolated corrected pipeline records corrected inputs per opening in `r10_shadow.sqlite3` (kill switch `KXBTC_R10_SHADOW=0`); live inputs unchanged | A (shadow data only) | pending CI |
 | L18 | 11-22 | Opening card lacked ticker, official threshold, countdown and WAIT coverage; shadow AI panel hidden by the minimal layout | Display gaps | `test_dashboard_connection_status.py` (market/score/shadow) | this commit | A | pending CI |
 | L19 | 11-22 | Order book, trade flow, momentum, short-horizon forecasts and contract EV were computed but not shown (or hidden) | Display gap | `test_market_pulse.py` | this commit: `/api/market-pulse` + visible MARKET PULSE panel; horizons scored prospectively, NOT VALIDATED until 500 forecasts with 95% lower bound > 50%; edge stays UNVERIFIED without a validated probability | A (research display) | pending CI |
+| L20 | 11-22 | Only one AI call visible; the challenger (v4) call for the same market was not shown | Display gap | `test_challenger_view.py` | this commit: CHALLENGER AI card + `/api/challenger-opening` (recomputed from the immutable opening record, reproducibility-checked, fixed per market, labelled NOT VALIDATED) | A (research display) | pending CI |
 
 ## Open items (not defects, or awaiting data/approval)
 

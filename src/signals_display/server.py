@@ -2357,6 +2357,14 @@ def make_handler(monitor):
                 lifecycle_path = f"{monitor.journal.path}.lifecycle-status.json"
                 body = json.dumps(combined_status(status_path, lifecycle_path), allow_nan=False, default=str).encode()
                 content_type = "application/json"
+            elif route == "/api/challenger-opening":
+                # Second AI call (v4 challenger) for the current market: research only, never the live call.
+                from .challenger_view import ChallengerView
+                if getattr(monitor, "challenger_view", None) is None:
+                    monitor.challenger_view = ChallengerView(getattr(monitor, "opening_artifact", None))
+                opening = ((monitor.snapshot() or {}).get("prediction_engine") or {}).get("initial") or {}
+                body = json.dumps(monitor.challenger_view.call(opening), default=str).encode()
+                content_type = "application/json"
             elif route == "/api/market-pulse":
                 # Research indicators (order book, trade flow, momentum, short horizons, contract EV).
                 # Read-only; never changes a signal, model, threshold, alert or record.

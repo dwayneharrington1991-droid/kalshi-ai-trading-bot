@@ -100,8 +100,9 @@ main>div.ai-scoreboard:not(#minimal-opening){display:flex!important;flex-directi
 @media(prefers-reduced-motion:reduce){body:after,#minimal-opening .minimal-value:after,.term-flip{animation:none!important}.term-arc,#minimal-opening .minimal-value{transition:none!important}}
 @media(prefers-contrast:more){#minimal-opening .minimal-value{background:#000;border-color:#fff}.term-qual{color:#fff}#minimal-opening h1{color:#fff;background:none}}
 #term-link[data-tone="green"]{color:#3fb950}#term-link[data-tone="amber"],#term-drift{color:#d29922}#term-link[data-tone="red"]{color:#f85149;font-weight:700}
+#challenger-card{grid-column:1/-1;order:3}#challenger-card h1{font-size:1.1em}#challenger-card #challenger-call{font-size:2.2em}
 </style></head><body><main>
-<section id="minimal-opening" aria-label="AI opening prediction" data-tone="amber"><article id="minimal-opening-card" class="card minimal-value term-call" data-signal="WAIT"><h1>AI OPENING CALL</h1><strong id="minimal-opening-call" class="amber" role="status" aria-live="polite">WAIT</strong><span id="term-predicting" class="term-qual term-predicting">PREDICTING: FINAL OUTCOME AT —</span><span id="term-call-qualifier" class="term-qual">Waiting for the frozen opening prediction</span><span id="term-last-result" class="term-qual term-last">LAST LOCKED CALL: checking…</span><span id="term-market" class="term-qual term-market">MARKET: checking</span><span id="term-score" class="term-qual term-score">SCOREBOARD: checking</span><span id="term-link" class="term-qual term-link" data-tone="amber" role="status" aria-live="polite">CONNECTION: checking</span><span id="term-drift" class="term-qual term-drift" data-tone="amber" hidden></span><p id="minimal-opening-call-note">Waiting for the immutable opening snapshot.</p></article><article id="minimal-confidence-card" class="card minimal-value term-conf" data-signal="WAIT"><h1>AI CONFIDENCE</h1><div id="minimal-confidence-gauge" class="term-gauge unavailable" role="meter" aria-valuemin="0" aria-valuemax="100" aria-label="Calibrated opening confidence unavailable"><svg viewBox="-14 -14 148 148" aria-hidden="true" focusable="false"><circle class="term-track" cx="60" cy="60" r="52"/><circle id="term-gauge-arc" class="term-arc" cx="60" cy="60" r="52"/></svg><strong id="minimal-opening-confidence" class="amber term-muted" aria-live="polite">—</strong></div><span id="term-confidence-qualifier" class="term-qual">Unavailable</span><p id="minimal-opening-confidence-note">Probability unavailable.</p></article></section>
+<section id="minimal-opening" aria-label="AI opening prediction" data-tone="amber"><article id="minimal-opening-card" class="card minimal-value term-call" data-signal="WAIT"><h1>AI OPENING CALL</h1><strong id="minimal-opening-call" class="amber" role="status" aria-live="polite">WAIT</strong><span id="term-predicting" class="term-qual term-predicting">PREDICTING: FINAL OUTCOME AT —</span><span id="term-call-qualifier" class="term-qual">Waiting for the frozen opening prediction</span><span id="term-last-result" class="term-qual term-last">LAST LOCKED CALL: checking…</span><span id="term-market" class="term-qual term-market">MARKET: checking</span><span id="term-score" class="term-qual term-score">SCOREBOARD: checking</span><span id="term-link" class="term-qual term-link" data-tone="amber" role="status" aria-live="polite">CONNECTION: checking</span><span id="term-drift" class="term-qual term-drift" data-tone="amber" hidden></span><p id="minimal-opening-call-note">Waiting for the immutable opening snapshot.</p></article><article id="challenger-card" class="card minimal-value" data-signal="WAIT"><h1>CHALLENGER AI (research)</h1><strong id="challenger-call" class="amber" role="status" aria-live="polite">WAIT</strong><span id="challenger-prob" class="term-qual">checking…</span><span id="challenger-compare" class="term-qual"></span><p id="challenger-note" class="small">Same market, same frozen opening inputs, with the 30 shifted inputs aligned (forward test v4). NOT VALIDATED — the AI OPENING CALL is the official call; this never changes it, the alerts or the scoreboard.</p></article><article id="minimal-confidence-card" class="card minimal-value term-conf" data-signal="WAIT"><h1>AI CONFIDENCE</h1><div id="minimal-confidence-gauge" class="term-gauge unavailable" role="meter" aria-valuemin="0" aria-valuemax="100" aria-label="Calibrated opening confidence unavailable"><svg viewBox="-14 -14 148 148" aria-hidden="true" focusable="false"><circle class="term-track" cx="60" cy="60" r="52"/><circle id="term-gauge-arc" class="term-arc" cx="60" cy="60" r="52"/></svg><strong id="minimal-opening-confidence" class="amber term-muted" aria-live="polite">—</strong></div><span id="term-confidence-qualifier" class="term-qual">Unavailable</span><p id="minimal-opening-confidence-note">Probability unavailable.</p></article></section>
 <header><div><div class="eyebrow">KX15 INTELLIGENCE · SIGNALS ONLY</div><h1>Bitcoin 15-Minute Command Center</h1></div><div class="header-status"><div class="opening-score" aria-live="polite"><span>IMMUTABLE OPENING CALLS</span><strong id="opening-score">— correct · — wrong</strong><small id="opening-score-note">Official outcomes only</small></div><span class="tag" id="freshness" role="status">WARMING UP</span></div></header>
 <p class="small">Your market prediction helper. Three simple answers, with the hard analysis handled behind the scenes. You place every trade yourself.</p>
 <div id="critical-warning" class="notice" role="alert" hidden></div>
@@ -844,6 +845,37 @@ $('load-market-history').onclick=()=>{marketHistoryBeforeClose=null;marketHistor
   }
   load();
   setInterval(load, 3000);
+})();
+</script>
+<script>
+(function () {
+  // Challenger AI card: reads only /api/challenger-opening; text nodes only; never touches the live call.
+  var call = document.getElementById('challenger-call'), prob = document.getElementById('challenger-prob'),
+      cmp = document.getElementById('challenger-compare'), card = document.getElementById('challenger-card');
+  if (!call || !prob || !cmp || !card) { return; }
+  function pct(x) { return (100 * x).toFixed(1) + '%'; }
+  function load() {
+    fetch('/api/challenger-opening', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })
+      .then(function (d) {
+        if (d.status !== 'READY') {
+          call.textContent = 'WAIT'; call.className = 'amber'; card.setAttribute('data-signal', 'WAIT');
+          prob.textContent = d.status + (d.reason ? ' — ' + d.reason : ''); cmp.textContent = ''; return;
+        }
+        var closes = Date.parse(d.closes_at);
+        if (Number.isFinite(closes) && Date.now() >= closes) {
+          call.textContent = 'WAIT'; prob.textContent = 'Contract closed — waiting for the next opening'; cmp.textContent = ''; return;
+        }
+        call.textContent = d.direction; call.className = d.direction === 'UP' ? 'green' : d.direction === 'DOWN' ? 'red' : 'amber';
+        card.setAttribute('data-signal', d.direction);
+        prob.textContent = 'P(UP) ' + pct(d.up) + ' · ' + d.ticker + ' · fixed at the opening';
+        cmp.textContent = 'Live AI: ' + d.live_direction + ' (P(UP) ' + pct(d.live_up) + ') — ' +
+          (d.agrees_with_live ? 'BOTH AGREE' : 'DISAGREE');
+      })
+      .catch(function () { prob.textContent = 'Challenger unavailable. The live call is unaffected.'; });
+  }
+  load();
+  setInterval(load, 15000);
 })();
 </script>
 </body></html>

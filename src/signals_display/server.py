@@ -389,6 +389,8 @@ class Monitor:
         if os.environ.get("KXBTC_R10_SHADOW", "1") != "0" and getattr(journal, "path", None) and str(journal.path) != ":memory:":
             from .r10_shadow import R10Shadow
             self.r10_shadow = R10Shadow(Path(journal.path).parent / "r10_shadow.sqlite3")
+        from .market_pulse import HorizonForecasts
+        self.pulse_horizons = HorizonForecasts()       # research-only short-horizon forecasts
         self.monitoring_alerts = MonitoringAlerts()
         self.market_strip = MarketStrip()
         self.last_proxy_observation = None
@@ -964,6 +966,13 @@ class Monitor:
             )
             payload["advanced_intelligence"] = advanced
             phases["advanced_analysis"] = round((perf_counter() - advanced_started) * 1000, 2)
+            try:                                       # research only; never a live input
+                from .market_pulse import pressure_score
+                pulse_src = (advanced.get("sources") or {}).get(advanced.get("primary_source")) or {}
+                self.pulse_horizons.observe(now, pulse_src.get("latest_price"),
+                                            pressure_score({"advanced_intelligence": advanced}))
+            except Exception:
+                pass
             coverage["Kalshi KXBTC15M public"] = {
                 "status": "CONNECTED" if market_now else "UNAVAILABLE",
                 "reason": "Public contract metadata and executable quotes only; no account access"
@@ -2347,6 +2356,16 @@ def make_handler(monitor):
                 status_path = f"{monitor.journal.path}.learning-status.json"
                 lifecycle_path = f"{monitor.journal.path}.lifecycle-status.json"
                 body = json.dumps(combined_status(status_path, lifecycle_path), allow_nan=False, default=str).encode()
+                content_type = "application/json"
+            elif route == "/api/market-pulse":
+                # Research indicators (order book, trade flow, momentum, short horizons, contract EV).
+                # Read-only; never changes a signal, model, threshold, alert or record.
+                from .market_pulse import build as pulse_build
+                shadow = getattr(monitor, "r10_shadow", None)
+                body = json.dumps(pulse_build(monitor.snapshot() or {},
+                                              r10=shadow.counters if shadow is not None else None,
+                                              horizons=getattr(monitor, "pulse_horizons", None),
+                                              validated_probability=False), default=str).encode()
                 content_type = "application/json"
             elif route == "/api/accuracy-health":
                 # Read-only diagnostic: data health and predictive edge, both scoreboard populations.

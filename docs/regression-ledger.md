@@ -29,6 +29,7 @@ Deployment categories:
 | L16 | 11-22 | Training could not tell reset-window from full-window stream inputs (root cause of L13) | No provenance on opening records; FEATURE_VERSION unchanged by 9a9a6ea | `test_stream_computation_provenance.py` | `9c88e74` (stamp + optional `dataset(stream_computation=)`) | A (metadata) | 36f1b0c (2026-11-22 03:40Z) |
 | L17 | 11-22 | R10: 68% of valid Coinbase trades rejected by the micro tracker and advanced flow; no corrected data existed to train on | Shared quote/trade clock + newest-first batches | `test_r10_shadow.py`, `test_micro_event_clock_r10.py` | this commit: isolated corrected pipeline records corrected inputs per opening in `r10_shadow.sqlite3` (kill switch `KXBTC_R10_SHADOW=0`); live inputs unchanged | A (shadow data only) | pending CI |
 | L18 | 11-22 | Opening card lacked ticker, official threshold, countdown and WAIT coverage; shadow AI panel hidden by the minimal layout | Display gaps | `test_dashboard_connection_status.py` (market/score/shadow) | this commit | A | pending CI |
+| L19 | 11-22 | Order book, trade flow, momentum, short-horizon forecasts and contract EV were computed but not shown (or hidden) | Display gap | `test_market_pulse.py` | this commit: `/api/market-pulse` + visible MARKET PULSE panel; horizons scored prospectively, NOT VALIDATED until 500 forecasts with 95% lower bound > 50%; edge stays UNVERIFIED without a validated probability | A (research display) | pending CI |
 
 ## Open items (not defects, or awaiting data/approval)
 

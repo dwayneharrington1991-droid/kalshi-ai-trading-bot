@@ -44,7 +44,9 @@ Deployment categories:
   changes micro inputs (category B) and the live model was trained without it.
 - Exchange choice for the opening reference (latest tick wins): measured effect 0.024 sigma, no
   change.
-- Model edge: the frozen forward test (`c08fb8c`) decides after 200 openings (about 2026-11-22
-  08:16 UTC).
+- Model edge: frozen forward test v1 (`c08fb8c`) DECIDED 2026-11-22 08:33 UTC on 201 openings: NO CANDIDATE
+  PASSED. Live Brier 0.2513 (83 calls, 55.4%, -1.5c/contract, CI -12.6c..+8.8c) vs base rate 0.2467,
+  distance-only 0.2438 (137 calls, 59.1%), core16 0.2651; no CI excludes zero. Report:
+  forward/20261122T083252Z/report.json (local). 168 of the 201 openings were after the 9a9a6ea input skew.
 - L13 input skew: forward test v3 (`docs/preregistration-v3-20261122.md`) decides after 200 openings from
   2026-11-22 01:00 UTC (about 2026-11-24 03:00 UTC).

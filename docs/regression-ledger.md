@@ -36,6 +36,13 @@ Deployment categories:
 
 ## Open items (not defects, or awaiting data/approval)
 
+- R10 shadow vs live inputs (inputs only, no outcomes; 14 paired openings 06:45-09:30 UTC Nov 22):
+  live trade_flow_imbalance is buy-skewed at short windows (median 15s 0.66 / 30s 0.46 live vs -0.04 / 0.09
+  with R10), and trade intensity reads about half (4.3 vs 8.0 trades/s). The rejected trades are not
+  random, so live flow inputs are biased, plausibly adding to the UP skew of L13. Separately, every
+  micro_*_depth_imbalance is identical (-0.907) across all windows in both pipelines: it comes from
+  Coinbase's 1-level ticker book (same source as L22) and carries no depth information. No live change;
+  feeds v5/R10 model design (exclude depth_imbalance from Coinbase, train on R10 flow). Re-check at >=100.
 - R10: measured on the live Coinbase feed 2026-11-22 (2 min): 0 duplicates, 0 stale, 0 future-dated, yet
   935/1,384 valid trades (68%) rejected. Two causes: quotes are stamped with message time and trades with
   (earlier) execution time on one shared clock, and market_trades batches arrive newest-first. Candidate

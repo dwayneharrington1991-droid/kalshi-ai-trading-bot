@@ -71,6 +71,7 @@ def test_four_line_strip_shows_server_lines_and_minute6_only_when_valid():
     assert ".ai-line.combined{font-size:2em" in html
     assert "#minimal-opening-card,#minimal-confidence-card,#minute6-card{display:none!important}" in html
     lines = four_lines.lines(("UP", 0.62), ("DOWN", 0.40), ("WAIT", 0.51))
+    assert lines[3] == "MINUTE-6: PENDING 🟡"
     ch = {"status": "READY", "ticker": "KX-Z", "closes_at": "2999-01-01T00:00:00Z",
           "generated_from": "2999-01-01T00:00:02Z", "lines": lines}
     m6 = {"status": "LOCKED", "valid": True, "ticker": "KX-Z", "locked_at": "2999-01-01T00:06:07Z",
@@ -81,9 +82,12 @@ def test_four_line_strip_shows_server_lines_and_minute6_only_when_valid():
     assert top_html.index('id="ai3-line"') < top_html.index('id="ai1-line"') < top_html.index('id="ai2-line"')
     assert r["ai1-line"]["className"] == "up" and r["ai2-line"]["className"] == "down"
     assert r["ai4-row"]["hidden"] is False and r["ai4-line"]["textContent"] == "MINUTE-6: DOWN 🔴 — 97% | WAIT"
-    other = dict(m6, ticker="KX-OLD")                                   # minute-6 of another market: hidden
-    assert _run_strip(ch, other)["ai4-row"]["hidden"] is True
-    assert _run_strip(ch, dict(m6, valid=False))["ai4-row"]["hidden"] is True
+    other = dict(m6, ticker="KX-OLD")                                   # minute-6 of another market: never shown
+    assert _run_strip(ch, other)["ai4-line"]["textContent"] == "MINUTE-6: PENDING 🟡"
+    invalid = dict(m6, valid=False, line="MINUTE-6: WAIT 🟡 — N/A")
+    assert _run_strip(ch, invalid)["ai4-line"]["textContent"] == "MINUTE-6: WAIT 🟡 — N/A"
+    pending = {"status": "WAITING FOR MINUTE 6", "ticker": "KX-Z", "line": "MINUTE-6: PENDING 🟡"}
+    assert _run_strip(ch, pending)["ai4-line"]["textContent"] == "MINUTE-6: PENDING 🟡"
     r = _run_strip({"status": "UNAVAILABLE", "closes_at": "2999-01-01T00:00:00Z"})
     assert [r[f"ai{k}-line"]["textContent"] for k in (3, 1, 2)] == ["COMBINED CALL: WAIT 🟡 — N/A", "AI #1: WAIT 🟡 — N/A", "AI #2: WAIT 🟡 — N/A"]
     expired = dict(ch, closes_at="2000-01-01T00:00:00Z")

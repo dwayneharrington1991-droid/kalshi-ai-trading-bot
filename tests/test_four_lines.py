@@ -7,7 +7,9 @@ def test_format():
     assert fl.fmt("WAIT", 0.515) == "WAIT 🟡 — 52% UP" and fl.fmt("WAIT", 0.47) == "WAIT 🟡 — 53% DOWN"
     for bad in ((None, 0.6), ("UP", None), ("UP", 1.2), ("MAYBE", 0.5)):
         assert fl.fmt(*bad) == "WAIT 🟡 — N/A"
-    assert fl.lines() == ["COMBINED CALL: WAIT 🟡 — N/A", "AI #1: WAIT 🟡 — N/A", "AI #2: WAIT 🟡 — N/A"]
+    assert fl.lines() == ["COMBINED CALL: WAIT 🟡 — N/A", "AI #1: WAIT 🟡 — N/A", "AI #2: WAIT 🟡 — N/A", "MINUTE-6: PENDING 🟡"]
+    assert fl.lines(minute6="INVALID")[3] == "MINUTE-6: WAIT 🟡 — N/A"
+    assert fl.lines(minute6=("UP", 0.9))[3] == "MINUTE-6: UP 🟢 — 90% | WAIT"
 
 
 def test_minute6_entry_needs_a_validated_rule_and_current_ask():

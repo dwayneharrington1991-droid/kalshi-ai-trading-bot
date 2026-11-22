@@ -32,7 +32,7 @@ class ChallengerView:
         self.cache = {}
 
     def call(self, opening):
-        """The challenger reading plus `lines`: the three dashboard/phone lines built by four_lines (one format)."""
+        """The challenger reading plus `lines`: the four dashboard/phone lines from four_lines (minute-6 PENDING here)."""
         r = dict(self._call(opening))
         live = (opening or {}).get("up")
         live_ok = isinstance(live, (int, float)) and r.get("status") != "WAITING"

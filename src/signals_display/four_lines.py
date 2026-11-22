@@ -47,10 +47,15 @@ def minute6_line(direction, p_up, quotes=None, rule=ENTRY_RULE):
     return f"MINUTE-6: {base}" + (f" | {entry(direction, quotes, rule)}" if direction in ("UP", "DOWN") else "")
 
 
+PENDING = "MINUTE-6: PENDING 🟡"
+UNAVAILABLE = "MINUTE-6: WAIT 🟡 — N/A"
+
+
 def lines(live=(None, None), challenger=(None, None), combined=(None, None), minute6=None):
+    """Always four lines. minute6: None before the minute-6 lock (PENDING), "INVALID" for a reading with fewer
+    than two eligible components (WAIT — N/A), else (direction, p_up[, quotes])."""
     out = [f"COMBINED CALL: {fmt(*combined)}", f"AI #1: {fmt(*live)}", f"AI #2: {fmt(*challenger)}"]
-    if minute6:
-        out.append(minute6_line(*minute6))
+    out.append(PENDING if minute6 is None else UNAVAILABLE if minute6 == "INVALID" else minute6_line(*minute6))
     return out
 
 

@@ -241,11 +241,13 @@ class Minute6Runner:
                 reading = json.loads(row[4])
                 out.update(status="LOCKED", locked_at=row[0], direction=row[1], components_agree=bool(row[2]),
                            reason=row[3], reading=reading, valid=self.valid(reading))
+                from src.signals_display import four_lines
                 if out["valid"]:
-                    from src.signals_display import four_lines
                     q = dict(zip(("up_ask", "down_ask"), self.db.execute(
                         "SELECT up_ask, down_ask FROM minute6 WHERE ticker=?", (m["ticker"],)).fetchone()))
                     out["line"] = four_lines.minute6_line(row[1], reading.get("consensus_p_up_average"), q)
+                else:
+                    out["line"] = four_lines.UNAVAILABLE
             else:
                 out["status"] = "WAITING FOR MINUTE 6" if now < m["opens"] + timedelta(seconds=m6.DECISION_LATEST_S) \
                     else "NO READING (service was not running at minute 6; nothing substituted)"

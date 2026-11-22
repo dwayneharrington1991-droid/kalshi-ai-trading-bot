@@ -214,8 +214,8 @@ class Minute6Runner:
                     self.db.execute("INSERT OR IGNORE INTO minute6_outcomes VALUES (?,?,?)",
                                     (x["ticker"], x["final_outcome"], datetime.now(timezone.utc).isoformat()))
             self.db.commit()
-        except Exception:
-            pass
+        except Exception as exc:                # logged, never fatal: the scoreboard just keeps its last state
+            self.log(json.dumps({"scoreboard_refresh_error": f"{type(exc).__name__}: {exc}"[:200]}))
         out = dict(self.db.execute("SELECT ticker, outcome FROM minute6_outcomes"))
         rows = self.db.execute("SELECT ticker, direction, price, threshold, up_ask, down_ask FROM minute6").fetchall()
         settled = [(t, d, p, th, ua, da, out[t]) for t, d, p, th, ua, da in rows if t in out]

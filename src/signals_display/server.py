@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 import re
 import math
+import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -383,6 +384,11 @@ class Monitor:
         startup_update("ANALYTICS", "Preparing advanced indicators and background evaluators")
         self.intelligence = MarketIntelligence()
         self.advanced = AdvancedIntelligence()
+        # R10-corrected inputs computed in parallel for research only (never live inputs).
+        self.r10_shadow = None
+        if os.environ.get("KXBTC_R10_SHADOW", "1") != "0" and getattr(journal, "path", None) and str(journal.path) != ":memory:":
+            from .r10_shadow import R10Shadow
+            self.r10_shadow = R10Shadow(Path(journal.path).parent / "r10_shadow.sqlite3")
         self.monitoring_alerts = MonitoringAlerts()
         self.market_strip = MarketStrip()
         self.last_proxy_observation = None
@@ -794,6 +800,11 @@ class Monitor:
                     except (KeyError, ValueError, TypeError, AttributeError):
                         rejected += 1
                 self.estimator.observe_reference(observation, now)
+            if self.r10_shadow is not None:
+                try:
+                    self.r10_shadow.observe_batch(payload.get("stream_observations", []))
+                except Exception:
+                    pass
             # Freeze opening inputs before optional analytics. This artifact is
             # independent of live-data freshness and remains usable when
             # threshold metadata or model generation arrives later.
@@ -1304,6 +1315,10 @@ class Monitor:
                                 opening = self.journal.opening_record(
                                     m["ticker"], state["mode"], candidate, generated
                                 )
+                                if self.r10_shadow is not None and candidate.get("up") is not None:
+                                    self.r10_shadow.record_async(
+                                        m["ticker"], opened, frozen, primary_source=primary,
+                                        threshold=m.get("strike"))
                             except sqlite3.OperationalError as exc:
                                 self.runtime_meter.error("opening_storage", type(exc).__name__)
                                 opening = {

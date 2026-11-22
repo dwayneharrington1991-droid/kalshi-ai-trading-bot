@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from . import feature_alignment
+from .consensus import combine
 from .opening_models import predict
 
 ALIGNMENT = Path(__file__).resolve().parents[2] / "research_artifacts" / "feature_alignment_20261122.json"
@@ -56,7 +57,8 @@ class ChallengerView:
                                        "live_up": float(live), "live_direction": _direction(float(live)),
                                        "agrees_with_live": _direction(p) == _direction(float(live)),
                                        "generated_from": opening.get("generated_at"),
-                                       "closes_at": opening.get("closes_at")}
+                                       "closes_at": opening.get("closes_at"),
+                                       **combine(float(live), p)}
             except Exception as exc:                       # research display only
                 self.cache[key] = {**base, "status": "UNAVAILABLE", "reason": type(exc).__name__}
             if len(self.cache) > 64:

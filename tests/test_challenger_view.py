@@ -35,6 +35,7 @@ def test_challenger_uses_the_same_frozen_inputs_with_aligned_values(tmp_path):
     view = ChallengerView(ART, _alignment(tmp_path))
     r = view.call(_opening({"distance_scaled": 0.2, "micro_30s_trade_flow_imbalance": 8.0}))
     assert r["status"] == "READY" and r["up"] < r["live_up"]          # skewed input pulled back
+    assert abs(r["combined_up"] - (r["up"] + r["live_up"]) / 2) < 1e-12 and r["combined"] in ("UP", "DOWN", "WAIT")
     assert r["direction"] in {"UP", "DOWN", "WAIT"} and "NOT VALIDATED" in r["label"]
 
 

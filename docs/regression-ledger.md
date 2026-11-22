@@ -24,6 +24,8 @@ Deployment categories:
 | L11 | 11-20 | Panel showed Kalshi/Coinbase as n/a | `feed_health` exists only in `monitor.snapshot()` | `test_live_connection_fields_come_from_the_served_snapshot` | `ca2cbe6` | A | 8c087de |
 | L12 | 11-20 | Main card did not say which settlement it predicts or how the last locked call scored | Display gap | `test_dashboard_opening_goal.py` | `b1469ea` | A | b1469ea |
 | L13 | 11-22 | Live model fed out-of-distribution inputs since 9a9a6ea; ensemble shifted toward UP (logistic component mean P(UP) 0.50 -> 0.61) | Training data recorded the 30 micro/flow inputs under the reconnect-loop computation (37-59% missing, reset windows); L6/L7 fixes changed their distribution | `test_forward_eval_v3.py` (candidate reproduction) | Not fixed in production: candidates pre-registered (v3); needs approval | C | no
+| L14 | 11-22 | Input drift (L13) was flagged only inside the Accuracy Health panel, so it went unnoticed for ~30 h | No warning on the opening card | `test_dashboard_connection_status.py::test_live_connection_and_drift_warning` | this commit | A | pending CI |
+| L15 | 11-22 | Stale dashboard could not be told apart: lost local SSH tunnel vs stale production data | Card only said "Connection lost" | `test_dashboard_connection_status.py` (node-run: unreachable / stale flag / frozen publication) | this commit | A | pending CI |
 
 ## Open items (not defects, or awaiting data/approval)
 

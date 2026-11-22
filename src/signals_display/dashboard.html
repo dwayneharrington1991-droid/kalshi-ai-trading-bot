@@ -99,8 +99,9 @@ main>div.ai-scoreboard:not(#minimal-opening){display:flex!important;flex-directi
 @media(max-width:760px){main>div.ai-scoreboard:not(#minimal-opening){top:92px;width:calc(100% - 24px)}#minimal-opening{padding-top:200px}}
 @media(prefers-reduced-motion:reduce){body:after,#minimal-opening .minimal-value:after,.term-flip{animation:none!important}.term-arc,#minimal-opening .minimal-value{transition:none!important}}
 @media(prefers-contrast:more){#minimal-opening .minimal-value{background:#000;border-color:#fff}.term-qual{color:#fff}#minimal-opening h1{color:#fff;background:none}}
+#term-link[data-tone="green"]{color:#3fb950}#term-link[data-tone="amber"],#term-drift{color:#d29922}#term-link[data-tone="red"]{color:#f85149;font-weight:700}
 </style></head><body><main>
-<section id="minimal-opening" aria-label="AI opening prediction" data-tone="amber"><article id="minimal-opening-card" class="card minimal-value term-call" data-signal="WAIT"><h1>AI OPENING CALL</h1><strong id="minimal-opening-call" class="amber" role="status" aria-live="polite">WAIT</strong><span id="term-predicting" class="term-qual term-predicting">PREDICTING: FINAL OUTCOME AT —</span><span id="term-call-qualifier" class="term-qual">Waiting for the frozen opening prediction</span><span id="term-last-result" class="term-qual term-last">LAST LOCKED CALL: checking…</span><p id="minimal-opening-call-note">Waiting for the immutable opening snapshot.</p></article><article id="minimal-confidence-card" class="card minimal-value term-conf" data-signal="WAIT"><h1>AI CONFIDENCE</h1><div id="minimal-confidence-gauge" class="term-gauge unavailable" role="meter" aria-valuemin="0" aria-valuemax="100" aria-label="Calibrated opening confidence unavailable"><svg viewBox="-14 -14 148 148" aria-hidden="true" focusable="false"><circle class="term-track" cx="60" cy="60" r="52"/><circle id="term-gauge-arc" class="term-arc" cx="60" cy="60" r="52"/></svg><strong id="minimal-opening-confidence" class="amber term-muted" aria-live="polite">—</strong></div><span id="term-confidence-qualifier" class="term-qual">Unavailable</span><p id="minimal-opening-confidence-note">Probability unavailable.</p></article></section>
+<section id="minimal-opening" aria-label="AI opening prediction" data-tone="amber"><article id="minimal-opening-card" class="card minimal-value term-call" data-signal="WAIT"><h1>AI OPENING CALL</h1><strong id="minimal-opening-call" class="amber" role="status" aria-live="polite">WAIT</strong><span id="term-predicting" class="term-qual term-predicting">PREDICTING: FINAL OUTCOME AT —</span><span id="term-call-qualifier" class="term-qual">Waiting for the frozen opening prediction</span><span id="term-last-result" class="term-qual term-last">LAST LOCKED CALL: checking…</span><span id="term-link" class="term-qual term-link" data-tone="amber" role="status" aria-live="polite">CONNECTION: checking</span><span id="term-drift" class="term-qual term-drift" data-tone="amber" hidden></span><p id="minimal-opening-call-note">Waiting for the immutable opening snapshot.</p></article><article id="minimal-confidence-card" class="card minimal-value term-conf" data-signal="WAIT"><h1>AI CONFIDENCE</h1><div id="minimal-confidence-gauge" class="term-gauge unavailable" role="meter" aria-valuemin="0" aria-valuemax="100" aria-label="Calibrated opening confidence unavailable"><svg viewBox="-14 -14 148 148" aria-hidden="true" focusable="false"><circle class="term-track" cx="60" cy="60" r="52"/><circle id="term-gauge-arc" class="term-arc" cx="60" cy="60" r="52"/></svg><strong id="minimal-opening-confidence" class="amber term-muted" aria-live="polite">—</strong></div><span id="term-confidence-qualifier" class="term-qual">Unavailable</span><p id="minimal-opening-confidence-note">Probability unavailable.</p></article></section>
 <header><div><div class="eyebrow">KX15 INTELLIGENCE · SIGNALS ONLY</div><h1>Bitcoin 15-Minute Command Center</h1></div><div class="header-status"><div class="opening-score" aria-live="polite"><span>IMMUTABLE OPENING CALLS</span><strong id="opening-score">— correct · — wrong</strong><small id="opening-score-note">Official outcomes only</small></div><span class="tag" id="freshness" role="status">WARMING UP</span></div></header>
 <p class="small">Your market prediction helper. Three simple answers, with the hard analysis handled behind the scenes. You place every trade yourself.</p>
 <div id="critical-warning" class="notice" role="alert" hidden></div>
@@ -712,6 +713,56 @@ $('load-market-history').onclick=()=>{marketHistoryBeforeClose=null;marketHistor
   }
   load();
   setInterval(load, 30000);
+})();
+</script>
+<script>
+(function () {
+  // Connection and model-input status for the opening card (L13 follow-up).
+  // Distinguishes "this browser cannot reach the dashboard server" (usually the local SSH tunnel)
+  // from "the server answers but its market data is stale". Text nodes only; never changes a call.
+  var link = document.getElementById('term-link'), drift = document.getElementById('term-drift');
+  if (!link || !drift) { return; }
+  var failures = 0, lastPublished = null, lastAdvance = performance.now();
+  function show(el, text, tone) { el.textContent = text; el.setAttribute('data-tone', tone); }
+  function heartbeat() {
+    var ctrl = new AbortController(), t = setTimeout(function () { ctrl.abort(); }, 4000);
+    fetch('/api/state-version?after=0&timeout=1', { cache: 'no-store', signal: ctrl.signal })
+      .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })
+      .then(function (v) {
+        clearTimeout(t); failures = 0;
+        if (v.published_at !== lastPublished) { lastPublished = v.published_at; lastAdvance = performance.now(); }
+        var st = (typeof lastState !== 'undefined' && lastState) ? lastState : null;
+        var frozen = (performance.now() - lastAdvance) / 1000;
+        if (frozen > 30 || (st && st.stale)) {
+          show(link, 'SERVER REACHABLE · PRODUCTION MARKET DATA STALE' + (frozen > 30 ? ' (no update for ' + Math.round(frozen) + ' s)' : '') + ' — not your connection', 'red');
+        } else {
+          show(link, 'CONNECTION: LIVE · production data updating', 'green');
+        }
+      })
+      .catch(function () {
+        clearTimeout(t); failures += 1;
+        if (failures >= 2) {
+          show(link, 'NO CONNECTION TO THE DASHBOARD SERVER — check this PC’s SSH tunnel; production keeps running and recording calls', 'red');
+        }
+      });
+  }
+  function driftCheck() {
+    fetch('/api/accuracy-health', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })
+      .then(function (h) {
+        var d = h && h.predictive_edge && h.predictive_edge.input_drift;
+        if (d && d.status === 'DRIFTED') {
+          var top = (d.largest || []).slice(0, 2).map(function (x) { return x.input + ' ' + x.shift_sd + ' SD'; }).join(', ');
+          drift.textContent = 'MODEL INPUT WARNING: live inputs differ from the model’s training data (average shift ' +
+            Number(d.mean_abs_standardized_shift).toFixed(2) + ' SD; largest ' + top + '). Calls may be biased — see Accuracy Health.';
+          drift.hidden = false;
+        } else { drift.hidden = true; }
+      })
+      .catch(function () { /* keep the last shown warning */ });
+  }
+  heartbeat(); driftCheck();
+  setInterval(heartbeat, 5000);
+  setInterval(driftCheck, 60000);
 })();
 </script>
 </body></html>

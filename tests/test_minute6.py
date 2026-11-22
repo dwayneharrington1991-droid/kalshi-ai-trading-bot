@@ -141,3 +141,34 @@ def test_dashboard_minute6_panel_renders_runner_output(tmp_path, monkeypatch):
     assert "MEASURED: BTC" in els["minute6-measured"]["textContent"] and "A price/distance" in els["minute6-components"]["textContent"]
     html_top = html[html.index('<section id="minimal-opening"'):]
     assert html_top.index('id="ai-three-lines"') < html_top.index('id="minute6-card"')
+
+
+def test_waits_for_the_late_minute6_candle_then_uses_it(tmp_path, monkeypatch):
+    monkeypatch.setattr("minute6_runner.time.sleep", lambda s: None)
+    published = {"upto": O + 240}                      # the +5 candle is not out yet
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {},
+                      candles=lambda: _candles(upto=published["upto"]), log=lambda x: None)
+    assert r.step(_state(), now=OPEN + timedelta(seconds=366), now_mono=0) == "WAITING FOR CANDLE"
+    published["upto"] = O + 300
+    assert r.step(_state(), now=OPEN + timedelta(seconds=372), now_mono=1) == "SENT"
+    assert r.db.execute("SELECT a_dir FROM minute6").fetchone()[0] is not None
+
+
+def test_missing_candle_at_the_deadline_locks_ineligible_not_invented(tmp_path, monkeypatch):
+    monkeypatch.setattr("minute6_runner.time.sleep", lambda s: None)
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {},
+                      candles=lambda: _candles(upto=O + 240), log=lambda x: None)
+    assert r.step(_state(), now=OPEN + timedelta(seconds=412), now_mono=0) == "SENT"
+    assert r.db.execute("SELECT a_dir, direction FROM minute6").fetchone() == (None, "WAIT")
+
+
+def test_merge_bars_uses_final_15s_bar_and_skips_unfinished_minutes():
+    from minute6_runner import merge_bars
+    minute = [{"start": 600, "low": 1, "high": 3, "open": 2, "close": 2.5, "volume": 1}]
+    b15 = [{"start": 600 + 15 * i, "low": 1, "high": 3, "open": 2, "close": 2.0 + i, "volume": 0.5} for i in range(4)]
+    b15 += [{"start": 660 + 15 * i, "low": 4, "high": 6, "open": 5, "close": 5.0 + i, "volume": 0.5} for i in range(4)]
+    b15 += [{"start": 720, "low": 7, "high": 7, "open": 7, "close": 7, "volume": 1}]     # unfinished minute
+    out = {c[0]: c for c in merge_bars(minute, b15)}
+    assert out[600][4] == 5.0                          # close of the bar starting at 600+45
+    assert out[660][4] == 8.0 and out[660][3] == 5 and abs(out[660][5] - 2.0) < 1e-12
+    assert 720 not in out

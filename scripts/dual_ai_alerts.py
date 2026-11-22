@@ -196,8 +196,9 @@ def main(argv=None):
     runner = None
     try:                                           # minute-6 research rides in the same loop (one service)
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from minute6_runner import Minute6Runner
+        from minute6_runner import Minute6Runner, server_candles
         runner = Minute6Runner(a.db, str(Path(a.db).with_name("minute6_latest.json")), phone_alerts.send, cfg,
+                               candles=lambda: server_candles(fetch_json),
                                history=lambda: fetch_json("/api/market-history"), log=lambda s: print(s, flush=True))
     except Exception as exc:
         print(json.dumps({"minute6": "disabled", "error": type(exc).__name__}), flush=True)

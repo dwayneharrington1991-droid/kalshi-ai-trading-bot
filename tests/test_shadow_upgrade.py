@@ -157,3 +157,57 @@ def test_oracle_runner_is_read_only_single_job_and_detached():
     assert "SHADOW: running the read-only 8768 audit first" in code   # never silent for minutes
     assert "$MODULE == shadow_upgrade && ! -f $RUN/audit.txt" in code   # combined run skips the duplicate audit
     assert '--previous-report "$PREVIOUS"' in code and "BLOCKED: previous shadow report" in code
+
+
+def test_vectorised_tree_values_match_row_by_row_routing():
+    import numpy as np
+    from src.signals_display import shadow_upgrade as su
+    rng = np.random.default_rng(3)
+    X = rng.normal(size=(400, 6))
+    X[rng.random(X.shape) < 0.1] = np.nan                       # missing values must route exactly as before
+    y = (rng.random(400) < 0.5).astype(float)
+    edges = [su._bin_edges(X[:, j], 16) for j in range(6)]
+    P = {"depth": 3, "min_leaf": 10, "l2": 1.0, "learning_rate": 0.1, "subsample": 0.8, "seed": 1, "patience": 5}
+    trees, _ = su._gbdt_rounds(X, y, 0.0, edges, P, 20)
+    for t in trees:
+        assert np.array_equal(su._tree_values(t, X), np.array([su._tree_value(t, x) for x in X]))
+
+
+def _reference_best_split(B, g, h, idx, nbins, min_leaf, l2):      # the original per-feature loop
+    import numpy as np
+    G, H = g[idx].sum(), h[idx].sum()
+    parent, best, count_all = G * G / (H + l2), None, len(idx)
+    for j in range(B.shape[1]):
+        nb = nbins[j]
+        if nb < 2:
+            continue
+        col = B[idx, j]
+        gs = np.bincount(col, weights=g[idx], minlength=nb)
+        hs = np.bincount(col, weights=h[idx], minlength=nb)
+        cs = np.bincount(col, minlength=nb)
+        gl, hl, cl = np.cumsum(gs)[:-1], np.cumsum(hs)[:-1], np.cumsum(cs)[:-1]
+        ok = (cl >= min_leaf) & (count_all - cl >= min_leaf)
+        if not ok.any():
+            continue
+        gain = np.where(ok, gl * gl / (hl + l2) + (G - gl) ** 2 / (H - hl + l2) - parent, -np.inf)
+        k = int(np.argmax(gain))
+        if gain[k] > 1e-9 and (best is None or gain[k] > best[0]):
+            best = (float(gain[k]), j, k)
+    return best, G, H
+
+
+def test_vectorised_best_split_matches_the_original_loop():
+    import numpy as np
+    from src.signals_display import shadow_upgrade as su
+    rng = np.random.default_rng(7)
+    for trial in range(40):
+        n, F = int(rng.integers(30, 400)), int(rng.integers(1, 30))
+        X = rng.normal(size=(n, F))
+        X[:, 0] = 1.0 if trial % 5 == 0 else X[:, 0]                # constant column: a single bin
+        X[rng.random(X.shape) < 0.05] = np.nan
+        edges = [su._bin_edges(X[:, j], int(rng.integers(2, 40))) for j in range(F)]
+        B, nbins = su._binned(X, edges), [e.size + 1 for e in edges]
+        g, h = rng.normal(size=n), rng.random(n) + 0.01
+        idx = np.flatnonzero(rng.random(n) < 0.8)
+        for min_leaf in (1, 5, 20):
+            assert su._best_split(B, g, h, idx, nbins, min_leaf, 1.0) == _reference_best_split(B, g, h, idx, nbins, min_leaf, 1.0)

@@ -24,10 +24,38 @@ def _ts(v):
     return datetime.fromisoformat(str(v).replace("Z", "+00:00")) if v else None
 
 
-def fetch_candles():
+def fetch_candles():                   # public Coinbase endpoint: ~2.5 min behind, so only a fallback
     req = Request(CANDLES_URL, headers={"User-Agent": "kalshi-signals-research/1.0"})
     with urlopen(req, timeout=10) as r:
         return json.loads(r.read())       # [time, low, high, open, close, volume], newest first
+
+
+def merge_bars(minute_bars, bars_15s):
+    """One-minute candles in Coinbase layout from the server's own Coinbase feeds: /api/signal-chart minute
+    bars (history) with each minute's close taken from the final 15-second trade bar that starts at minute+45
+    (the last trade of that minute, available ~7 s after the minute ends). Only complete minutes are returned."""
+    by = {}
+    for b in minute_bars or []:
+        t = int(b["start"])
+        by[t] = [t, float(b["low"]), float(b["high"]), float(b["open"]), float(b["close"]), float(b.get("volume") or 0)]
+    groups = {}
+    for b in bars_15s or []:
+        groups.setdefault(int(b["start"]) // 60 * 60, []).append(b)
+    for t, bs in groups.items():
+        bs.sort(key=lambda b: b["start"])
+        if int(bs[-1]["start"]) != t + 45:
+            continue                       # minute not finished (its last 15 s bar is not final yet)
+        lo, hi = min(float(b["low"]) for b in bs), max(float(b["high"]) for b in bs)
+        vol = sum(float(b.get("volume") or 0) for b in bs)
+        if t in by:
+            by[t][4] = float(bs[-1]["close"])
+        elif len(bs) == 4:
+            by[t] = [t, lo, hi, float(bs[0]["open"]), float(bs[-1]["close"]), vol]
+    return sorted(by.values(), key=lambda c: -c[0])
+
+
+def server_candles(fetch):
+    return merge_bars(fetch("/api/signal-chart").get("bars"), fetch("/api/live-chart").get("bars"))
 
 
 def wilson(k, n, z=1.96):
@@ -95,7 +123,13 @@ class Minute6Runner:
         if self.db.execute("SELECT 1 FROM minute6 WHERE ticker=?", (m["ticker"],)).fetchone():
             return "ALREADY LOCKED"
         thr = m["threshold"] if isinstance(m["threshold"], (int, float)) and m["threshold"] > 0 else None
-        closes = m6.candles_to_closes(self._candles(now_mono), int(m["opens"].timestamp()))
+        try:                                   # fresh fetch: the candle closing at +6:00 is published a few seconds late
+            self.cache = (now_mono, self.candles())
+        except Exception:
+            pass
+        closes = m6.candles_to_closes(self.cache[1] or [], int(m["opens"].timestamp()))
+        if closes is None and since < m6.DECISION_LATEST_S - 10:
+            return "WAITING FOR CANDLE"        # retry next poll; lock without it only at the deadline
         a = m6.component_a(closes, thr) if closes else {"status": "INELIGIBLE", "reason": "one-minute candles missing"}
         b = m6.component_b(closes) if closes else {"status": "INELIGIBLE", "reason": "one-minute candles missing"}
         eng_ok = m["engine_at"] is not None and m["engine_at"] <= now

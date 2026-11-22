@@ -76,28 +76,31 @@ def _binned(X, edges):
 
 
 def _best_split(B, g, h, idx, nbins, min_leaf, l2):
+    """Best (gain, feature, bin) over all features in one vectorised pass. Same sums in the same row order and
+    the same tie-breaking as the per-feature loop (earliest feature, then earliest bin, strictly positive gain)."""
     G, H = g[idx].sum(), h[idx].sum()
     parent = G * G / (H + l2)
-    best = None
     count_all = len(idx)
-    for j in range(B.shape[1]):
-        nb = nbins[j]
-        if nb < 2:
-            continue
-        col = B[idx, j]
-        gs = np.bincount(col, weights=g[idx], minlength=nb)
-        hs = np.bincount(col, weights=h[idx], minlength=nb)
-        cs = np.bincount(col, minlength=nb)
-        gl, hl, cl = np.cumsum(gs)[:-1], np.cumsum(hs)[:-1], np.cumsum(cs)[:-1]
-        ok = (cl >= min_leaf) & (count_all - cl >= min_leaf)
-        if not ok.any():
-            continue
+    F = B.shape[1]
+    width = max(max(nbins), 2)
+    flat = (B[idx] + np.arange(F) * width).ravel()
+    size = F * width
+    gs = np.bincount(flat, weights=np.repeat(g[idx], F), minlength=size).reshape(F, width)
+    hs = np.bincount(flat, weights=np.repeat(h[idx], F), minlength=size).reshape(F, width)
+    cs = np.bincount(flat, minlength=size).reshape(F, width)
+    gl, hl, cl = np.cumsum(gs, axis=1)[:, :-1], np.cumsum(hs, axis=1)[:, :-1], np.cumsum(cs, axis=1)[:, :-1]
+    usable = (np.asarray(nbins) >= 2)[:, None]
+    ok = usable & (cl >= min_leaf) & (count_all - cl >= min_leaf)
+    if not ok.any():
+        return None, G, H
+    with np.errstate(divide="ignore", invalid="ignore"):
         gain = gl * gl / (hl + l2) + (G - gl) ** 2 / (H - hl + l2) - parent
-        gain = np.where(ok, gain, -np.inf)
-        k = int(np.argmax(gain))
-        if gain[k] > 1e-9 and (best is None or gain[k] > best[0]):
-            best = (float(gain[k]), j, k)
-    return best, G, H
+    gain = np.where(ok, gain, -np.inf)
+    flat_best = int(np.argmax(gain))
+    j, k = divmod(flat_best, gain.shape[1])
+    if not gain[j, k] > 1e-9:
+        return None, G, H
+    return (float(gain[j, k]), j, k), G, H
 
 
 def _grow(B, g, h, idx, depth, nbins, edges, P):
@@ -119,9 +122,17 @@ def _tree_value(tree, x):
 
 
 def _tree_values(tree, X):
+    """Vectorised _tree_value over rows (identical routing: NaN <= threshold is False, so NaN goes right)."""
     out = np.empty(len(X))
-    for i in range(len(X)):
-        out[i] = _tree_value(tree, X[i])
+    stack = [(tree, np.arange(len(X)))]
+    while stack:
+        node, rows = stack.pop()
+        if "leaf" in node:
+            out[rows] = node["leaf"]
+            continue
+        go_left = X[rows, node["feature"]] <= node["threshold"]
+        stack.append((node["left"], rows[go_left]))
+        stack.append((node["right"], rows[~go_left]))
     return out
 
 

@@ -480,3 +480,9 @@ def test_scheduled_wrapper_forwards_the_activator_arguments_only_when_configured
     code = (ROOT / "deploy/oracle/run_lifecycle_8768.sh").read_text()
     assert '${LIFECYCLE_EXTRA_ARGS:-}' in code        # empty by default: the schedule stays disabled-activator
     assert "--activator guarded" not in code          # never hard-wired on
+
+
+def test_routine_training_cycles_send_no_phone_message():
+    code = (ROOT / "src/signals_display/lifecycle_runner.py").read_text()
+    assert 'notify("training_completed"' not in code
+    assert 'notify("candidate_qualified"' in code

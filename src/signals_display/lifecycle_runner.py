@@ -151,7 +151,8 @@ def run(journal, state_dir, commit, live_artifact, *, asof, min_new=lc.MIN_NEW_S
                               candidates_evaluated=len(reports))
     if status.get("decision") != "SKIPPED_NOT_ENOUGH_NEW_DATA":
         _publish(state_dir / PROGRESS, {"last_settled_cutoff": asof.isoformat()})
-        notify("training_completed", {"decision": status.get("decision"), "settled_markets": status.get("settled_markets")})
+        # Routine cycles (NO_CANDIDATE, rejected candidates) are recorded in the status file only; the phone
+        # hears about qualified candidates, promotions, rollbacks and critical failures.
     if status.get("decision") == "CANDIDATE_QUALIFIED":
         notify("candidate_qualified", {"candidate_checksum": (status.get("candidate_checksum") or "")[:12]})
     samples = [probe(port)]

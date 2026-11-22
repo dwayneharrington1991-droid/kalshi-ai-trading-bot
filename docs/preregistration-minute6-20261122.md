@@ -70,3 +70,13 @@ Component comparison (same splits; calls / accuracy / coverage):
 - Dropping C (whose dev timing allowed a reading up to 40 s after 6:00) leaves about 91%. So the accuracy is not driven by that lookahead.
 
 **Hour-of-day volatility adjustment (rejected).** The volatility blend σ = w·σ₆₀ₘ + (1 − w)·σ_hour used an hour table from fit markets only. It was selected on fit for maximum coverage with Wilson low ≥ 0.85, which gave w = 0, t = 0.75. It did not hold on the clean check set: 69/86 = 80.2% (Wilson low 0.71), against the baseline 46/51 = 90.2%. The extra coverage came from genuinely uncertain markets. The rule is kept unchanged.
+
+**Strict-timing audit with real asks (2026-11-22 23:45 UTC).** The C reading is used only if it was stamped ≤ opens + 367 s; 3 readings were dropped. Asks are the latest Kalshi quotes observed ≤ opens + 367 s. The fee is 0.07·p·(1−p), rounded up to 1¢, plus 1¢ slippage.
+
+| Set | Accuracy | Avg ask paid | Net per contract (95%) |
+|---|---|---|---|
+| Fit | 80/86 = 93.0% | 0.897 | +1.2¢ (±5.3¢) |
+| Check | 42/46 = 91.3% | 0.908 | −1.6¢ (±8.0¢) |
+| Holdout (viewed) | 31/33 = 93.9% | 0.918 | +0.2¢ (±8.0¢) |
+
+Accuracy is unchanged under strict timing. There is no measurable edge at real entry prices. `four_lines.ENTRY_RULE` stays None, so the dashboard and Telegram show `| WAIT`.

@@ -2369,6 +2369,11 @@ def make_handler(monitor):
                     body = json.dumps(monitor.challenger_view.call(opening), default=str).encode()
                     monitor.challenger_cache = (monotonic(), body)
                 content_type = "application/json"
+            elif route == "/api/minute6":
+                # Minute-6 research reading + live analytics written by the alert service. Read-only file read.
+                from .minute6 import latest_body
+                body = latest_body()
+                content_type = "application/json"
             elif route == "/api/market-pulse":
                 # Research indicators (order book, trade flow, momentum, short horizons, contract EV).
                 # Read-only; never changes a signal, model, threshold, alert or record.

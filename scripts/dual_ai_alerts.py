@@ -22,6 +22,7 @@ import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.request import urlopen
 
 BASE = "http://127.0.0.1:8768"
@@ -192,14 +193,29 @@ def main(argv=None):
     if "telegram" not in phone_alerts.channels(cfg):
         print("telegram not configured; nothing sent"); return 2
     ledger = Ledger(a.db)
-    end = datetime.max.replace(tzinfo=timezone.utc) if a.hours <= 0 else datetime.now(timezone.utc) + timedelta(hours=a.hours)
+    runner = None
+    try:                                           # minute-6 research rides in the same loop (one service)
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from minute6_runner import Minute6Runner
+        runner = Minute6Runner(a.db, str(Path(a.db).with_name("minute6_latest.json")), phone_alerts.send, cfg,
+                               history=lambda: fetch_json("/api/market-history"), log=lambda s: print(s, flush=True))
+    except Exception as exc:
+        print(json.dumps({"minute6": "disabled", "error": type(exc).__name__}), flush=True)
+    end =datetime.max.replace(tzinfo=timezone.utc) if a.hours <= 0 else datetime.now(timezone.utc) + timedelta(hours=a.hours)
     print(json.dumps({"started": datetime.now(timezone.utc).isoformat(), "ends": end.isoformat()}), flush=True)
     while datetime.now(timezone.utc) < end:
+        state = None
         try:
-            step(ledger, phone_alerts.send, cfg, fetch_json("/api/state"), fetch_json("/api/challenger-opening"),
+            state = fetch_json("/api/state")
+            step(ledger, phone_alerts.send, cfg, state, fetch_json("/api/challenger-opening"),
                  datetime.now(timezone.utc), log=lambda s: print(s, flush=True))
         except Exception as exc:
             print(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "error": type(exc).__name__}), flush=True)
+        if runner is not None and state is not None:
+            try:
+                runner.step(state)
+            except Exception as exc:
+                print(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "minute6_error": type(exc).__name__}), flush=True)
         time.sleep(a.poll)
     print(json.dumps({"ended": datetime.now(timezone.utc).isoformat()}), flush=True)
     return 0

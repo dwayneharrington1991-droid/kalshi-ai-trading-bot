@@ -16,6 +16,7 @@ contained and counted; recording runs off the opening path in a background threa
 received at or before the opening are stored.
 """
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -137,3 +138,10 @@ class R10Shadow:
     def record_async(self, *args, **kwargs):
         threading.Thread(target=self.record, args=args, kwargs=kwargs, daemon=True,
                          name="r10-shadow-record").start()
+
+
+def from_journal(journal_path):
+    """The live server's shadow, or None when disabled (KXBTC_R10_SHADOW=0)."""
+    if os.environ.get("KXBTC_R10_SHADOW", "1") == "0":
+        return None
+    return R10Shadow(Path(journal_path).parent / "r10_shadow.sqlite3")

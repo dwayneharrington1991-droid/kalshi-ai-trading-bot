@@ -10,7 +10,6 @@ from decimal import Decimal
 from pathlib import Path
 import re
 import math
-import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -386,9 +385,9 @@ class Monitor:
         self.advanced = AdvancedIntelligence()
         # R10-corrected inputs computed in parallel for research only (never live inputs).
         self.r10_shadow = None
-        if os.environ.get("KXBTC_R10_SHADOW", "1") != "0" and getattr(journal, "path", None) and str(journal.path) != ":memory:":
-            from .r10_shadow import R10Shadow
-            self.r10_shadow = R10Shadow(Path(journal.path).parent / "r10_shadow.sqlite3")
+        if getattr(journal, "path", None) and str(journal.path) != ":memory:":
+            from .r10_shadow import from_journal as _r10_shadow
+            self.r10_shadow = _r10_shadow(journal.path)
         from .market_pulse import HorizonForecasts
         self.pulse_horizons = HorizonForecasts()       # research-only short-horizon forecasts
         self.monitoring_alerts = MonitoringAlerts()

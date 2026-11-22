@@ -52,7 +52,8 @@ def test_starts_at_zero_and_window_is_written_once(tmp_path):
     assert again == w                                                     # never overwritten
     r = sb.compute(_db(tmp_path), w, now=START)
     for m in sb.MODELS:
-        assert r["models"][m] == {"correct": 0, "wrong": 0, "wait": 0, "missing": 0, "accuracy": None}
+        assert r["models"][m] == {"correct": 0, "wrong": 0, "wait": 0, "missing": 0, "accuracy": None,
+                                  "eligible": 0, "coverage": None}
 
 
 def test_counts_boundaries_missing_and_delayed_settlements(tmp_path):
@@ -70,13 +71,13 @@ def test_counts_boundaries_missing_and_delayed_settlements(tmp_path):
                             _mk("TD", d, "DOWN"), _mk("TL", late, "UP"), _mk("TC", c, None, "UNVERIFIED")])
     r = sb.compute(db, w, now=START + timedelta(hours=2))
     assert r["settled_markets"] == 3                                       # TA, TB, TD (TC not settled yet)
-    assert r["models"]["AI #1"] == {"correct": 1, "wrong": 1, "wait": 0, "missing": 1, "accuracy": 50.0}
-    assert r["models"]["COMBINED"] == {"correct": 1, "wrong": 0, "wait": 1, "missing": 1, "accuracy": 100.0}
-    assert r["models"]["MINUTE-6"] == {"correct": 0, "wrong": 1, "wait": 1, "missing": 1, "accuracy": 0.0}
+    assert r["models"]["AI #1"] == {"correct": 1, "wrong": 1, "wait": 0, "missing": 1, "accuracy": 50.0, "eligible": 3, "coverage": 66.7}
+    assert r["models"]["COMBINED CALL"] == {"correct": 1, "wrong": 0, "wait": 1, "missing": 1, "accuracy": 100.0, "eligible": 3, "coverage": 33.3}
+    assert r["models"]["MINUTE-6 FINAL"] == {"correct": 0, "wrong": 1, "wait": 1, "missing": 1, "accuracy": 0.0, "eligible": 3, "coverage": 33.3}
     sb.record_outcomes(db, [_mk("TC", c, "UP")])                           # delayed settlement arrives later
     r = sb.compute(db, w, now=START + timedelta(hours=3))
     assert r["models"]["AI #1"]["correct"] == 2 and r["models"]["AI #2"]["missing"] == 2
-    assert r["models"]["MINUTE-6"]["missing"] == 2                         # invalid minute-6 reading is not a WAIT
+    assert r["models"]["MINUTE-6 FINAL"]["missing"] == 2                         # invalid minute-6 reading is not a WAIT
     assert sb.record_outcomes(db, [_mk("TA", a, "DOWN")]) == 0             # an outcome is never replaced
     with pytest.raises(sqlite3.DatabaseError):
         db.execute("UPDATE outcomes7 SET outcome='DOWN'")
@@ -92,7 +93,7 @@ def test_window_completes_and_keeps_final_results(tmp_path):
     assert r["models"]["AI #1"]["correct"] == 1
 
 
-def test_dashboard_table_renders_four_rows_with_minute6_accuracy(tmp_path):
+def test_dashboard_table_renders_five_rows_with_their_own_accuracy(tmp_path):
     node = shutil.which("node")
     if not node:
         pytest.skip("node not installed")
@@ -103,7 +104,7 @@ def test_dashboard_table_renders_four_rows_with_minute6_accuracy(tmp_path):
     payload = {"scoreboard7": {"status": "RUNNING", **sb.compute(db, w, now=START + timedelta(hours=1))}}
     html = (ROOT / "src/signals_display/dashboard.html").read_text(encoding="utf-8")
     top = html[html.index('<section id="minimal-opening"'):]
-    assert top.index('id="ai-three-lines"') < top.index('id="score7-box"') < top.index('id="minimal-opening-card"')
+    assert top.index('id="score7-box"') < top.index('id="ai-three-lines"') < top.index('id="minimal-opening-card"')
     start = html.index("Seven-day scoreboard: reads only /api/minute6")
     block = html[html.rindex("<script>", 0, start) + 8:html.index("</script>", start)]
     assert "innerHTML" not in block
@@ -118,6 +119,25 @@ def test_dashboard_table_renders_four_rows_with_minute6_accuracy(tmp_path):
     out = subprocess.run([node, "-e", src], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert out.returncode == 0, out.stderr
     r = json.loads(out.stdout)
-    assert r["rows"] == [["COMBINED", "0", "0", "N/A", "1"], ["AI #1", "1", "0", "100.0%", "0"],
-                         ["AI #2", "0", "1", "0.0%", "0"], ["MINUTE-6", "1", "0", "100.0%", "0"]]
+    assert r["rows"] == [["COMBINED CALL", "0", "0", "N/A", "1"], ["AI #1", "1", "0", "100.0%", "0"],
+                         ["AI #2", "0", "1", "0.0%", "0"], ["FIRST 6 MIN (shadow)", "0", "0", "N/A", "0"],
+                         ["MINUTE-6 FINAL", "1", "0", "100.0%", "0"]]
     assert "7-DAY TEST · 2026-11-23 00:00 UTC → 2026-11-30 00:00 UTC" in r["head"] and "1 settled markets" in r["head"]
+
+
+def test_first6_scored_on_its_own_six_minute_target_with_ties_and_start_time(tmp_path):
+    db, w = _db(tmp_path), sb.start_window(tmp_path / "w.json", now=START)
+    db.executescript("""CREATE TABLE first6(ticker TEXT PRIMARY KEY, opens_at TEXT, locked_at TEXT, p_up REAL,
+        direction TEXT, version TEXT, reference_open REAL);
+        CREATE TABLE first6_outcomes(ticker TEXT PRIMARY KEY, opens_at TEXT, reference_open REAL, reference_6m REAL,
+        outcome TEXT, recorded_at TEXT);""")
+    a, b, c = (START + timedelta(minutes=15 * (i + 1)) for i in range(3))
+    for t, o, d, out in (("TA", a, "DOWN", "DOWN"), ("TB", b, "WAIT", "UP"), ("TC", c, "UP", "FLAT")):
+        db.execute("INSERT INTO first6 VALUES (?,?,?,?,?,?,?)",
+                   (t, o.isoformat(), (o + timedelta(seconds=12)).isoformat(), .4, d, "v0", 100.0))
+        db.execute("INSERT INTO first6_outcomes VALUES (?,?,?,?,?,?)", (t, o.isoformat(), 100.0, 99.0, out, o.isoformat()))
+    sb.record_outcomes(db, [_mk("TA", a, "UP")])           # final settlement UP: never used for FIRST 6 MIN
+    r = sb.compute(db, w, now=START + timedelta(hours=2))
+    f = r["models"]["FIRST 6 MIN"]
+    assert (f["correct"], f["wrong"], f["wait"], f["eligible"]) == (1, 0, 1, 2)   # FLAT move not scored
+    assert r["first6_scoring_start"] == (a + timedelta(seconds=12)).isoformat()

@@ -8,7 +8,9 @@ survives restarts and deployments and its final results stay readable after it e
   * CORRECT / WRONG for UP/DOWN against the official outcome, WAIT for a genuine WAIT, MISSING when the model
     has no valid locked reading for that market (never silently counted as WAIT);
   * accuracy = CORRECT / (CORRECT + WRONG), N/A until one directional call has settled.
-Opening calls (COMBINED, AI #1, AI #2) and MINUTE-6 are scored separately. All-time records are untouched.
+Opening calls (COMBINED CALL, AI #1, AI #2) and MINUTE-6 FINAL are scored against official Kalshi settlements;
+FIRST 6 MIN (shadow AI) is scored against its own target, the BTC reference price at opens+6:00 versus the open
+(a FLAT move has no direction and is not scored). All-time records are untouched.
 
   python3 scoreboard7.py start --db sent.sqlite3 [--window score_window.json]   # starts the test once
 """
@@ -20,7 +22,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HOURS = 168
-MODELS = ("COMBINED", "AI #1", "AI #2", "MINUTE-6")
+MODELS = ("COMBINED CALL", "AI #1", "AI #2", "FIRST 6 MIN", "MINUTE-6 FINAL")
+FINAL_MODELS = ("COMBINED CALL", "AI #1", "AI #2", "MINUTE-6 FINAL")
 
 
 def _ts(v):
@@ -81,7 +84,7 @@ def compute(db, window, now=None):
                 "SELECT ticker, generated_at, kind, live, challenger, combined FROM openings"):
             if start <= _ts(gen) < end:
                 ready = kind == "READY"
-                opens[t] = {"AI #1": live, "AI #2": ch if ready else None, "COMBINED": comb if ready else None}
+                opens[t] = {"AI #1": live, "AI #2": ch if ready else None, "COMBINED CALL": comb if ready else None}
     m6 = {}
     if _table(db, "minute6"):
         for t, locked, direction, payload in db.execute("SELECT ticker, locked_at, direction, payload FROM minute6"):
@@ -90,24 +93,41 @@ def compute(db, window, now=None):
                 m6[t] = direction if ok else None
     for t, outcome in markets:
         calls = dict(opens.get(t, {}))
-        calls["MINUTE-6"] = m6.get(t)
-        for m in MODELS:
-            d, cell = calls.get(m), board[m]
-            if d in ("UP", "DOWN"):
-                cell["correct" if d == outcome else "wrong"] += 1
-            elif d == "WAIT":
-                cell["wait"] += 1
-            else:
-                cell["missing"] += 1
-    for cell in board.values():
+        calls["MINUTE-6 FINAL"] = m6.get(t)
+        for m in FINAL_MODELS:
+            _tally(board[m], calls.get(m), outcome)
+    # FIRST 6 MIN: its own target; eligible = markets opening in the window whose six-minute move is recorded
+    f6_start = None
+    if _table(db, "first6") and _table(db, "first6_outcomes"):
+        preds = {t: (d, _ts(lk)) for t, d, lk in db.execute("SELECT ticker, direction, locked_at FROM first6")}
+        locks = [lk for _, lk in preds.values() if start <= lk < end]
+        f6_start = min(locks).isoformat() if locks else None
+        for t, opens_at, outcome in db.execute("SELECT ticker, opens_at, outcome FROM first6_outcomes"):
+            if not start <= _ts(opens_at) < end or outcome not in ("UP", "DOWN"):
+                continue
+            d, lk = preds.get(t, (None, None))
+            _tally(board["FIRST 6 MIN"], d if lk is not None and start <= lk < end else None, outcome)
+    for m, cell in board.items():
         n = cell["correct"] + cell["wrong"]
+        total = n + cell["wait"] + cell["missing"]
         cell["accuracy"] = round(100 * cell["correct"] / n, 1) if n else None
+        cell["eligible"] = total
+        cell["coverage"] = round(100 * n / total, 1) if total else None
     elapsed = min(max((now - start).total_seconds() / 3600, 0), window["hours"])
     return {"window": {"start": window["start"], "end": window["end"], "hours": window["hours"],
                        "elapsed_hours": round(elapsed, 2), "complete": now >= end,
                        "production_model_at_start": window.get("production_model_at_start")},
-            "settled_markets": len(markets), "models": board,
-            "rule": "accuracy = correct / (correct + wrong); WAIT and MISSING not counted; one locked prediction per market"}
+            "settled_markets": len(markets), "first6_scoring_start": f6_start, "models": board,
+            "rule": "accuracy = right / (right + wrong); WAIT and MISSING not counted; one locked prediction per market"}
+
+
+def _tally(cell, d, outcome):
+    if d in ("UP", "DOWN"):
+        cell["correct" if d == outcome else "wrong"] += 1
+    elif d == "WAIT":
+        cell["wait"] += 1
+    else:
+        cell["missing"] += 1
 
 
 def main(argv=None):

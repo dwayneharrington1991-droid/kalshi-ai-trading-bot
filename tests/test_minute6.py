@@ -65,7 +65,7 @@ def test_runner_locks_once_sends_once_and_is_immutable(tmp_path, monkeypatch):
     assert r.step(_state(), now=OPEN + timedelta(seconds=300), now_mono=0) == "OUTSIDE WINDOW"
     assert r.step(_state(), now=OPEN + timedelta(seconds=366), now_mono=1) == "SENT"
     assert r.step(_state(), now=OPEN + timedelta(seconds=380), now_mono=2) == "ALREADY LOCKED"
-    assert len(s.calls) == 1 and "MINUTE-6: " in s.calls[0] and "KX-M" in s.calls[0]
+    assert len(s.calls) == 1 and "MINUTE-6 FINAL: " in s.calls[0] and "KX-M" in s.calls[0]
     assert "AI #1: WAIT 🟡 — N/A" in s.calls[0]                 # no opening row stored for KX-M: nothing invented
     with pytest.raises(sqlite3.DatabaseError):
         r.db.execute("UPDATE minute6 SET direction='DOWN'")
@@ -180,9 +180,9 @@ def test_merge_bars_uses_final_15s_bar_and_skips_unfinished_minutes():
 def test_latest_json_carries_pending_then_unavailable_lines(tmp_path):
     r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {}, candles=_candles, log=lambda x: None)
     r.write_latest(_state(), OPEN + timedelta(seconds=120), 0)
-    assert json.loads((tmp_path / "m6.json").read_text())["line"] == "MINUTE-6: PENDING 🟡"
+    assert json.loads((tmp_path / "m6.json").read_text())["line"] == "MINUTE-6 FINAL: PENDING 🟡"
     r.write_latest(_state(), OPEN + timedelta(seconds=500), 1)
-    assert json.loads((tmp_path / "m6.json").read_text())["line"] == "MINUTE-6: WAIT 🟡 — N/A"
+    assert json.loads((tmp_path / "m6.json").read_text())["line"] == "MINUTE-6 FINAL: WAIT 🟡 — N/A"
 
 
 def test_latest_json_carries_scoreboard7_not_started_then_running(tmp_path):
@@ -194,4 +194,29 @@ def test_latest_json_carries_scoreboard7_not_started_then_running(tmp_path):
     scoreboard7.start_window(tmp_path / "score_window.json", now=OPEN)
     r.write_latest(_state(), OPEN + timedelta(seconds=130), 1)
     sb7 = json.loads((tmp_path / "m6.json").read_text())["scoreboard7"]
-    assert sb7["status"] == "RUNNING" and sb7["models"]["MINUTE-6"]["accuracy"] is None
+    assert sb7["status"] == "RUNNING" and sb7["models"]["MINUTE-6 FINAL"]["accuracy"] is None
+
+
+def test_first6_shadow_locks_once_from_pre_open_data_and_records_six_minute_outcome(tmp_path, monkeypatch):
+    from src.signals_display import first6 as f6
+    monkeypatch.setattr("minute6_runner.time.sleep", lambda s: None)
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {}, candles=_candles, log=lambda x: None)
+    assert r.first6_step(_state(), OPEN + timedelta(seconds=5), 0) == "IDLE"          # before the lock window
+    assert r.first6_step(_state(), OPEN + timedelta(seconds=12), 1) == "LOCKED"
+    assert r.first6_step(_state(), OPEN + timedelta(seconds=20), 2) == "IDLE"         # once only
+    row = r.db.execute("SELECT direction, version, reference_open FROM first6").fetchone()
+    by = {c[0]: c[4] for c in _candles()}
+    assert row[1] == f6.VERSION and row[2] == by[O - 60]                              # minute ending at the open
+    assert r.db.execute("SELECT COUNT(*) FROM first6_outcomes").fetchone()[0] == 0
+    r.first6_step(_state(), OPEN + timedelta(seconds=370), 3)
+    ref0, ref6, out = r.db.execute("SELECT reference_open, reference_6m, outcome FROM first6_outcomes").fetchone()
+    assert ref6 == by[O + 300] and out == ("UP" if ref6 > ref0 else "DOWN" if ref6 < ref0 else "FLAT")
+    with pytest.raises(sqlite3.DatabaseError):
+        r.db.execute("UPDATE first6 SET direction='UP'")
+
+
+def test_first6_missing_candles_never_invent_a_prediction(tmp_path):
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {},
+                      candles=lambda: [c for c in _candles() if c[0] != O - 600], log=lambda x: None)
+    assert r.first6_step(_state(), OPEN + timedelta(seconds=30), 0) == "IDLE"
+    assert r.db.execute("SELECT COUNT(*) FROM first6").fetchone()[0] == 0

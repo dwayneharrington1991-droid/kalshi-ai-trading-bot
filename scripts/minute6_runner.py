@@ -15,6 +15,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 
+from src.signals_display import first6 as f6
 from src.signals_display import minute6 as m6
 
 import scoreboard7
@@ -86,6 +87,16 @@ class Minute6Runner:
             CREATE TABLE IF NOT EXISTS minute6_outcomes(ticker TEXT PRIMARY KEY, outcome TEXT, seen_at TEXT);
             CREATE TRIGGER IF NOT EXISTS minute6_outcomes_immutable BEFORE UPDATE ON minute6_outcomes
                 BEGIN SELECT RAISE(ABORT, 'outcomes are immutable'); END;
+            CREATE TABLE IF NOT EXISTS first6(ticker TEXT PRIMARY KEY, opens_at TEXT, locked_at TEXT, p_up REAL,
+                direction TEXT, version TEXT, reference_open REAL);
+            CREATE TABLE IF NOT EXISTS first6_outcomes(ticker TEXT PRIMARY KEY, opens_at TEXT, reference_open REAL,
+                reference_6m REAL, outcome TEXT, recorded_at TEXT);
+            CREATE TRIGGER IF NOT EXISTS first6_immutable BEFORE UPDATE ON first6
+                BEGIN SELECT RAISE(ABORT, 'first-6 predictions are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS first6_no_delete BEFORE DELETE ON first6
+                BEGIN SELECT RAISE(ABORT, 'first-6 predictions are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS first6_outcomes_immutable BEFORE UPDATE ON first6_outcomes
+                BEGIN SELECT RAISE(ABORT, 'first-6 outcomes are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS minute6_deliveries_append BEFORE UPDATE ON minute6_deliveries
                 BEGIN SELECT RAISE(ABORT, 'append-only'); END;""")
         self.db.commit()
@@ -279,9 +290,51 @@ class Minute6Runner:
         os.replace(tmp, self.out_path)
         return out
 
+    def first6_step(self, state, now, now_mono):
+        """FIRST 6 MIN shadow AI: lock once between opens+10 s and opens+90 s from closes ending at the open;
+        record the six-minute reference outcome once the candle ending at opens+6:00 exists. Never sends."""
+        m = self._market(state)
+        if not m:
+            return "NO MARKET"
+        o = int(m["opens"].timestamp())
+        since = (now - m["opens"]).total_seconds()
+        status = "IDLE"
+        if 10 <= since <= 90 and not self.db.execute("SELECT 1 FROM first6 WHERE ticker=?", (m["ticker"],)).fetchone():
+            closes = f6.closes_to_open(self._candles(now_mono) or [], o)
+            if closes is None:
+                try:                           # the minute ending at the open is final ~7 s after it
+                    self.cache = (now_mono, self.candles())
+                except Exception:
+                    pass
+                closes = f6.closes_to_open(self.cache[1] or [], o)
+            r = f6.predict(closes) if closes else None
+            if r:
+                self.db.execute("INSERT OR IGNORE INTO first6 VALUES (?,?,?,?,?,?,?)",
+                                (m["ticker"], m["opens"].isoformat(), now.isoformat(), r["p_up"], r["direction"],
+                                 r["version"], r["reference_open"]))
+                self.db.commit()
+                status = "LOCKED"
+        for t, opens_at, ref0 in self.db.execute(
+                "SELECT ticker, opens_at, reference_open FROM first6 WHERE ticker NOT IN (SELECT ticker FROM first6_outcomes)").fetchall():
+            ot = int(datetime.fromisoformat(opens_at).timestamp())
+            if now.timestamp() < ot + 367:
+                continue
+            ref6 = f6.reference_at(self._candles(now_mono) or [], ot)
+            if ref6 is None or not ref0:
+                continue
+            outcome = "UP" if ref6 > ref0 else "DOWN" if ref6 < ref0 else "FLAT"
+            self.db.execute("INSERT OR IGNORE INTO first6_outcomes VALUES (?,?,?,?,?,?)",
+                            (t, opens_at, ref0, ref6, outcome, now.isoformat()))
+            self.db.commit()
+        return status
+
     def step(self, state, now=None, now_mono=None):
         now = now or datetime.now(timezone.utc)
         now_mono = time.monotonic() if now_mono is None else now_mono
+        try:
+            self.first6_step(state, now, now_mono)
+        except Exception as exc:               # shadow model: never blocks the four existing predictions
+            self.log(json.dumps({"first6_error": f"{type(exc).__name__}: {exc}"[:200]}))
         status = self.maybe_lock(state, now, now_mono)
         self.write_latest(state, now, now_mono)
         return status

@@ -52,7 +52,7 @@ def _run_strip(challenger, minute6=None):
     html = (ROOT / "src/signals_display/dashboard.html").read_text(encoding="utf-8")
     start = html.index("Four-line top strip")
     block = html[html.rindex("<script>", 0, start) + 8:html.index("</script>", start)]
-    ids = ["ai1-line", "ai2-line", "ai3-line", "ai4-line", "ai4-row", "ai-lock-note", "ai4-note"]
+    ids = ["ai1-line", "ai2-line", "ai3-line", "ai4-line", "ai5-line", "ai4-row", "ai-lock-note", "ai4-note"]
     src = ("var els={};" + json.dumps(ids) + ".forEach(function(i){els[i]={textContent:'',className:'',hidden:true};});"
            "var document={getElementById:function(i){return els[i];}};var setInterval=function(){};"
            "var P={'/api/challenger-opening':" + json.dumps(challenger) + ",'/api/minute6':" + json.dumps(minute6 or {}) + "};"
@@ -71,7 +71,7 @@ def test_four_line_strip_shows_server_lines_and_minute6_only_when_valid():
     assert ".ai-line.combined{font-size:2em" in html
     assert "#minimal-opening-card,#minimal-confidence-card,#minute6-card{display:none!important}" in html
     lines = four_lines.lines(("UP", 0.62), ("DOWN", 0.40), ("WAIT", 0.51))
-    assert lines[3] == "MINUTE-6: PENDING 🟡"
+    assert lines[3] == "FIRST 6 MIN: TESTING 🟡" and lines[4] == "MINUTE-6 FINAL: PENDING 🟡"
     ch = {"status": "READY", "ticker": "KX-Z", "closes_at": "2999-01-01T00:00:00Z",
           "generated_from": "2999-01-01T00:00:02Z", "lines": lines}
     m6 = {"status": "LOCKED", "valid": True, "ticker": "KX-Z", "locked_at": "2999-01-01T00:06:07Z",
@@ -81,13 +81,14 @@ def test_four_line_strip_shows_server_lines_and_minute6_only_when_valid():
     top_html = html[html.index('id="ai-three-lines"'):]
     assert top_html.index('id="ai3-line"') < top_html.index('id="ai1-line"') < top_html.index('id="ai2-line"')
     assert r["ai1-line"]["className"] == "up" and r["ai2-line"]["className"] == "down"
-    assert r["ai4-row"]["hidden"] is False and r["ai4-line"]["textContent"] == "MINUTE-6: DOWN 🔴 — 97% | WAIT"
+    assert r["ai5-line"]["textContent"] == "FIRST 6 MIN: TESTING 🟡"
+    assert r["ai4-row"]["hidden"] is False and r["ai4-line"]["textContent"] == "MINUTE-6 FINAL: DOWN 🔴 — 97% | WAIT"
     other = dict(m6, ticker="KX-OLD")                                   # minute-6 of another market: never shown
-    assert _run_strip(ch, other)["ai4-line"]["textContent"] == "MINUTE-6: PENDING 🟡"
-    invalid = dict(m6, valid=False, line="MINUTE-6: WAIT 🟡 — N/A")
-    assert _run_strip(ch, invalid)["ai4-line"]["textContent"] == "MINUTE-6: WAIT 🟡 — N/A"
-    pending = {"status": "WAITING FOR MINUTE 6", "ticker": "KX-Z", "line": "MINUTE-6: PENDING 🟡"}
-    assert _run_strip(ch, pending)["ai4-line"]["textContent"] == "MINUTE-6: PENDING 🟡"
+    assert _run_strip(ch, other)["ai4-line"]["textContent"] == "MINUTE-6 FINAL: PENDING 🟡"
+    invalid = dict(m6, valid=False, line="MINUTE-6 FINAL: WAIT 🟡 — N/A")
+    assert _run_strip(ch, invalid)["ai4-line"]["textContent"] == "MINUTE-6 FINAL: WAIT 🟡 — N/A"
+    pending = {"status": "WAITING FOR MINUTE 6", "ticker": "KX-Z", "line": "MINUTE-6 FINAL: PENDING 🟡"}
+    assert _run_strip(ch, pending)["ai4-line"]["textContent"] == "MINUTE-6 FINAL: PENDING 🟡"
     r = _run_strip({"status": "UNAVAILABLE", "closes_at": "2999-01-01T00:00:00Z"})
     assert [r[f"ai{k}-line"]["textContent"] for k in (3, 1, 2)] == ["COMBINED CALL: WAIT 🟡 — N/A", "AI #1: WAIT 🟡 — N/A", "AI #2: WAIT 🟡 — N/A"]
     expired = dict(ch, closes_at="2000-01-01T00:00:00Z")

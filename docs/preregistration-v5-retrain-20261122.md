@@ -35,3 +35,18 @@ All are refit every 48 openings on all eligible openings settled before each ref
   must come from out-of-sample calibration only.
 - Holm correction across the 4 candidates.
 - A pass permits a guarded deployment proposal (shadow first, then explicit approval); never automatic.
+
+## Amendment 1 (2026-11-22 04:50 UTC, before any post-fix outcome was used)
+
+A dry run of `scripts/train_v5.py --mode legacy-dry-run` on legacy, non-reserved openings (312 scored,
+2026-11-16 21:15 .. 11-20 06:00) showed the recipe above overfits: all 536 candidate inputs, lambda at
+the grid maximum (100) on every refit, calibration slopes 0.24-0.39, Brier 0.254-0.268 vs live 0.2425;
+coverage cuts taken from in-sample predictions gave 49-68% coverage. Amended, from that evidence only:
+- inputs = the live model's 87 receipt-proven inputs (fixed list from the artifact);
+- lambda grid 10, 30, 100, 300, 1000, 3000, 10000;
+- post_gbm: depth 2, 100 iterations, learning rate 0.03, min leaf 40, l2 1.0;
+- each model's 33% coverage cut from out-of-sample predictions (fit on the first 70% of the training rows,
+  scored on the last 30%).
+Dry run after amendment: post_ridge 0.2428, post_gbm 0.2437, post_ensemble 0.2427 vs live 0.2425 and
+Kalshi mid 0.2470; calls 36-45% of openings at 61-62% accuracy (Wilson ~52-70%). Level with live on
+legacy data - the v5 question is whether consistent post-fix inputs change that.

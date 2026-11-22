@@ -844,7 +844,7 @@ $('load-market-history').onclick=()=>{marketHistoryBeforeClose=null;marketHistor
       .catch(function () { box.textContent = 'Market pulse unavailable. Live signals are unaffected.'; });
   }
   load();
-  setInterval(load, 3000);
+  setInterval(load, 10000);
 })();
 </script>
 <script>

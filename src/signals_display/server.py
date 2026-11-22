@@ -2361,18 +2361,28 @@ def make_handler(monitor):
                 from .challenger_view import ChallengerView
                 if getattr(monitor, "challenger_view", None) is None:
                     monitor.challenger_view = ChallengerView(getattr(monitor, "opening_artifact", None))
-                opening = ((monitor.snapshot() or {}).get("prediction_engine") or {}).get("initial") or {}
-                body = json.dumps(monitor.challenger_view.call(opening), default=str).encode()
+                cached = getattr(monitor, "challenger_cache", None)
+                if cached and monotonic() - cached[0] < 10:             # bounded cost: one snapshot per 10 s
+                    body = cached[1]
+                else:
+                    opening = ((monitor.snapshot() or {}).get("prediction_engine") or {}).get("initial") or {}
+                    body = json.dumps(monitor.challenger_view.call(opening), default=str).encode()
+                    monitor.challenger_cache = (monotonic(), body)
                 content_type = "application/json"
             elif route == "/api/market-pulse":
                 # Research indicators (order book, trade flow, momentum, short horizons, contract EV).
                 # Read-only; never changes a signal, model, threshold, alert or record.
                 from .market_pulse import build as pulse_build
-                shadow = getattr(monitor, "r10_shadow", None)
-                body = json.dumps(pulse_build(monitor.snapshot() or {},
-                                              r10=shadow.counters if shadow is not None else None,
-                                              horizons=getattr(monitor, "pulse_horizons", None),
-                                              validated_probability=False), default=str).encode()
+                cached = getattr(monitor, "pulse_cache", None)
+                if cached and monotonic() - cached[0] < 5:              # bounded cost: one build per 5 s
+                    body = cached[1]
+                else:
+                    shadow = getattr(monitor, "r10_shadow", None)
+                    body = json.dumps(pulse_build(monitor.snapshot() or {},
+                                                  r10=shadow.counters if shadow is not None else None,
+                                                  horizons=getattr(monitor, "pulse_horizons", None),
+                                                  validated_probability=False), default=str).encode()
+                    monitor.pulse_cache = (monotonic(), body)
                 content_type = "application/json"
             elif route == "/api/accuracy-health":
                 # Read-only diagnostic: data health and predictive edge, both scoreboard populations.

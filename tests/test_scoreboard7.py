@@ -134,3 +134,14 @@ def test_first6_scored_on_its_own_six_minute_target_with_ties_and_start_time(tmp
     f = r["models"]["FIRST 6 MIN"]
     assert (f["correct"], f["wrong"], f["wait"], f["eligible"]) == (1, 0, 1, 2)   # FLAT move not scored
     assert r["first6_scoring_start"] == (a + timedelta(seconds=12)).isoformat()
+
+
+def test_hidden_panels_do_not_poll_heavy_server_reports():
+    html = (ROOT / "src/signals_display/dashboard.html").read_text(encoding="utf-8")
+    assert "function panelShown(id){const e=document.getElementById(id);return !!e&&e.offsetParent!==null}" in html
+    for guard in ("if(document.hidden||!panelShown('ai-chart-canvas'))return;",
+                  "if(document.hidden||!panelShown('ai-chart-canvas')||signalChart.interval!=='15s'||liveChartBusy)return;",
+                  "!(panelShown('engine-performance')||panelShown('learning-summary'))",
+                  "if (box.offsetParent === null) { return; }",
+                  "if (document.hidden || !el || el.offsetParent === null) return;"):
+        assert guard in html, guard

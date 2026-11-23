@@ -47,5 +47,42 @@ if "telegram" in p.channels(cfg):
 ' "$name" "$decision" || true
   fi
 done
+# v5 clean-data retrain (docs/preregistration-v5-retrain-20261122.md): walk-forward on full-window openings,
+# holdout from 2026-11-24 06:30 UTC, decision at >= 300 holdout openings. The script itself refuses to run
+# earlier. Research only: the report is kept and one Telegram line sent at the decision; nothing is promoted.
+v5_due=$(date -u -d "2026-11-24T06:35:00Z" +%s)
+if [[ ! -f $OUT/v5.decided ]] && (( now >= v5_due )); then
+  if [[ -z $dump ]]; then
+    dump="$OUT/journal_dump-$(date -u +%Y%m%dT%H%M%SZ).json"
+    ( cd "$SRC" && nice -n 19 ionice -c3 timeout 900 "$PY" scripts/export_opening_research.py ) > "$dump" || { echo "export failed"; rm -f "$dump"; exit 4; }
+  fi
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 1200 "$PY" scripts/train_v5.py --journal "$dump" --artifact "$ART" --mode v5 ) > "$OUT/v5-$stamp.json" 2> "$OUT/v5-$stamp.err"
+  decision=$("$PY" - "$OUT/v5-$stamp.json" <<'PY'
+import json, sys
+try:
+    r = json.load(open(sys.argv[1])); e = r.get("evaluation") or {}
+except Exception:
+    print(""); sys.exit()
+n = e.get("openings") or 0
+if n < 300:
+    print(f"NOT ENOUGH FORWARD DATA ({n}/300)")
+else:
+    passed = [k for k, v in (e.get("candidates") or {}).items() if v.get("passes")]
+    print("PASSED: " + ", ".join(passed) if passed else "NO CANDIDATE PASSED")
+PY
+)
+  echo "v5: $decision"
+  if [[ -n $decision && $decision != NOT\ ENOUGH* ]]; then
+    cp "$OUT/v5-$stamp.json" "$OUT/v5.decided"
+    PYTHONPATH=/home/opc/dual-ai-alerts/vendor "$PY" -c '
+import sys
+from src.signals_display import phone_alerts as p
+cfg = p.load_config()
+if "telegram" in p.channels(cfg):
+    p.send("telegram", cfg, "8768 v5 CLEAN-DATA RETRAIN: " + sys.argv[1] + " (research only; nothing promoted without approval)")
+' "$decision" || true
+  fi
+fi
 find "$OUT" -name 'journal_dump-*.json' -mtime +2 -delete 2>/dev/null
 exit 0

@@ -18,6 +18,12 @@ BUILD=$(curl -s --max-time 10 http://127.0.0.1:8768/readyz | "$PY" -c 'import js
 SRC=/home/opc/kalshi-preview-repair-$BUILD
 [[ -n $BUILD && -d $SRC/src ]] || { echo "deployed release not found ($BUILD)"; exit 3; }
 now=$(date -u +%s)
+# Daily read-only stability report (scripts/stability_report.py): first run of each UTC day, low priority.
+REP=/home/opc/dual-ai-alerts/reports
+mkdir -p "$REP"
+if ! ls "$REP"/stability-$(date -u +%Y%m%d)*.json >/dev/null 2>&1; then
+  nice -n 19 ionice -c3 timeout 300 python3 /home/opc/dual-ai-alerts/stability_report.py > "$REP/stability-$(date -u +%Y%m%dT%H%M%SZ).json" 2>"$REP/stability.err" || true
+fi
 dump=""
 for spec in "v2 2d4d007 forward_eval_v2.py 2026-11-23T02:00:00Z" \
             "v3 30a5ee8 forward_eval_v3.py 2026-11-24T03:00:00Z" \

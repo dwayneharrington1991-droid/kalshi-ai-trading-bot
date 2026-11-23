@@ -87,3 +87,28 @@ the v4 freeze, so it is not reserved for v4. The alignment used inputs only from
   Part of the strong start was early-sample luck (Nov 17: 29 calls, 72%).
 - **Action:** no production change. The v4 forward test still decides about 05:30 UTC Nov 24. The cure for
   consistency is training on the same full-window inputs the live bot computes, which is the v5 protocol.
+
+## Root-cause test of the decline (2026-11-23, `scripts/research_fix_candidates_20261123.py`)
+These are the frozen v3/v4 corrections run on non-reserved windows only.
+
+| Window | Variant | Calls | Right | Accuracy | UP share | Brier | ΔBrier vs live (95%) |
+|---|---|---|---|---|---|---|---|
+| Pre-change, 369 openings (inputs match training) | live | 126 | 81 | 64.3% | 38% | 0.2433 | |
+| | masked (30 skewed inputs removed) | 126 | 78 | 61.9% | 35% | 0.2441 | +0.0008 [−0.0012, +0.0029] |
+| | no_logistic | 109 | 67 | 61.5% | 32% | 0.2435 | +0.0001 [−0.0022, +0.0025] |
+| Skew window, 114 openings (after change, before v3 freeze) | live | 53 | 29 | 54.7% | 66% | 0.2527 | |
+| | masked | 48 | 26 | 54.2% | 42% | 0.2532 | +0.0005 [−0.0072, +0.0079] |
+| | no_logistic | 40 | 20 | 50.0% | 35% | 0.2516 | −0.0011 [−0.0105, +0.0083] |
+| | aligned (AI #2) | 46 | 23 | 50.0% | 46% | 0.2520 | −0.0007 [−0.0060, +0.0047] |
+
+**Conclusion.**
+1. The train/serve skew is a real bug, and it explains the UP bias. All three corrections remove it.
+2. The skew does **not** explain the accuracy decline. Even before the change, the 30 inputs added almost
+   nothing (masked 61.9% vs 64.3%). After the change, every corrected variant is still at 50–54%, with Brier
+   near the base rate. The early 64% came from the other inputs in a mostly-DOWN market (Nov 16–20, 44% UP;
+   DOWN calls 54/78 right), plus small-sample luck. That edge did not persist.
+3. **Smallest consistent repair:** "masked", which uses only inputs computed identically in training and
+   serving. It restores train/serve consistency and an honest UP/DOWN balance, with no measurable change in
+   accuracy. Promoting it would change live predictions, so it requires the pre-registered v3 result (about
+   03:00 UTC Nov 24) and explicit approval. Consistently better accuracy needs a model retrained on full-window
+   inputs (v5), judged on unseen markets.

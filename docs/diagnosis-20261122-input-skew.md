@@ -67,3 +67,23 @@ no evidence yet that either is better; they are pre-registered as forward test v
 - Feed interruptions: none material in the last 8 h; Kalshi REST read timeouts 3-13 per hour are absorbed
   by the cached-payload path. Opening calls generated 2-4 s after every open, no gaps, no overwrites.
 - Tests v1 and v2 are affected by the same skew for all models; their rules are unchanged.
+
+## Follow-up 2026-11-23: does fixing the skew restore accuracy? (`scripts/research_align_window_20261123.py`)
+Window: 124 settled openings from 2026-11-20 20:30 to 2026-11-22 03:15. This is after the input change and before
+the v4 freeze, so it is not reserved for v4. The alignment used inputs only from this window, never outcomes.
+43.5% of these markets settled UP; the base-rate Brier is 0.2458.
+
+| | Calls | Right | UP share of calls | Avg P(UP) | Brier |
+|---|---|---|---|---|---|
+| AI #1 live | 58 | 51.7% (UP 18/40, DOWN 12/18) | 69% | 0.518 | 0.2546 |
+| AI #1 with quantile-aligned inputs (AI #2 mechanism) | 48 | 50.0% (UP 10/23, DOWN 14/25) | 48% | 0.495 | 0.2532 |
+| AI #1 before the change (369 openings) | 126 | 64.3% | 38% | 0.492 | 0.2433 |
+
+- Aligned minus live Brier is −0.0013, with a 95% bootstrap CI of [−0.0065, +0.0040].
+- **Confirmed:** the train/serve skew creates an UP bias. The UP share went from 38% to 69% of calls (z ≈ 4).
+  Alignment removes the bias.
+- **Not restored:** accuracy and Brier stay near coin-flip level with aligned inputs. The accuracy drop itself
+  (64.3% of 126 calls to 51.7% of 58) is not statistically distinguishable from market variation (p ≈ 0.10).
+  Part of the strong start was early-sample luck (Nov 17: 29 calls, 72%).
+- **Action:** no production change. The v4 forward test still decides about 05:30 UTC Nov 24. The cure for
+  consistency is training on the same full-window inputs the live bot computes, which is the v5 protocol.

@@ -82,3 +82,22 @@ Component comparison (same splits; calls / accuracy / coverage):
 Accuracy is unchanged under strict timing. There is no measurable edge at real entry prices. `four_lines.ENTRY_RULE` stays None, so the dashboard and Telegram show `| WAIT`.
 
 **Momentum-confirmed lower threshold (rejected, 2026-11-23).** The rule A ≥ 0.75 with momentum agreeing (score ≥ 0) was selected on fit: 122/133 = 91.7%, Wilson low 0.858, 41% coverage. It did not hold on the clean check set: 54/63 = 85.7%, against the baseline 46/51 = 90.2% at 36% coverage. Together with the hour-of-day test, the evidence is that about 90% minute-6 accuracy is available only at roughly 30–35% coverage on this data.
+
+**Consistency check (2026-11-23, `scripts/research_m6_consistency_20261123.py`; frozen rule, all 640 markets).**
+
+| Group | Calls | Right | Accuracy | Coverage |
+|---|---|---|---|---|
+| Nov 16 | 20 | 20 | 100% | 22% |
+| Nov 17 | 25 | 23 | 92.0% | 26% |
+| Nov 18 | 30 | 28 | 93.3% | 31% |
+| Nov 19 | 25 | 22 | 88.0% | 28% |
+| Nov 20 | 32 | 29 | 90.6% | 33% |
+| Nov 21 | 19 | 18 | 94.7% | 20% |
+| Nov 22 | 14 | 13 | 92.9% | 18% |
+| Low volatility | 48 | 44 | 91.7% | 23% |
+| Mid volatility | 60 | 54 | 90.0% | 28% |
+| High volatility | 57 | 55 | 96.5% | 27% |
+
+Accuracy stays within 88–100% every day and in every volatility regime; only the coverage moves. This is the
+consistent model, unlike opening AI #1, whose accuracy decayed. The figures are historical, and the prospective
+test continues.

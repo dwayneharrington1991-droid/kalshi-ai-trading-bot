@@ -112,3 +112,17 @@ These are the frozen v3/v4 corrections run on non-reserved windows only.
    accuracy. Promoting it would change live predictions, so it requires the pre-registered v3 result (about
    03:00 UTC Nov 24) and explicit approval. Consistently better accuracy needs a model retrained on full-window
    inputs (v5), judged on unseen markets.
+
+## Consistency finding: AI #1's calibration is non-stationary (2026-11-23, `scripts/research_calibration_shrink_20261123.py`)
+Non-reserved openings before the v3 freeze, split chronologically: fit 289, check 194.
+- **Calibration slope:** 1.95 on fit (under-confident: the probabilities were too close to 0.5) and 0.51 on check
+  (over-confident). The probability-to-outcome relationship changed between consecutive periods.
+- **Threshold chosen on fit:** 0.57, which gave 41/57 = 71.9% on fit. On check it gave 30/62 = 48.4%, against
+  the current 0.55 at 49/85 = 57.6%.
+- **Conclusion:** no fixed recalibration, threshold or confidence filter chosen on past opening data makes AI #1
+  consistent; its opening edge is not stable over time.
+- **Implication:** threshold and recalibration changes are not candidates for approval. The remaining credible
+  route is retraining on consistent full-window inputs (v5), judged prospectively.
+- **Contrast:** MINUTE-6 FINAL's mechanical price/distance signal is stable across days and regimes; see the
+  minute-6 consistency table.
+- **Also:** the pre-registered H-session test has 8 of 120 window calls (5 right); no decision yet.

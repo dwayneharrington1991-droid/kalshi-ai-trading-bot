@@ -220,3 +220,18 @@ def test_first6_missing_candles_never_invent_a_prediction(tmp_path):
                       candles=lambda: [c for c in _candles() if c[0] != O - 600], log=lambda x: None)
     assert r.first6_step(_state(), OPEN + timedelta(seconds=30), 0) == "IDLE"
     assert r.db.execute("SELECT COUNT(*) FROM first6").fetchone()[0] == 0
+
+
+def test_market_history_is_fetched_sparingly(tmp_path):
+    calls = []
+
+    def history(pages=1):
+        calls.append(pages)
+        return {"markets": []}
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {}, candles=_candles,
+                      history=history, log=lambda x: None)
+    for i, t in enumerate((0, 30, 300, 599)):
+        r.write_latest(_state(), OPEN + timedelta(seconds=100 + t), 1000 + t)
+    assert calls == [3]                                     # one 3-page backfill, then cached for 10 minutes
+    r.write_latest(_state(), OPEN + timedelta(seconds=800), 1000 + 601)
+    assert calls == [3, 1]

@@ -22,6 +22,7 @@ import scoreboard7
 
 CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60"
 FEE_RATE, SLIPPAGE = 0.07, 0.01
+HISTORY_REFRESH_S = 600
 
 
 def _ts(v):
@@ -211,13 +212,21 @@ class Minute6Runner:
         except Exception as exc:
             return {"status": "UNAVAILABLE", "reason": type(exc).__name__}
 
+    def _history_pages(self, pages):
+        try:
+            return self.history(pages=pages)
+        except TypeError:                      # simple callables (tests) take no arguments
+            return self.history()
+
     def scoreboard(self, now_mono):
         if self.history is None:
             return None
-        if now_mono - self.board[0] < 120 and self.board[1] is not None:
+        # /api/market-history costs the server ~5 s CPU per page, so refresh only every HISTORY_REFRESH_S
+        # (settlements arrive every 15 min); the first refresh after a restart backfills 3 pages, later ones 1.
+        if now_mono - self.board[0] < HISTORY_REFRESH_S and self.board[1] is not None:
             return self.board[1]
         try:                                   # keep official settlements locally: the API pages only recent markets
-            markets = (self.history() or {}).get("markets", [])
+            markets = (self._history_pages(3 if self.board[1] is None else 1) or {}).get("markets", [])
             scoreboard7.ensure_tables(self.db)
             scoreboard7.record_outcomes(self.db, markets)
             for x in markets:

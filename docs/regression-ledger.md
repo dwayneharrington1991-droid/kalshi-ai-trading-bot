@@ -39,6 +39,8 @@ Deployment categories:
 
 ## Open items (not defects, or awaiting data/approval)
 
+- Forward test v2 DECIDED 2026-11-23 02:06 UTC (200 openings from 2026-11-21 00:00): NO CANDIDATE PASSED. Brier: live 0.2507 (87 calls, 55.2%), stable_ridge 0.2494 (127 calls, 59.1%), blend 0.2500, ensemble 0.2514, gbm 0.2552, Kalshi mid 0.2501; every CI of the Brier difference vs live includes 0. At the opening, the live AI, the challengers and the market price are all near coin-flip quality. Live model unchanged.
+
 - R10 shadow vs live inputs (inputs only, no outcomes; 14 paired openings 06:45-09:30 UTC Nov 22):
   live trade_flow_imbalance is buy-skewed at short windows (median 15s 0.66 / 30s 0.46 live vs -0.04 / 0.09
   with R10), and trade intensity reads about half (4.3 vs 8.0 trades/s). The rejected trades are not

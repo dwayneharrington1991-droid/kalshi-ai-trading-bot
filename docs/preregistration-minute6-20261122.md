@@ -80,3 +80,5 @@ Component comparison (same splits; calls / accuracy / coverage):
 | Holdout (viewed) | 31/33 = 93.9% | 0.918 | +0.2¢ (±8.0¢) |
 
 Accuracy is unchanged under strict timing. There is no measurable edge at real entry prices. `four_lines.ENTRY_RULE` stays None, so the dashboard and Telegram show `| WAIT`.
+
+**Momentum-confirmed lower threshold (rejected, 2026-11-23).** The rule A ≥ 0.75 with momentum agreeing (score ≥ 0) was selected on fit: 122/133 = 91.7%, Wilson low 0.858, 41% coverage. It did not hold on the clean check set: 54/63 = 85.7%, against the baseline 46/51 = 90.2% at 36% coverage. Together with the hour-of-day test, the evidence is that about 90% minute-6 accuracy is available only at roughly 30–35% coverage on this data.

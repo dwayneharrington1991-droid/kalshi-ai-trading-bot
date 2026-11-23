@@ -93,36 +93,29 @@ def test_window_completes_and_keeps_final_results(tmp_path):
     assert r["models"]["AI #1"]["correct"] == 1
 
 
-def test_dashboard_table_renders_five_rows_with_their_own_accuracy(tmp_path):
+def test_original_top_right_scoreboard_shows_combined_call_seven_day_numbers(tmp_path):
     node = shutil.which("node")
     if not node:
         pytest.skip("node not installed")
     db, w = _db(tmp_path), sb.start_window(tmp_path / "w.json", now=START)
-    a = START + timedelta(minutes=15)
-    _open(db, "TA", a, "UP", "DOWN", "WAIT"); _m6(db, "TA", a, "UP")
-    sb.record_outcomes(db, [_mk("TA", a, "UP")])
+    a, b = START + timedelta(minutes=15), START + timedelta(minutes=30)
+    _open(db, "TA", a, "UP", "UP", "UP"); _open(db, "TB", b, "DOWN", "WAIT", "WAIT")
+    sb.record_outcomes(db, [_mk("TA", a, "UP"), _mk("TB", b, "UP")])
     payload = {"scoreboard7": {"status": "RUNNING", **sb.compute(db, w, now=START + timedelta(hours=1))}}
     html = (ROOT / "src/signals_display/dashboard.html").read_text(encoding="utf-8")
-    top = html[html.index('<section id="minimal-opening"'):]
-    assert top.index('id="score7-box"') < top.index('id="ai-three-lines"') < top.index('id="minimal-opening-card"')
-    start = html.index("Seven-day scoreboard: reads only /api/minute6")
-    block = html[html.rindex("<script>", 0, start) + 8:html.index("</script>", start)]
-    assert "innerHTML" not in block
-    src = ("function El(){this.children=[];this.textContent='';this.className='';}"
-           "El.prototype.appendChild=function(c){this.children.push(c);};El.prototype.removeChild=function(c){this.children.splice(this.children.indexOf(c),1);};"
-           "Object.defineProperty(El.prototype,'firstChild',{get:function(){return this.children[0]||null;}});"
-           "var els={'score7-head':new El(),'score7-body':new El(),'score7-foot':new El()};"
-           "var document={getElementById:function(i){return els[i];},createElement:function(){return new El();}};var setInterval=function(){};"
-           "var fetch=function(){return Promise.resolve({ok:true,json:function(){return " + json.dumps(payload) + ";}});};"
-           + block + ";setTimeout(function(){console.log(JSON.stringify({head:els['score7-head'].textContent,"
-           "rows:els['score7-body'].children.map(function(r){return r.children.map(function(c){return c.textContent;});})}));},30);")
-    out = subprocess.run([node, "-e", src], capture_output=True, text=True, encoding="utf-8", timeout=30)
-    assert out.returncode == 0, out.stderr
-    r = json.loads(out.stdout)
-    assert r["rows"] == [["COMBINED CALL", "0", "0", "N/A", "1"], ["AI #1", "1", "0", "100.0%", "0"],
-                         ["AI #2", "0", "1", "0.0%", "0"], ["FIRST 6 MIN (shadow)", "0", "0", "N/A", "0"],
-                         ["MINUTE-6 FINAL", "1", "0", "100.0%", "0"]]
-    assert "7-DAY TEST · 2026-11-23 00:00 UTC → 2026-11-30 00:00 UTC" in r["head"] and "1 settled markets" in r["head"]
+    assert 'id="score7-box"' not in html                                   # no second scoreboard box
+    assert 'id="ai-scoreboard"' in html and "COMBINED CALL · 7-DAY TEST" in html
+    start = html.index("async function refreshScoreboard(){")
+    fn = html[start:html.index(chr(10) + "}" + chr(10), start) + 3]
+    assert "innerHTML" not in fn and "/api/minute6" in fn
+    src = ("var out={};function txt(id,v){out[id]=String(v);}"
+           "var fetch=function(){return Promise.resolve({ok:true,json:function(){return Promise.resolve(" + json.dumps(payload) + ");}});};"
+           + fn + ";refreshScoreboard().then(function(){console.log(JSON.stringify(out));});")
+    res = subprocess.run([node, "-e", src], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out["score-correct"] == "1" and out["score-wrong"] == "0" and out["score-accuracy"] == "100.0%"
+    assert out["score-sample"] == "Since 2026-11-23 00:00 UTC · 2 settled · 1 WAIT"
 
 
 def test_first6_scored_on_its_own_six_minute_target_with_ties_and_start_time(tmp_path):

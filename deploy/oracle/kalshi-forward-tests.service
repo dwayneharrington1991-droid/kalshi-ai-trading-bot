@@ -1,0 +1,11 @@
+# Scores the frozen v2/v3/v4 forward tests on Oracle (research only). See deploy/oracle/run_forward_tests.sh.
+[Unit]
+Description=Kalshi 8768 forward-test scoring (research only)
+
+[Service]
+Type=oneshot
+User=opc
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/bin/bash /home/opc/dual-ai-alerts/run_forward_tests.sh
+TimeoutStartSec=1800

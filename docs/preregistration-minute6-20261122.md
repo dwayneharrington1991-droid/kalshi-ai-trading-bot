@@ -101,3 +101,11 @@ Accuracy is unchanged under strict timing. There is no measurable edge at real e
 Accuracy stays within 88–100% every day and in every volatility regime; only the coverage moves. This is the
 consistent model, unlike opening AI #1, whose accuracy decayed. The figures are historical, and the prospective
 test continues.
+
+
+**Timing repair (2026-11-23).** The live runner had accepted the engine's P(UP) for component C up to the lock
+time, and the lock can be as late as opens + 7:00. The strict audit above, which is the validated contract, caps
+C at opens + 367 s. The runner now keeps the latest engine reading published at or before opens + 367 s and uses
+only that (`minute6.ENGINE_CUTOFF_S`). Tests: `test_engine_component_uses_only_values_published_by_opens_plus_367s`
+and `test_engine_published_only_after_cutoff_leaves_c_ineligible`. Under strict timing the historical scores are
+unchanged: 80/86, 42/46 and 31/33. The rule and its thresholds are unchanged, and recorded predictions are untouched.

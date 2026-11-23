@@ -42,7 +42,7 @@ def _journal(tmp_path, *, n=120, skill=0.0, missing=0, delay=2.0, last_pred_age=
                     None if (last and withheld_last) else up, "DELAYED", json.dumps(payload)))
         if not last:
             db.execute("INSERT INTO forecast_outcomes VALUES (?, 'official', ?, ?)", (f"T{i}", opens.isoformat(), y))
-            db.execute("INSERT INTO opening_quote_snapshots VALUES (?, 2.0, 0.51, 0.51)", (f"T{i}",))
+            db.execute("INSERT INTO opening_quote_snapshots VALUES (?, -2.0, 0.51, 0.51)", (f"T{i}",))   # pre-open quote
     db.commit()
     db.close()
     return path
@@ -168,3 +168,30 @@ def test_final_minute_coverage_counts_closed_contracts(tmp_path):
     db.close()
     fm = ah._final_minute(sqlite3.connect(path), NOW)
     assert fm == {"contracts": 4, "with_final_minute_prediction": 2, "share": 0.5}
+
+
+
+def test_opening_quotes_are_only_those_available_at_or_before_the_open():
+    import sqlite3
+    from src.signals_display.accuracy_health import _pre_open_quotes
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE opening_quote_snapshots (ticker TEXT, seconds_from_open REAL, up_ask REAL, down_ask REAL, "
+               "quote_event_time TEXT, opens_at TEXT)")
+    o = "2026-11-23T03:00:00+00:00"
+    rows = [("PRE", -3.0, 0.50, 0.52, "2026-11-23T02:59:57+00:00", o), ("PRE", -1.0, 0.55, 0.47, "2026-11-23T02:59:59+00:00", o),
+            ("PRE", 2.0, 0.90, 0.12, "2026-11-23T03:00:02+00:00", o),                       # late: never used
+            ("EDGE", 0.0, 0.60, 0.42, o, o),                                              # exactly at the open: allowed
+            ("LATE", 4.0, 0.70, 0.32, "2026-11-23T03:00:04+00:00", o),                    # only a late quote: missing
+            ("SKEW", -0.5, 0.61, 0.41, "2026-11-23T03:00:01+00:00", o),                   # received early, stamped late
+            ("NOEVT", -2.0, 0.58, 0.44, None, o),                                         # no exchange time: receipt rule
+            ("OLD", -9.0, 0.50, 0.52, "2026-11-23T02:59:51+00:00", o)]                    # outside the 5 s window
+    for r in reversed(rows):                                                              # out-of-order inserts
+        db.execute("INSERT INTO opening_quote_snapshots VALUES (?,?,?,?,?,?)", r)
+    q = _pre_open_quotes(db)
+    assert q["PRE"] == (-1.0, 0.55, 0.47) and q["EDGE"] == (0.0, 0.60, 0.42) and q["NOEVT"] == (-2.0, 0.58, 0.44)
+    assert "LATE" not in q and "SKEW" not in q and "OLD" not in q
+
+
+def test_model_id_match_is_exact_not_substring():
+    src = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src/signals_display/accuracy_health.py").read_text()
+    assert 'model.rsplit("/", 1)[-1] != artifact_model_id' in src and "artifact_model_id not in model" not in src

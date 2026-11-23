@@ -104,6 +104,7 @@ class Minute6Runner:
         self.out_path, self.send, self.cfg, self.candles, self.history, self.log = out_path, send, cfg, candles, history, log
         self.cache = (0.0, None)
         self.board = (0.0, None)
+        self.engine_seen = {}                  # ticker -> (published_at, p_up) latest at or before ENGINE_CUTOFF_S
 
     def _candles(self, now_mono):
         if now_mono - self.cache[0] > 12 or self.cache[1] is None:
@@ -128,10 +129,23 @@ class Minute6Runner:
         return {"up_ask": (s.get("up") or {}).get("ask"), "up_bid": (s.get("up") or {}).get("bid"),
                 "down_ask": (s.get("down") or {}).get("ask"), "down_bid": (s.get("down") or {}).get("bid")}
 
+    def remember_engine(self, m, now):
+        """Keep the latest engine P(UP) published at or before opens + ENGINE_CUTOFF_S (and not in the future)."""
+        at, up = m.get("engine_at"), m.get("engine_up")
+        if at is None or not isinstance(up, (int, float)) or at > now:
+            return
+        if at <= m["opens"] + timedelta(seconds=m6.ENGINE_CUTOFF_S):
+            prev = self.engine_seen.get(m["ticker"])
+            if prev is None or at >= prev[0]:
+                self.engine_seen[m["ticker"]] = (at, float(up))
+        if len(self.engine_seen) > 16:
+            self.engine_seen.pop(next(iter(self.engine_seen)))
+
     def maybe_lock(self, state, now, now_mono):
         m = self._market(state)
         if not m:
             return "NO MARKET"
+        self.remember_engine(m, now)
         since = (now - m["opens"]).total_seconds()
         if not m6.DECISION_AT_S + 5 <= since <= m6.DECISION_LATEST_S:
             return "OUTSIDE WINDOW"
@@ -147,8 +161,8 @@ class Minute6Runner:
             return "WAITING FOR CANDLE"        # retry next poll; lock without it only at the deadline
         a = m6.component_a(closes, thr) if closes else {"status": "INELIGIBLE", "reason": "one-minute candles missing"}
         b = m6.component_b(closes) if closes else {"status": "INELIGIBLE", "reason": "one-minute candles missing"}
-        eng_ok = m["engine_at"] is not None and m["engine_at"] <= now
-        c = m6.component_c(m["engine_up"] if eng_ok else None)
+        seen = self.engine_seen.get(m["ticker"])          # never an engine value published after opens + 367 s
+        c = m6.component_c(seen[1] if seen else None)
         r = m6.consensus(a, b, c)
         q = self._quotes(state, m["ticker"])
         cutoff = m["opens"] + timedelta(seconds=m6.DECISION_AT_S)

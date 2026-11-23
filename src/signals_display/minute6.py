@@ -23,6 +23,7 @@ RULE = {"a": 0.80, "b": 0.5, "c": 0.70}
 HORIZON_MIN = 9
 DECISION_AT_S = 360            # opens + 6:00 (the candle that closes then is the last input)
 DECISION_LATEST_S = 420        # never lock later than opens + 7:00
+ENGINE_CUTOFF_S = 367          # C may only use an engine P(UP) published by opens + 6:07 (strict audit boundary)
 LABEL = "MINUTE-6 RESEARCH - NOT VALIDATED (predicts this market's final outcome from minute-6 information)"
 # Median sigma of 1m log returns (x1e-4) by UTC hour, development markets before 2026-11-21 (historical frequency).
 TYPICAL_SIGMA_1E4 = {0: 6.514, 1: 6.861, 2: 7.706, 3: 6.771, 4: 6.138, 5: 5.311, 6: 5.0, 7: 5.048, 8: 5.182,

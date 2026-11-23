@@ -235,3 +235,23 @@ def test_market_history_is_fetched_sparingly(tmp_path):
     assert calls == [3]                                     # one 3-page backfill, then cached for 10 minutes
     r.write_latest(_state(), OPEN + timedelta(seconds=800), 1000 + 601)
     assert calls == [3, 1]
+
+
+def test_engine_component_uses_only_values_published_by_opens_plus_367s(tmp_path, monkeypatch):
+    monkeypatch.setattr("minute6_runner.time.sleep", lambda s: None)
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {},
+                      candles=lambda: _candles(upto=O + 240), log=lambda x: None)    # +6:00 candle late -> late lock
+    seen_early = _state(up=0.80, updated=OPEN + timedelta(seconds=360))
+    assert r.step(seen_early, now=OPEN + timedelta(seconds=362), now_mono=0) == "OUTSIDE WINDOW"
+    late = _state(up=0.10, updated=OPEN + timedelta(seconds=395))                  # published after the cutoff
+    r.candles = _candles
+    assert r.step(late, now=OPEN + timedelta(seconds=400), now_mono=1) == "SENT"
+    c_p = r.db.execute("SELECT c_p_up FROM minute6").fetchone()[0]
+    assert c_p == 0.80                                                              # the 0.10 reading never used
+
+
+def test_engine_published_only_after_cutoff_leaves_c_ineligible(tmp_path, monkeypatch):
+    monkeypatch.setattr("minute6_runner.time.sleep", lambda s: None)
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {}, candles=_candles, log=lambda x: None)
+    r.step(_state(updated=OPEN + timedelta(seconds=380)), now=OPEN + timedelta(seconds=390), now_mono=0)
+    assert r.db.execute("SELECT c_dir, c_p_up FROM minute6").fetchone() == (None, None)

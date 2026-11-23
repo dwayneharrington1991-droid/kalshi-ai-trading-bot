@@ -227,18 +227,44 @@ def _input_drift(db, artifact, n=50):
             "status": "DRIFTED" if sum(shifts.values()) / len(shifts) > 0.5 else "WITHIN TRAINING RANGE"}
 
 
+PRE_OPEN_WINDOW_S = 5
+
+
+def _pre_open_quotes(db):
+    """Latest two-sided Kalshi quote per ticker that was available AT OR BEFORE the open: received no later than
+    the open (seconds_from_open <= 0) and, when the exchange event time is recorded, not stamped after the open.
+    A later quote is never used for an opening evaluation; a market with no such quote has no quote (missing)."""
+    cols = {r[1] for r in db.execute("PRAGMA table_info(opening_quote_snapshots)")}
+    event = "quote_event_time" in cols and "opens_at" in cols
+    sql = ("SELECT ticker, seconds_from_open, up_ask, down_ask" + (", quote_event_time, opens_at" if event else "") +
+           " FROM opening_quote_snapshots WHERE seconds_from_open BETWEEN ? AND 0"
+           " AND up_ask IS NOT NULL AND down_ask IS NOT NULL")
+    quotes = {}
+    for row in db.execute(sql, (-PRE_OPEN_WINDOW_S,)):
+        ticker, sec, ua, da = row[:4]
+        if event and row[4] and row[5]:
+            try:
+                if _ts(row[4]) > _ts(row[5]):
+                    continue                          # exchange says the quote is from after the open
+            except (TypeError, ValueError):
+                continue
+        if ticker not in quotes or sec > quotes[ticker][0]:
+            quotes[ticker] = (sec, ua, da)
+    return quotes
+
+
+def _ts(v):
+    from datetime import datetime
+    return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+
+
 def _predictive(db, artifact_model_id=None):
     rows = db.execute(
         """SELECT o.ticker, o.up, o.payload, f.outcome FROM btc_engine_opening o
         JOIN forecast_outcomes f ON f.ticker=o.ticker AND f.origin='official'
         WHERE o.mode='PUBLIC MARKET DATA' AND o.up IS NOT NULL ORDER BY o.generated_at"""
     ).fetchall()
-    quotes = {}
-    for ticker, sec, ua, da in db.execute(
-            "SELECT ticker, seconds_from_open, up_ask, down_ask FROM opening_quote_snapshots "
-            "WHERE seconds_from_open BETWEEN -5 AND 30 AND up_ask IS NOT NULL AND down_ask IS NOT NULL"):
-        if ticker not in quotes or abs(sec) < abs(quotes[ticker][0]):
-            quotes[ticker] = (sec, ua, da)
+    quotes = _pre_open_quotes(db)
     history, scored = [], []
     model_name = None
     for ticker, up, payload, outcome in rows:
@@ -246,7 +272,7 @@ def _predictive(db, artifact_model_id=None):
         base = (sum(history) + 1) / (len(history) + 2)          # past-only base rate
         history.append(int(outcome))
         model = p.get("model") or ""
-        if artifact_model_id and artifact_model_id not in model:
+        if artifact_model_id and model.rsplit("/", 1)[-1] != artifact_model_id:   # exact id, not a substring
             continue
         if not model.startswith("opening-candidate"):
             continue

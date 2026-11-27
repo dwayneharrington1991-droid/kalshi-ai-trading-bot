@@ -206,7 +206,12 @@ class Minute6Runner:
         body = four_lines.lines((o[0], o[1]), (o[2], o[3]), (o[4], o[5]),
                                 minute6=(r["direction"], r["consensus_p_up_average"], q))
         head = [f"{m['ticker']} · minute-6 update · expires {m['closes'].strftime('%H:%M UTC')}"]
-        return "\n".join(head + body + [four_lines.FOOTER])
+        try:
+            from src.signals_display import orderflow_context
+            flow = orderflow_context.line(orderflow_context.load())
+        except Exception:
+            flow = "ORDER FLOW (context, not a prediction): UNAVAILABLE"
+        return "\n".join(head + body + [flow, four_lines.FOOTER])
 
     def _has_openings(self):
         return self.db.execute("SELECT 1 FROM sqlite_master WHERE name='openings'").fetchone() is not None

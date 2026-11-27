@@ -2374,6 +2374,11 @@ def make_handler(monitor):
                 from .orderbook_live import latest_body as orderbook_body
                 body = orderbook_body()
                 content_type = "application/json"
+            elif route == "/api/of1":
+                # AI A / B / C order-flow research status written by the research timer. Read-only file read.
+                from .minute6 import file_body
+                body = file_body("of1_status.json")
+                content_type = "application/json"
             elif route == "/api/minute6":
                 # Minute-6 research reading + live analytics written by the alert service. Read-only file read.
                 from .minute6 import latest_body

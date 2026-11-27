@@ -316,6 +316,9 @@ def evaluate(records_path, spec_path):
         delta = metrics[name]["brier"] - metrics["price_only"]["brier"]
         comparisons[name] = {"brier_minus_price_only": delta,
                              "paired_bootstrap_ci95": _paired_ci(values, price, labels)}
+        if name != "recorded_baseline":     # AI A: the recorded production probability on the same decisions
+            comparisons[name]["brier_minus_recorded_baseline"] =                 metrics[name]["brier"] - metrics["recorded_baseline"]["brier"]
+            comparisons[name]["vs_recorded_baseline_ci95"] = _paired_ci(values, series["recorded_baseline"], labels)
     spec_bytes = Path(spec_path).read_bytes()
     return {
         "status": "RESEARCH_ONLY", "target": spec["target"],

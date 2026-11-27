@@ -143,6 +143,14 @@ if "telegram" in p.channels(cfg):
 ' "$decision" || true
   fi
 fi
+# OF1 order-flow forward test (AI A / B / C, research only): pinned copy in of1_code (git commit in of1_code/COMMIT);
+# exports point-in-time records from the alert DB + collector file and writes of1_status.json for the dashboard.
+OF1=/home/opc/dual-ai-alerts/of1_code
+if [[ -f $OF1/scripts/of1_status.py ]]; then
+  nice -n 19 ionice -c3 timeout 600 /home/opc/dual-ai-alerts/research-venv/bin/python "$OF1/scripts/of1_status.py" \
+    > "$OUT/of1.last" 2> "$OUT/of1.err"
+  rc=$?; if (( rc == 0 )); then record of1 OK; echo "of1: $(cat "$OUT/of1.last")"; else record of1 "of1_status exit $rc"; fi
+fi
 # Keep no more than the export just used: each is tens of MB and is re-created on every run.
 [[ -n $dump ]] && rm -f "$dump"
 find "$OUT" -name 'journal_dump-*.json' -mmin +60 -delete 2>/dev/null

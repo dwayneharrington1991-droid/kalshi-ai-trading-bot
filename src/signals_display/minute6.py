@@ -171,3 +171,20 @@ def latest_body(path=None, now=None):
         data = {"status": "STALE", "label": LABEL, "reason": "minute-6 research service is not updating",
                 "age_seconds": age, "scoreboard": data.get("scoreboard"), "scoreboard7": data.get("scoreboard7")}
     return json.dumps(data, default=str).encode()
+
+
+def file_body(name, max_age_s=6 * 3600):
+    """Bytes of a small JSON status file in ~/dual-ai-alerts (read-only), or an honest UNAVAILABLE body."""
+    import json
+    import time
+    from pathlib import Path
+    path = Path.home() / "dual-ai-alerts" / name
+    try:
+        data = json.loads(path.read_text())
+        age = time.time() - path.stat().st_mtime
+    except (OSError, ValueError):
+        return json.dumps({"status": "UNAVAILABLE", "reason": f"{name} not written yet"}).encode()
+    data["file_age_s"] = round(age)
+    if age > max_age_s:
+        data["status"] = "STALE"
+    return json.dumps(data, default=str).encode()

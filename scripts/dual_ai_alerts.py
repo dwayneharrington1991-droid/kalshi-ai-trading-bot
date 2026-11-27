@@ -87,15 +87,25 @@ def opening(state, challenger, now):
     return "CHALLENGER_UNAVAILABLE", {**d, "challenger_reason": str(reason)[:120]}
 
 
+def orderflow_line():
+    """Labelled order-flow context (never a prediction); UNAVAILABLE when the collector data is stale."""
+    try:
+        from src.signals_display import orderflow_context
+        return orderflow_context.line(orderflow_context.load())
+    except Exception:
+        return "ORDER FLOW (context, not a prediction): UNAVAILABLE"
+
+
 def message(kind, d):
-    """Same four-line layout as the dashboard (src/signals_display/four_lines.py); minute-6 comes later."""
+    """Same five-line layout as the dashboard (src/signals_display/four_lines.py) plus a labelled order-flow
+    context line; minute-6 comes later."""
     from src.signals_display import four_lines
     ready = kind == "READY"
     body = four_lines.lines(live=(d["live"], d["live_up"]),
                             challenger=(d["challenger"], d["challenger_up"]) if ready else (None, None),
                             combined=(d["combined"], d["combined_up"]) if ready else (None, None))
     head = [f"{d['ticker']} · locked at open · expires {d['closes'].strftime('%H:%M UTC')}"]
-    return "\n".join(head + body + [four_lines.FOOTER])
+    return "\n".join(head + body + [orderflow_line(), four_lines.FOOTER])
 
 
 class Ledger:

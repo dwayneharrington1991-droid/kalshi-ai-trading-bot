@@ -54,3 +54,7 @@ def test_watchdog_never_touches_trading_models_or_journal():
     code = (ROOT / "scripts/watchdog_8768.py").read_text(encoding="utf-8")
     for forbidden in ("place_order", "cancel_order", "create_order", "8765", "upgraded-live-8768.db\"", "DELETE", "DROP"):
         assert forbidden not in code, forbidden
+
+
+def test_disk_alert_gives_days_of_warning():
+    assert wd.LIMITS["disk_free_gb"] >= 12.0          # journal grows ~4 GB/day: alert with ~3 days to act

@@ -30,7 +30,7 @@ DEPLOY_LOCKS = (HOME / ".kalshi-deploy/preview-8768/deploy.lock", HOME / ".kalsh
 LIFECYCLE_STATUS = HOME / "kalshi-preview-upgrade/logs/upgraded-live-8768.db.lifecycle-status.json"
 MAX_RESTARTS, RESTART_WINDOW_H = 3, 6
 FAIL_AFTER = 2                       # consecutive bad runs before alerting
-LIMITS = {"stale_s": 180, "opening_gap_min": 17, "disk_free_gb": 5.0, "settlement_gap_min": 120,
+LIMITS = {"stale_s": 180, "opening_gap_min": 17, "disk_free_gb": 12.0, "settlement_gap_min": 120,
           "lifecycle_gap_min": 150, "cpu_pct": 97.0}
 
 

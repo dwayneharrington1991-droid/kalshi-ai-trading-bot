@@ -240,8 +240,11 @@ def test_previously_valid_openings_are_computed_exactly_as_before(tmp_path):
                                 capture_output=True, text=True, timeout=300)
         assert result.returncode == 0, result.stderr[-3000:]
         outputs.append(json.loads(result.stdout.strip().splitlines()[-1]))
-    assert outputs[0]["up"] is not None
-    assert outputs[1] == outputs[0]
+    approved, current = outputs
+    assert approved["up"] is not None
+    assert "stream_computation" not in approved["frozen_features"]
+    assert current["frozen_features"].pop("stream_computation") == "full-window-v1"
+    assert current == approved
 
 
 # ----------------------------------------------------------- deploy guard

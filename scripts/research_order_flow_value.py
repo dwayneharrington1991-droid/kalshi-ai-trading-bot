@@ -375,6 +375,12 @@ def evaluate(records_path, spec_path):
         delta = metrics[name]["brier"] - metrics["price_only"]["brier"]
         comparisons[name] = {"brier_minus_price_only": delta,
                              "paired_bootstrap_ci95": _paired_ci(values, price, labels)}
+    recorded = series["recorded_baseline"]
+    comparisons_to_recorded = {
+        name: {"brier_minus_recorded": metrics[name]["brier"] - metrics["recorded_baseline"]["brier"],
+               "paired_bootstrap_ci95": _paired_ci(values, recorded, labels)}
+        for name, values in series.items() if name != "recorded_baseline"
+    }
     spec_bytes = Path(spec_path).read_bytes()
     competition = {}
     if spec.get("competition"):
@@ -418,6 +424,7 @@ def evaluate(records_path, spec_path):
         "method": "expanding chronological fit; label receipt strictly before decision; fold-local scaling; matched samples",
         "threshold": spec["threshold"], "coverage": coverage, "metrics": metrics,
         "comparisons": comparisons,
+        "comparisons_to_recorded_baseline": comparisons_to_recorded,
         **competition,
         "warnings": [
             "No result changes production or authorizes model promotion.",

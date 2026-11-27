@@ -52,7 +52,8 @@ The `order-flow-competition-v1` payload provides sample size, latest scored deci
 correct, wrong, wrong UP/DOWN, WAIT, missing from the matched sample, directional accuracy
 and coverage, Brier, log loss, reliability bins, Wilson intervals, trailing call windows,
 and daily, regime and baseline-version splits. It reports both matched and all-exported-market
-coverage. It includes paired Brier differences for adding walls and then trades.
+coverage. It includes paired Brier differences against the recorded baseline and for
+adding walls and then trades.
 Bootstrap intervals are descriptive because adjacent contracts can be dependent. A favorable
 development comparison should lead to a freshly preregistered forward study and separate approval.
 

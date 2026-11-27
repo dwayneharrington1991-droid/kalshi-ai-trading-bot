@@ -58,3 +58,18 @@ def test_watchdog_never_touches_trading_models_or_journal():
 
 def test_disk_alert_gives_days_of_warning():
     assert wd.LIMITS["disk_free_gb"] >= 12.0          # journal grows ~4 GB/day: alert with ~3 days to act
+
+
+def test_deployment_guard_holds_both_locks_and_releases_on_contention(tmp_path):
+    deploy, jobs = tmp_path / "deploy.lock", tmp_path / "jobs.lock"
+    with wd.deployment_guard((deploy, jobs)) as acquired:
+        assert acquired
+        for path in (deploy, jobs):
+            with wd.deployment_guard((path,)) as other:
+                assert not other
+    with wd.deployment_guard((jobs,)) as acquired:
+        assert acquired
+        with wd.deployment_guard((deploy, jobs)) as other:
+            assert not other
+        with wd.deployment_guard((deploy,)) as other:
+            assert other

@@ -25,10 +25,6 @@ FEE_RATE, SLIPPAGE = 0.07, 0.01
 HISTORY_REFRESH_S = 600
 
 
-def _ts(v):
-    return datetime.fromisoformat(str(v).replace("Z", "+00:00")) if v else None
-
-
 def fetch_candles():                   # public Coinbase endpoint: ~2.5 min behind, so only a fallback
     req = Request(CANDLES_URL, headers={"User-Agent": "kalshi-signals-research/1.0"})
     with urlopen(req, timeout=10) as r:
@@ -100,7 +96,7 @@ class Minute6Runner:
                 BEGIN SELECT RAISE(ABORT, 'first-6 outcomes are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS minute6_deliveries_append BEFORE UPDATE ON minute6_deliveries
                 BEGIN SELECT RAISE(ABORT, 'append-only'); END;""")
-        self.db.commit()
+        scoreboard7.ensure_tables(self.db)
         self.out_path, self.send, self.cfg, self.candles, self.history, self.log = out_path, send, cfg, candles, history, log
         self.cache = (0.0, None)
         self.board = (0.0, None)
@@ -114,11 +110,11 @@ class Minute6Runner:
     @staticmethod
     def _market(state):
         pe = (state or {}).get("prediction_engine") or {}
-        ticker, closes = pe.get("ticker"), _ts(pe.get("closes_at"))
+        ticker, closes = pe.get("ticker"), scoreboard7._ts(pe.get("closes_at"))
         if not ticker or not closes:
             return None
         return {"ticker": ticker, "opens": closes - timedelta(minutes=15), "closes": closes,
-                "threshold": pe.get("threshold"), "engine_up": pe.get("up"), "engine_at": _ts(pe.get("updated_at"))}
+                "threshold": pe.get("threshold"), "engine_up": pe.get("up"), "engine_at": scoreboard7._ts(pe.get("updated_at"))}
 
     @staticmethod
     def _quotes(state, ticker):
@@ -130,11 +126,11 @@ class Minute6Runner:
                 "down_ask": (s.get("down") or {}).get("ask"), "down_bid": (s.get("down") or {}).get("bid")}
 
     def remember_engine(self, m, now):
-        """Keep the latest engine P(UP) published at or before opens + ENGINE_CUTOFF_S (and not in the future)."""
+        """Keep the latest engine P(UP) published and observed by the learned-component cutoff."""
         at, up = m.get("engine_at"), m.get("engine_up")
-        if at is None or not isinstance(up, (int, float)) or at > now:
+        if at is None or not m6.valid_probability(up):
             return
-        if at <= m["opens"] + timedelta(seconds=m6.ENGINE_CUTOFF_S):
+        if m["opens"] <= at <= now <= m["opens"] + timedelta(seconds=m6.ENGINE_CUTOFF_S):
             prev = self.engine_seen.get(m["ticker"])
             if prev is None or at >= prev[0]:
                 self.engine_seen[m["ticker"]] = (at, float(up))
@@ -243,14 +239,10 @@ class Minute6Runner:
             markets = (self._history_pages(3 if self.board[1] is None else 1) or {}).get("markets", [])
             scoreboard7.ensure_tables(self.db)
             scoreboard7.record_outcomes(self.db, markets)
-            for x in markets:
-                if x.get("outcome_status") == "VERIFIED_OFFICIAL" and x.get("final_outcome") in ("UP", "DOWN"):
-                    self.db.execute("INSERT OR IGNORE INTO minute6_outcomes VALUES (?,?,?)",
-                                    (x["ticker"], x["final_outcome"], datetime.now(timezone.utc).isoformat()))
-            self.db.commit()
         except Exception as exc:                # logged, never fatal: the scoreboard just keeps its last state
             self.log(json.dumps({"scoreboard_refresh_error": f"{type(exc).__name__}: {exc}"[:200]}))
-        out = dict(self.db.execute("SELECT ticker, outcome FROM minute6_outcomes"))
+        out = dict(self.db.execute("""SELECT ticker, outcome FROM minute6_outcomes
+            WHERE ticker NOT IN (SELECT ticker FROM official_outcome_conflicts)"""))
         rows = self.db.execute("SELECT ticker, direction, price, threshold, up_ask, down_ask FROM minute6").fetchall()
         settled = [(t, d, p, th, ua, da, out[t]) for t, d, p, th, ua, da in rows if t in out]
         y = lambda v: 1 if v == "UP" else 0

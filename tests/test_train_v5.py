@@ -26,3 +26,20 @@ def test_amended_recipe_is_recorded():
     assert max(tv5.LAMBDAS) >= 10000 and tv5.COVERAGE == pytest.approx(1 / 3)
     src = (ROOT / "scripts/train_v5.py").read_text(encoding="utf-8")
     assert "OUT-OF-SAMPLE predictions" in src and "87 receipt-proven inputs" in src
+
+
+def test_lambda_search_preprocesses_each_training_prefix(monkeypatch):
+    import numpy as np
+
+    features = np.arange(100.0)[:, None]
+    seen = []
+    prepare = tv5.prepare
+
+    def audit(train, validation):
+        seen.append((len(train), len(validation)))
+        assert train[-1, 0] < validation[0, 0]
+        return prepare(train, validation)
+
+    monkeypatch.setattr(tv5, "prepare", audit)
+    tv5.choose_lambda(features, np.arange(100) % 2)
+    assert seen == [(40, 20), (60, 20), (80, 20)]

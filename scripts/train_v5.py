@@ -12,6 +12,7 @@ Modes
 Read-only: works on exports; never touches production.
 """
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -48,7 +49,7 @@ def load(paths, computation, start=None, end=None):
         out = {r[0]: r[3] for r in d["forecast_outcomes"]["rows"]}
         quotes = {}
         for r in d.get("opening_quote_snapshots", {}).get("rows", []):
-            if None in (r[5], r[6], r[7], r[8]):
+            if not _finite(r[4]) or r[4] > 0 or not all(_finite(v) and 0 < v < 1 for v in r[5:9]):
                 continue
             if r[1] not in quotes or abs(r[4]) < abs(quotes[r[1]][0]):
                 quotes[r[1]] = (r[4], ((r[5] + r[6]) / 2 + 1 - (r[7] + r[8]) / 2) / 2)
@@ -140,13 +141,16 @@ def predict_lr(w, X):
 def choose_lambda(X, y, folds=5):
     n = len(y)
     best, best_loss = LAMBDAS[0], np.inf
+    splits = []
+    for k in range(1, folds):
+        a, b = n * k // folds, n * (k + 1) // folds
+        if a >= 30 and b > a:
+            train, validation = prepare(X[:a], X[a:b])
+            splits.append((a, b, train, validation))
     for lam in LAMBDAS:
         losses = []
-        for k in range(1, folds):                      # chronological: train on the past, test the next block
-            a, b = int(n * k / folds), int(n * (k + 1) / folds)
-            if a < 30 or b <= a:
-                continue
-            p = predict_lr(ridge_logistic(X[:a], y[:a], lam), X[a:b])
+        for a, b, train, validation in splits:
+            p = predict_lr(ridge_logistic(train, y[:a], lam), validation)
             losses.append(np.mean((p - y[a:b]) ** 2))
         if losses and np.mean(losses) < best_loss:
             best, best_loss = lam, np.mean(losses)
@@ -165,14 +169,14 @@ def _models(Xtr_raw, ytr, Xte_raw, dist_tr, dist_te, lam):
 
 
 def fit_predict(Xtr_raw, ytr, Xte_raw, dist_tr, dist_te):
-    Xa, _ = prepare(Xtr_raw, Xtr_raw[:1])
-    lam = choose_lambda(Xa, ytr)
+    lam = choose_lambda(Xtr_raw, ytr)
     preds = _models(Xtr_raw, ytr, Xte_raw, dist_tr, dist_te, lam)
     # Per-model confidence cut for the prespecified 33% coverage, from OUT-OF-SAMPLE predictions on the
     # last 30% of the training rows (models fit on the first 70%) - amended 11-22: in-sample cuts gave
     # 49-68% coverage in the dry run.
     k = int(len(ytr) * 0.7)
-    inner = _models(Xtr_raw[:k], ytr[:k], Xtr_raw[k:], dist_tr[:k], dist_tr[k:], lam)
+    inner_lam = choose_lambda(Xtr_raw[:k], ytr[:k])
+    inner = _models(Xtr_raw[:k], ytr[:k], Xtr_raw[k:], dist_tr[:k], dist_tr[k:], inner_lam)
     cuts = {m: float(np.quantile(np.abs(v - 0.5), 1 - COVERAGE)) for m, v in inner.items()}
     return preds, lam, cuts
 
@@ -266,7 +270,13 @@ def _slope(p, y):
 def run(journals, mode, artifact, now=None):
     """Inputs = the live model's 87 receipt-proven inputs (amended 11-22: all 536 candidates overfit)."""
     now = now or datetime.now(timezone.utc)
-    names = list(json.load(open(artifact))["model"]["components"][0]["preprocessor"]["names"])
+    artifact_bytes = Path(artifact).read_bytes()
+    names = list(json.loads(artifact_bytes)["model"]["components"][0]["preprocessor"]["names"])
+    provenance = {
+        "feature_source_artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "training_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "preprocessing": "chronological-fold-local-v1",
+    }
     if mode == "v5":
         if now < T_TRAIN_END + HOLDOUT_GAP:
             raise SystemExit(f"v5 refuses to run before {T_TRAIN_END + HOLDOUT_GAP:%Y-%m-%d %H:%M} UTC: "
@@ -279,9 +289,9 @@ def run(journals, mode, artifact, now=None):
     else:
         raise SystemExit("unknown mode")
     if not rows:
-        return {"mode": mode, "issues": issues, "decision": "NO DATA"}
+        return {"mode": mode, "issues": issues, "decision": "NO DATA", "provenance": provenance}
     scored, P, cuts, lams = walk_forward(rows, names, eval_start)
-    report = {"mode": mode, "issues": issues, "quality": quality_report(rows, names),
+    report = {"mode": mode, "issues": issues, "provenance": provenance, "quality": quality_report(rows, names),
               "lambdas_chosen": lams, "evaluation": evaluate(rows, scored, P, cuts, minimum)}
     if mode == "legacy-dry-run":
         report["note"] = "Pipeline validation on legacy, non-reserved openings; not a v5 result."

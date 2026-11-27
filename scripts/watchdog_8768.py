@@ -11,6 +11,7 @@ Run every 2 minutes by deploy/oracle/kalshi-8768-watchdog.timer. Each run:
     runs, or recovered), using the existing bot and destination. Routine runs send nothing.
 Read-only against the journal (it never opens it); writes only under ~/dual-ai-alerts/watchdog/.
 """
+import fcntl
 import json
 import os
 import socket
@@ -18,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import urlopen
@@ -84,17 +86,21 @@ def listener_pid(port=PORT):
     return None
 
 
-def lock_held(path):
-    import fcntl
-    try:
-        with open(path) as f:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(f, fcntl.LOCK_UN)
-            return False
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
+@contextmanager
+def deployment_guard(paths):
+    """Own the same locks as deploy/job launch until the watchdog launch finishes."""
+    with ExitStack() as stack:
+        try:
+            for path in paths:
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+                stack.callback(os.close, fd)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            stack.close()
+            yield False
+        else:
+            yield True
 
 
 def snapshot(pid, wd=WD):
@@ -214,16 +220,20 @@ def main(argv=None):
                 snapshot(pid)
         except Exception:
             pass
-    deploy = any(lock_held(p) for p in DEPLOY_LOCKS)
     snap_ok = all((WD / f"server.{n}").exists() for n in ("argv", "env", "cwd"))
-    action, state = restart_decision(pid is not None, state, deploy, snap_ok, time.time())
-    if action == "RESTART" and not dry:
-        try:
-            unit = relaunch()
-            msgs.append(f"8768 was down; relaunched the last healthy build ({unit}).")
-        except Exception as exc:
-            msgs.append(f"8768 is DOWN and the relaunch failed ({type(exc).__name__}). Manual action needed.")
-    elif action == "LIMIT" and not state.get("limit_alerted"):
+    with deployment_guard(DEPLOY_LOCKS) as guarded:
+        # Recheck after acquiring the guard: a deploy could have finished
+        # between the initial probe and lock acquisition.
+        if guarded:
+            pid = listener_pid()
+        action, state = restart_decision(pid is not None, state, not guarded, snap_ok, time.time())
+        if action == "RESTART" and not dry:
+            try:
+                unit = relaunch()
+                msgs.append(f"8768 was down; requested relaunch of the last healthy build ({unit}).")
+            except Exception as exc:
+                msgs.append(f"8768 is DOWN and the relaunch failed ({type(exc).__name__}). Manual action needed.")
+    if action == "LIMIT" and not state.get("limit_alerted"):
         msgs.append(f"8768 is DOWN and {MAX_RESTARTS} restarts in {RESTART_WINDOW_H} h were used; not retrying. Manual action needed.")
         state["limit_alerted"] = True
     elif action == "NO_SNAPSHOT" and not state.get("limit_alerted"):

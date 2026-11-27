@@ -107,7 +107,12 @@ if [[ ! -f $OUT/v5.decided ]] && (( now >= v5_due )); then
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
   # v5 needs scikit-learn: a separate research venv, never the production one (deploy/oracle/research-venv.txt).
   RPY=/home/opc/dual-ai-alerts/research-venv/bin/python
-  ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 1200 "$RPY" scripts/train_v5.py --journal "$dump" --artifact "$ART" --mode v5 ) > "$OUT/v5-$stamp.json" 2> "$OUT/v5-$stamp.err"
+  # v5 is pinned to its pre-registered script (332aa31) like v2-v4, so later edits (e.g. Codex PR #5's fold-local
+  # preprocessing) cannot change the test mid-evaluation; such edits are reported separately, labelled.
+  W5=$(mktemp -d); mkdir -p "$W5/scripts" && ln -s "$SRC/src" "$W5/src"
+  git -C "$REPO" show "332aa31:scripts/train_v5.py" > "$W5/scripts/train_v5.py"
+  ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 1200 "$RPY" "$W5/scripts/train_v5.py" --journal "$dump" --artifact "$ART" --mode v5 ) > "$OUT/v5-$stamp.json" 2> "$OUT/v5-$stamp.err"
+  rm -rf "$W5"
   rc=$?
   status=$(check_report "$OUT/v5-$stamp.json" evaluation "$rc")
   record v5 "$status"

@@ -32,13 +32,16 @@ for spec in "v2 2d4d007 forward_eval_v2.py 2026-11-23T02:00:00Z" \
   [[ -f $OUT/$name.decided ]] && continue
   (( now >= due )) || continue
   W=$(mktemp -d)
-  git -C "$REPO" show "$freeze:scripts/$ev" > "$W/$ev" || { echo "$name: frozen evaluator missing"; rm -rf "$W"; continue; }
+  # The frozen evaluator resolves files relative to its own location (ROOT = parent of scripts/), so give it the
+  # repository layout it expects: frozen bytes in scripts/, src and research_artifacts from the deployed release.
+  mkdir -p "$W/scripts" && ln -s "$SRC/src" "$W/src" && ln -s "$SRC/research_artifacts" "$W/research_artifacts"
+  git -C "$REPO" show "$freeze:scripts/$ev" > "$W/scripts/$ev" || { echo "$name: frozen evaluator missing"; rm -rf "$W"; continue; }
   if [[ -z $dump ]]; then
     dump="$OUT/journal_dump-$(date -u +%Y%m%dT%H%M%SZ).json"
     ( cd "$SRC" && nice -n 19 ionice -c3 timeout 900 "$PY" scripts/export_opening_research.py ) > "$dump" || { echo "export failed"; rm -f "$dump"; rm -rf "$W"; exit 4; }
   fi
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 900 "$PY" "$W/$ev" --journal "$dump" --artifact "$ART" ) > "$OUT/$name-$stamp.json" 2> "$OUT/$name-$stamp.err"
+  ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 900 "$PY" "$W/scripts/$ev" --journal "$dump" --artifact "$ART" ) > "$OUT/$name-$stamp.json" 2> "$OUT/$name-$stamp.err"
   rm -rf "$W"
   decision=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("decision",""))' "$OUT/$name-$stamp.json" 2>/dev/null)
   echo "$name: $decision"
@@ -63,7 +66,9 @@ if [[ ! -f $OUT/v5.decided ]] && (( now >= v5_due )); then
     ( cd "$SRC" && nice -n 19 ionice -c3 timeout 900 "$PY" scripts/export_opening_research.py ) > "$dump" || { echo "export failed"; rm -f "$dump"; exit 4; }
   fi
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 1200 "$PY" scripts/train_v5.py --journal "$dump" --artifact "$ART" --mode v5 ) > "$OUT/v5-$stamp.json" 2> "$OUT/v5-$stamp.err"
+  # v5 needs scikit-learn: a separate research venv, never the production one (deploy/oracle/research-venv.txt).
+  RPY=/home/opc/dual-ai-alerts/research-venv/bin/python
+  ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 1200 "$RPY" scripts/train_v5.py --journal "$dump" --artifact "$ART" --mode v5 ) > "$OUT/v5-$stamp.json" 2> "$OUT/v5-$stamp.err"
   decision=$("$PY" - "$OUT/v5-$stamp.json" <<'PY'
 import json, sys
 try:
@@ -90,5 +95,9 @@ if "telegram" in p.channels(cfg):
 ' "$decision" || true
   fi
 fi
-find "$OUT" -name 'journal_dump-*.json' -mtime +2 -delete 2>/dev/null
+# Keep no more than the export just used: each is tens of MB and is re-created on every run.
+[[ -n $dump ]] && rm -f "$dump"
+find "$OUT" -name 'journal_dump-*.json' -mmin +60 -delete 2>/dev/null
+# Keep only the 6 newest raw reports per test (decisions are kept in *.decided).
+for t in v3 v4 v5; do ls -t "$OUT"/$t-*.json 2>/dev/null | tail -n +7 | while read -r f; do rm -f "$f" "${f%.json}.err"; done; done
 exit 0

@@ -20,7 +20,7 @@ Example record (all timestamps must be timezone-aware)::
        "flow":{"received_at":"2026-11-25T11:59:59Z",
                "values":{"cvd_60s":1.2}}}}
 
-The spec fixes ``target``, ``eval_start``, optional ``eval_end``, ``min_train``,
+The spec fixes ``target``, ``eval_start``, ``eval_end``, ``min_train``,
 ``threshold``, ``l2`` and ``candidates``.  Candidate features use dotted names,
 for example ``price.return_60s``.  Every reported model and the recorded
 baseline are evaluated on the same intersection of eligible samples.  The
@@ -35,7 +35,7 @@ import hashlib
 import json
 import math
 import random
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +43,9 @@ import numpy as np
 
 ROLLING_CALLS = (25, 50, 100, 300)
 DEVELOPMENT_END = datetime.fromisoformat("2026-11-20T06:00:00+00:00")
+TARGETS = {"opening_final": (0, 0, 900, "official_kalshi"),
+           "first6": (0, 0, 360, "verified_btc_reference"),
+           "minute6_final": (360, 367, 900, "official_kalshi")}
 
 
 def _ts(value, field):
@@ -101,6 +104,20 @@ def _load_spec(path):
             raise ValueError("every candidate needs a nonempty feature list")
         if len(features) != len(set(features)) or any(not isinstance(x, str) or "." not in x for x in features):
             raise ValueError("candidate features must be unique dotted names")
+    if raw.get("competition"):
+        if raw["target"] not in TARGETS or raw["threshold"] != .55:
+            raise ValueError("competition requires a supported target and the fixed 0.55 threshold")
+        candidates = raw["candidates"]
+        if set(candidates) != {"price_only", "price_walls", "price_walls_trades"}:
+            raise ValueError("competition requires all three nested candidates")
+        a, b, c = (set(candidates[name]) for name in ("price_only", "price_walls", "price_walls_trades"))
+        if (not a < b < c or not all(x.startswith("price.") for x in a)
+                or not all(x.startswith("walls.") for x in b - a)
+                or not all(x.startswith("trades.") for x in c - b)):
+            raise ValueError("competition requires price, then wall, then executed-trade additions")
+        age = raw.get("flow_max_age_s")
+        if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
+            raise ValueError("competition requires a positive flow freshness limit")
     return raw
 
 
@@ -110,7 +127,7 @@ def load_records(path, spec):
     Malformed rows fail the entire run.  Silently dropping a losing or
     inconvenient row would make selective accuracy impossible to audit.
     """
-    records, seen = [], set()
+    records, seen, markets = [], set(), set()
     with Path(path).open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
@@ -131,6 +148,26 @@ def load_records(path, spec):
                     raise ValueError("label was available at or before the decision")
                 if baseline_at > decision:
                     raise ValueError("baseline was generated after the decision")
+                metadata = {}
+                if spec.get("competition"):
+                    opened = _ts(raw["opens_at"], "opens_at")
+                    market = raw["market_id"]
+                    earliest, latest, outcome_delay, origin = TARGETS[spec["target"]]
+                    if (not isinstance(market, str) or not market or market in markets
+                            or opened.timestamp() % 900 != 0):
+                        raise ValueError("duplicate market or invalid 15-minute opening")
+                    if not opened + timedelta(seconds=earliest) <= decision <= opened + timedelta(seconds=latest):
+                        raise ValueError("decision outside target cutoff")
+                    if label_at < opened + timedelta(seconds=outcome_delay) or raw.get("label_origin") != origin:
+                        raise ValueError("outcome lacks target-specific timing or verified source")
+                    if not opened + timedelta(seconds=earliest) <= baseline_at <= decision:
+                        raise ValueError("baseline generated outside target decision window")
+                    version, direction = raw.get("baseline_model_version"), raw.get("baseline_call")
+                    if not isinstance(version, str) or not version or direction not in ("UP", "DOWN", "WAIT"):
+                        raise ValueError("competition requires the recorded baseline call and model version")
+                    metadata = {"market_id": market, "baseline_call": direction, "baseline_model_version": version,
+                                "regime": raw.get("volatility_regime") if isinstance(raw.get("volatility_regime"), str)
+                                else "unknown"}
                 families = raw.get("families")
                 if not isinstance(families, dict):
                     raise ValueError("families must be an object")
@@ -145,6 +182,10 @@ def load_records(path, spec):
                         event = _ts(family["event_at"], f"{family_name}.event_at")
                         if event > received:
                             raise ValueError("feature event time is after receipt time")
+                    if spec.get("competition") and family_name in ("walls", "trades"):
+                        if (family.get("quality") != "VERIFIED" or family.get("event_at") is None
+                                or (decision - event).total_seconds() > spec["flow_max_age_s"]):
+                            continue
                     values = family.get("values")
                     if not isinstance(values, dict):
                         raise ValueError("feature values must be an object")
@@ -162,8 +203,11 @@ def load_records(path, spec):
                     "y": _label(raw["label"]),
                     "baseline": _probability(raw["baseline_probability"], "baseline_probability"),
                     "features": flat,
+                    **metadata,
                 })
                 seen.add(sample_id)
+                if metadata:
+                    markets.add(metadata["market_id"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid record at line {line_number}: {exc}") from exc
     records.sort(key=lambda row: (row["decision_at"], row["sample_id"]))
@@ -222,6 +266,7 @@ def walk_forward(records, spec):
             continue
         result = {"sample_id": test["sample_id"], "decision_at": test["decision_at"],
                   "y": test["y"], "baseline": test["baseline"], "train_n": len(train), "p": {}}
+        result.update({key: test[key] for key in ("baseline_call", "baseline_model_version", "regime") if key in test})
         for name, names in spec["candidates"].items():
             X = np.asarray([[row["features"][feature] for feature in names] for row in train], dtype=float)
             y = np.asarray([row["y"] for row in train], dtype=float)
@@ -244,17 +289,22 @@ def _wilson(correct, total, z=1.96):
     return [center - radius, center + radius]
 
 
-def _metrics(probabilities, labels, threshold):
+def _metrics(probabilities, labels, threshold, recorded_calls=None):
     p, y = np.asarray(probabilities, dtype=float), np.asarray(labels, dtype=int)
-    calls = (p >= threshold) | (p <= 1 - threshold)
-    directions = p >= threshold
+    if recorded_calls is None:
+        calls = (p >= threshold) | (p <= round(1 - threshold, 15))
+        directions = p >= threshold
+    else:
+        calls = np.asarray([call != "WAIT" for call in recorded_calls], dtype=bool)
+        directions = np.asarray([call == "UP" for call in recorded_calls], dtype=bool)
     correct = int(np.sum((directions == y) & calls))
     total_calls = int(np.sum(calls))
     eps = 1e-9
     clipped = np.clip(p, eps, 1 - eps)
     bins = []
-    for low in np.arange(0.0, 1.0, 0.1):
-        use = (p >= low) & (p < low + 0.1 if low < 0.9 else p <= 1)
+    for index in range(10):
+        low, high = index / 10, (index + 1) / 10
+        use = (p >= low) & (p < high if index < 9 else p <= 1)
         if np.any(use):
             bins.append({"low": round(float(low), 1), "n": int(np.sum(use)),
                          "mean_probability": float(np.mean(p[use])), "up_rate": float(np.mean(y[use]))})
@@ -265,6 +315,8 @@ def _metrics(probabilities, labels, threshold):
         rolling[str(window)] = {"n": len(values), "accuracy": sum(values) / len(values) if values else None}
     return {
         "n": len(y), "correct": correct, "wrong": total_calls - correct,
+        "wrong_up": int(np.sum(calls & directions & (y == 0))),
+        "wrong_down": int(np.sum(calls & ~directions & (y == 1))),
         "wait": len(y) - total_calls, "coverage": total_calls / len(y) if len(y) else None,
         "accuracy": correct / total_calls if total_calls else None,
         "accuracy_ci95": _wilson(correct, total_calls),
@@ -296,7 +348,14 @@ def evaluate(records_path, spec_path):
     series = {"recorded_baseline": [row["baseline"] for row in predictions]}
     for name in spec["candidates"]:
         series[name] = [row["p"][name] for row in predictions]
-    metrics = {name: _metrics(values, labels, spec["threshold"]) for name, values in series.items()}
+    if spec.get("competition"):
+        members = ("price_only", "price_walls", "price_walls_trades")
+        series["combined_research"] = [sum(row["p"][name] for name in members) / len(members)
+                                       for row in predictions]
+    recorded_calls = [row["baseline_call"] for row in predictions] if spec.get("competition") else None
+    metrics = {name: _metrics(values, labels, spec["threshold"],
+                              recorded_calls if name == "recorded_baseline" else None)
+               for name, values in series.items()}
     price = series["price_only"]
     comparisons = {}
     for name, values in series.items():
@@ -306,12 +365,49 @@ def evaluate(records_path, spec_path):
         comparisons[name] = {"brier_minus_price_only": delta,
                              "paired_bootstrap_ci95": _paired_ci(values, price, labels)}
     spec_bytes = Path(spec_path).read_bytes()
+    competition = {}
+    if spec.get("competition"):
+        days = [row["decision_at"].astimezone(timezone.utc).date().isoformat() for row in predictions]
+        regimes = [row["regime"] for row in predictions]
+        competition = {"scoreboard_schema": "order-flow-competition-v1", "approaches": {},
+                       "last_decision_at": predictions[-1]["decision_at"].isoformat()}
+        for name, values in series.items():
+            calls = recorded_calls if name == "recorded_baseline" else None
+            groups = {}
+            partitions_by_field = [("day_utc", days), ("volatility_regime", regimes)]
+            if calls is not None:
+                partitions_by_field.append(("model_version", [row["baseline_model_version"] for row in predictions]))
+            for field, partitions in partitions_by_field:
+                groups[field] = {}
+                for group in sorted(set(partitions)):
+                    idx = [i for i, item in enumerate(partitions) if item == group]
+                    groups[field][group] = _metrics([values[i] for i in idx], [labels[i] for i in idx],
+                                                   spec["threshold"], [calls[i] for i in idx] if calls else None)
+            versions = (sorted({row["baseline_model_version"] for row in predictions}) if calls
+                        else ["equal-weight-abc-v1"] if name == "combined_research"
+                        else ["regularized-logistic-v1"])
+            competition["approaches"][name] = {
+                **metrics[name], "versions": versions, "groups": groups,
+                "missing_from_evaluation": coverage["evaluation_records"] - len(predictions),
+                "coverage_all_evaluation": (metrics[name]["correct"] + metrics[name]["wrong"])
+                / coverage["evaluation_records"],
+                "calibration_status": "DESCRIPTIVE_OUT_OF_SAMPLE",
+                "status": "RECORDED_BASELINE" if calls else "RESEARCH_ONLY",
+            }
+        comparisons["trades_increment"] = {
+            "brier_minus_price_walls": metrics["price_walls_trades"]["brier"] - metrics["price_walls"]["brier"],
+            "paired_bootstrap_ci95": _paired_ci(series["price_walls_trades"], series["price_walls"], labels),
+        }
+    with Path(records_path).open("rb") as records_file:
+        records_hash = hashlib.file_digest(records_file, "sha256").hexdigest()
     return {
         "status": "RESEARCH_ONLY", "target": spec["target"],
         "spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
+        "records_sha256": records_hash,
         "method": "expanding chronological fit; label receipt strictly before decision; fold-local scaling; matched samples",
         "threshold": spec["threshold"], "coverage": coverage, "metrics": metrics,
         "comparisons": comparisons,
+        **competition,
         "warnings": [
             "No result changes production or authorizes model promotion.",
             "Use only development data outside protected V3/V4/V5 holdouts.",
@@ -326,12 +422,16 @@ def main(argv=None):
     parser.add_argument("--spec", required=True)
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
-    report = evaluate(args.records, args.spec)
     output = Path(args.out)
+    if output.suffix != ".json" or output.resolve() in {Path(args.records).resolve(), Path(args.spec).resolve()}:
+        parser.error("--out must be a separate .json report")
+    if output.exists() or output.is_symlink():
+        parser.error("--out must be a new path")
+    report = evaluate(args.records, args.spec)
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
-    temporary.replace(output)
+    with output.open("x", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, default=str, allow_nan=False)
+        handle.write("\n")
     return 0 if report["status"] == "RESEARCH_ONLY" else 2
 
 

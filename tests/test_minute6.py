@@ -222,6 +222,31 @@ def test_first6_missing_candles_never_invent_a_prediction(tmp_path):
     assert r.db.execute("SELECT COUNT(*) FROM first6").fetchone()[0] == 0
 
 
+def test_first6_bad_legacy_opening_does_not_block_valid_outcomes(tmp_path):
+    r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {},
+                      candles=_candles, log=lambda x: None)
+    r.db.execute("INSERT INTO first6 VALUES (?,?,?,?,?,?,?)",
+                 ("BAD", "not-a-timestamp", OPEN.isoformat(), .5, "WAIT", "legacy", 60000))
+    r.db.commit()
+    assert r.first6_step(_state(), OPEN + timedelta(seconds=12), 1) == "LOCKED"
+    r.first6_step(_state(), OPEN + timedelta(seconds=370), 2)
+    assert r.db.execute("SELECT ticker FROM first6_outcomes").fetchall() == [("KX-M",)]
+    assert r.db.execute("SELECT opens_at FROM first6 WHERE ticker='BAD'").fetchone() == ("not-a-timestamp",)
+
+
+def test_first6_invalid_or_duplicate_references_fail_closed():
+    from src.signals_display import first6
+
+    candles = _candles()
+    opening_ref = next(c for c in candles if c[0] == O - 60)
+    six_minute_ref = next(c for c in candles if c[0] == O + 300)
+    assert first6.closes_to_open(candles + [opening_ref], O) is None
+    assert first6.reference_at(candles + [six_minute_ref], O) is None
+    assert first6.predict([60000] * 64 + [float("nan")]) is None
+    assert first6.reference_at([[O + 300, 0, 0, 0, float("inf")]], O) is None
+    assert first6.reference_at(candles + [opening_ref], O) == six_minute_ref[4]
+
+
 def test_market_history_is_fetched_sparingly(tmp_path):
     calls = []
 

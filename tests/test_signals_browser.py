@@ -133,6 +133,10 @@ def test_live_chart_advances_without_click_and_preserves_selected_interval(tmp_p
             )
             assert page.evaluate("signalChart.interval") == "3m"
 
+            # The five-line layout hides the chart and pauses its background requests.
+            # Expose it in this test to exercise the visible chart refresh path.
+            playwright.expect(page.locator("#ai-signal-chart")).to_be_hidden()
+            page.add_style_tag(content="main > #ai-signal-chart { display: block !important; }")
             page.locator('[data-chart-interval="15s"]').evaluate("element=>element.click()")
             playwright.expect(page.locator("#chart-status")).to_contain_text(
                 "genuine closed 15s bars"
@@ -271,7 +275,7 @@ def test_browser_monitor_panels_rollover_staleness_and_readonly_journal(tmp_path
             playwright.expect(page.locator("#contract")).to_have_text("KXBTC15M-NEXT")
             monitor.state = analyze(data, NOW + timedelta(seconds=606))
             playwright.expect(page.locator("#freshness")).to_contain_text("STALE")
-            assert page.locator("#direction").text_content() == "UNCLEAR"
+            assert page.locator("#direction").text_content() == "WAIT"
             assert page.locator("#scalp").text_content() == "WAIT"
             assert page.locator("#prob-up").text_content() == "unavailable"
             page.set_viewport_size({"width": 390, "height": 844})

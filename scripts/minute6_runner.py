@@ -336,11 +336,14 @@ class Minute6Runner:
                 status = "LOCKED"
         for t, opens_at, ref0 in self.db.execute(
                 "SELECT ticker, opens_at, reference_open FROM first6 WHERE ticker NOT IN (SELECT ticker FROM first6_outcomes)").fetchall():
-            ot = int(datetime.fromisoformat(opens_at).timestamp())
+            opened = scoreboard7._ts(opens_at)
+            if opened is None or opened.timestamp() % 900 != 0 or not f6.valid_reference(ref0):
+                continue
+            ot = int(opened.timestamp())
             if now.timestamp() < ot + 367:
                 continue
             ref6 = f6.reference_at(self._candles(now_mono) or [], ot)
-            if ref6 is None or not ref0:
+            if ref6 is None:
                 continue
             outcome = "UP" if ref6 > ref0 else "DOWN" if ref6 < ref0 else "FLAT"
             self.db.execute("INSERT OR IGNORE INTO first6_outcomes VALUES (?,?,?,?,?,?)",

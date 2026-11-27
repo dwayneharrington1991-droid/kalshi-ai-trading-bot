@@ -37,7 +37,7 @@ def features(closes):
 
 
 def predict(closes):
-    if not closes or len(closes) < 65 or any(c is None or c <= 0 for c in closes[-65:]):
+    if not closes or len(closes) < 65 or not all(valid_reference(c) for c in closes[-65:]):
         return None
     z = [1.0] + [max(-5.0, min(5.0, (f - MU[j]) / SD[j])) for j, f in enumerate(features(closes))]
     p = 1 / (1 + math.exp(-max(-30.0, min(30.0, sum(w * x for w, x in zip(W, z))))))
@@ -45,14 +45,31 @@ def predict(closes):
             "version": VERSION, "reference_open": closes[-1]}
 
 
+def valid_reference(price):
+    return type(price) in (int, float) and math.isfinite(price) and price > 0
+
+
+def _closes(candles, starts):
+    result = {}
+    for candle in candles:
+        if not isinstance(candle, (tuple, list)) or not candle or candle[0] not in starts:
+            continue
+        start = candle[0]
+        if len(candle) < 5 or start in result or not valid_reference(candle[4]):
+            return {}
+        result[start] = candle[4]
+    return result
+
+
 def closes_to_open(candles, opens_ts):
     """Closes from opens-65min up to the candle starting opens-1min (it ends at the open); None if incomplete."""
-    by = {int(c[0]): float(c[4]) for c in candles}
-    out = [by.get(opens_ts + 60 * k) for k in range(-65, 0)]
+    starts = range(opens_ts - 65 * 60, opens_ts, 60)
+    by = _closes(candles, starts)
+    out = [by.get(start) for start in starts]
     return None if None in out else out
 
 
 def reference_at(candles, opens_ts, minute=6):
     """Close of the candle ending at opens+minute (the six-minute reference price), or None."""
-    by = {int(c[0]): float(c[4]) for c in candles}
-    return by.get(opens_ts + 60 * (minute - 1))
+    start = opens_ts + 60 * (minute - 1)
+    return _closes(candles, (start,)).get(start)

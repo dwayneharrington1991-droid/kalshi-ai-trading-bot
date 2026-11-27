@@ -41,7 +41,23 @@ def test_walls_and_wall_events_with_trade_consumption():
     b.apply("bid", D("89"), D("0")); b.apply("ask", D("112"), D("0"))     # ask wall pulled without trades
     v2, _ = ob.depth_view(b, now=now, prev_walls=walls, recent_trades=flow)
     gone = {e["wall"]: e["classification"] for e in v2["wall_events"] if e["event"] == "GONE"}
-    assert gone["bid:89"] == "CONSUMED BY TRADES" and gone["ask:112"].startswith("PULLED")
+    assert gone["bid:89"] == "MATCHING EXECUTIONS OBSERVED"
+    assert gone["ask:112"] == "NO MATCHING EXECUTIONS OBSERVED"
+
+
+def test_future_wrong_side_or_nearby_trades_do_not_corroborate_wall_changes():
+    book = _book([(str(100 - i), "1") for i in range(10)] + [("89", "10")], [("101", "1")])
+    _, walls = ob.depth_view(book)
+    book.apply("bid", D("89"), D("0"))
+    flow = ob.TradeFlow()
+    now = time.time()
+    assert flow.add(now, "buy", 3, 89, "wrong-side")
+    assert flow.add(now, "sell", 3, 89.01, "nearby")
+    assert flow.add(now + 1, "sell", 3, 89, "future")
+    assert not flow.add(now, "unknown", 3, 89, "bad-side")
+    assert flow.windows(now)["1s"]["sell_btc"] == 3
+    view, _ = ob.depth_view(book, now, walls, flow)
+    assert view["wall_events"][0]["matching_trade_btc"] == 0
 
 
 def test_kraken_checksum_matches_reference_construction():
@@ -62,6 +78,20 @@ def test_duplicate_trades_ignored_and_cvd_windows():
     w = f.windows(now)
     assert w["1s"]["sell_btc"] == 0.5 and w["5s"]["buy_btc"] == 2.0 and w["300s"]["trades"] == 3
     assert f.cvd == 0.5 and w["5s"]["large_trades"] == 1
+
+
+def test_collector_requires_exchange_clock_recognized_side_and_trade_id():
+    from scripts.orderbook_service import record_trade, ts
+
+    flow = ob.TradeFlow()
+    cutoff = ts("2026-11-19T00:00:01Z")
+    assert not record_trade(flow, None, "sell", 1, 100, "x", cutoff)
+    assert not record_trade(flow, "2026-11-19T00:00:00", "sell", 1, 100, "x", cutoff)
+    assert not record_trade(flow, "2026-11-19T00:00:02Z", "sell", 1, 100, "x", cutoff)
+    assert not record_trade(flow, "2026-11-19T00:00:00Z", None, 1, 100, "x", cutoff)
+    assert not record_trade(flow, "2026-11-19T00:00:00Z", "sell", 1, 100, None, cutoff)
+    assert record_trade(flow, "2026-11-19T00:00:00.900000001Z", "sell", 1, 100, "x", cutoff)
+    assert flow.cvd == -1 and flow.windows(cutoff)["1s"]["trades"] == 1
 
 
 def test_stale_crossed_and_resync_books_are_never_live():
@@ -96,4 +126,5 @@ def test_api_body_marks_old_snapshot_stale(tmp_path):
     stale = json.loads(ob.latest_body(f, now=1010.0))
     assert stale["status"] == "STALE" and stale["venues"]["kraken"]["status"] == "STALE"
     assert json.loads(ob.latest_body(f, now=1001.0))["venues"]["kraken"]["status"] == "LIVE"
+    assert json.loads(ob.latest_body(f, now=999.0))["status"] == "UNAVAILABLE"
     assert json.loads(ob.latest_body(tmp_path / "none.json"))["status"] == "UNAVAILABLE"

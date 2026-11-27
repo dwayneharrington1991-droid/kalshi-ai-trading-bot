@@ -21,6 +21,23 @@ Use [Coinbase's Exchange channels](https://docs.cdp.coinbase.com/exchange/websoc
 
 ## Forecasting follow-up
 
+The offline `order_flow_contract.dashboard_payload` adapter defines `btc-order-flow-v1` for
+Claude's collector comparison. It keeps BTC depth and Kalshi contract quantities in separate
+blocks. An adapter should submit only one frame per venue for the same BTC/USD instrument.
+Publish proven trade windows by supplying `trade_coverage_start` and `trade_coverage_end` from an
+uninterrupted trade capture. The end must match the requested cutoff. A missing coverage proof
+withholds executed flow while allowing an independently fresh book. Compare normalized values
+and timestamps on the exact same second before wiring the dashboard.
+
+The offline comparison runner accepts immutable development exports and a frozen JSON spec
+described in `scripts/research_order_flow_value.py`. Run
+`python scripts/research_order_flow_value.py --records development.jsonl --spec comparison.json --out report.json`.
+Use one target per run. The tool restricts decisions to the documented development period before
+November 20 at 06:00 UTC and reports matched-feature coverage alongside call coverage.
+The fixed regularized logistic comparison requires labeled decision snapshots and can be used
+to compare price-only features against the same price features plus order flow. No eligible
+row-level market export is available in this checkout.
+
 Join one immutable feature snapshot per decision to the matching independently confirmed outcome. Keep opening settlement, first-six-minute BTC direction, minute-six settlement and longer BTC horizons in separate evaluations. Use price-only and price-plus-order-flow inputs on identical markets and compare with the unchanged model. Freeze the feature variants, coverage rule, fit schedule and pass criteria before gathering a new forward sample. Preserve V3/V4/V5 reserved samples and prior decisions.
 
 The V5 changes close an inner-fold preprocessing leak and enforce pre-opening quote eligibility. The report includes the feature-source artifact and evaluator hashes. Treat output from the repaired evaluator as a distinct recipe and use a fresh forward window if a protected result has already been examined. The repository contains prior results for V3, FIRST 6 MIN, and MINUTE-6 FINAL. This work generated no new empirical model results.
@@ -30,6 +47,13 @@ For the alert-service repair, review `scripts/minute6_runner.py`, `scripts/score
 ## Direct public-feed replay evidence
 
 A single 315-second capture on Nov. 26, 2026 Mountain Time compared each post-update top-10 spot ladder to the replayed wire levels. It checked cumulative size at every level using exact rational arithmetic, matched spread and midprice, and independently summed observed aggressor-side trades and CVD for each receipt-eligible window.
+
+**Reproducibility boundary:** the raw 315-second capture is not committed to this repository (it may contain
+high-volume wire data and workstation timing metadata). The aggregate measurements below are therefore preserved
+evidence from that live run, not a replay that CI or another checkout can independently reproduce. CI independently
+verifies the same arithmetic, point-in-time receipt filtering, duplicate/conflict handling and stale-book behavior
+with deterministic fixtures. A production-integration decision must retain a bounded credential-free capture and
+its SHA-256 manifest so a second operator can reproduce the exact live counts before promotion.
 
 | Venue | Ladders checked | Trades | Observed buy / sell / CVD (BTC) | Event timestamp to workstation receipt p50 / p95 / p99 |
 | --- | ---: | ---: | --- | --- |

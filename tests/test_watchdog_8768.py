@@ -69,3 +69,7 @@ def test_deployment_guard_holds_both_locks_and_releases_on_contention(tmp_path):
             assert not other
         with wd.deployment_guard((deploy,)) as other:
             assert other
+
+
+def test_disk_alert_gives_days_of_warning():
+    assert wd.LIMITS["disk_free_gb"] >= 12.0          # journal grows ~4 GB/day: alert with ~3 days to act

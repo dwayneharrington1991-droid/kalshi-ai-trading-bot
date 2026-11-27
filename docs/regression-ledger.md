@@ -40,6 +40,8 @@ Deployment categories:
 
 ## Open items (not defects, or awaiting data/approval)
 
+- Forward test v4 DECIDED 2026-11-27 01:48 UTC: CANDIDATE DOES NOT PASS ('aligned' = AI #2). Scored LATE on 465 openings (minimum 200) because the Oracle scheduler failed every run from Nov 24 (FileNotFoundError: frozen evaluator copied to a temp dir without research_artifacts; fixed 515fdd3, evaluator bytes unchanged). Brier aligned 0.2472 vs live 0.2489 (delta -0.0017, not passing); 210 calls 56.2% vs live 196 calls 54.6%. v5 had also failed every run (sklearn missing; research venv added) and is at 261/300 holdout openings.
+
 - Forward test v3 DECIDED 2026-11-24 03:40 UTC (Oracle scheduler, frozen evaluator 30a5ee8; 202 openings from 2026-11-22 01:00): CANDIDATE PASSES - 'masked' (the 30 train/serve-skewed inputs removed at inference). Brier 0.2400 vs live 0.2462, delta -0.0062 [-0.0107, -0.0018]; log loss 0.6725 vs 0.6852; 88 calls 64.8% (UP 32, DOWN 56) vs live 83 calls 59.0% (UP 48, DOWN 35). no_logistic did not pass (CI upper +0.0008). Earlier non-reserved window (114 markets) had masked ~ live (+0.0005 +-0.0075), so the forward gain is modest. Promotion needs the user's explicit approval; live model unchanged.
 
 - Forward test v2 DECIDED 2026-11-23 02:06 UTC (200 openings from 2026-11-21 00:00): NO CANDIDATE PASSED. Brier: live 0.2507 (87 calls, 55.2%), stable_ridge 0.2494 (127 calls, 59.1%), blend 0.2500, ensemble 0.2514, gbm 0.2552, Kalshi mid 0.2501; every CI of the Brier difference vs live includes 0. At the opening, the live AI, the challengers and the market price are all near coin-flip quality. Live model unchanged.

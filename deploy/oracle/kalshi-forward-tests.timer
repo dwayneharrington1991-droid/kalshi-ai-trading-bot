@@ -1,0 +1,9 @@
+[Unit]
+Description=Score due Kalshi forward tests at :40 every 3 hours
+
+[Timer]
+OnCalendar=*-*-* 00/3:40:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

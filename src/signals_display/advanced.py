@@ -83,7 +83,6 @@ class AdvancedIntelligence:
             else short_bars or []
         )
         key = (
-            int(now.timestamp()) // 30,
             primary,
             history.get("received_at"),
             rows[-1].get("start") if rows else None,

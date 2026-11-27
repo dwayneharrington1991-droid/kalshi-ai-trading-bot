@@ -36,7 +36,9 @@ class Flow:
         if not 0 <= (now - at).total_seconds() <= 5 or (self.last and at < self.last):
             raise ValueError("Stale/out-of-order trade; reset CVD session")
         price = number(float(price), 0.000001, 1e12)
-        quantity = number(float(quantity), 0.000001, 1e15)
+        # Kraken prints real dust trades below 1e-6 BTC; zero, negative and
+        # non-finite quantities are still rejected.
+        quantity = number(float(quantity), 1e-12, 1e15)
         if side not in ("buy", "sell"):
             raise ValueError("Unknown aggressor side")
         if self.started is None:

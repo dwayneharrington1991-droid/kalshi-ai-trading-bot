@@ -1,8 +1,9 @@
 """Bounded history and live HTTP responsiveness during blocked background jobs."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import sqlite3
 import threading
 from time import perf_counter
 from urllib.request import urlopen
@@ -11,8 +12,14 @@ from urllib.error import HTTPError
 import pytest
 
 from src.signals_display.monitor import Journal, PublicFeed, analyze, utcnow
-from src.signals_display.runtime import CachedReport, LatestPayload
-from src.signals_display.server import Monitor, StartupStatus, make_handler, make_startup_handler
+from src.signals_display.runtime import CachedReport, LatestPayload, RuntimeMeter
+from src.signals_display.server import (
+    Monitor,
+    StartupStatus,
+    make_handler,
+    make_startup_handler,
+    process_prediction_frame,
+)
 from tests.test_signals_display import NOW
 from tests.test_signals_monitor import frame
 
@@ -164,6 +171,43 @@ def test_large_journal_defers_historical_contract_summary_backfill(tmp_path, mon
     assert not any("GROUP BY" in statement.upper() for statement in statements)
     with journal.read() as db:
         assert db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0] == 0
+
+
+def test_deferred_contract_summary_backfill_is_bounded_resumable_and_read_only(tmp_path):
+    journal = Journal(tmp_path / "bounded-summary.db")
+    with journal.connect() as db:
+        for index in range(5):
+            ticker = f"KXBTC15M-LEGACY-{index}"
+            for revision in range(index + 1):
+                at = (NOW + timedelta(seconds=revision)).isoformat()
+                db.execute(
+                    "INSERT INTO btc_engine_predictions VALUES (?,?,?,?,?,?,?,?,?)",
+                    ("PUBLIC MARKET DATA", ticker, at, at, NOW.isoformat(), 0.5,
+                     "test", "v1", '{"immutable":true}'),
+                )
+        before = db.execute(
+            "SELECT COUNT(*),SUM(LENGTH(payload)) FROM btc_engine_predictions"
+        ).fetchone()
+        db.execute("DELETE FROM btc_engine_contracts")
+        db.execute(
+            "DELETE FROM dashboard_migrations WHERE name=?",
+            ("btc_engine_contract_summaries_v1",),
+        )
+
+    first = journal.backfill_contract_summaries(limit=2)
+    assert first["status"] == "IN_PROGRESS" and first["processed"] == 2
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0] == 2
+    for _ in range(10):
+        result = journal.backfill_contract_summaries(limit=2)
+        if result["status"] == "COMPLETE":
+            break
+    assert result["status"] == "COMPLETE"
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_engine_contracts").fetchone()[0] == 5
+        assert db.execute(
+            "SELECT COUNT(*),SUM(LENGTH(payload)) FROM btc_engine_predictions"
+        ).fetchone() == before
 
 
 def test_journal_initialization_never_executes_secondary_index_builds(tmp_path, monkeypatch):
@@ -321,6 +365,430 @@ def test_state_version_wait_wakes_immediately_without_database_or_model_work(tmp
     assert observed == [1]
 
 
+def test_runtime_meter_reports_bounded_nearest_rank_percentiles():
+    meter = RuntimeMeter()
+    for value in range(1, 101):
+        meter.observe("total_processing", value)
+    for value in range(500):
+        meter.observe("http_chart", value)
+    meter.observe("untrusted-stage", 999999)
+    meter.observe("advanced_analysis", 12.5)
+    meter.observe("account_manual_scheduling", 3.5)
+    meter.error("journal_indexes", "OperationalError")
+    report = meter.latency_summary()
+    assert report["total_processing"] == {
+        "samples": 100,
+        "p50_ms": 50.0,
+        "p95_ms": 95.0,
+        "p99_ms": 99.0,
+        "latest_ms": 100.0,
+    }
+    assert report["http_chart"]["samples"] == 300
+    assert report["http_chart"]["latest_ms"] == 499.0
+    assert "untrusted-stage" not in report
+    assert report["advanced_analysis"]["latest_ms"] == 12.5
+    assert report["account_manual_scheduling"]["latest_ms"] == 3.5
+    assert meter.failures()["journal_indexes"]["error_type"] == "OperationalError"
+
+
+def test_background_learning_status_is_bounded_cached_and_safety_marked(tmp_path):
+    status = tmp_path / "latest.json"
+    status.write_text(json.dumps({
+        "status": "COMPLETE",
+        "finished_at": utcnow().isoformat(),
+        "automated_trading": "DISABLED",
+        "model_promotion_performed": False,
+        "stages": {
+            "settlement": {"return_code": 0},
+            "opening": {"return_code": 0},
+            "scalp": {"return_code": 0},
+        },
+    }))
+    monitor = Monitor(
+        None, Journal(tmp_path / "journal.db"), learning_status_path=status
+    )
+    result = monitor.background_learning_status()
+    assert result["status"] == "COMPLETE"
+    assert result["automated_trading"] == "DISABLED"
+    assert result["stale"] is False
+
+    status.write_text(json.dumps({"status": "COMPLETE", "automated_trading": "ENABLED"}))
+    result = monitor.background_learning_status()
+    assert result["status"] == "STATUS_UNREADABLE"
+    assert result["error_type"] == "ValueError"
+
+
+def test_chart_http_uses_monitor_candle_snapshot_before_first_journal_write(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "j.db"))
+    first = int(NOW.timestamp()) - 60 * 60
+    monitor.latest_candles = {
+        "source": "Coinbase verified test preload",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+        "candles": [
+            {
+                "start": first + index * 60,
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 10 + index,
+            }
+            for index in range(60)
+        ],
+    }
+    monitor.state["model"] = {
+        "developing_candle": {
+            "start": int(NOW.timestamp()) // 60 * 60,
+            "open": 200.0,
+            "high": 202.0,
+            "low": 199.0,
+            "close": 201.0,
+            "volume": None,
+            "status": "DEVELOPING",
+            "observed_at": NOW.isoformat(),
+            "source": "Receipt-time proxy samples; volume unknown",
+        }
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/signal-chart?interval=1m&limit=30",
+            timeout=2,
+        ) as response:
+            chart = json.load(response)
+        assert chart["status"] == "READY"
+        assert len(chart["bars"]) == 30
+        assert chart["journal_persistence_pending"] is True
+        assert "Verified live Coinbase preload" in chart["source"]
+        assert chart["forming_candle"]["status"] == "DEVELOPING"
+        assert chart["latest_closed_candle_age_seconds"] >= 0
+
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/signal-chart?interval=3m&limit=30",
+            timeout=2,
+        ) as response:
+            wider = json.load(response)
+        bucket = int(NOW.timestamp()) // 180 * 180
+        assert wider["forming_candle"]["start"] == bucket
+        assert wider["forming_candle"]["interval_seconds"] == 180
+        assert wider["forming_candle"]["open"] == 158
+        assert wider["forming_candle"]["close"] == 201
+        assert all(bar["start"] < bucket for bar in wider["bars"])
+        assert wider["latest_bar_start"] == wider["bars"][-1]["start"]
+
+        event = utcnow() - timedelta(seconds=20)
+        assert monitor.live_trade_chart.observe({
+            "source": "Coinbase BTC/USD stream", "kind": "trade",
+            "price": 70123.0, "volume": 0.125, "trade_id": "api-live-1",
+            "event_at": event.isoformat(),
+            "received_at": (event + timedelta(milliseconds=25)).isoformat(),
+            "session_id": "api-test",
+        })
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/live-chart?limit=30",
+            timeout=2,
+        ) as response:
+            live = json.load(response)
+        assert live["status"] == "READY"
+        assert live["interval"] == "15s"
+        assert live["bars"][-1]["volume"] == 0.125
+        assert live["latency"]["event_to_receipt_p50_ms"] == 25.0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_verified_candles_persist_before_optional_intelligence_failure(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    monitor = Monitor(None, journal)
+    payload = frame()
+    first = int(NOW.timestamp()) - 60 * 60
+    payload["btc_candles"] = {
+        "source": "Coinbase verified test preload",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+        "candles": [
+            {
+                "start": first + index * 60,
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 10 + index,
+            }
+            for index in range(60)
+        ],
+    }
+
+    def fail_optional(*_args, **_kwargs):
+        raise RuntimeError("optional analysis failed")
+
+    monitor.advanced.summarize = fail_optional
+    monitor.tick((payload, NOW, NOW, 1.0))
+    with journal.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM btc_candles").fetchone()[0] == 60
+
+
+def test_ready_preload_reaches_chart_before_prediction_worker_runs(tmp_path):
+    """Regression: Oracle had READY 1440 preload but NO_RECORDED_CANDLES."""
+    journal = Journal(tmp_path / "j.db")
+    monitor = Monitor(None, journal)
+    payload = frame()
+    first = int(NOW.timestamp()) - 60 * 60
+    payload["btc_candles"] = {
+        "source": "Coinbase BTC-USD public one-minute candles",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "retained_bars": 60, "missing_bars": 0},
+        "candles": [
+            {
+                "start": first + index * 60,
+                "open": 100 + index,
+                "high": 102 + index,
+                "low": 99 + index,
+                "close": 101 + index,
+                "volume": 10 + index,
+            }
+            for index in range(60)
+        ],
+    }
+
+    # This is the collector handoff. Deliberately do not call monitor.tick().
+    assert monitor.accept_candle_batch(payload, NOW) is True
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/signal-chart?interval=1m&limit=30",
+            timeout=2,
+        ) as response:
+            chart = json.load(response)
+        assert chart["status"] == "READY"
+        assert len(chart["bars"]) == 30
+        assert chart["fallback_kind"] is None
+        assert chart["journal_persistence_pending"] is False
+        assert chart["markers"] == []
+        with journal.read() as db:
+            assert db.execute("SELECT COUNT(*) FROM btc_candles").fetchone()[0] == 60
+            assert db.execute("SELECT COUNT(*) FROM ai_signal_markers").fetchone()[0] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_collector_recovers_exact_gap_from_receipt_proven_journal_without_lookahead(
+    tmp_path,
+):
+    """Regression: live Coinbase APIs returned 1439/1440 for one old minute."""
+    journal = Journal(tmp_path / "gap.db")
+    monitor = Monitor(None, journal)
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    first = cutoff - 86400
+    missing = first + 317 * 60
+    recovered = {
+        "start": missing, "open": 90.0, "high": 92.0, "low": 89.0,
+        "close": 91.0, "volume": 4.0,
+    }
+    with journal.connect() as db:
+        db.execute(
+            "INSERT INTO btc_candles VALUES (?,?,?,?)",
+            (
+                "Coinbase Exchange BTC-USD one-minute gap fill", missing,
+                json.dumps(recovered), (NOW - timedelta(hours=1)).isoformat(),
+            ),
+        )
+        # A second gap exists only as a post-cutoff receipt and must not leak in.
+        future_start = first + 318 * 60
+        future = {**recovered, "start": future_start, "close": 999.0}
+        db.execute(
+            "INSERT INTO btc_candles VALUES (?,?,?,?)",
+            (
+                "Coinbase future test row", future_start, json.dumps(future),
+                (NOW + timedelta(seconds=1)).isoformat(),
+            ),
+        )
+
+    payload = frame()
+    payload["btc_candles"] = {
+        "source": "Coinbase BTC-USD public one-minute candles",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "INCOMPLETE", "missing_bars": 2},
+        "candles": [
+            {
+                "start": stamp, "open": 100.0, "high": 102.0, "low": 99.0,
+                "close": 101.0, "volume": 2.0,
+            }
+            for stamp in range(first, cutoff, 60)
+            if stamp not in {missing, future_start}
+        ],
+    }
+
+    assert monitor.accept_candle_batch(payload, NOW) is True
+    history = payload["btc_candles"]
+    assert len(history["candles"]) == 1439
+    assert history["diagnostics"]["missing_intervals"] == [
+        datetime.fromtimestamp(future_start, timezone.utc).isoformat()
+    ]
+    assert history["diagnostics"]["journal_recovery"]["bars"] == 1
+    assert next(bar for bar in history["candles"] if bar["start"] == missing) == recovered
+    assert all(bar["start"] != future_start for bar in history["candles"])
+
+    # Once the second row's genuine receipt is within the allowed cutoff, the
+    # same bounded recovery becomes complete without changing old records.
+    later = NOW + timedelta(seconds=2)
+    completed = journal.recover_recorded_candles(history, later)
+    assert completed["diagnostics"]["status"] == "READY"
+    assert completed["diagnostics"]["missing_bars"] == 0
+    assert len(completed["candles"]) == 1440
+    assert "error" not in completed
+
+
+def test_candle_persistence_failure_keeps_live_chart_and_reports_error(tmp_path, monkeypatch):
+    """A full disk must not kill the collector or erase its verified preload."""
+    journal = Journal(tmp_path / "j.db")
+    monitor = Monitor(None, journal)
+    payload = frame()
+    payload["btc_candles"] = {
+        "source": "Coinbase BTC-USD public one-minute candles",
+        "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY", "missing_bars": 0},
+        "candles": [{
+            "start": int(NOW.timestamp()) - 60,
+            "open": 100.0, "high": 102.0, "low": 99.0,
+            "close": 101.0, "volume": 2.0,
+        }],
+    }
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError("simulated disk pressure")
+
+    monkeypatch.setattr(journal, "record_candles", disk_full)
+    assert monitor.accept_candle_batch(payload, NOW) is False
+    assert monitor.latest_candles is payload["btc_candles"]
+    assert monitor.runtime_meter.failures()["candle_persistence"]["error_type"] == "OSError"
+
+    chart = journal.signal_chart(
+        60, limit=30, candle_fallback=monitor.latest_candles
+    )
+    assert chart["status"] == "READY"
+    assert chart["fallback_kind"] == "LIVE_VERIFIED_PRELOAD"
+    assert len(chart["bars"]) == 1
+
+
+def test_opening_sqlite_lock_is_reported_as_wait_without_resetting_live_state(
+    tmp_path, monkeypatch
+):
+    journal = Journal(tmp_path / "locked.db")
+    monitor = Monitor(None, journal)
+    payload = frame()
+
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(journal, "opening_record", locked)
+    monitor.tick((payload, NOW, NOW, 1.0))
+
+    initial = monitor.state["prediction_engine"]["initial"]
+    assert initial["direction"] == "WAIT"
+    assert initial["up"] is None
+    assert initial["status"] == "UNAVAILABLE"
+    assert initial["reason"].startswith("OPENING_STORAGE_UNAVAILABLE")
+    assert monitor.state.get("connection_error") is not True
+    assert monitor.runtime_meter.failures()["opening_storage"]["error_type"] == (
+        "OperationalError"
+    )
+
+
+def test_storage_health_reports_root_pressure_without_scanning_database(
+    tmp_path, monkeypatch
+):
+    journal = Journal(tmp_path / "health.db")
+    usage = __import__("collections").namedtuple("usage", "total used free")
+    monkeypatch.setattr(
+        "src.signals_display.monitor.shutil.disk_usage",
+        lambda _path: usage(100 * 1024**3, 93 * 1024**3, 7 * 1024**3),
+    )
+
+    health = journal.storage_health()
+    assert health["status"] == "CRITICAL_DISK_PRESSURE"
+    assert health["filesystem_used_percent"] == 93.0
+    assert health["filesystem_free_bytes"] == 7 * 1024**3
+
+
+def test_candle_integrity_endpoint_reports_full_window_and_exact_gap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("src.signals_display.server.utcnow", lambda: NOW)
+    cutoff = int(NOW.timestamp()) // 60 * 60
+    monitor = Monitor(None, Journal(tmp_path / "integrity.db"))
+    monitor.latest_candles = {
+        "source": "Coinbase verified test preload", "received_at": NOW.isoformat(),
+        "diagnostics": {"status": "READY"},
+        "candles": [
+            {"start": stamp, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+            for stamp in range(cutoff - 86400, cutoff, 60)
+        ],
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(monitor))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/api/candle-integrity"
+        with urlopen(url, timeout=2) as response:
+            complete = json.load(response)
+        assert complete["status"] == "READY"
+        assert complete["bars"] == complete["unique_bars"] == 1440
+        assert complete["starts"] == list(range(cutoff - 86400, cutoff, 60))
+
+        missing = cutoff - 300
+        monitor.latest_candles["candles"] = [
+            bar for bar in monitor.latest_candles["candles"] if bar["start"] != missing
+        ]
+        monitor.latest_candles["diagnostics"].update(
+            provider_attempts=[{"provider": "Coinbase Exchange candles", "status": "UNAVAILABLE"}],
+            provider_backoffs=[{"endpoint": "https://example.invalid", "retry_after_seconds": 12}],
+            next_retry_at="2026-10-26T12:16:12+00:00",
+            reason="provider retry pending",
+        )
+        with urlopen(url, timeout=2) as response:
+            incomplete = json.load(response)
+        assert incomplete["status"] == "INCOMPLETE"
+        assert incomplete["missing_intervals"] == [missing]
+        assert incomplete["recovery"]["next_retry_at"] == "2026-10-26T12:16:12+00:00"
+        assert incomplete["recovery"]["attempts"][0]["status"] == "UNAVAILABLE"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_prediction_enrichment_failure_isolated_and_next_frame_runs(tmp_path):
+    monitor = Monitor(None, Journal(tmp_path / "j.db"))
+
+    class Feed:
+        fail = True
+
+        def enriched(self, payload, _now):
+            if self.fail:
+                raise ValueError("malformed optional stream frame")
+            return payload
+
+    feed = Feed()
+    collected = (frame(), NOW, NOW, 1.0)
+    failure = process_prediction_frame(monitor, feed, collected)
+    assert isinstance(failure, ValueError)
+    assert monitor.runtime_meter.failures()["prediction"]["error_type"] == "ValueError"
+
+    feed.fail = False
+    assert process_prediction_frame(monitor, feed, collected) is None
+    assert monitor.state_version == 1
+
+
 def test_history_pages_are_indexed_bounded_and_do_not_run_research(tmp_path, monkeypatch):
     journal = Journal(tmp_path / "j.db")
     with journal.connect() as db:
@@ -354,7 +822,14 @@ def test_fast_main_state_and_pagination_during_blocked_research(tmp_path):
     monitor = Monitor(None, Journal(tmp_path / "j.db"))
     monitor.state = analyze(frame(), NOW)
     monitor.state_version = 1
-    monitor.state["model"] = {"version": "test", "coverage": {"raw": "x" * 150000}}
+    monitor.state["model"] = {
+        "version": "test",
+        "coverage": {"raw": "x" * 150000},
+        "developing_candle": {
+            "status": "DEVELOPING", "start": 1, "open": 2,
+            "high": 3, "low": 1, "close": 2.5,
+        },
+    }
     started, release = threading.Event(), threading.Event()
 
     def slow():
@@ -379,6 +854,7 @@ def test_fast_main_state_and_pagination_during_blocked_research(tmp_path):
         data = get("/api/state?view=main")
         assert perf_counter() - timer < 1
         assert "coverage" not in data["model"] and data["market"]
+        assert data["model"]["developing_candle"]["status"] == "DEVELOPING"
         assert "connection_diagnostics" not in data and "streaming" not in data
         assert "blockers" not in data["scalping_monitor"]
         assert "checks" not in data["scalping_monitor"]
@@ -486,6 +962,54 @@ def test_quick_learning_summary_uses_compact_records(tmp_path):
     assert value["official_settlements"] == 1
     assert value["correct_directional_openings"] == 1
     assert value["opening_directional_accuracy"] == 1
+    assert value["current_policy"] == {
+        "cohort": "verified-opening-policy-v2",
+        "settled_openings": 0,
+        "directional_opening_calls": 0,
+        "correct_directional_openings": 0,
+        "incorrect_directional_openings": 0,
+        "wait_openings": 0,
+        "directional_accuracy": None,
+        "accuracy_interval": None,
+        "directional_coverage": None,
+        "historical_rows_rewritten": False,
+    }
+
+
+def test_new_opening_score_cohort_starts_without_rewriting_lifetime_history(tmp_path):
+    journal = Journal(tmp_path / "signals.db")
+    payload = json.dumps(
+        {
+            "up": 0.7,
+            "direction": "UNCLEAR",
+            "score_cohort": "verified-opening-policy-v2",
+            "model": "opening24h-zero-drift-final-average-v1",
+        }
+    )
+    with journal.connect() as db:
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            ("KXBTC15M-NEW", "official", "2026-10-30T20:16:00+00:00", 1),
+        )
+        db.execute(
+            "INSERT INTO btc_engine_opening VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "PUBLIC MARKET DATA",
+                "KXBTC15M-NEW",
+                "2026-10-30T20:00:01+00:00",
+                "2026-10-30T20:00:00+00:00",
+                "2026-10-30T20:15:00+00:00",
+                0.7,
+                "DELAYED",
+                payload,
+            ),
+        )
+    value = journal.quick_learning_summary()
+    assert value["current_policy"]["settled_openings"] == 1
+    assert value["current_policy"]["directional_opening_calls"] == 0
+    assert value["current_policy"]["wait_openings"] == 1
+    assert value["current_policy"]["directional_accuracy"] is None
+    assert value["settled_opening_probability_samples"] == 1
 
 
 def test_storage_health_is_constant_time_and_preserves_database(tmp_path):
@@ -499,6 +1023,7 @@ def test_storage_health_is_constant_time_and_preserves_database(tmp_path):
 
 def test_new_official_settlement_invalidates_learning_count_immediately():
     class JournalStub:
+        def backfill_contract_summaries(self, limit): assert limit == 20
         def backfill_contract_reviews(self, limit): assert limit == 20
         def seed_settlement_queue(self): pass
         def due_settlements(self, _now): return ["KXBTC15M-MOCK"]

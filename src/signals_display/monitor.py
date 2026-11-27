@@ -6,10 +6,13 @@ from __future__ import annotations
 from .storage import connect as storage_connect
 
 from dataclasses import asdict
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import threading
 import json
 import math
 import re
+import shutil
 from pathlib import Path
 import sqlite3
 from time import perf_counter, monotonic
@@ -21,10 +24,12 @@ from .coverage import FeedHub
 from . import prediction_engine
 from . import scalp_paper
 from . import edge_scanner
+from . import strategy_paper
 from .model import Display, evaluate, fee, number, timestamp
 from .edges import assess_edges
 from .reliability import metrics, wilson
 from .multi_asset import asset_of, ALIASES
+from .contract_rules import snapshot as contract_rule_snapshot
 
 UTC = timezone.utc
 LIVE_JOURNAL_MAINTENANCE_LIMIT_BYTES = 512 * 1024 * 1024
@@ -32,8 +37,16 @@ CONTRACT_SUMMARY_MIGRATION = "btc_engine_contract_summaries_v1"
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 COINBASE = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 COINBASE_EXCHANGE_CANDLES = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+COINBASE_MARKET_TRADES = "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/ticker"
 CANDLE_WINDOW = 1440
 CANDLE_SECONDS = 60
+TRADE_RECOVERY_LIMIT = 1000
+TRADE_RECOVERY_MAX_MINUTES = 5
+TRADE_RECOVERY_MAX_PAGES = 10  # bounded: at most 10 x 1000 trades for one minute
+# A minute the trade endpoint CONFIRMED to contain no trades cannot be filled
+# (no bar is ever invented). Re-check it at most this often instead of on
+# every 5-second retry for up to 24 hours.
+CONFIRMED_EMPTY_RECHECK_SECONDS = 600
 
 
 def utcnow():
@@ -60,6 +73,8 @@ class PublicFeed:
         self.transport_diagnostics = []
         self.candle_cache = None
         self.candles_checked = None
+        self.confirmed_empty_minutes = {}       # minute start -> confirmation time
+        self.only_confirmed_empty_missing = False
         self.candle_diagnostics = {
             "status": "WARMING_UP", "last_attempt_at": None,
             "last_success_at": None, "error_type": None,
@@ -128,7 +143,7 @@ class PublicFeed:
         if self.client:
             self.client.close()
 
-    def _read(self, url):
+    def _read(self, url, timeout=4):
         started = perf_counter()
         diagnostic = {
             "endpoint": url.split("?")[0],
@@ -143,7 +158,7 @@ class PublicFeed:
                 raise ValueError("PUBLIC_HTTP_BACKOFF: waiting for provider retry interval")
             response = self.get(
                 url,
-                timeout=4,
+                timeout=timeout,
                 follow_redirects=False,
                 headers={"Accept": "application/json", "Cache-Control": "no-cache"},
             )
@@ -160,6 +175,7 @@ class PublicFeed:
                 self.http_backoff[diagnostic["endpoint"]] = {
                     "until": monotonic() + delay,
                     "attempts": attempts,
+                    "root_failure": diagnostic["failure_reason"],
                 }
                 diagnostic["retry_after_seconds"] = delay
             from email.utils import parsedate_to_datetime
@@ -240,6 +256,26 @@ class PublicFeed:
                 }
         return None
 
+    def retry_status(self, urls=None):
+        """Return bounded provider backoff state without making a request."""
+        endpoints = {url.split("?")[0] for url in urls} if urls else None
+        now_mono = monotonic()
+        values = []
+        for endpoint, retry in self.http_backoff.items():
+            if endpoints is not None and endpoint not in endpoints:
+                continue
+            remaining = max(0.0, float(retry.get("until", 0)) - now_mono)
+            if remaining <= 0:
+                continue
+            values.append({
+                "endpoint": endpoint,
+                "retry_after_seconds": round(remaining, 2),
+                "next_retry_at": (utcnow() + timedelta(seconds=remaining)).isoformat(),
+                "attempts": int(retry.get("attempts", 0)),
+                "root_failure": retry.get("root_failure"),
+            })
+        return sorted(values, key=lambda item: (item["next_retry_at"], item["endpoint"]))
+
     def poll_failure_code(self, exc):
         """Stable credential-free cause for a failed public collection pass."""
         if isinstance(exc, ValueError) and not str(exc).startswith("PUBLIC_HTTP_BACKOFF"):
@@ -255,6 +291,21 @@ class PublicFeed:
             + "_" + type(exc).__name__
         )
         return re.sub(r"\W+", "_", code).strip("_") or type(exc).__name__
+
+    def _candle_retry_seconds(self, retained, now=None):
+        """60 s when complete, or when every still-missing minute was confirmed
+        empty by the trade endpoint (retrying sooner cannot fill it); else 5 s.
+        A complete history whose newest closed bar ends before the current
+        minute boundary (fetched before the provider published the just-closed
+        minute) also retries after 5 s, so an opening does not freeze a history
+        that is a minute staler than necessary."""
+        complete = retained >= 1440 and not (self.candle_cache or {}).get("error")
+        if complete and now is not None:
+            starts = [int(b["start"]) for b in (self.candle_cache or {}).get("candles", []) if "start" in b]
+            boundary = int(now.timestamp()) // CANDLE_SECONDS * CANDLE_SECONDS
+            if starts and max(starts) + CANDLE_SECONDS < boundary:
+                return 5
+        return 60 if complete or self.only_confirmed_empty_missing else 5
 
     def sampled_candles(self, now):
         if self.candle_pool is None:
@@ -277,7 +328,7 @@ class PublicFeed:
                 }
             self.candle_job = None
         retained = len((self.candle_cache or {}).get("candles", []))
-        retry_seconds = 60 if retained >= 1440 and not (self.candle_cache or {}).get("error") else 5
+        retry_seconds = self._candle_retry_seconds(retained, now)
         if self.candle_job is None and (
             self.candle_started is None
             or (now - self.candle_started).total_seconds() >= retry_seconds
@@ -415,7 +466,7 @@ class PublicFeed:
     def candles(self, now):
         self.candle_diagnostics["last_attempt_at"] = now.isoformat()
         retained = len((self.candle_cache or {}).get("candles", []))
-        retry_seconds = 60 if retained >= 1440 and not (self.candle_cache or {}).get("error") else 5
+        retry_seconds = self._candle_retry_seconds(retained, now)
         if (
             self.candles_checked is not None
             and (now - self.candles_checked).total_seconds() < retry_seconds
@@ -426,7 +477,9 @@ class PublicFeed:
         try:
             merged = {}
             duplicate_intervals = []
+            conflicting_duplicate_intervals = []
             source_counts = {}
+            provider_attempts = []
 
             def add_rows(rows, source, exchange_format=False):
                 starts = []
@@ -454,7 +507,13 @@ class PublicFeed:
                         duplicate_intervals.append(start)
                         if any(float(existing[key]) != float(bar[key]) for key in
                                ("open", "high", "low", "close", "volume")):
-                            raise ValueError("Conflicting duplicate one-minute candle")
+                            # Public candle endpoints can revise an overlapping
+                            # boundary minute while we request the next missing
+                            # minute. Preserve the already accepted immutable
+                            # bar and record the disagreement; never discard an
+                            # otherwise complete 24-hour window or replace past
+                            # training input with a later revision.
+                            conflicting_duplicate_intervals.append(start)
                         continue
                     merged[start] = bar
                     source_counts[bar["source"]] = source_counts.get(bar["source"], 0) + 1
@@ -477,16 +536,33 @@ class PublicFeed:
                 else:
                     ranges.append([stamp, stamp + CANDLE_SECONDS])
             if not ranges:
+                self.only_confirmed_empty_missing = False
                 self.candle_diagnostics.update(
                     status="READY", last_success_at=utcnow().isoformat(), error_type=None,
                     retained_bars=len(merged), missing_bars=0, missing_intervals=[],
                     duplicate_intervals=len(set(duplicate_intervals)),
+                    conflicting_duplicate_intervals=len(
+                        set(conflicting_duplicate_intervals)
+                    ),
                     cache_order=cache_order, source_counts=source_counts,
+                    provider_attempts=[], provider_backoffs=[], next_retry_at=None,
                 )
-                return {**(self.candle_cache or {}), "diagnostics": dict(self.candle_diagnostics)}
+                self.candle_cache = {
+                    **(self.candle_cache or {}),
+                    "candles": [merged[t] for t in sorted(merged)],
+                    # The cache is an immutable view of this exact closed-minute
+                    # window.  API readers must not reinterpret it against a
+                    # later wall-clock minute while the next provider request is
+                    # still in flight.
+                    "window_cutoff": cutoff,
+                    "received_at": now.isoformat(),
+                    "diagnostics": dict(self.candle_diagnostics),
+                }
+                self.candle_cache.pop("error", None)
+                return self.candle_cache
             requests = 0
             response_orders = []
-            for left, right in ranges[:5]:
+            for left, right in ranges[:6]:
                 start = left - CANDLE_SECONDS
                 end = min(int(utcnow().timestamp()), right + CANDLE_SECONDS)
                 url = (
@@ -495,10 +571,23 @@ class PublicFeed:
                         {"start": start, "end": end, "granularity": "ONE_MINUTE", "limit": 300}
                     )
                 )
-                response_orders.append(add_rows(
-                    self._read(url)["candles"], "Coinbase Advanced Trade one-minute candles"
-                ))
                 requests += 1
+                try:
+                    response_orders.append(add_rows(
+                        self._read(url)["candles"],
+                        "Coinbase Advanced Trade one-minute candles",
+                    ))
+                    provider_attempts.append({
+                        "provider": "Coinbase Advanced Trade candles",
+                        "range_start": left, "range_end": right, "status": "OK",
+                    })
+                except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                    provider_attempts.append({
+                        "provider": "Coinbase Advanced Trade candles",
+                        "range_start": left, "range_end": right,
+                        "status": "UNAVAILABLE", "error_type": type(exc).__name__,
+                        "reason": str(exc)[:160],
+                    })
 
             # The brokerage history endpoint occasionally omits isolated closed
             # minutes for several seconds. Fill only still-missing intervals
@@ -513,31 +602,114 @@ class PublicFeed:
                     fallback_ranges[-1][1] += CANDLE_SECONDS
                 else:
                     fallback_ranges.append([stamp, stamp + CANDLE_SECONDS])
-            for left, right in fallback_ranges[:5]:
+            for left, right in fallback_ranges[:6]:
                 params = urlencode({
                     "start": datetime.fromtimestamp(left, timezone.utc).isoformat(),
                     "end": datetime.fromtimestamp(right, timezone.utc).isoformat(),
                     "granularity": CANDLE_SECONDS,
                 })
-                response_orders.append(add_rows(
-                    self._read(COINBASE_EXCHANGE_CANDLES + "?" + params),
-                    "Coinbase Exchange BTC-USD one-minute gap fill", exchange_format=True,
-                ))
                 requests += 1
+                try:
+                    response_orders.append(add_rows(
+                        self._read(COINBASE_EXCHANGE_CANDLES + "?" + params),
+                        "Coinbase Exchange BTC-USD one-minute gap fill",
+                        exchange_format=True,
+                    ))
+                    provider_attempts.append({
+                        "provider": "Coinbase Exchange candles",
+                        "range_start": left, "range_end": right, "status": "OK",
+                    })
+                except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                    provider_attempts.append({
+                        "provider": "Coinbase Exchange candles",
+                        "range_start": left, "range_end": right,
+                        "status": "UNAVAILABLE", "error_type": type(exc).__name__,
+                        "reason": str(exc)[:160],
+                    })
+
+            # Both Coinbase candle products can omit the same isolated minute.
+            # Recover only from genuine timestamped public trades requested for
+            # that exact closed UTC minute. A response at the provider limit is
+            # rejected as potentially truncated; no OHLCV is interpolated.
+            remaining = [t for t in range(cutoff - 86400, cutoff, CANDLE_SECONDS)
+                         if t not in merged]
+            trade_recovery = []
+            self.confirmed_empty_minutes = {
+                t: at for t, at in self.confirmed_empty_minutes.items() if t >= cutoff - 86400
+            }
+
+            def recently_confirmed_empty(stamp):
+                at = self.confirmed_empty_minutes.get(stamp)
+                return at is not None and 0 <= (now - at).total_seconds() < CONFIRMED_EMPTY_RECHECK_SECONDS
+
+            for stamp in [t for t in remaining if recently_confirmed_empty(t)][:TRADE_RECOVERY_MAX_MINUTES]:
+                trade_recovery.append({"start": stamp, "status": "CONFIRMED_NO_TRADES_RECHECK_LATER"})
+            for stamp in [t for t in remaining if not recently_confirmed_empty(t)][:TRADE_RECOVERY_MAX_MINUTES]:
+                try:
+                    requests += 1
+                    bar = self._candle_from_market_trades(stamp, cutoff)
+                except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                    provider_attempts.append({
+                        "provider": "Coinbase Advanced Trade market trades",
+                        "range_start": stamp, "range_end": stamp + CANDLE_SECONDS,
+                        "status": "UNAVAILABLE", "error_type": type(exc).__name__,
+                        "reason": str(exc)[:160],
+                    })
+                    trade_recovery.append({
+                        "start": stamp,
+                        "status": "UNAVAILABLE",
+                        "reason": type(exc).__name__ + ": " + str(exc)[:160],
+                    })
+                    continue
+                if bar is None:
+                    self.confirmed_empty_minutes[stamp] = now
+                    provider_attempts.append({
+                        "provider": "Coinbase Advanced Trade market trades",
+                        "range_start": stamp, "range_end": stamp + CANDLE_SECONDS,
+                        "status": "NO_VERIFIED_TRADES",
+                    })
+                    trade_recovery.append({
+                        "start": stamp,
+                        "status": "NO_VERIFIED_TRADES",
+                    })
+                    continue
+                add_rows(
+                    [bar],
+                    "Coinbase Advanced Trade public market trades exact-minute recovery",
+                )
+                provider_attempts.append({
+                    "provider": "Coinbase Advanced Trade market trades",
+                    "range_start": stamp, "range_end": stamp + CANDLE_SECONDS,
+                    "status": "RECOVERED", "trades": bar["trade_count"],
+                })
+                trade_recovery.append({
+                    "start": stamp,
+                    "status": "RECOVERED_FROM_VERIFIED_TRADES",
+                    "trades": bar["trade_count"],
+                })
             received = utcnow()
             expected = list(range(cutoff - 86400, cutoff, CANDLE_SECONDS))
             remaining = [stamp for stamp in expected if stamp not in merged]
             ordered = [merged[t] for t in expected if t in merged]
             status = "READY" if not remaining else "INCOMPLETE"
+            self.only_confirmed_empty_missing = bool(remaining) and all(
+                recently_confirmed_empty(t) for t in remaining
+            )
+            backoffs = self.retry_status([
+                "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles",
+                COINBASE_EXCHANGE_CANDLES,
+                COINBASE_MARKET_TRADES,
+            ])
             self.candle_cache = {
                 "candles": ordered,
+                "window_cutoff": cutoff,
                 "source": "Coinbase BTC-USD public one-minute candles; Exchange endpoint fills verified gaps",
                 "received_at": received.isoformat(),
                 "refresh": {
                     "method": "Initial 24h preload, then exact missing-interval backfill",
                     "requests": requests,
                     "retained_bars": len(merged),
-                    "maximum_requests_per_refresh": 10,
+                    "maximum_requests_per_refresh": 17,
                 },
                 "diagnostics": {
                     "status": status, "last_attempt_at": now.isoformat(),
@@ -549,8 +721,15 @@ class PublicFeed:
                         for stamp in remaining[:20]
                     ],
                     "duplicate_intervals": len(set(duplicate_intervals)),
+                    "conflicting_duplicate_intervals": len(
+                        set(conflicting_duplicate_intervals)
+                    ),
                     "cache_order": cache_order,
                     "response_orders": response_orders,
+                    "trade_recovery": trade_recovery,
+                    "provider_attempts": provider_attempts,
+                    "provider_backoffs": backoffs,
+                    "next_retry_at": backoffs[0]["next_retry_at"] if backoffs else None,
                     "source_counts": source_counts,
                     "reason": None if not remaining else
                     f"Historical providers still missing {len(remaining)}/1440 exact UTC minutes",
@@ -573,6 +752,80 @@ class PublicFeed:
                 "diagnostics": dict(self.candle_diagnostics),
             }
         return self.candle_cache
+
+    def _candle_from_market_trades(self, start, cutoff):
+        """Build one closed candle from a complete bounded public trade response."""
+        start = int(start)
+        end = start + CANDLE_SECONDS
+        if start % CANDLE_SECONDS or end > int(cutoff):
+            raise ValueError("Trade recovery requires one aligned closed minute")
+        # Verified against the live endpoint on 2026-11-20: RFC3339 start/end
+        # return HTTP 500 on every request, while Unix-second strings return
+        # trades bounded to [start, end) in descending time order. A busy BTC
+        # minute holds more than one page (2,477 trades at 2026-11-19 21:19
+        # UTC), so the minute is read newest-first in pages: each next page
+        # ends one second after the oldest trade seen, the overlapping second is
+        # de-duplicated by trade id, and the minute is complete only when a page
+        # comes back shorter than the limit. A page that cannot advance, a
+        # conflicting duplicate, or running out of pages fails closed.
+        by_id = {}
+        page_end = end
+        for _page in range(TRADE_RECOVERY_MAX_PAGES):
+            url = COINBASE_MARKET_TRADES + "?" + urlencode({
+                "start": str(start),
+                "end": str(page_end),
+                "limit": TRADE_RECOVERY_LIMIT,
+            })
+            # Historical public REST is outside the one-second quote path. Give
+            # it a bounded ten seconds without delaying live contract collection.
+            value = self._read(url, timeout=10)
+            trades = value.get("trades")
+            if not isinstance(trades, list):
+                raise ValueError("Unsupported Coinbase market-trades schema")
+            page_ids = set()
+            oldest = None
+            for raw in trades:
+                identifier = str(raw["trade_id"])
+                if identifier in page_ids:
+                    raise ValueError("Duplicate market trade identifier")
+                page_ids.add(identifier)
+                observed = timestamp(raw["time"])
+                if not start <= observed.timestamp() < min(end, page_end):
+                    raise ValueError("Market trade outside requested minute")
+                price = number(float(raw["price"]), 0.000001, 1e15)
+                size = number(float(raw["size"]), 0.000000000000001, 1e15)
+                row = (observed, identifier, price, size)
+                prior = by_id.get(identifier)
+                if prior is not None and prior != row:
+                    raise ValueError("Conflicting market trade receipts for one identifier")
+                by_id[identifier] = row
+                oldest = observed if oldest is None or observed < oldest else oldest
+            if len(trades) < TRADE_RECOVERY_LIMIT:
+                break
+            next_end = int(oldest.timestamp()) + 1
+            if next_end >= page_end:
+                raise ValueError("Market-trades response may be truncated")
+            page_end = next_end
+        else:
+            raise ValueError("Market-trades response may be truncated")
+        parsed = list(by_id.values())
+        if not parsed:
+            return None
+        parsed.sort(key=lambda item: (item[0], item[1]))
+        prices = [item[2] for item in parsed]
+        return {
+            "start": start,
+            "open": prices[0],
+            "high": max(prices),
+            "low": min(prices),
+            "close": prices[-1],
+            "volume": sum(item[3] for item in parsed),
+            "trade_count": len(parsed),
+            "source": (
+                "Coinbase Advanced Trade public market trades "
+                "exact-minute recovery"
+            ),
+        }
 
     def sampled_multi_assets(self, now):
         """Run bounded discovery/history preparation away from the primary BTC poll."""
@@ -730,8 +983,13 @@ class PublicFeed:
         history_ready = sorted(
             asset for asset, item in histories.items() if len(item.get("candles", [])) >= 1440
         )
+        # This worker powers the optional *additional-market* strip.  The
+        # primary KXBTC15M contract is selected by ``poll`` above and must not
+        # be described as missing merely because this auxiliary scan found no
+        # other compatible cards.
         diagnostics = {
-            "status": "READY" if candidates else "NO_COMPATIBLE_MARKETS",
+            "scope": "ADDITIONAL_MARKETS_ONLY",
+            "status": "READY" if candidates else "NO_ADDITIONAL_COMPATIBLE_MARKETS",
             "last_attempt_at": attempted_at, "last_success_at": utcnow().isoformat(),
             "error_type": None, "markets_scanned": len(rows),
             "compatible_markets": len(candidates), "rejections": rejections,
@@ -741,7 +999,7 @@ class PublicFeed:
             "reason": (
                 "Compatible listings discovered; individual cards still require verified rules and opening inputs"
                 if candidates else
-                "Kalshi returned no supported 15-minute listing in the current/pre-open window"
+                "No additional supported 15-minute listing was found in the current/pre-open window; the primary KXBTC15M contract is monitored separately"
             ),
         }
         return {"markets": candidates, "references": references, "histories": histories,
@@ -883,6 +1141,7 @@ class PublicFeed:
                 }
             except (KeyError, ValueError, TypeError):
                 pass
+            frozen_rules = contract_rule_snapshot(raw, series, received_at=now.isoformat())
             result.append(
                 dict(
                     ticker=raw["ticker"],
@@ -892,12 +1151,23 @@ class PublicFeed:
                     closes_at=close.isoformat(),
                     observed_at=now.isoformat(),
                     strike=raw.get("floor_strike"),
+                    strike_type=raw.get("strike_type"),
                     metadata_received_at=now.isoformat(),
                     settlement_reference=source,
                     up_definition="YES according to published contract settlement rules"
                     if orientation
                     else "unknown",
                     rules=raw.get("rules_primary", ""),
+                    rules_primary=raw.get("rules_primary", ""),
+                    rules_secondary=raw.get("rules_secondary", ""),
+                    settlement_spec=raw.get("settlement_spec"),
+                    price_level_structure=raw.get("price_level_structure"),
+                    price_ranges=raw.get("price_ranges"),
+                    tick_size_dollars=raw.get("tick_size_dollars"),
+                    contract_rule_snapshot=(
+                        frozen_rules.as_dict()
+                        if hasattr(frozen_rules, "as_dict") else frozen_rules
+                    ),
                     quotes=quotes,
                     fee_type=series.get("fee_type"),
                     fee_multiplier=series.get("fee_multiplier"),
@@ -905,16 +1175,12 @@ class PublicFeed:
                     comparison_operator=">="
                     if orientation and "at least" in str(raw.get("rules_primary", "")).lower()
                     else None,
-                    averaging_seconds=60,
+                    averaging_seconds=getattr(
+                        frozen_rules, "averaging_window_seconds", None
+                    ),
                     averaging_rule_verified=(
-                        orientation
-                        and "CF Benchmarks" in source
-                        and str(raw.get("rules_primary", ""))
-                        .lower()
-                        .count("simple average of the sixty seconds")
-                        == 2
-                        and "at least" in str(raw.get("rules_primary", "")).lower()
-                        and "brti" in str(raw.get("rules_primary", "")).lower()
+                        getattr(frozen_rules, "rule_status", None)
+                        == "STRUCTURED_SETTLEMENT_RULE_VERIFIED"
                     ),
                 )
             )
@@ -1227,6 +1493,8 @@ class Journal:
         self.path = str(path)
         self._last_candle_batch = None
         self._last_learning_sample = {}
+        self._strategy_cache = None
+        self._strategy_cache_lock = threading.Lock()
         try:
             existing_size = Path(self.path).stat().st_size
         except FileNotFoundError:
@@ -1289,6 +1557,7 @@ class Journal:
                 )
             scalp_paper.create_schema(db)
             edge_scanner.create_schema(db)
+            strategy_paper.create_schema(db)
             db.execute(
                 "CREATE TABLE IF NOT EXISTS forecast_outcomes (ticker TEXT,origin TEXT,observed_at TEXT,outcome INTEGER,PRIMARY KEY(ticker,origin))"
             )
@@ -1314,6 +1583,35 @@ class Journal:
                     mode TEXT NOT NULL,ticker TEXT NOT NULL,opens_at TEXT NOT NULL,
                     captured_at TEXT NOT NULL,finalized INTEGER NOT NULL,payload TEXT NOT NULL,
                     PRIMARY KEY(mode,ticker));
+                CREATE TRIGGER IF NOT EXISTS opening_input_snapshots_no_update
+                    BEFORE UPDATE ON opening_input_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Opening input snapshots are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS opening_input_snapshots_no_delete
+                    BEFORE DELETE ON opening_input_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Opening input snapshots are immutable'); END;
+                CREATE TABLE IF NOT EXISTS opening_quote_snapshots (
+                    mode TEXT NOT NULL,ticker TEXT NOT NULL,observed_at TEXT NOT NULL,
+                    opens_at TEXT NOT NULL,seconds_from_open REAL NOT NULL,
+                    up_bid REAL,up_ask REAL,down_bid REAL,down_ask REAL,
+                    up_ask_size REAL,down_ask_size REAL,fee_multiplier REAL,fee_type TEXT,
+                    quote_event_time TEXT,payload TEXT NOT NULL,
+                    PRIMARY KEY(mode,ticker,observed_at));
+                CREATE TRIGGER IF NOT EXISTS opening_quote_snapshots_no_update
+                    BEFORE UPDATE ON opening_quote_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Opening quote snapshots are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS opening_quote_snapshots_no_delete
+                    BEFORE DELETE ON opening_quote_snapshots BEGIN
+                    SELECT RAISE(ABORT,'Opening quote snapshots are immutable'); END;
+                CREATE TABLE IF NOT EXISTS preopen_reference_ticks (
+                    mode TEXT NOT NULL,source TEXT NOT NULL,received_at TEXT NOT NULL,
+                    price REAL NOT NULL,opens_at TEXT NOT NULL,persisted_at TEXT NOT NULL,
+                    PRIMARY KEY(mode,opens_at,source,received_at));
+                CREATE TRIGGER IF NOT EXISTS preopen_reference_ticks_no_update
+                    BEFORE UPDATE ON preopen_reference_ticks BEGIN
+                    SELECT RAISE(ABORT,'Pre-opening reference receipts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS preopen_reference_ticks_no_delete
+                    BEFORE DELETE ON preopen_reference_ticks BEGIN
+                    SELECT RAISE(ABORT,'Pre-opening reference receipts are immutable'); END;
                 CREATE TABLE IF NOT EXISTS learning_contract_reviews (
                     ticker TEXT NOT NULL,origin TEXT NOT NULL,observed_at TEXT NOT NULL,
                     outcome INTEGER NOT NULL,payload TEXT NOT NULL,
@@ -1328,6 +1626,19 @@ class Journal:
                     first_observed_at TEXT NOT NULL,last_observed_at TEXT NOT NULL,
                     samples INTEGER NOT NULL,first_payload TEXT NOT NULL,last_payload TEXT NOT NULL,
                     PRIMARY KEY(mode,ticker,minute_start));
+                CREATE TABLE IF NOT EXISTS ai_signal_markers (
+                    id INTEGER PRIMARY KEY,marker_key TEXT NOT NULL UNIQUE,
+                    ticker TEXT NOT NULL,signal_type TEXT NOT NULL,created_at TEXT NOT NULL,
+                    btc_price REAL NOT NULL,contract_price REAL,probability REAL,
+                    after_cost_edge REAL,reason TEXT NOT NULL,data_freshness TEXT NOT NULL,
+                    risk_status TEXT NOT NULL,experimental INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,payload TEXT NOT NULL);
+                CREATE TRIGGER IF NOT EXISTS ai_signal_markers_no_update
+                    BEFORE UPDATE ON ai_signal_markers BEGIN
+                    SELECT RAISE(ABORT,'AI signal markers are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS ai_signal_markers_no_delete
+                    BEFORE DELETE ON ai_signal_markers BEGIN
+                    SELECT RAISE(ABORT,'AI signal markers are immutable'); END;
                 """
             )
 
@@ -1352,6 +1663,7 @@ class Journal:
             "CREATE INDEX IF NOT EXISTS scalp_book_mode_id ON scalp_book_observations(mode,id DESC)",
             "CREATE INDEX IF NOT EXISTS scalp_book_ticker_time ON scalp_book_observations(mode,ticker,recorded_at)",
             "CREATE INDEX IF NOT EXISTS edge_observations_close ON edge_observations(mode,closes_at)",
+            "CREATE INDEX IF NOT EXISTS preopen_reference_ticks_open ON preopen_reference_ticks(mode,opens_at)",
         )
         with self.read() as db:
             existing = {
@@ -1439,6 +1751,306 @@ class Journal:
 
         self._last_candle_batch = batch
 
+    def recover_recorded_candles(self, data, as_of):
+        """Fill exact gaps from previously receipt-proven Coinbase candles.
+
+        The public candle APIs occasionally omit an interval that an earlier
+        response already delivered.  Those immutable rows are authoritative
+        provider observations, not interpolations.  Only rows first received
+        by ``as_of`` are eligible, so this method cannot introduce post-cutoff
+        information into an opening snapshot.
+        """
+        if not isinstance(data, dict):
+            return data
+        as_of = as_of.astimezone(UTC) if isinstance(as_of, datetime) else timestamp(as_of)
+        cutoff = int(as_of.timestamp()) // CANDLE_SECONDS * CANDLE_SECONDS
+        expected = list(range(cutoff - 86400, cutoff, CANDLE_SECONDS))
+        expected_set = set(expected)
+        merged = {}
+        duplicates = set()
+        for raw in data.get("candles", []):
+            try:
+                start = int(raw["start"])
+                if start not in expected_set or start % CANDLE_SECONDS:
+                    continue
+                if start in merged:
+                    duplicates.add(start)
+                    continue
+                # Validate numeric OHLCV before allowing a bar into a model
+                # history.  Preserve the provider payload without rewriting it.
+                for key in ("open", "high", "low", "close", "volume"):
+                    number(float(raw[key]), 0, 1e15)
+                if float(raw["low"]) > float(raw["high"]):
+                    continue
+                merged[start] = dict(raw)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+
+        missing = expected_set - set(merged)
+        recovered_sources = {}
+        recovered = 0
+        if missing:
+            placeholders = ",".join("?" for _ in missing)
+            with self.read() as db:
+                rows = db.execute(
+                    f"""SELECT source,start,payload,first_received_at
+                        FROM btc_candles
+                        WHERE start IN ({placeholders})
+                          AND source LIKE 'Coinbase%'
+                          AND julianday(first_received_at)<=julianday(?)
+                        ORDER BY start,first_received_at,source""",
+                    (*sorted(missing), as_of.isoformat()),
+                ).fetchall()
+            for row in rows:
+                start = int(row["start"])
+                if start in merged:
+                    continue
+                try:
+                    bar = json.loads(row["payload"])
+                    if int(bar["start"]) != start:
+                        continue
+                    for key in ("open", "high", "low", "close", "volume"):
+                        number(float(bar[key]), 0, 1e15)
+                    if float(bar["low"]) > float(bar["high"]):
+                        continue
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                merged[start] = bar
+                recovered += 1
+                recovered_sources[row["source"]] = recovered_sources.get(row["source"], 0) + 1
+
+        remaining = [start for start in expected if start not in merged]
+        diagnostics = dict(data.get("diagnostics") or {})
+        diagnostics.update(
+            status="READY" if not remaining else "INCOMPLETE",
+            retained_bars=len(merged),
+            missing_bars=len(remaining),
+            missing_intervals=[
+                datetime.fromtimestamp(start, UTC).isoformat() for start in remaining[:20]
+            ],
+            journal_recovery={
+                "status": "RECOVERED" if recovered else "NO_ELIGIBLE_RECORDED_GAPS",
+                "bars": recovered,
+                "sources": recovered_sources,
+                "cutoff": as_of.isoformat(),
+                "rule": "first_received_at must be at or before cutoff",
+            },
+            duplicate_intervals=max(
+                int(diagnostics.get("duplicate_intervals") or 0), len(duplicates)
+            ),
+            reason=(
+                None if not remaining else
+                f"Historical providers and receipt-proven journal still missing {len(remaining)}/1440 exact UTC minutes"
+            ),
+        )
+        result = {
+            **data,
+            "candles": [merged[start] for start in expected if start in merged],
+            "diagnostics": diagnostics,
+        }
+        if remaining:
+            result["error"] = (
+                f"MISSING_CANDLES: {len(remaining)}/1440 UTC intervals unavailable after authoritative recovery"
+            )
+        else:
+            result.pop("error", None)
+        return result
+
+    def record_ai_signal_markers(self, state):
+        """Append new non-repainting signals; never mutate prior markers."""
+        from .signal_chart import marker_is_chronological, markers_from_state
+
+        markers = markers_from_state(state)
+        if not markers:
+            return 0
+        inserted = 0
+        with self.connect() as db:
+            for marker in markers:
+                if not marker_is_chronological(marker, state.get("now")):
+                    continue
+                payload = json.dumps(marker, allow_nan=False, separators=(",", ":"))
+                cursor = db.execute(
+                    """INSERT OR IGNORE INTO ai_signal_markers
+                    (marker_key,ticker,signal_type,created_at,btc_price,contract_price,
+                     probability,after_cost_edge,reason,data_freshness,risk_status,
+                     experimental,fingerprint,payload)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        marker["marker_key"], marker["ticker"], marker["signal_type"],
+                        marker["timestamp"], marker["btc_price"], marker.get("contract_price"),
+                        marker.get("probability"), marker.get("after_cost_edge"),
+                        marker.get("reason") or "No reason recorded", marker["data_freshness"],
+                        marker.get("risk_status") or "UNAVAILABLE", bool(marker["experimental"]),
+                        marker["fingerprint"], payload,
+                    ),
+                )
+                inserted += cursor.rowcount
+        return inserted
+
+    def signal_chart(self, interval_seconds, limit=240, ticker=None, candle_fallback=None):
+        """Return bounded closed bars and immutable markers for dashboard use."""
+        from .signal_chart import (
+            MAX_CHART_BARS,
+            SUPPORTED_INTERVALS,
+            aggregate_candles,
+            normalize_recorded_candle,
+        )
+
+        if interval_seconds not in SUPPORTED_INTERVALS:
+            return {
+                "status": "INTERVAL_UNAVAILABLE",
+                "reason": (
+                    "Verified Coinbase one-minute OHLCV cannot be subdivided into real "
+                    "15-second candles. Timestamped sub-minute trades with complete "
+                    "interval coverage have not been recorded, so no bars are fabricated."
+                ),
+                "required_data": "Continuous timestamped sub-minute trades with volume and receipt-time validation",
+                "available_source": "Recorded Coinbase closed one-minute OHLCV",
+                "interval_seconds": interval_seconds,
+                "bars": [], "markers": [],
+            }
+        limit = max(30, min(MAX_CHART_BARS, int(limit)))
+        source_limit = min(1600, limit * (interval_seconds // 60) + interval_seconds // 60)
+        with self.read() as db:
+            rows = db.execute(
+                """SELECT payload FROM btc_candles WHERE source LIKE 'Coinbase%'
+                ORDER BY start DESC LIMIT ?""",
+                (source_limit * 3,),
+            ).fetchall()
+            if ticker:
+                marker_rows = db.execute(
+                    "SELECT payload FROM ai_signal_markers WHERE ticker=? ORDER BY id DESC LIMIT 500",
+                    (ticker,),
+                ).fetchall()
+            else:
+                marker_rows = db.execute(
+                    "SELECT payload FROM ai_signal_markers ORDER BY id DESC LIMIT 500"
+                ).fetchall()
+            performance_rows = db.execute(
+                """SELECT m.ticker,m.signal_type,m.probability,m.after_cost_edge,o.outcome
+                FROM ai_signal_markers m LEFT JOIN forecast_outcomes o
+                ON o.ticker=m.ticker AND o.origin='official'
+                WHERE m.signal_type IN ('BUY UP','BUY DOWN') ORDER BY m.id"""
+            ).fetchall()
+            official_contracts = db.execute(
+                "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
+            ).fetchone()[0]
+            snapshot_row = db.execute(
+                """SELECT payload FROM opening_input_snapshots
+                WHERE mode='PUBLIC MARKET DATA'
+                ORDER BY opens_at DESC LIMIT 1"""
+            ).fetchone()
+        unique = {}
+        invalid_payloads = 0
+        for row in rows:
+            try:
+                bar = normalize_recorded_candle(json.loads(row[0]))
+                if bar is None:
+                    invalid_payloads += 1
+                    continue
+                unique.setdefault(bar["start"], bar)
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                invalid_payloads += 1
+                continue
+        fallback_used = False
+        fallback_kind = None
+        if not unique and isinstance(candle_fallback, dict):
+            # The verified 24-hour preload can complete before its first
+            # asynchronous journal write. Render those same closed source bars
+            # during that startup window; markers remain journal-only and
+            # immutable. No candle is interpolated or fabricated.
+            for bar in candle_fallback.get("candles", []):
+                normalized = normalize_recorded_candle(bar)
+                if normalized is not None:
+                    unique.setdefault(normalized["start"], normalized)
+            fallback_used = bool(unique)
+            fallback_kind = "LIVE_VERIFIED_PRELOAD" if fallback_used else None
+        if not unique and snapshot_row:
+            # Opening snapshots contain the immutable, receipt-proven candle
+            # window used at that contract's cutoff. They are a safe durable
+            # startup seed when the additive chart table has not populated;
+            # timestamps are preserved and no later observation is backfilled.
+            try:
+                saved = json.loads(snapshot_row[0])
+                history = saved.get("history") or {}
+                for bar in history.get("candles", []):
+                    normalized = normalize_recorded_candle(bar)
+                    if normalized is not None:
+                        unique.setdefault(normalized["start"], normalized)
+                fallback_used = bool(unique)
+                fallback_kind = "IMMUTABLE_OPENING_SNAPSHOT" if fallback_used else None
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        bars = aggregate_candles(list(unique.values()), interval_seconds)[-limit:]
+        markers = [json.loads(row[0]) for row in reversed(marker_rows)]
+        settled = [row for row in performance_rows if row[4] in (0, 1)]
+        correct = sum(
+            (row[1] == "BUY UP" and row[4] == 1)
+            or (row[1] == "BUY DOWN" and row[4] == 0)
+            for row in settled
+        )
+        pnl = []
+        for _ticker, signal_type, probability, edge, outcome in settled:
+            if all(type(value) in (int, float) for value in (probability, edge)):
+                side_probability = probability if signal_type == "BUY UP" else 1 - probability
+                estimated_cost = side_probability - edge
+                if 0 < estimated_cost < 1:
+                    won = outcome == (1 if signal_type == "BUY UP" else 0)
+                    pnl.append((1 if won else 0) - estimated_cost)
+        from .scores import wilson_interval
+
+        marker_performance = {
+            "actionable_signals": len(performance_rows),
+            "independently_settled_signals": len(settled),
+            "correct": correct,
+            "incorrect": len(settled) - correct,
+            "directional_accuracy": correct / len(settled) if settled else None,
+            "accuracy_interval_95": wilson_interval(correct, len(settled)),
+            "market_coverage": (
+                len({row[0] for row in performance_rows}) / official_contracts
+                if official_contracts
+                else None
+            ),
+            "counterfactual_after_cost_pnl": sum(pnl) if pnl else None,
+            "counterfactual_after_cost_samples": len(pnl),
+            "actual_realized_results": None,
+            "actual_results_reason": "Actual read-only account fills remain separate from chart-marker counterfactuals",
+            "edge_status": "edge unverified",
+        }
+        return {
+            "status": "READY" if bars else "NO_RECORDED_CANDLES",
+            "interval_seconds": interval_seconds,
+            "interval": SUPPORTED_INTERVALS[interval_seconds],
+            "bars": bars,
+            "markers": markers,
+            "performance": marker_performance,
+            "non_repainting": True,
+            "source": (
+                "Verified live Coinbase preload; candle-table persistence pending"
+                if fallback_kind == "LIVE_VERIFIED_PRELOAD"
+                else "Immutable receipt-proven opening candle snapshot"
+                if fallback_kind == "IMMUTABLE_OPENING_SNAPSHOT"
+                else "Recorded Coinbase BTC-USD closed one-minute candles"
+            ),
+            "journal_persistence_pending": fallback_used,
+            "fallback_kind": fallback_kind,
+            "latest_bar_start": bars[-1]["start"] if bars else None,
+            "candle_diagnostics": {
+                "queried_rows": len(rows),
+                "valid_unique_candles": len(unique),
+                "invalid_payloads": invalid_payloads,
+                "database_path": str(self.path),
+            },
+            "reason": (
+                None
+                if bars
+                else "RECORDED_CANDLE_PAYLOADS_INVALID"
+                if rows
+                else "NO_MATCHING_RECORDED_CANDLES"
+            ),
+            "note": "Markers are append-only receipt-time records. Chart history is not an official settlement index.",
+        }
+
     @staticmethod
     def _minute_memory_payload(state):
         """Compact as-of intelligence evidence; no outcome or model mutation."""
@@ -1503,9 +2115,26 @@ class Journal:
             except OSError:
                 sizes[label + "_bytes"] = 0
         total = sizes["database_bytes"] + sizes["wal_bytes"]
+        try:
+            disk = shutil.disk_usage(path.parent)
+            free_bytes = disk.free
+            used_ratio = disk.used / disk.total if disk.total else 1.0
+        except OSError:
+            disk = None
+            free_bytes = None
+            used_ratio = None
+        critical = (
+            free_bytes is not None
+            and (free_bytes < 5 * 1024**3 or used_ratio >= 0.90)
+        )
         return {
             **sizes, "total_mib": round(total / 1048576, 2),
-            "status": "HIGH_STORAGE_PRESSURE" if total >= 2 * 1024**3 else "NORMAL",
+            "filesystem_total_bytes": disk.total if disk else None,
+            "filesystem_free_bytes": free_bytes,
+            "filesystem_used_percent": round(used_ratio * 100, 2)
+            if used_ratio is not None else None,
+            "status": "CRITICAL_DISK_PRESSURE" if critical else
+            "HIGH_STORAGE_PRESSURE" if total >= 2 * 1024**3 else "NORMAL",
             "note": "Existing history is preserved; new prediction evidence uses bounded compact rows",
         }
 
@@ -1532,6 +2161,7 @@ class Journal:
                 key: market.get(key) for key in (
                     "ticker", "opens_at", "closes_at", "strike", "mapping_verified",
                     "comparison_operator", "averaging_rule_verified", "observed_at", "quotes",
+                    "fee_multiplier", "fee_type",
                 ) if market.get(key) is not None
             },
             "reference": {
@@ -1592,6 +2222,10 @@ class Journal:
         market = state["market"]
         capture_learning = self._learning_sample_due(state)
         with self.connect() as db:
+            strategy_paper.record_and_resolve(
+                db, state, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+            )
+
             for card in state.get("market_strip", []):
                 try:
                     db.execute(
@@ -1957,6 +2591,37 @@ class Journal:
                     ),
                 )
 
+    def strategy_performance(self, asof=None):
+        """Paper-strategy summary, recomputed only when its inputs change.
+
+        strategy_paper.performance rereads and re-aggregates every paper signal
+        ever recorded; it ran on every prediction cycle and every /api/state
+        request, so its cost grew without bound with the journal. Both paper
+        tables are insert-only (UPDATE/DELETE abort via triggers) and
+        forecast_outcomes is insert-only, so the result is fully determined by
+        the newest row of each paper table, the official-outcome count and the
+        calendar day of ``asof`` (used only for today's P&L). A cache hit returns
+        an independent copy of exactly the value a full recomputation returns.
+        """
+        day = (timestamp(asof) if isinstance(asof, str) else asof or utcnow()).date()
+        with self.read() as db:
+            key = (
+                db.execute("SELECT MAX(rowid) FROM strategy_paper_signals").fetchone()[0],
+                db.execute("SELECT MAX(rowid) FROM strategy_paper_outcomes").fetchone()[0],
+                db.execute(
+                    "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
+                ).fetchone()[0],
+                day,
+            )
+            with self._strategy_cache_lock:
+                cached = self._strategy_cache
+            if cached is not None and cached[0] == key:
+                return deepcopy(cached[1])
+            value = strategy_paper.performance(db, asof=asof)
+        with self._strategy_cache_lock:
+            self._strategy_cache = (key, deepcopy(value))
+        return value
+
     def settle(self, ticker, yes_result, mode, observed_at=None):
         if yes_result not in {"yes", "no"}:
             return False
@@ -1981,11 +2646,20 @@ class Journal:
             if not rows:
                 break
             # Decode outside the writer lock. Preserve legacy mapping safeguards.
-            updates = [
-                (int(yes_result == "yes"), origin, seen, row["id"])
-                for row in rows
-                if json.loads(row["payload"])["market"].get("mapping_verified", True)
-            ]
+            updates = []
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload"])
+                    market = payload["market"]
+                    mapping_verified = market.get("mapping_verified", True)
+                except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+                    # Preserve malformed legacy evidence unchanged. One bad
+                    # payload must not prevent later, independently valid
+                    # predictions for the same official contract from being
+                    # reconciled and scored.
+                    continue
+                if mapping_verified is True:
+                    updates.append((int(yes_result == "yes"), origin, seen, row["id"]))
             with self.connect() as db:
                 db.executemany(
                     "UPDATE predictions SET settlement_up=?,settlement_origin=?,settled_at=? WHERE id=?",
@@ -2067,6 +2741,87 @@ class Journal:
             )
         return len(rows)
 
+    def backfill_contract_summaries(self, limit=20):
+        """Resume bounded derived summaries without scanning prediction blobs.
+
+        Immutable forecasts and openings are never updated. A keyset cursor in
+        ``dashboard_migrations`` keeps every maintenance pass restart-safe and
+        bounded on multi-gigabyte live journals.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Contract summary backfill limit must be 1..100")
+        with self.connect() as db:
+            saved = db.execute(
+                "SELECT value FROM dashboard_migrations WHERE name=?",
+                (CONTRACT_SUMMARY_MIGRATION,),
+            ).fetchone()
+            if saved and saved[0] == "complete":
+                return {"status": "COMPLETE", "processed": 0}
+            try:
+                cursor = json.loads(saved[0]) if saved else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                cursor = {}
+            phase = cursor.get("phase", "predictions")
+            mode, ticker = cursor.get("mode", ""), cursor.get("ticker", "")
+            processed = 0
+            while processed < limit:
+                table = (
+                    "btc_engine_predictions"
+                    if phase == "predictions"
+                    else "btc_engine_opening"
+                )
+                rows = db.execute(
+                    f"""SELECT mode,ticker,MIN(closes_at) AS closes_at
+                        FROM {table}
+                        WHERE mode>? OR (mode=? AND ticker>?)
+                        GROUP BY mode,ticker ORDER BY mode,ticker LIMIT ?""",
+                    (mode, mode, ticker, limit - processed),
+                ).fetchall()
+                for row in rows:
+                    if phase == "predictions":
+                        revisions, latest_at, closes_at = db.execute(
+                            """SELECT COUNT(*),MAX(timestamp),MIN(closes_at)
+                               FROM btc_engine_predictions
+                               WHERE mode=? AND ticker=?""",
+                            (row["mode"], row["ticker"]),
+                        ).fetchone()
+                    else:
+                        revisions, latest_at, closes_at = 0, None, row["closes_at"]
+                    db.execute(
+                        """INSERT OR IGNORE INTO btc_engine_contracts
+                           (mode,ticker,closes_at,revisions,latest_at)
+                           VALUES (?,?,?,?,?)""",
+                        (row["mode"], row["ticker"], closes_at, revisions, latest_at),
+                    )
+                    mode, ticker = row["mode"], row["ticker"]
+                    processed += 1
+                if rows:
+                    break
+                if phase == "predictions":
+                    phase, mode, ticker = "openings", "", ""
+                    continue
+                db.execute(
+                    "INSERT OR REPLACE INTO dashboard_migrations(name,value) VALUES (?,?)",
+                    (CONTRACT_SUMMARY_MIGRATION, "complete"),
+                )
+                return {"status": "COMPLETE", "processed": processed}
+            db.execute(
+                "INSERT OR REPLACE INTO dashboard_migrations(name,value) VALUES (?,?)",
+                (
+                    CONTRACT_SUMMARY_MIGRATION,
+                    json.dumps(
+                        {"phase": phase, "mode": mode, "ticker": ticker},
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            return {
+                "status": "IN_PROGRESS",
+                "processed": processed,
+                "phase": phase,
+                "cursor": {"mode": mode, "ticker": ticker},
+            }
+
     def record_feeds(self, coverage):
         with self.connect() as db:
             for name, feed in coverage.items():
@@ -2088,7 +2843,7 @@ class Journal:
                 "WHERE status='EXPERIMENTAL' AND probability_up IS NOT NULL AND outcome IS NOT NULL"
             ).fetchall()
             opening_rows = db.execute(
-                """SELECT o.up,f.outcome FROM btc_engine_opening o
+                """SELECT o.up,o.payload,f.outcome FROM btc_engine_opening o
                 JOIN forecast_outcomes f ON f.ticker=o.ticker AND f.origin='official'
                 WHERE o.mode='PUBLIC MARKET DATA' AND o.up IS NOT NULL
                 ORDER BY o.generated_at"""
@@ -2111,13 +2866,20 @@ class Journal:
         for group in multi_asset.values():
             group["brier"] /= group["settled_samples"]
             group["status"] = "INSUFFICIENT_FOR_ASSET_MODEL_PROMOTION"
-        from .prediction_engine import direction_label
+        from .prediction_engine import recorded_opening_direction
+
+        def saved_direction(row):
+            try:
+                value = json.loads(row["payload"]) if row["payload"] else {"up": row["up"]}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {"up": row["up"]}
+            return recorded_opening_direction(value)
 
         opening_directional = [
-            row for row in opening_rows if direction_label(row["up"]) in {"UP", "DOWN"}
+            row for row in opening_rows if saved_direction(row) in {"UP", "DOWN"}
         ]
         opening_correct = sum(
-            (direction_label(row["up"]) == "UP") == bool(row["outcome"])
+            (saved_direction(row) == "UP") == bool(row["outcome"])
             for row in opening_directional
         )
         opening_accuracy = {
@@ -2128,6 +2890,40 @@ class Journal:
             if opening_directional else None,
             "accuracy_interval": wilson(opening_correct, len(opening_directional))
             if opening_directional else None,
+            "policy": "Past official outcomes only; current/future outcomes never enter a frozen opening",
+        }
+        # Evidence for the statistical-fallback quality guard. It must judge the
+        # fallback on its own record only (never on a candidate model's calls),
+        # and it must keep accumulating after the guard fires. Saved directions
+        # become UNCLEAR once suppressed, so scoring them would freeze the guard
+        # on stale evidence forever. The immutable recorded probability still
+        # implies a direction, which is the fallback's genuine forecast.
+        from .prediction_engine import direction_label
+
+        def fallback_record(row):
+            try:
+                value = json.loads(row["payload"]) if row["payload"] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {}
+            model = str(value.get("model") or "opening24h-zero-drift-final-average-v1")
+            return model.startswith("opening24h-zero-drift")
+
+        fallback_directional = [
+            row for row in opening_rows
+            if fallback_record(row) and direction_label(row["up"]) in {"UP", "DOWN"}
+        ]
+        fallback_correct = sum(
+            (direction_label(row["up"]) == "UP") == bool(row["outcome"])
+            for row in fallback_directional
+        )
+        fallback_accuracy = {
+            "directional_samples": len(fallback_directional),
+            "correct": fallback_correct,
+            "accuracy": fallback_correct / len(fallback_directional)
+            if fallback_directional else None,
+            "accuracy_interval": wilson(fallback_correct, len(fallback_directional))
+            if fallback_directional else None,
+            "scope": "Statistical fallback openings only; probability-implied direction, including openings whose displayed call was withheld",
             "policy": "Past official outcomes only; current/future outcomes never enter a frozen opening",
         }
         return {
@@ -2148,6 +2944,7 @@ class Journal:
             },
             "multi_asset_opening_learning": multi_asset,
             "opening_forward_accuracy": opening_accuracy,
+            "opening_fallback_forward_accuracy": fallback_accuracy,
             "opening_training_coverage": opening_coverage,
             "reason": (
                 f"{count} official outcomes recorded; "
@@ -2156,6 +2953,77 @@ class Journal:
                 "Missing historical features are not reconstructed from later data. "
                 "Minimum count is not evidence of skill."
             ),
+        }
+
+    DISPLAYABLE_OPENING_CONFIDENCE = {
+        "CALIBRATED",
+        "EXPERIMENTAL CALIBRATED CANDIDATE",
+    }
+
+    def verified_opening_scoreboard(self):
+        """Verified live AI performance: immutable opening calls the dashboard
+        actually showed as UP/DOWN, matched with official Kalshi settlements.
+
+        A call counts only when its saved immutable record says UP or DOWN, its
+        confidence status was explicitly displayable/calibrated, and its
+        probability agrees with the side. WAIT/UNCLEAR, unsettled contracts,
+        replay records, duplicates and invalid records are excluded and counted
+        separately. Retrospective research predictions never enter.
+        """
+        with self.read() as db:
+            rows = db.execute(
+                """SELECT b.ticker,b.generated_at,b.up,b.payload,f.outcome
+                FROM btc_engine_opening b
+                LEFT JOIN forecast_outcomes f ON f.ticker=b.ticker AND f.origin='official'
+                WHERE b.mode='PUBLIC MARKET DATA'
+                ORDER BY b.generated_at,b.ticker"""
+            ).fetchall()
+        seen, correct, wrong = set(), 0, 0
+        excluded = {"wait_or_no_call": 0, "unsettled": 0, "invalid": 0, "duplicate": 0}
+        first = last = None
+        for ticker, generated_at, up, payload, outcome in rows:
+            if ticker in seen:
+                excluded["duplicate"] += 1
+                continue
+            seen.add(ticker)
+            try:
+                saved = json.loads(payload) if payload else {}
+            except (TypeError, ValueError):
+                excluded["invalid"] += 1
+                continue
+            direction = saved.get("direction")
+            status = (saved.get("confidence") or {}).get("status")
+            if direction not in {"UP", "DOWN"} or status not in self.DISPLAYABLE_OPENING_CONFIDENCE:
+                excluded["wait_or_no_call"] += 1
+                continue
+            if (
+                type(up) not in (int, float)
+                or not math.isfinite(up)
+                or not 0 <= up <= 1
+                or (direction == "UP") != (up >= 0.5)
+            ):
+                excluded["invalid"] += 1
+                continue
+            if outcome not in (0, 1):
+                excluded["unsettled"] += 1
+                continue
+            if (direction == "UP") == bool(outcome):
+                correct += 1
+            else:
+                wrong += 1
+            first = first or generated_at
+            last = generated_at
+        total = correct + wrong
+        return {
+            "correct": correct,
+            "wrong": wrong,
+            "verified_calls": total,
+            "accuracy": correct / total if total else None,
+            "accuracy_interval_95": wilson(correct, total) if total else None,
+            "excluded": excluded,
+            "first_call_at": first,
+            "last_call_at": last,
+            "scope": "Immutable live opening calls shown as UP/DOWN, matched to official Kalshi settlements only",
         }
 
     def quick_learning_summary(self):
@@ -2169,7 +3037,7 @@ class Journal:
                 "SELECT COUNT(*) FROM forecast_outcomes WHERE origin='official'"
             ).fetchone()[0]
             openings = db.execute(
-                """SELECT b.up,o.outcome FROM btc_engine_opening b
+                """SELECT b.up,b.payload,o.outcome FROM btc_engine_opening b
                 JOIN forecast_outcomes o ON o.ticker=b.ticker AND o.origin='official'
                 WHERE b.mode='PUBLIC MARKET DATA' AND b.up IS NOT NULL"""
             ).fetchall()
@@ -2177,13 +3045,36 @@ class Journal:
                 "SELECT COUNT(*),COALESCE(SUM(samples),0),MAX(last_observed_at) "
                 "FROM intelligence_minute_memory"
             ).fetchone()
-        from .prediction_engine import direction_label, wilson_interval
+        from .prediction_engine import recorded_opening_direction, wilson_interval
 
-        directional = [row for row in openings if direction_label(row[0]) in {"UP", "DOWN"}]
+        def saved_direction(row):
+            try:
+                value = json.loads(row[1]) if row[1] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {}
+            value.setdefault("up", row[0])
+            return recorded_opening_direction(value)
+
+        directional = [row for row in openings if saved_direction(row) in {"UP", "DOWN"}]
         correct = sum(
-            (direction_label(row[0]) == "UP") == bool(row[1]) for row in directional
+            (saved_direction(row) == "UP") == bool(row[2]) for row in directional
         )
         total = len(directional)
+        cohort_rows = []
+        for row in openings:
+            try:
+                payload = json.loads(row[1]) if row[1] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if payload.get("score_cohort") == "verified-opening-policy-v2":
+                cohort_rows.append(row)
+        cohort_directional = [
+            row for row in cohort_rows if saved_direction(row) in {"UP", "DOWN"}
+        ]
+        cohort_correct = sum(
+            (saved_direction(row) == "UP") == bool(row[2]) for row in cohort_directional
+        )
+        cohort_total = len(cohort_directional)
         return {
             "recorded_markets": cycle[0],
             "timestamped_prediction_revisions": cycle[1],
@@ -2194,12 +3085,30 @@ class Journal:
             "incorrect_directional_openings": total - correct,
             "opening_directional_accuracy": correct / total if total else None,
             "opening_accuracy_interval": wilson_interval(correct, total),
+            "directional_coverage": total / len(openings) if openings else None,
+            "wait_openings": len(openings) - total,
             "unclear_openings": len(openings) - total,
+            "current_policy": {
+                "cohort": "verified-opening-policy-v2",
+                "settled_openings": len(cohort_rows),
+                "directional_opening_calls": cohort_total,
+                "correct_directional_openings": cohort_correct,
+                "incorrect_directional_openings": cohort_total - cohort_correct,
+                "wait_openings": len(cohort_rows) - cohort_total,
+                "directional_accuracy": cohort_correct / cohort_total
+                if cohort_total
+                else None,
+                "accuracy_interval": wilson_interval(cohort_correct, cohort_total),
+                "directional_coverage": cohort_total / len(cohort_rows)
+                if cohort_rows
+                else None,
+                "historical_rows_rewritten": False,
+            },
             "minute_memory_records": memory[0],
             "second_level_samples": memory[1],
             "last_learning_observation": memory[2],
             "status": "DESCRIPTIVE_ONLY_EDGE_UNVERIFIED",
-            "note": "Official outcomes and immutable opening records only. Accuracy is descriptive, not a profitability claim.",
+            "note": "Official outcomes and immutable opening records only. The current-policy cohort starts with forecasts generated by that policy; lifetime history is preserved. Accuracy is descriptive, not a profitability claim.",
         }
 
     def opening_inputs(self, opened):
@@ -2218,6 +3127,101 @@ class Journal:
             "received_at": max((r[2] for r in rows), default=opened.isoformat()),
         }
 
+    OPENING_QUOTE_WINDOW_SECONDS = 120
+    OPENING_PREOPEN_QUOTE_SECONDS = 60
+
+    @classmethod
+    def _safe_quote_quality(cls, *args):
+        """Diagnostics must never stop a quote the recorder would have kept."""
+        try:
+            return cls._quote_quality(*args)
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"quote_quality_error": type(exc).__name__}
+
+    @staticmethod
+    def _quote_quality(market, up, down, up_ask, down_ask):
+        """Explicit evidence for research (Phase 5); never infers a missing side.
+
+        executable: the market status is open/active and the ask is strictly
+        inside (0, 1). Sizes are proven only when the source reported them
+        (order book / stream); listing quotes carry no depth and are labelled
+        SIZE_UNKNOWN rather than treated as proven liquidity.
+        """
+        from .edge_scanner import quantity_fee
+
+        def size(side):
+            value = side.get("ask_size")
+            return float(value) if type(value) in (int, float) and math.isfinite(value) and value > 0 else None
+
+        tradable = str(market.get("status", "")).lower() in {"open", "active"}
+        up_size, down_size = size(up), size(down)
+        multiplier = market.get("fee_multiplier")
+        fees = {}
+        for name, ask in (("up", up_ask), ("down", down_ask)):
+            try:
+                fees[name] = quantity_fee(ask, 1, multiplier)
+            except (TypeError, ValueError):
+                fees[name] = None
+        bid = up.get("bid")
+        return {
+            "quote_quality_version": 1,
+            "market_status": market.get("status"),
+            "quote_source": "DEPTH_REPORTED" if (up_size or down_size) else "LISTING_SIZE_UNKNOWN",
+            "executable": {
+                "up": tradable and 0 < up_ask < 1,
+                "down": tradable and 0 < down_ask < 1,
+            },
+            "ask_size_proven": {"up": up_size, "down": down_size},
+            "up_spread": (round(up_ask - bid, 6)
+                          if type(bid) in (int, float) and 0 <= bid <= up_ask else None),
+            "taker_fee_one_contract": fees,
+            "fee_multiplier_recorded": type(multiplier) in (int, float),
+            "observed_not_inferred": True,
+        }
+
+    def record_opening_quote(self, market, mode, now):
+        """Append one executable Kalshi quote observed early in a contract.
+
+        Only quotes received during the first two minutes after the opening
+        are kept, with their own receipt/event times and the fee schedule, so
+        later research can price opening calls without guessing. Quotes older
+        than 5 s at receipt, inconsistent books or missing asks are skipped,
+        never zero-filled. Rows are append-only.
+        """
+        try:
+            opened = timestamp(market["opens_at"])
+            observed = timestamp(market["observed_at"])
+            seconds = (observed - opened).total_seconds()
+            # From 60 s before the opening (the next contract is already listed)
+            # through two minutes after it.
+            if not -self.OPENING_PREOPEN_QUOTE_SECONDS <= seconds <= self.OPENING_QUOTE_WINDOW_SECONDS:
+                return False
+            if not 0 <= (now - observed).total_seconds() <= 5:
+                return False
+            quotes = market["quotes"]
+            up, down = quotes["up"], quotes["down"]
+            up_ask, down_ask = float(up["ask"]), float(down["ask"])
+            if not (0 < up_ask < 1 and 0 < down_ask < 1):
+                return False
+            row = (
+                mode, market["ticker"], observed.isoformat(), opened.isoformat(), seconds,
+                up.get("bid"), up_ask, down.get("bid"), down_ask,
+                up.get("ask_size"), down.get("ask_size"),
+                market.get("fee_multiplier"), market.get("fee_type"),
+                market.get("quote_event_time"),
+                json.dumps({"quotes": quotes, "received_at": observed.isoformat(),
+                            "recorded_at": now.isoformat(),
+                            **self._safe_quote_quality(market, up, down, up_ask, down_ask)},
+                           allow_nan=False),
+            )
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return False
+        with self.connect() as db:
+            return db.execute(
+                "INSERT OR IGNORE INTO opening_quote_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                row,
+            ).rowcount == 1
+
     def opening_snapshot(self, ticker, mode):
         with self.read() as db:
             row = db.execute(
@@ -2229,41 +3233,140 @@ class Journal:
     def freeze_opening_snapshot(
         self, market, mode, history, reference_points, reference_source, captured_at, finalized
     ):
-        """Persist receipt-proven opening inputs independently from live freshness."""
+        """Persist one receipt-proven snapshot at/after open; never rewrite it."""
         opened = timestamp(market["opens_at"])
+        if captured_at < opened:
+            raise ValueError("Opening snapshot cannot be persisted before contract start")
+        if not finalized:
+            raise ValueError("Only final immutable opening snapshots may be persisted")
         points = [
             [when.isoformat(), price]
             for when, price in reference_points
-            if when <= opened
+            if when < opened
         ]
+        cutoff_candidates = [timestamp(history["received_at"])] if history.get("received_at") else []
+        cutoff_candidates.extend(timestamp(point[0]) for point in points)
+        cutoff_candidates = [value for value in cutoff_candidates if value < opened]
         payload = {
             "ticker": market["ticker"],
             "opens_at": opened.isoformat(),
             "captured_at": captured_at.isoformat(),
             "data_cutoff": opened.isoformat(),
+            "input_data_cutoff": max(cutoff_candidates).isoformat()
+            if cutoff_candidates else None,
             "history": history,
             "reference_points": points,
             "reference_source": reference_source,
             "finalized": bool(finalized),
             "future_data_excluded": True,
+            "contract_rule_snapshot": market.get("contract_rule_snapshot", {
+                "rule_status": "UNAVAILABLE_AT_OPEN"
+            }),
         }
         with self.connect() as db:
             existing = db.execute(
                 "SELECT finalized,payload FROM opening_input_snapshots WHERE mode=? AND ticker=?",
                 (mode, market["ticker"]),
             ).fetchone()
-            if existing and existing[0]:
+            if existing:
                 return json.loads(existing[1])
             db.execute(
                 """INSERT INTO opening_input_snapshots
-                   (mode,ticker,opens_at,captured_at,finalized,payload) VALUES (?,?,?,?,?,?)
-                   ON CONFLICT(mode,ticker) DO UPDATE SET
-                     captured_at=excluded.captured_at,finalized=excluded.finalized,payload=excluded.payload
-                   WHERE opening_input_snapshots.finalized=0""",
+                   (mode,ticker,opens_at,captured_at,finalized,payload)
+                   VALUES (?,?,?,?,?,?) ON CONFLICT(mode,ticker) DO NOTHING""",
                 (mode, market["ticker"], opened.isoformat(), captured_at.isoformat(),
                  int(bool(finalized)), json.dumps(payload, allow_nan=False)),
             )
-        return payload
+            saved = db.execute(
+                "SELECT payload FROM opening_input_snapshots WHERE mode=? AND ticker=?",
+                (mode, market["ticker"]),
+            ).fetchone()
+        return json.loads(saved[0])
+
+    # A recovered receipt is trusted only if it was written to the journal
+    # promptly after it was received: a row persisted long after its receipt
+    # time cannot prove it was available before the opening.
+    PREOPEN_PERSIST_SLACK_SECONDS = 10
+    PREOPEN_REFERENCE_WINDOW_SECONDS = 65
+
+    def record_preopen_references(self, ticks, mode, persisted_at):
+        """Append pre-opening BTC reference receipts (source, receipt time, price)."""
+        rows = []
+        for source, received, price, opens_at in ticks:
+            if not (type(price) in (int, float) and math.isfinite(price) and price > 0):
+                continue
+            if received > opens_at or (opens_at - received).total_seconds() > 70:
+                continue
+            rows.append((mode, source, received.isoformat(), float(price), opens_at.isoformat(),
+                         persisted_at.isoformat()))
+        if not rows:
+            return 0
+        with self.connect() as db:
+            return db.executemany(
+                "INSERT OR IGNORE INTO preopen_reference_ticks VALUES (?,?,?,?,?,?)", rows
+            ).rowcount
+
+    def preopen_reference_points(self, opened, mode):
+        """Receipt-proven pre-opening reference points for crash recovery.
+
+        Same selection as LiveEstimator.opening_points (latest receipt, then
+        most points, within 65 s before the opening). A row is rejected when
+        its receipt is after the opening, outside the window, or it was
+        persisted more than PREOPEN_PERSIST_SLACK_SECONDS after its receipt.
+        Returns ([(received_at, price), ...], source, diagnostics).
+        """
+        start = opened - timedelta(seconds=self.PREOPEN_REFERENCE_WINDOW_SECONDS)
+        by_source, rejected = {}, {}
+        with self.read() as db:
+            tables = {n for (n,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "preopen_reference_ticks" not in tables:
+                return [], None, {"status": "TABLE_ABSENT"}
+            found = db.execute(
+                "SELECT source,received_at,price,persisted_at FROM preopen_reference_ticks "
+                "WHERE mode=? AND opens_at=? ORDER BY received_at",
+                (mode, opened.isoformat()),
+            ).fetchall()
+        for source, received_at, price, persisted_at in found:
+            try:
+                received, persisted = timestamp(received_at), timestamp(persisted_at)
+                value = float(price)
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                rejected["UNPARSEABLE"] = rejected.get("UNPARSEABLE", 0) + 1
+                continue
+            if received > opened:
+                reason = "RECEIVED_AFTER_OPENING"
+            elif received < start:
+                reason = "OUTSIDE_65S_WINDOW"
+            elif (persisted - received).total_seconds() > self.PREOPEN_PERSIST_SLACK_SECONDS:
+                reason = "PERSISTED_TOO_LATE_TO_PROVE_AVAILABILITY"
+            elif not (math.isfinite(value) and value > 0):
+                reason = "INVALID_PRICE"
+            else:
+                by_source.setdefault(source, []).append((received, value))
+                continue
+            rejected[reason] = rejected.get(reason, 0) + 1
+        diagnostics = {"status": "RECOVERED" if by_source else "NO_VERIFIABLE_RECEIPTS",
+                       "rows": len(found), "rejected": rejected}
+        if not by_source:
+            return [], None, diagnostics
+        source, points = max(by_source.items(), key=lambda item: (item[1][-1][0], len(item[1])))
+        diagnostics.update(source=source, points=len(points), latest_received_at=points[-1][0].isoformat())
+        return points, source, diagnostics
+
+    def recent_openings(self, mode, limit=12):
+        """Most recent immutable opening payloads, oldest first (read only)."""
+        with self.read() as db:
+            rows = db.execute(
+                "SELECT payload FROM btc_engine_opening WHERE mode=? ORDER BY cutoff DESC LIMIT ?",
+                (mode, int(limit)),
+            ).fetchall()
+        out = []
+        for (payload,) in reversed(rows):
+            try:
+                out.append(json.loads(payload))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def opening_record(self, ticker, mode, candidate=None, wall_now=None):
         with self.read() if candidate is None else self.connect() as db:
@@ -2497,7 +3600,7 @@ class Journal:
                     opening_verified = False
 
             direction = (
-                prediction_engine.direction_label(probability)
+                prediction_engine.recorded_opening_direction(opening)
                 if opening_verified
                 else "UNCLEAR"
             )

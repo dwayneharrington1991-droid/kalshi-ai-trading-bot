@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from decimal import Decimal
 from pathlib import Path
 import re
+import math
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, parse_qs
 from time import perf_counter, monotonic
 import uuid
@@ -23,6 +27,11 @@ from .account_state import (
 )
 from .scanner import context as scanner_context, qualify as scanner_qualify
 from .decision import assess as trade_decision
+from .decision_coordinator import coordinate as coordinate_intelligence
+from .news_intelligence import classify as classify_news
+from .contract_rules import snapshot as contract_rule_snapshot
+from .settlement_probability import estimate as settlement_probability
+from .fair_value import compare as compare_fair_value
 from .market_health import selection_summary, diagnose as diagnose_market
 from .prediction_engine import (
     view as engine_view,
@@ -35,17 +44,209 @@ from .live_model import LiveEstimator
 from .learning import load_artifact, predict as learned_predict
 from .model import Display, timestamp
 from .monitor import Journal, PublicFeed, ReplayFeed, active_market, analyze, utcnow
-from .runtime import CachedReport, LatestPayload, RuntimeMeter
+from .runtime import CachedReport, LatestPayload, RuntimeMeter, background_pool, background_thread_priority
 from .intelligence import MarketIntelligence
 from .comparison import model_market
 from .alerts import MonitoringAlerts, risk_alerts
 from .scalp_monitor import diagnose as diagnose_scalp, ScalpCriteria
 from .advanced import AdvancedIntelligence, attach_reliability, refresh_status
 from .edge_scanner import calculate as calculate_edge_scanner, performance as edge_performance
+from .strategy_paper import evaluate as evaluate_dual_strategy
 from .multi_asset import MarketStrip
 
-OPENING_PRELOAD_SECONDS = 120
 OPENING_INPUT_GRACE_SECONDS = 120
+# Pre-opening reference receipts persisted for crash recovery (opening uses 65 s).
+PREOPEN_PERSIST_SECONDS = 70
+# Same limit context24 applies to an opening's candle receipt.
+CANDLE_CACHE_STALE_SECONDS = 150
+# KXBTC15M contracts open on quarter-hour boundaries. Measured 2026-11-20 from
+# public listings: the new contract is active with its published threshold
+# within about one second of the boundary. Polling faster only in this short
+# window lets the immutable opening appear sooner; inputs stay cut off at open.
+CONTRACT_PERIOD_SECONDS = 900
+ROLLOVER_FAST_POLL_WINDOW_SECONDS = 6.0
+ROLLOVER_FAST_POLL_SECONDS = 0.25
+
+
+def collector_wait_seconds(now_epoch, elapsed, poll_seconds):
+    """Seconds the public collector waits before its next poll.
+
+    Normally ``poll_seconds - elapsed``. In the first seconds after a
+    quarter-hour boundary the wait is capped at 0.25 s, and a wait that would
+    cross the next boundary is shortened to wake just after it. Never negative.
+    """
+    wait = max(0.0, poll_seconds - elapsed)
+    since = now_epoch % CONTRACT_PERIOD_SECONDS
+    if since < ROLLOVER_FAST_POLL_WINDOW_SECONDS:
+        wait = min(wait, ROLLOVER_FAST_POLL_SECONDS)
+    until_next = CONTRACT_PERIOD_SECONDS - since
+    if until_next < wait:
+        wait = until_next + 0.05
+    return max(0.0, wait)
+
+
+def candle_integrity_report(source, observed_at):
+    """Describe one published candle snapshot against its own immutable cutoff.
+
+    Collector and HTTP workers run independently. Grading the previous
+    collector snapshot against the request's newer wall-clock minute creates a
+    false 1439/1440 gap at minute rollover. ``window_cutoff`` is the exact
+    window the collector asked providers to fill; older payloads derive it
+    from their receipt timestamp for compatibility.
+
+    Status precedence (most severe first):
+      INVALID    - the snapshot's own timestamps are impossible (a cutoff later
+                   than the request clock or than its receipt, a receipt in the
+                   future, or a window more than 24 h old). Never deployable.
+      STALE      - no receipt timestamp, or the cutoff is older than 120 s, or
+                   the receipt is older than the 150 s opening freshness limit.
+                   A stale collector is never deployable, complete or not.
+      INCOMPLETE - fresh, but a bar is missing, duplicated, unaligned,
+                   out of order, or outside the window.
+      READY      - fresh, exactly 1,440 unique, ordered, aligned bars.
+    """
+    source = source if isinstance(source, dict) else {}
+    wall_cutoff = int(observed_at.timestamp()) // 60 * 60
+    try:
+        received = timestamp(source["received_at"])
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        received = None
+    try:
+        snapshot_cutoff = int(source.get("window_cutoff"))
+        cutoff_source = "collector_window_cutoff"
+    except (TypeError, ValueError, OverflowError):
+        cutoff_source = "received_at_compatibility_fallback"
+        snapshot_cutoff = (
+            int(received.timestamp()) // 60 * 60 if received is not None else wall_cutoff
+        )
+    receipt_age = (
+        (observed_at - received).total_seconds() if received is not None else None
+    )
+    invalid_reasons = []
+    if snapshot_cutoff % 60:
+        invalid_reasons.append("window_cutoff is not minute-aligned")
+    if snapshot_cutoff > wall_cutoff:
+        invalid_reasons.append("window_cutoff is later than the request clock")
+    elif wall_cutoff - snapshot_cutoff > 86400:
+        invalid_reasons.append("window_cutoff is more than 24 h old")
+    if received is not None:
+        # Clock skew allowance between collector and HTTP worker threads is
+        # zero in-process; allow 5 s for monotonic/wall adjustments only.
+        if receipt_age < -5:
+            invalid_reasons.append("received_at is in the future")
+        if snapshot_cutoff > int(received.timestamp()) // 60 * 60:
+            # A window ending after its own receipt would claim bars that had
+            # not closed when the data arrived (future-data leakage).
+            invalid_reasons.append("window_cutoff is later than its receipt")
+    cutoff_valid = not invalid_reasons
+    starts, invalid = [], 0
+    for raw in source.get("candles", []):
+        try:
+            start = int(raw["start"])
+            if start % 60:
+                raise ValueError("unaligned")
+            starts.append(start)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            invalid += 1
+    unique = sorted(set(starts))
+    # Measured on the provider order before any sorting, so a reordered
+    # publication is visible instead of being silently repaired.
+    out_of_order = starts != sorted(starts)
+    expected = list(range(snapshot_cutoff - 86400, snapshot_cutoff, 60))
+    expected_set = set(expected)
+    unique_set = set(unique)
+    missing = [stamp for stamp in expected if stamp not in unique_set]
+    unexpected = [stamp for stamp in unique if stamp not in expected_set]
+    age = wall_cutoff - snapshot_cutoff if cutoff_valid else None
+    stale_reasons = []
+    if cutoff_valid:
+        if received is None:
+            stale_reasons.append("no receipt timestamp")
+        elif receipt_age > CANDLE_CACHE_STALE_SECONDS:
+            stale_reasons.append(
+                f"receipt {receipt_age:.0f}s old > {CANDLE_CACHE_STALE_SECONDS}s"
+            )
+        if age > OPENING_INPUT_GRACE_SECONDS:
+            stale_reasons.append(f"cutoff {age}s old > {OPENING_INPUT_GRACE_SECONDS}s")
+    structurally_ready = bool(
+        cutoff_valid and not missing and not unexpected and len(starts) == 1440
+        and len(unique) == 1440 and not invalid and not out_of_order
+    )
+    status = (
+        "INVALID" if not cutoff_valid
+        else "STALE" if stale_reasons
+        else "READY" if structurally_ready
+        else "INCOMPLETE"
+    )
+    diagnostics = source.get("diagnostics", {})
+    return {
+        "status": status,
+        "invalid_reasons": invalid_reasons,
+        "stale_reasons": stale_reasons,
+        "cutoff": snapshot_cutoff,
+        "wall_clock_cutoff": wall_cutoff,
+        "snapshot_age_seconds": age,
+        "cache_age_seconds": round(receipt_age, 3) if receipt_age is not None else None,
+        "stale_after_seconds": CANDLE_CACHE_STALE_SECONDS,
+        "cutoff_source": cutoff_source,
+        "interval_seconds": 60,
+        "received_at": source.get("received_at"),
+        "starts": unique,
+        "bars": len(starts),
+        "unique_bars": len(unique),
+        "duplicate_bars": len(starts) - len(unique),
+        "invalid_bars": invalid,
+        "out_of_order": out_of_order,
+        "missing_intervals": missing,
+        "unexpected_intervals": unexpected,
+        "recovery": {
+            "attempts": diagnostics.get("provider_attempts", []),
+            "backoffs": diagnostics.get("provider_backoffs", []),
+            "next_retry_at": diagnostics.get("next_retry_at"),
+            "reason": diagnostics.get("reason"),
+        },
+        "diagnostics": diagnostics,
+        "note": (
+            "Timestamp-only integrity evidence for the collector's published "
+            "snapshot; no prices, credentials, account data, or historical rows "
+            "are exposed."
+        ),
+    }
+
+
+def process_prediction_frame(monitor, feed, collected):
+    """Process one latest-value frame and isolate recoverable enrichment faults.
+
+    Returning the exception type to worker telemetry keeps the live thread
+    running without exposing provider payloads or exception messages.
+    """
+    base, started, completed, duration = collected
+    try:
+        if isinstance(base, Exception):
+            monitor.tick(collected)
+        else:
+            enriched = feed.enriched(base, utcnow())
+            monitor.tick((enriched, started, completed, duration))
+    except Exception as exc:
+        monitor.runtime_meter.error("prediction", type(exc).__name__)
+        return exc
+    return None
+
+
+def _eligible_bar_count(item, opened):
+    """Closed one-minute bars in the 24 h window that were received by the opening."""
+    try:
+        received = timestamp(item["received_at"])
+        # Same arithmetic as before; the per-bar constants are computed once.
+        limit = min(opened.timestamp(), received.timestamp())
+        floor = opened.timestamp() - 86520
+        return sum(
+            1 for bar in item.get("candles", [])
+            if int(bar["start"]) + 60 <= limit
+            and int(bar["start"]) >= floor
+        )
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return -1
 
 
 class Monitor:
@@ -64,13 +265,38 @@ class Monitor:
         account_client=None,
         account_store=None,
         model_registry=None,
+        learning_status_path=None,
         opening_model_artifact=None,
         build_commit="unknown",
         startup_update=None,
     ):
         startup_update = startup_update or (lambda _stage, _message: None)
         self.feed, self.journal = feed, journal
+        self.opening_model_file_sha = _sha256_or_none(opening_model_artifact)   # the bytes this process loaded
+        # Keep the exact most recently collected candle payload on the monitor.
+        # PublicFeed owns asynchronous refreshes, but request handlers must not
+        # depend on its internal cache timing after a release restart.
+        self.latest_candles = None
+        # Receipt-proven histories are retained only across the imminent
+        # contract boundary. This prevents an after-open refresh or a
+        # transient journal lock from turning a truthful 1439/1440 snapshot
+        # into 0/1440. Nothing in this cache may be updated after its opening.
+        self.preopening_histories = {}
+        # Kraken order-flow observations received at or before each opening.
+        self.preopening_flow = {}
+        self.candle_lock = threading.Lock()
+        from .signal_chart import LiveTradeCandles
+
+        self.live_trade_chart = LiveTradeCandles()
         self.build_commit = build_commit
+        self.learning_status_path = (
+            Path(learning_status_path) if learning_status_path is not None else None
+        )
+        self.learning_status_cache = {
+            "status": "NOT_CONFIGURED" if learning_status_path is None else "NO_COMPLETED_CYCLE",
+            "reason": "No durable scheduled-learning result has been recorded yet",
+        }
+        self.learning_status_mtime = None
         self.target, self.stop, self.horizon = target, stop, horizon
         self.account_client = account_client
         self.account_candidate = None
@@ -157,10 +383,24 @@ class Monitor:
         startup_update("ANALYTICS", "Preparing advanced indicators and background evaluators")
         self.intelligence = MarketIntelligence()
         self.advanced = AdvancedIntelligence()
+        # R10-corrected inputs computed in parallel for research only (never live inputs).
+        self.r10_shadow = None
+        if getattr(journal, "path", None) and str(journal.path) != ":memory:":
+            from .r10_shadow import from_journal as _r10_shadow
+            self.r10_shadow = _r10_shadow(journal.path)
+        from .market_pulse import HorizonForecasts
+        self.pulse_horizons = HorizonForecasts()       # research-only short-horizon forecasts
         self.monitoring_alerts = MonitoringAlerts()
         self.market_strip = MarketStrip()
         self.last_proxy_observation = None
         self.runtime_meter = RuntimeMeter()
+        # Phone alerts for NEW calibrated UP/DOWN opening calls (signals only;
+        # no-op without private credentials; never blocks or fails a tick).
+        try:
+            from .phone_alerts import from_journal as _phone_alerts
+            self.phone_alerts = _phone_alerts(journal.path) if getattr(journal, "path", None) else None
+        except Exception:
+            self.phone_alerts = None
         self.worker_lock = threading.Lock()
         self.worker_status = {
             "collector": {"status": "NOT_STARTED", "last_started_at": None,
@@ -170,15 +410,11 @@ class Monitor:
         }
         self.worker_threads = {}
         self.index_maintenance = {"status": "PENDING"}
-        self.maintenance_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="settlement-results"
-        )
+        self.maintenance_pool = background_pool(1, "settlement-results")
         self.maintenance_job = None
         self.maintenance_error = None
         self.readiness_job = None
-        self.readiness_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="learning-readiness"
-        )
+        self.readiness_pool = background_pool(1, "learning-readiness")
         self.engine_report = CachedReport(
             self.prediction_performance, interval=30, name="prediction-performance"
         )
@@ -195,6 +431,9 @@ class Monitor:
         )
         self.quick_learning_report = CachedReport(
             self.journal.quick_learning_summary, interval=30, name="quick-learning-summary"
+        )
+        self.opening_scoreboard_report = CachedReport(
+            self.journal.verified_opening_scoreboard, interval=30, name="opening-scoreboard"
         )
         self.scheduled_learning = None
         self.scheduled_scalp_learning = None
@@ -215,6 +454,40 @@ class Monitor:
                 name="scheduled-scalp-shadow-evaluation",
             )
         startup_update("MONITOR_READY", "Intelligence monitor initialized")
+
+    def background_learning_status(self):
+        """Read the small atomic scheduler result without touching model state."""
+        path = self.learning_status_path
+        if path is None:
+            return dict(self.learning_status_cache)
+        try:
+            stat = path.stat()
+            if stat.st_size > 65536:
+                raise ValueError("status file exceeds bounded size")
+            if self.learning_status_mtime != stat.st_mtime_ns:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(value, dict) or value.get("automated_trading") != "DISABLED":
+                    raise ValueError("invalid learning status safety marker")
+                self.learning_status_cache = value
+                self.learning_status_mtime = stat.st_mtime_ns
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.learning_status_cache = {
+                "status": "STATUS_UNREADABLE",
+                "error_type": type(exc).__name__,
+                "reason": "Scheduled-learning status is unavailable; live inference continues independently",
+                "automated_trading": "DISABLED",
+            }
+        result = dict(self.learning_status_cache)
+        try:
+            finished = timestamp(result["finished_at"])
+            result["age_seconds"] = max(0, (utcnow() - finished).total_seconds())
+            result["stale"] = result["age_seconds"] > 26 * 3600
+        except (KeyError, ValueError, TypeError, AttributeError):
+            result["age_seconds"] = None
+            result["stale"] = True
+        return result
 
     def worker_event(self, name, event, error=None):
         with self.worker_lock:
@@ -272,6 +545,7 @@ class Monitor:
     def maintain_settlements(self, now):
         # Older settled forecasts may predate the compact review table. Process
         # a bounded batch in maintenance so live collection is never blocked.
+        self.journal.backfill_contract_summaries(limit=20)
         self.journal.backfill_contract_reviews(limit=20)
         self.journal.seed_settlement_queue()
         learned = False
@@ -293,6 +567,9 @@ class Monitor:
             self.engine_report.invalidate()
             self.research_report.invalidate()
             self.edge_report.invalidate()
+            scoreboard = getattr(self, "opening_scoreboard_report", None)
+            if scoreboard is not None:
+                scoreboard.invalidate()
             # Force the displayed official-label count to refresh immediately
             # after a new result instead of retaining the prior 60-second cache.
             self.readiness_at = None
@@ -316,6 +593,174 @@ class Monitor:
             self.settlement_check = now
             self.maintenance_job = self.maintenance_pool.submit(self.maintain_settlements, now)
 
+    def accept_candle_batch(self, payload, received_at=None):
+        """Publish and persist verified closed candles at the collector boundary.
+
+        Public candle preload and prediction run on separate workers. Keeping
+        this handoff before the prediction mailbox prevents a healthy 1,440-bar
+        preload from temporarily producing an empty chart. The journal keeps
+        the provider's original timestamps; signal markers remain independent
+        append-only receipts and are never synthesized here.
+        """
+        candles = payload.get("btc_candles") if isinstance(payload, dict) else None
+        if not isinstance(candles, dict) or not candles.get("candles"):
+            return False
+        observed = received_at or utcnow()
+        persisted = True
+        with self.candle_lock:
+            try:
+                self.journal.record_candles(candles, observed)
+            except Exception as exc:
+                # Disk pressure or a transient SQLite writer conflict must not
+                # kill the collector and freeze every live panel.  The exact
+                # provider candles remain available to the chart fallback,
+                # while health diagnostics explicitly report persistence loss.
+                self.runtime_meter.error("candle_persistence", type(exc).__name__)
+                persisted = False
+            try:
+                # The provider batch receipt defines its rolling window. This
+                # also keeps deterministic replay histories anchored to their
+                # original clock instead of the machine's current wall clock.
+                recovery_cutoff = candles.get("received_at") or observed
+                candles = self.journal.recover_recorded_candles(candles, recovery_cutoff)
+                payload["btc_candles"] = candles
+            except Exception as exc:
+                # A read lock/corrupt row never licenses a guessed candle. Keep
+                # the provider batch and expose the recovery failure.
+                diagnostics = dict(candles.get("diagnostics") or {})
+                diagnostics["journal_recovery"] = {
+                    "status": "UNAVAILABLE", "error_type": type(exc).__name__
+                }
+                candles = {**candles, "diagnostics": diagnostics}
+                payload["btc_candles"] = candles
+                self.runtime_meter.error("candle_recovery", type(exc).__name__)
+            self.latest_candles = candles
+        return persisted
+
+    def opening_reference_points(self, opened, mode):
+        """Pre-opening reference points: in-memory receipts first; only when
+        none exist (e.g. after a restart) the journal's receipt-proven
+        pre-opening ticks. Returns (points, source, recovery_diagnostics)."""
+        points, source = self.estimator.opening_points(opened)
+        if points:
+            return points, source, None
+        try:
+            recovered, recovered_source, diagnostics = self.journal.preopen_reference_points(opened, mode)
+        except sqlite3.OperationalError as exc:
+            self.runtime_meter.error("preopen_reference_recovery", type(exc).__name__)
+            return [], None, {"status": "STORAGE_UNAVAILABLE"}
+        if not recovered:
+            return [], None, diagnostics
+        return recovered, f"{recovered_source} [journal-recovered pre-opening receipts]", diagnostics
+
+    def archived_opening_inputs(self, opened):
+        """Journal archive of receipt-proven pre-opening candles, memoised for
+        5 s: the grace-window retries otherwise re-read it on every tick."""
+        cache = getattr(self, "_archive_cache", {})
+        wall = utcnow()
+        hit = cache.get(opened)
+        if hit and 0 <= (wall - hit[0]).total_seconds() < 5:
+            return hit[1]
+        value = self.journal.opening_inputs(opened)
+        self._archive_cache = {k: v for k, v in cache.items() if (wall - v[0]).total_seconds() < 60}
+        self._archive_cache[opened] = (wall, value)
+        return value
+
+    @staticmethod
+    def opening_inputs_complete(history, points, opened):
+        """True only when these inputs pass the opening model's own input
+        checks: a READY cutoff-safe 24 h window received by the opening and a
+        reference receipt no more than 5 s before it. Mirrors opening_forecast."""
+        try:
+            if timestamp(history["received_at"]) > opened:
+                return False
+            if context24(history, opened).get("status") != "READY":
+                return False
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return False
+        fresh = [when for when, _ in points if opened - timedelta(seconds=65) <= when < opened]
+        return bool(fresh) and (opened - max(fresh)).total_seconds() <= 5
+
+    def remember_preopening_histories(self, payload, now):
+        """Retain bounded, pre-open-only candle receipts for rollover."""
+        raw = payload.get("btc_candles", {}) if isinstance(payload, dict) else {}
+        try:
+            received = timestamp(raw["received_at"])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            received = None
+        retained = {}
+        for market in payload.get("markets", []) if isinstance(payload, dict) else []:
+            try:
+                ticker = market["ticker"]
+                opened = timestamp(market["opens_at"])
+                closes = timestamp(market["closes_at"])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            prior = self.preopening_histories.get(ticker)
+            if prior is not None and now < closes:
+                retained[ticker] = prior
+            if (
+                received is not None
+                and received <= opened
+                and now <= opened
+                and raw.get("candles")
+            ):
+                # PublicFeed replaces rather than mutates history objects, but
+                # a deep copy makes the opening boundary explicit and testable.
+                try:
+                    unchanged = (
+                        prior is not None
+                        and timestamp(prior["received_at"]) == received
+                    )
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    unchanged = False
+                if not unchanged:
+                    retained[ticker] = deepcopy(raw)
+        self.preopening_histories = dict(list(retained.items())[-12:])
+
+    def remember_preopening_flow(self, payload, now):
+        """Keep the newest pre-open Kraken order-flow item per upcoming contract.
+
+        Only observations received at or before the opening are retained, so a
+        delayed opening forecast can still use genuinely as-of-opening flow.
+        Bounded and in memory: after a restart these features stay unavailable.
+        """
+        coverage = (payload or {}).get("coverage") or {}
+        entry = coverage.get("Kraken public order flow") if isinstance(coverage, dict) else None
+        flow = (entry.get("data") if isinstance(entry, dict) else None) or {}
+        if not isinstance(flow, dict):
+            flow = {}
+        retained = {}
+        for market in (payload or {}).get("markets", []) or []:
+            if not isinstance(market, dict):
+                continue
+            try:
+                ticker = market["ticker"]
+                opened = timestamp(market["opens_at"])
+                closes = timestamp(market["closes_at"])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            prior = dict(self.preopening_flow.get(ticker) or {})
+            if now >= closes:
+                continue
+            if now <= opened + timedelta(seconds=5):
+                for key in ("spot", "perpetual", "spot_book"):
+                    item = flow.get(key)
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        observed = timestamp(item["observed_at"])
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        continue
+                    if item.get("status") != "LIVE" or observed > opened or observed > now:
+                        continue
+                    previous = prior.get(key)
+                    if previous is None or timestamp(previous["observed_at"]) < observed:
+                        prior[key] = deepcopy(item)
+            if prior:
+                retained[ticker] = prior
+        self.preopening_flow = dict(list(retained.items())[-12:])
+
     def tick(self, collected=None):
         tick_started = perf_counter()
         phases = {}
@@ -330,6 +775,10 @@ class Monitor:
                 if isinstance(payload, Exception):
                     raise payload
             phases["market_collection"] = round(collection_ms, 2)
+            # Replay mode and prediction-worker recovery still use this path;
+            # the public collector normally accepted the same immutable batch
+            # before placing it in the latest-value mailbox.
+            self.accept_candle_batch(payload, utcnow())
             calculation_started = perf_counter()
             now = timestamp(payload["clock"]) if "clock" in payload else utcnow()
             coverage = payload.setdefault("coverage", {})
@@ -342,6 +791,7 @@ class Monitor:
             market_now = active_market(payload, now)
             rejected = 0
             for observation in payload.get("stream_observations", []):
+                self.live_trade_chart.observe(observation)
                 # Independent consumers must not discard valid trade-channel
                 # volume merely because the legacy price sampler rejected an
                 # older cross-channel event timestamp.
@@ -351,16 +801,68 @@ class Monitor:
                     except (KeyError, ValueError, TypeError, AttributeError):
                         rejected += 1
                 self.estimator.observe_reference(observation, now)
+            if self.r10_shadow is not None:
+                try:
+                    self.r10_shadow.observe_batch(payload.get("stream_observations", []))
+                except Exception:
+                    pass
             # Freeze opening inputs before optional analytics. This artifact is
             # independent of live-data freshness and remains usable when
             # threshold metadata or model generation arrives later.
             mode = payload.get("mode", "PUBLIC MARKET DATA")
+            # Crash-safe pre-opening reference receipts (Phase 5). Written with
+            # the wall-clock persistence time so recovery can prove each one
+            # was stored promptly after receipt, i.e. before the opening.
+            try:
+                # Peek/ack rather than drain-before-write. If SQLite is busy or
+                # the transaction fails, the receipts remain queued for the
+                # next tick instead of being silently lost.
+                pending = self.estimator.peek_preopen_references()
+                opens = set()
+                for listed in payload.get("markets", []) or ([market_now] if market_now else []):
+                    try:
+                        opens.add(timestamp(listed["opens_at"]))
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        continue
+                ticks = []
+                for source, received, price in pending:
+                    # The next contract may not be listed until it opens, so
+                    # the next quarter-hour boundary (KXBTC15M schedule) is
+                    # also kept. Recovery still requires an exact match with
+                    # the actual opening time, so an extra key is harmless.
+                    boundary = datetime.fromtimestamp(
+                        math.ceil(received.timestamp() / 900) * 900, timezone.utc
+                    )
+                    for opened in opens | {boundary}:
+                        if 0 <= (opened - received).total_seconds() <= PREOPEN_PERSIST_SECONDS:
+                            ticks.append((source, received, price, opened))
+                if ticks:
+                    self.journal.record_preopen_references(
+                        ticks, mode, utcnow() if mode == "PUBLIC MARKET DATA" else now
+                    )
+                self.estimator.acknowledge_preopen_references(len(pending))
+            except Exception as exc:
+                self.runtime_meter.error("preopen_reference_persistence", type(exc).__name__)
+            self.remember_preopening_histories(payload, now)
+            # Optional evidence capture. A failure here is recorded but must never
+            # turn the tick into a market-data failure (stale state -> /readyz 503).
+            try:
+                self.remember_preopening_flow(payload, now)
+            except Exception as exc:
+                self.runtime_meter.error("preopening_flow_capture", type(exc).__name__)
+            # Every listed market: the next contract's pre-open book and the new
+            # contract's first two minutes (the recorder enforces the window).
+            for listed in payload.get("markets", []) or ([market_now] if market_now else []):
+                try:
+                    self.journal.record_opening_quote(listed, mode, now)
+                except Exception as exc:
+                    self.runtime_meter.error("opening_quote_capture", type(exc).__name__)
+                    break
             for discovered in payload.get("markets", []):
                 try:
                     opened = timestamp(discovered["opens_at"])
                     if not (
-                        opened - timedelta(seconds=OPENING_PRELOAD_SECONDS)
-                        <= now
+                        opened <= now
                         <= opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
                     ):
                         continue
@@ -373,6 +875,7 @@ class Monitor:
                     candidates = [
                         item for item in (
                             raw_history if eligible else None,
+                            self.preopening_histories.get(discovered["ticker"]),
                             (existing or {}).get("history"),
                         )
                         if isinstance(item, dict)
@@ -381,12 +884,13 @@ class Monitor:
                     def eligible_count(item):
                         try:
                             received = timestamp(item["received_at"])
+                            # Same arithmetic; per-bar constants computed once.
+                            limit = min(opened.timestamp(), received.timestamp())
+                            floor = opened.timestamp() - 86520
                             return sum(
                                 1 for bar in item.get("candles", [])
-                                if int(bar["start"]) + 60 <= min(
-                                    opened.timestamp(), received.timestamp()
-                                )
-                                and int(bar["start"]) >= opened.timestamp() - 86520
+                                if int(bar["start"]) + 60 <= limit
+                                and int(bar["start"]) >= floor
                             )
                         except (KeyError, ValueError, TypeError, AttributeError):
                             return -1
@@ -397,15 +901,18 @@ class Monitor:
                     # normal live updates independent of journal size.
                     best_count = max((eligible_count(item) for item in candidates), default=-1)
                     if best_count < 1440 and not existing:
-                        archived = self.journal.opening_inputs(opened)
+                        archived = self.archived_opening_inputs(opened)
                         if isinstance(archived, dict):
                             candidates.append(archived)
                     frozen_history = max(candidates, key=eligible_count) if candidates else {}
-                    frozen_points, frozen_source = self.estimator.opening_points(opened)
-                    history_ready = context24(frozen_history, opened).get("status") == "READY"
-                    finalize = (
-                        now >= opened + timedelta(seconds=5) and history_ready
-                    ) or now >= opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
+                    frozen_points, frozen_source, _recovery = self.opening_reference_points(opened, mode)
+                    # Phase 5 repair: an immutable snapshot used to be frozen on
+                    # the first tick even when incomplete, so every retry inside
+                    # the grace window reused the same gap. Freeze only inputs
+                    # that pass the opening model's own checks; otherwise keep
+                    # retrying from receipt-proven pre-opening sources.
+                    if not existing and not self.opening_inputs_complete(frozen_history, frozen_points, opened):
+                        continue
                     self.journal.freeze_opening_snapshot(
                         discovered,
                         mode,
@@ -413,8 +920,13 @@ class Monitor:
                         frozen_points,
                         frozen_source,
                         now,
-                        finalized=finalize,
+                        finalized=True,
                     )
+                except sqlite3.OperationalError as exc:
+                    self.runtime_meter.error(
+                        "opening_snapshot_storage", type(exc).__name__
+                    )
+                    continue
                 except (KeyError, ValueError, TypeError, AttributeError):
                     continue
             primary = None
@@ -453,6 +965,13 @@ class Monitor:
             )
             payload["advanced_intelligence"] = advanced
             phases["advanced_analysis"] = round((perf_counter() - advanced_started) * 1000, 2)
+            try:                                       # research only; never a live input
+                from .market_pulse import pressure_score
+                pulse_src = (advanced.get("sources") or {}).get(advanced.get("primary_source")) or {}
+                self.pulse_horizons.observe(now, pulse_src.get("latest_price"),
+                                            pressure_score({"advanced_intelligence": advanced}))
+            except Exception:
+                pass
             coverage["Kalshi KXBTC15M public"] = {
                 "status": "CONNECTED" if market_now else "UNAVAILABLE",
                 "reason": "Public contract metadata and executable quotes only; no account access"
@@ -576,6 +1095,60 @@ class Monitor:
                             "artifact_status"
                         ] = "Future-trained artifact rejected at this prediction time"
             state = analyze(payload, now, self.target, self.stop, self.horizon, result, info)
+            rules = contract_rule_snapshot(
+                market_now or {}, getattr(self.feed, "last_series", {}) or {},
+                received_at=(market_now or {}).get("metadata_received_at", now.isoformat()),
+            )
+            state["contract_rules"] = (
+                (market_now or {}).get("contract_rule_snapshot")
+                or (rules.as_dict() if hasattr(rules, "as_dict") else rules)
+            )
+            probability = {"status": "UNAVAILABLE", "reason": "Contract or volatility inputs unavailable", "actionable": False}
+            fair_values = {}
+            if hasattr(rules, "as_dict"):
+                context = state.get("model", {}).get("btc_context", {})
+                probability = settlement_probability(
+                    reference=state.get("reference", {}).get("price"),
+                    strike=rules.strike,
+                    seconds_remaining=state.get("remaining_seconds"),
+                    realized_volatility_per_sqrt_second=context.get(
+                        "volatility_dollars_per_sqrt_second"
+                    ),
+                    jump_volatility_per_sqrt_second=0,
+                    data_uncertainty=0,
+                    comparison_operator=rules.comparison_operator,
+                    averaging_remaining_fraction=1,
+                )
+                yes_probability = probability.get("probability_yes")
+                for side, side_probability in (
+                    ("up", yes_probability),
+                    ("down", str(Decimal(1) - Decimal(yes_probability)) if yes_probability is not None else None),
+                ):
+                    quote = (state.get("market") or {}).get("quotes", {}).get(side, {})
+                    fair_values[side] = compare_fair_value(
+                        probability=side_probability,
+                        bid=quote.get("bid"), ask=quote.get("ask"),
+                        ask_depth=quote.get("ask_size"), quantity=1,
+                        fee_multiplier=(state.get("market") or {}).get("fee_multiplier"),
+                        price_increment=rules.price_increment, slippage_ticks=1,
+                    )
+            state["settlement_intelligence"] = {
+                "rule_snapshot": state["contract_rules"],
+                "time_to_settlement": probability,
+                "fair_values": fair_values,
+                "official_reference": {
+                    "status": "UNAVAILABLE_NO_AUTHORIZED_REALTIME_FEED",
+                    "source": getattr(rules, "settlement_source", None),
+                },
+                "estimated_reference": {
+                    "status": "AVAILABLE" if state.get("reference", {}).get("price") is not None else "UNAVAILABLE",
+                    "source": state.get("reference", {}).get("source"),
+                    "official": False,
+                    "warning": "External proxy; not the official settlement index.",
+                },
+                "model_status": "SHADOW_UNCALIBRATED",
+                "actionable": False,
+            }
             strip_markets = list(payload.get("multi_asset_markets", []))
             strip_references = dict(payload.get("multi_asset_references", {}))
             strip_histories = dict(payload.get("multi_asset_histories", {}))
@@ -604,101 +1177,194 @@ class Monitor:
                 "multi_asset_diagnostics", {"status": "UNAVAILABLE"}
             )
             state["market_health"] = diagnose_market(state, now)
-            prior = (
-                self.journal.engine_prior(state["market"]["ticker"], state["mode"])
-                if state.get("market")
-                else None
-            )
+            try:
+                prior = (
+                    self.journal.engine_prior(state["market"]["ticker"], state["mode"])
+                    if state.get("market")
+                    else None
+                )
+            except sqlite3.OperationalError as exc:
+                self.runtime_meter.error("opening_storage", type(exc).__name__)
+                prior = None
             opening = None
-            if state.get("market") and self.models_enabled:
-                m = state["market"]
-                opening = self.journal.opening_record(m["ticker"], state["mode"])
-                if (
-                    opening is None
-                    and m.get("strike") is not None
-                    and m.get("mapping_verified")
-                    and m.get("averaging_rule_verified")
-                    and m.get("comparison_operator") == ">="
-                ):
-                    opened = timestamp(m["opens_at"])
-                    snapshot = self.journal.opening_snapshot(m["ticker"], state["mode"])
-                    if snapshot:
-                        frozen = snapshot.get("history", {})
-                        frozen_points = [
-                            (timestamp(point[0]), point[1])
-                            for point in snapshot.get("reference_points", [])
-                        ]
-                        frozen_source = snapshot.get("reference_source")
-                    else:
-                        raw_history = payload.get("btc_candles", {})
-                        try:
-                            eligible = timestamp(raw_history["received_at"]) <= opened
-                        except (KeyError, ValueError, TypeError, AttributeError):
-                            eligible = False
-                        frozen = raw_history if eligible else self.journal.opening_inputs(opened)
-                        frozen_points, frozen_source = self.estimator.opening_points(opened)
-                    generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
-                    candidate = opening_forecast(
-                        m,
-                        frozen,
-                        frozen_points,
-                        generated,
-                        reference_source=frozen_source,
-                        audit_context={
-                            "official_contracts": self.readiness.get("official_contracts"),
-                            "minimum_contracts": self.readiness.get("minimum_contracts", 170),
-                            "artifact_status": self.opening_artifact_status,
-                            "live_model": self.artifact.get("model", {}).get("kind")
-                            if self.artifact
-                            else "experimental statistical fallback",
-                            "live_ensemble_active": bool(
-                                self.artifact
-                                and self.artifact.get("model", {}).get("kind") == "ensemble"
+            try:
+                if state.get("market") and self.models_enabled:
+                    m = state["market"]
+                    try:
+                        opening = self.journal.opening_record(m["ticker"], state["mode"])
+                    except sqlite3.OperationalError as exc:
+                        self.runtime_meter.error("opening_storage", type(exc).__name__)
+                        opening = {
+                            "status": "UNAVAILABLE",
+                            "direction": "WAIT",
+                            "up": None,
+                            "down": None,
+                            "reason": (
+                                "OPENING_STORAGE_UNAVAILABLE: immutable journal is busy; "
+                                "no opening call will be inferred or rewritten"
                             ),
-                            "opening_candidate_status": self.opening_artifact_status,
-                            "opening_forward_accuracy": self.readiness.get(
-                                "opening_forward_accuracy", {}
-                            ),
-                        },
-                        frozen_context={
-                            **self.intelligence.summarize(
-                                opened, candles=frozen, primary_source=primary
-                            ),
-                            "primary_source": primary,
-                            "advanced_features": self.advanced.summarize(
-                                opened,
-                                candles=frozen,
-                                primary_source=primary,
-                                threshold=m["strike"],
-                            ),
-                        },
-                        candidate_artifact=self.opening_artifact,
-                    )
-                    if state["mode"] == "PUBLIC MARKET DATA":
-                        generated = utcnow()
-                        candidate["timestamp"] = candidate["generated_at"] = generated.isoformat()
-                        candidate["opening_delay_seconds"] = max(
-                            0, (generated - opened).total_seconds()
-                        )
-                        if candidate.get("up") is not None:
-                            candidate["status"] = "DELAYED" if generated > opened else "ON_TIME"
-                    candidate["closes_at"] = m["closes_at"]
-                    # Keep retrying briefly when asynchronous history/reference
-                    # delivery straddles rollover. Inputs remain cut off at the
-                    # opening instant; later observations can never be backfilled.
-                    retry_until = opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
-                    if candidate.get("up") is not None or generated >= retry_until:
-                        opening = self.journal.opening_record(
-                            m["ticker"], state["mode"], candidate, generated
-                        )
-                    else:
-                        candidate["status"] = "WARMING UP"
-                        candidate["reason"] += (
-                            "; retrying receipt-proven pre-opening inputs while the bounded "
-                            f"{OPENING_INPUT_GRACE_SECONDS}-second rollover window remains open"
-                        )
-                        candidate["retry_until"] = retry_until.isoformat()
-                        opening = candidate
+                        }
+                    if (
+                        opening is None
+                        and m.get("strike") is not None
+                        and m.get("mapping_verified")
+                        and m.get("averaging_rule_verified")
+                        and m.get("comparison_operator") == ">="
+                    ):
+                        opened = timestamp(m["opens_at"])
+                        snapshot = self.journal.opening_snapshot(m["ticker"], state["mode"])
+                        if snapshot:
+                            frozen = snapshot.get("history", {})
+                            frozen_points = [
+                                (timestamp(point[0]), point[1])
+                                for point in snapshot.get("reference_points", [])
+                            ]
+                            frozen_source = snapshot.get("reference_source")
+                        else:
+                            raw_history = payload.get("btc_candles", {})
+                            try:
+                                eligible = timestamp(raw_history["received_at"]) <= opened
+                            except (KeyError, ValueError, TypeError, AttributeError):
+                                eligible = False
+                            frozen = raw_history if eligible else self.journal.opening_inputs(opened)
+                            frozen_points, frozen_source = self.estimator.opening_points(opened)
+                        generated = utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
+
+                        def forecast(history, points, source):
+                            return opening_forecast(
+                                m,
+                                history,
+                                points,
+                                generated,
+                                reference_source=source,
+                                audit_context={
+                                    "official_contracts": self.readiness.get("official_contracts"),
+                                    "minimum_contracts": self.readiness.get("minimum_contracts", 170),
+                                    "artifact_status": self.opening_artifact_status,
+                                    "live_model": self.artifact.get("model", {}).get("kind")
+                                    if self.artifact
+                                    else "experimental statistical fallback",
+                                    "live_ensemble_active": bool(
+                                        self.artifact
+                                        and self.artifact.get("model", {}).get("kind") == "ensemble"
+                                    ),
+                                    "opening_candidate_status": self.opening_artifact_status,
+                                    # The fallback quality guard judges the fallback on
+                                    # its own probability-implied record only.
+                                    "opening_forward_accuracy": self.readiness.get(
+                                        "opening_fallback_forward_accuracy",
+                                        self.readiness.get("opening_forward_accuracy", {}),
+                                    ),
+                                },
+                                frozen_context={
+                                    **self.intelligence.summarize(
+                                        opened, candles=history, primary_source=primary
+                                    ),
+                                    "primary_source": primary,
+                                    "order_flow": self.preopening_flow.get(m["ticker"]),
+                                    "advanced_features": self.advanced.summarize(
+                                        opened,
+                                        candles=history,
+                                        primary_source=primary,
+                                        threshold=m["strike"],
+                                    ),
+                                },
+                                candidate_artifact=self.opening_artifact,
+                            )
+
+                        # The original input path always runs first, so an
+                        # opening that was already valid is computed exactly as
+                        # before. Only when it yields no probability is a second
+                        # attempt made from other RECEIPT-PROVEN pre-opening
+                        # inputs (Phase 5 repair). Nothing received after the
+                        # opening can enter: histories are cutoff-checked by
+                        # context24 and reference receipts must precede the open.
+                        candidate = forecast(frozen, frozen_points, frozen_source)
+                        if snapshot and "journal-recovered" in str(frozen_source) and candidate.get("up") is not None:
+                            candidate["input_recovery"] = {
+                                "status": "RECOVERED_FROM_RECEIPT_PROVEN_PREOPENING_INPUTS",
+                                "history_replaced": False,
+                                "reference_points_recovered_from_journal": True,
+                                "via": "complete opening snapshot frozen from journal-recovered receipts",
+                            }
+                        if candidate.get("up") is None and not snapshot:
+                            options = [frozen, self.preopening_histories.get(m["ticker"])]
+                            if frozen is raw_history:
+                                options.append(self.archived_opening_inputs(opened))
+                            options = [o for o in options if isinstance(o, dict) and o]
+                            alt_history = max(options, key=lambda o: _eligible_bar_count(o, opened)) if options else frozen
+                            alt_points, alt_source, recovery = self.opening_reference_points(opened, state["mode"])
+                            if alt_history is not frozen or alt_points != frozen_points:
+                                retried = forecast(alt_history, alt_points, alt_source)
+                                if retried.get("up") is not None:
+                                    retried["input_recovery"] = {
+                                        "status": "RECOVERED_FROM_RECEIPT_PROVEN_PREOPENING_INPUTS",
+                                        "history_replaced": alt_history is not frozen,
+                                        "reference_points_recovered_from_journal": bool(recovery),
+                                        "reference_recovery": recovery,
+                                        "primary_failure_reason": candidate.get("reason"),
+                                    }
+                                    candidate = retried
+                        if state["mode"] == "PUBLIC MARKET DATA":
+                            generated = utcnow()
+                            candidate["timestamp"] = candidate["generated_at"] = generated.isoformat()
+                            candidate["opening_delay_seconds"] = max(
+                                0, (generated - opened).total_seconds()
+                            )
+                            if candidate.get("up") is not None:
+                                candidate["status"] = "DELAYED" if generated > opened else "ON_TIME"
+                        candidate["closes_at"] = m["closes_at"]
+                        # Keep retrying briefly when asynchronous history/reference
+                        # delivery straddles rollover. Inputs remain cut off at the
+                        # opening instant; later observations can never be backfilled.
+                        retry_until = opened + timedelta(seconds=OPENING_INPUT_GRACE_SECONDS)
+                        if candidate.get("up") is not None or generated >= retry_until:
+                            try:
+                                opening = self.journal.opening_record(
+                                    m["ticker"], state["mode"], candidate, generated
+                                )
+                                if self.r10_shadow is not None and candidate.get("up") is not None:
+                                    self.r10_shadow.record_async(
+                                        m["ticker"], opened, frozen, primary_source=primary,
+                                        threshold=m.get("strike"))
+                            except sqlite3.OperationalError as exc:
+                                self.runtime_meter.error("opening_storage", type(exc).__name__)
+                                opening = {
+                                    "status": "UNAVAILABLE",
+                                    "direction": "WAIT",
+                                    "up": None,
+                                    "down": None,
+                                    "reason": (
+                                        "OPENING_STORAGE_UNAVAILABLE: immutable journal is busy; "
+                                        "no opening call will be inferred or rewritten"
+                                    ),
+                                }
+                        else:
+                            candidate["status"] = "WARMING UP"
+                            candidate["reason"] += (
+                                "; retrying receipt-proven pre-opening inputs while the bounded "
+                                f"{OPENING_INPUT_GRACE_SECONDS}-second rollover window remains open"
+                            )
+                            candidate["retry_until"] = retry_until.isoformat()
+                            opening = candidate
+            except Exception as exc:
+                # The immutable opening is optional for market readiness. An
+                # unexpected error is recorded and the opening is shown as
+                # unavailable (WAIT, no confidence) instead of failing every tick
+                # for the whole contract, which made the state stale (/readyz 503).
+                self.runtime_meter.error("opening_generation", type(exc).__name__)
+                opening = {
+                    "status": "UNAVAILABLE",
+                    "up": None,
+                    "direction": "WAIT",
+                    "reason": "OPENING_GENERATION_ERROR: " + type(exc).__name__
+                    + "; no opening call is shown and no probability is invented",
+                }
+            if getattr(self, "phone_alerts", None) is not None and state["mode"] == "PUBLIC MARKET DATA":
+                try:
+                    self.phone_alerts.consider(opening, stale=bool(state.get("stale")), now=utcnow())
+                except Exception as exc:
+                    self.runtime_meter.error("phone_alerts", type(exc).__name__)
             state["prediction_engine"] = engine_view(
                 state, prior, opening, utcnow() if state["mode"] == "PUBLIC MARKET DATA" else now
             )
@@ -746,8 +1412,15 @@ class Monitor:
             )
             journal_started = perf_counter()
             self.journal.record_feeds(payload.get("coverage", {}))
-            self.journal.record_candles(payload.get("btc_candles", {}), now)
             state["trade_decision"] = trade_decision(state)
+            state["news_intelligence"] = classify_news(
+                payload.get("coverage", {}).get("Federal Reserve public releases", {}), now
+            )
+            state["decision_intelligence"] = coordinate_intelligence(state)
+            state["dual_strategy"] = evaluate_dual_strategy(
+                state, paper_performance=self.journal.strategy_performance(state["now"])
+            )
+            self.journal.record_ai_signal_markers(state)
             self.journal.step(state)
             phases["journal_write"] = round((perf_counter() - journal_started) * 1000, 2)
             if isinstance(self.feed, PublicFeed):
@@ -789,6 +1462,19 @@ class Monitor:
         with self.lock:
             self.state_version += 1
             published_at = utcnow()
+            processing_ms = (perf_counter() - tick_started) * 1000
+            for stage in (
+                "market_collection", "advanced_analysis", "prediction_calculation",
+                "account_manual_scheduling", "journal_write",
+            ):
+                if stage in phases:
+                    self.runtime_meter.observe(stage, phases[stage])
+            self.runtime_meter.observe("total_processing", processing_ms)
+            if "collection_completed" in locals():
+                self.runtime_meter.observe(
+                    "publish_after_collection",
+                    max(0, (published_at - collection_completed).total_seconds() * 1000),
+                )
             state["runtime"] = {
                 "state_version": self.state_version,
                 "collection_started_at": collection_started.isoformat()
@@ -799,7 +1485,7 @@ class Monitor:
                 else None,
                 "published_at": published_at.isoformat(),
                 "phases_ms": phases,
-                "processing_ms": round((perf_counter() - tick_started) * 1000, 2),
+                "processing_ms": round(processing_ms, 2),
                 "update_interval_ms": round((tick_started - self.last_cycle_started) * 1000, 2)
                 if self.last_cycle_started is not None
                 else None,
@@ -808,6 +1494,11 @@ class Monitor:
                 ),
                 "settlement_status": self.maintenance_error,
                 "resources": self.runtime_meter.sample(),
+                "latency_percentiles": self.runtime_meter.latency_summary(),
+                "latency_scope": (
+                    "Bounded recent in-process and public-request durations; "
+                    "not measured one-way exchange latency"
+                ),
             }
             self.state = state
             self.last_tick = published_at
@@ -1086,6 +1777,37 @@ class Monitor:
                     }
         self.manual.guidance(self.manual_quotes, now, state)
 
+    def readiness_view(self):
+        """The /readyz inputs of snapshot(), without the dashboard extras.
+
+        /readyz used to build a full dashboard snapshot (account view, manual
+        guidance, paper-strategy summary, edge scanner, ...) only to read three
+        values; under readiness probing and open dashboards that work competed
+        with the market-data path on a single CPU. The decision here applies the
+        SAME rules as snapshot(): stale state, the 0..5 s snapshot age and
+        unexpired-contract check, and diagnose_market's 5-second quote and
+        reference freshness, using one clock. Nothing is relaxed.
+        """
+        with self.lock:
+            state = dict(self.state)
+            last_tick = self.last_tick
+        clock = (
+            utcnow()
+            if state.get("mode") == "PUBLIC MARKET DATA"
+            else timestamp(state["now"]) + (utcnow() - last_tick)
+        )
+        stale = bool(state.get("stale", True))
+        market = state.get("market")
+        if market:
+            age = (clock - timestamp(market["observed_at"])).total_seconds()
+            remaining = max(0, (timestamp(market["closes_at"]) - clock).total_seconds())
+            if not 0 <= age <= 5 or not remaining:
+                stale = True
+        health = diagnose_market(state, clock)
+        if not health["contract_quotes_fresh"] or not health["reference_fresh"]:
+            stale = True
+        return {"stale": stale, "market": market, "market_health": health}
+
     def snapshot(self):
         with self.lock:
             state = dict(self.state)
@@ -1169,6 +1891,7 @@ class Monitor:
             account=state["account"],
             now=health_clock,
         )
+        state["decision_intelligence"] = coordinate_intelligence(state)
         reference = state.get("reference", {})
         market = state.get("market") or {}
         stream_public = state.get("streaming", {}).get("public", {})
@@ -1221,6 +1944,10 @@ class Monitor:
         state["scalping_monitor"] = diagnose_scalp(
             state, self.scalp_criteria, account=state["account"], now=health_clock
         )
+        state["storage_health"] = self.journal.storage_health()
+        state["dual_strategy"] = evaluate_dual_strategy(
+            state, paper_performance=self.journal.strategy_performance(health_clock)
+        )
         state["connection_diagnostics"] = {
             "credentials": credential_status(),
             "account_enabled": self.account_client is not None,
@@ -1254,7 +1981,16 @@ class Monitor:
             "response_generated_at": utcnow().isoformat(),
             "state_age_seconds": max(0, (utcnow() - last_tick).total_seconds()),
         }
+        state["background_learning"] = self.background_learning_status()
         return state
+
+
+def _sha256_or_none(path):
+    import hashlib
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else None
+    except OSError:
+        return None
 
 
 def make_handler(monitor):
@@ -1303,7 +2039,10 @@ def make_handler(monitor):
                     value["model"] = {
                         k: v
                         for k, v in value.get("model", {}).items()
-                        if k in {"version", "enabled", "validated", "overall_reason", "scalp_reason"}
+                        if k in {
+                            "version", "enabled", "validated", "overall_reason",
+                            "scalp_reason", "developing_candle",
+                        }
                     }
                     value["scalping_monitor"] = {
                         k: v for k, v in value.get("scalping_monitor", {}).items()
@@ -1319,6 +2058,169 @@ def make_handler(monitor):
                         value["advanced_intelligence"], monitor.engine_report.get()
                     )
                 body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/live-chart":
+                try:
+                    limit = int(query.get("limit", ["180"])[0])
+                    if not 30 <= limit <= 500:
+                        raise ValueError("Invalid live chart limit")
+                except (ValueError, TypeError):
+                    self.send_error(400, "Use limit 30..500")
+                    return
+                value = monitor.live_trade_chart.snapshot(utcnow(), limit)
+                with monitor.lock:
+                    websocket_status = (
+                        (monitor.state.get("feed_health") or {}).get(
+                            "coinbase_websocket_status"
+                        )
+                    )
+                value["connection_status"] = websocket_status or "UNAVAILABLE"
+                if value["status"] == "NO_RECORDED_TRADES" and websocket_status == "LIVE":
+                    value["status"] = "CONNECTED_IDLE"
+                    value["reason"] = "WebSocket connected; waiting for the next genuine BTC trade"
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/signal-chart":
+                intervals = {"15s": 15, "1m": 60, "3m": 180, "5m": 300, "15m": 900}
+                try:
+                    interval_name = query.get("interval", ["1m"])[0]
+                    interval_seconds = intervals[interval_name]
+                    limit = int(query.get("limit", ["240"])[0])
+                    ticker = query.get("ticker", [None])[0]
+                    if not 30 <= limit <= 500:
+                        raise ValueError("Invalid chart limit")
+                    if ticker is not None and not re.fullmatch(
+                        r"KXBTC15M-[A-Za-z0-9_-]{1,100}", ticker
+                    ):
+                        raise ValueError("Invalid chart ticker")
+                except (KeyError, ValueError, TypeError):
+                    self.send_error(400, "Use interval 15s/1m/3m/5m/15m and limit 30..500")
+                    return
+                if interval_seconds == 15:
+                    # Marker/performance history remains journal-backed, while
+                    # genuine sub-minute OHLCV comes only from timestamped
+                    # Coinbase market_trades WebSocket executions.
+                    value = monitor.journal.signal_chart(
+                        60,
+                        limit,
+                        ticker,
+                        candle_fallback=(
+                            monitor.latest_candles
+                            or getattr(monitor.feed, "candle_cache", None)
+                        ),
+                    )
+                    live = monitor.live_trade_chart.snapshot(utcnow(), limit)
+                    value.update(live)
+                    with monitor.lock:
+                        websocket_status = (
+                            (monitor.state.get("feed_health") or {}).get(
+                                "coinbase_websocket_status"
+                            )
+                        )
+                    value["connection_status"] = websocket_status or "UNAVAILABLE"
+                    if value["status"] == "NO_RECORDED_TRADES" and websocket_status == "LIVE":
+                        value["status"] = "CONNECTED_IDLE"
+                        value["reason"] = "WebSocket connected; waiting for the next genuine BTC trade"
+                    else:
+                        value["reason"] = None if value["status"] == "READY" else value.get("reason")
+                else:
+                    value = monitor.journal.signal_chart(
+                        interval_seconds,
+                        limit,
+                        ticker,
+                        candle_fallback=(
+                            monitor.latest_candles
+                            or getattr(monitor.feed, "candle_cache", None)
+                        ),
+                    )
+                with monitor.lock:
+                    developing = dict(
+                        ((monitor.state.get("model") or {}).get("developing_candle") or {})
+                    )
+                if interval_seconds != 15:
+                    value["forming_candle"] = None
+                if interval_seconds != 15 and developing.get("status") == "DEVELOPING" and value.get("status") == "READY":
+                    try:
+                        start = int(developing["start"])
+                        bucket = start - start % interval_seconds
+                        forming = {
+                            **developing,
+                            "start": bucket,
+                            "interval_seconds": interval_seconds,
+                        }
+                        # A larger-timeframe aggregate can contain completed
+                        # one-minute source bars from its still-open bucket.
+                        # Move that partial aggregate into the faded developing
+                        # candle so it is never presented twice or called closed.
+                        bars = value.get("bars") or []
+                        if bars and bars[-1].get("start") == bucket:
+                            partial = bars.pop()
+                            forming.update(
+                                open=partial["open"],
+                                high=max(float(partial["high"]), float(developing["high"])),
+                                low=min(float(partial["low"]), float(developing["low"])),
+                                close=float(developing["close"]),
+                                volume=partial.get("volume"),
+                                source_bars=partial.get("source_bars", 0),
+                            )
+                        value["forming_candle"] = forming
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        value["forming_candle"] = None
+                latest = value.get("latest_bar_start")
+                if value.get("bars"):
+                    latest = value["bars"][-1]["start"]
+                    value["latest_bar_start"] = latest
+                value["latest_closed_candle_age_seconds"] = (
+                    max(0, utcnow().timestamp() - latest - interval_seconds)
+                    if isinstance(latest, (int, float))
+                    else None
+                )
+                body = json.dumps(value, allow_nan=False).encode()
+                content_type = "application/json"
+            elif route == "/api/candle-integrity":
+                # Copy one atomic publication. Never combine bars from one
+                # collector cycle with diagnostics from another.
+                with monitor.candle_lock:
+                    source = deepcopy(
+                        monitor.latest_candles
+                        or getattr(monitor.feed, "candle_cache", None)
+                        or {}
+                    )
+                body = json.dumps(
+                    candle_integrity_report(source, utcnow()), allow_nan=False
+                ).encode()
+                content_type = "application/json"
+            elif route == "/api/data-quality-alerts":
+                # Read-only Phase 5 monitoring; never changes a forecast and is
+                # independent of /healthz and /readyz.
+                from .opening_alerts import compute_alerts
+
+                wall = utcnow()
+                with monitor.candle_lock:
+                    source = deepcopy(
+                        monitor.latest_candles
+                        or getattr(monitor.feed, "candle_cache", None)
+                        or {}
+                    )
+                ages = {
+                    name: (wall - history[-1][0]).total_seconds()
+                    for name, history in list(monitor.estimator.opening_references.items())
+                    if history
+                }
+                artifact = getattr(monitor, "opening_artifact", None) or {}
+                model = artifact.get("model") or {}
+                inputs = sorted({
+                    name for part in (model.get("components") or [model])
+                    for name in ((part.get("preprocessor") or {}).get("names") or [])
+                })
+                try:
+                    recent = monitor.journal.recent_openings("PUBLIC MARKET DATA")
+                except sqlite3.OperationalError:
+                    recent = []
+                body = json.dumps(
+                    compute_alerts(recent, candle_integrity_report(source, wall), ages, inputs, wall),
+                    allow_nan=False, default=str,
+                ).encode()
                 content_type = "application/json"
             elif route == "/api/market-history":
                 try:
@@ -1435,6 +2337,108 @@ def make_handler(monitor):
                 }
                 body = json.dumps(value, allow_nan=False).encode()
                 content_type = "application/json"
+            elif route == "/api/opening-scoreboard":
+                report = monitor.opening_scoreboard_report.get()
+                body = json.dumps(
+                    {
+                        "status": report["status"],
+                        "scoreboard": report["value"],
+                        "generated_at": report["generated_at"],
+                    },
+                    allow_nan=False,
+                ).encode()
+                content_type = "application/json"
+            elif route == "/api/learning-status":
+                # Read-only: the offline learning run publishes this file; nothing is computed here.
+                from .learning_loop import combined_status
+                # Status lives beside the journal, so no environment change is needed on the service.
+                status_path = f"{monitor.journal.path}.learning-status.json"
+                lifecycle_path = f"{monitor.journal.path}.lifecycle-status.json"
+                body = json.dumps(combined_status(status_path, lifecycle_path), allow_nan=False, default=str).encode()
+                content_type = "application/json"
+            elif route == "/api/challenger-opening":
+                # Second AI call (v4 challenger) for the current market: research only, never the live call.
+                from .challenger_view import ChallengerView
+                if getattr(monitor, "challenger_view", None) is None:
+                    monitor.challenger_view = ChallengerView(getattr(monitor, "opening_artifact", None))
+                cached = getattr(monitor, "challenger_cache", None)
+                if cached and monotonic() - cached[0] < 10:             # bounded cost: one snapshot per 10 s
+                    body = cached[1]
+                else:
+                    opening = ((monitor.snapshot() or {}).get("prediction_engine") or {}).get("initial") or {}
+                    body = json.dumps(monitor.challenger_view.call(opening), default=str).encode()
+                    monitor.challenger_cache = (monotonic(), body)
+                content_type = "application/json"
+            elif route == "/api/orderbook":
+                # Live BTC books + trade flow written by the separate order-book collector. Read-only file read.
+                from .orderbook_live import latest_body as orderbook_body
+                body = orderbook_body()
+                content_type = "application/json"
+            elif route == "/api/of1":
+                # AI A / B / C order-flow research status written by the research timer. Read-only file read.
+                from .minute6 import file_body
+                body = file_body("of1_status.json")
+                content_type = "application/json"
+            elif route == "/api/minute6":
+                # Minute-6 research reading + live analytics written by the alert service. Read-only file read.
+                from .minute6 import latest_body
+                body = latest_body()
+                content_type = "application/json"
+            elif route == "/api/market-pulse":
+                # Research indicators (order book, trade flow, momentum, short horizons, contract EV).
+                # Read-only; never changes a signal, model, threshold, alert or record.
+                from .market_pulse import build as pulse_build
+                cached = getattr(monitor, "pulse_cache", None)
+                if cached and monotonic() - cached[0] < 5:              # bounded cost: one build per 5 s
+                    body = cached[1]
+                else:
+                    shadow = getattr(monitor, "r10_shadow", None)
+                    body = json.dumps(pulse_build(monitor.snapshot() or {},
+                                                  r10=shadow.counters if shadow is not None else None,
+                                                  horizons=getattr(monitor, "pulse_horizons", None),
+                                                  validated_probability=False), default=str).encode()
+                    monitor.pulse_cache = (monotonic(), body)
+                content_type = "application/json"
+            elif route == "/api/accuracy-health":
+                # Read-only diagnostic: data health and predictive edge, both scoreboard populations.
+                # Cached for 60 s; it never changes a signal, threshold, model or alert.
+                from .accuracy_health import CachedReport
+                if getattr(monitor, "accuracy_health_report", None) is None:
+                    artifact = monitor.opening_artifact if isinstance(getattr(monitor, "opening_artifact", None), dict) else None
+                    monitor.accuracy_health_report = CachedReport(monitor.journal.path, artifact)
+                # Same read-only view /api/state serves (feed health is built per snapshot).
+                state = monitor.snapshot() or {}
+                feed = state.get("feed_health") or {}
+                intel = ((state.get("model") or {}).get("market_intelligence") or {}).get("sources") or {}
+
+                def stream(name):
+                    item = intel.get(name) or {}
+                    return {"status": item.get("status"), "data_age_seconds": item.get("data_age_seconds"),
+                            "window_resets_since_start": item.get("reconnection_or_gap_resets"),
+                            "rejected_updates": item.get("rejected_updates")}
+                live = {
+                    "release": monitor.build_commit,
+                    "opening_model_id": (monitor.opening_artifact or {}).get("model_id")
+                    if isinstance(getattr(monitor, "opening_artifact", None), dict) else None,
+                    "kalshi": {"status": feed.get("kalshi_connection"), "age_seconds": feed.get("kalshi_age_seconds")},
+                    "btc_reference": {"source": feed.get("btc_source"), "age_seconds": feed.get("btc_age_seconds")},
+                    "coinbase_websocket": {"status": feed.get("coinbase_websocket_status"),
+                                           "reconnects_since_start": feed.get("websocket_reconnects"),
+                                           **{k: v for k, v in stream("Coinbase BTC/USD stream").items() if k != "status"}},
+                    "kraken_spot": stream("Kraken BTC/USD stream"),
+                    "kraken_futures": stream("Kraken futures stream"),
+                    "last_processing_completed_at": feed.get("last_processing_completed_at"),
+                }
+                body = json.dumps({**monitor.accuracy_health_report.get(), "live_process": live},
+                                  allow_nan=False, default=str).encode()
+                content_type = "application/json"
+            elif route == "/api/shadow-opening":
+                # Read-only view of the independent shadow ledger. It never computes, substitutes or feeds live output.
+                from .opening_shadow_view import ledger_view, shadow_ledger_path
+                body = json.dumps(
+                    ledger_view(shadow_ledger_path(monitor.journal.path)), allow_nan=False, default=str
+                ).encode()
+                content_type = "application/json"
             elif route == "/api/learning-summary":
                 report = monitor.quick_learning_report.get()
                 body = json.dumps(
@@ -1478,16 +2482,48 @@ def make_handler(monitor):
                         "state_age_seconds": round(age, 3),
                         "state_version": version,
                         "build_commit": monitor.build_commit,
+                        "model_file_sha": monitor.opening_model_file_sha,
                         "signals_only": True,
                         "workers": workers,
                     }
                 ).encode()
+                content_type = "application/json"
+            elif route == "/readyz":
+                state = monitor.readiness_view()
+                health = state.get("market_health", {})
+                ready = bool(
+                    not state.get("stale", True)
+                    and health.get("contract_quotes_fresh")
+                    and health.get("reference_fresh")
+                    and state.get("market")
+                )
+                status_code = 200 if ready else 503
+                body = json.dumps({
+                    "status": "READY" if ready else "NOT_READY",
+                    "build_commit": monitor.build_commit,
+                    "signals_only": True,
+                    "contract": (state.get("market") or {}).get("ticker"),
+                    "contract_quotes_fresh": bool(health.get("contract_quotes_fresh")),
+                    "reference_fresh": bool(health.get("reference_fresh")),
+                    "stale_reasons": health.get("contract_quote_reasons", [])
+                        + health.get("reference_reasons", []),
+                    "note": "Readiness may fail during an external feed outage without making the dashboard process unhealthy.",
+                }).encode()
                 content_type = "application/json"
             elif route == "/health":
                 body, content_type = b"signals-only dashboard", "text/plain"
             else:
                 self.send_error(404)
                 return
+            request_ms = (perf_counter() - request_started) * 1000
+            monitor.runtime_meter.observe(
+                "http_main_state"
+                if route == "/api/state" and query.get("view") == ["main"]
+                else "http_chart"
+                if route == "/api/signal-chart"
+                else "http_other",
+                request_ms,
+            )
             self.send_response(status_code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -1495,7 +2531,7 @@ def make_handler(monitor):
             self.send_header("X-Dashboard-Build", monitor.build_commit)
             self.send_header(
                 "Server-Timing",
-                "dashboard;dur=" + str(round((perf_counter() - request_started) * 1000, 2)),
+                "dashboard;dur=" + str(round(request_ms, 2)),
             )
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header(
@@ -1658,7 +2694,7 @@ def make_startup_handler(startup):
             if route == "/":
                 body = Path(__file__).with_name("dashboard.html").read_bytes()
                 content_type, status = "text/html; charset=utf-8", 200
-            elif route in {"/healthz", "/api/startup"}:
+            elif route in {"/healthz", "/readyz", "/api/startup"}:
                 body = json.dumps(startup.snapshot()).encode()
                 content_type, status = "application/json", 503
             elif route in {"/api/state", "/api/details"}:
@@ -1733,6 +2769,7 @@ def main():
         "--opening-model-artifact", type=Path, default=Path("signals_opening_model.json")
     )
     parser.add_argument("--model-registry", type=Path, default=Path("signals_model_registry"))
+    parser.add_argument("--learning-status", type=Path)
     parser.add_argument(
         "--disable-scheduled-learning",
         action="store_true",
@@ -1825,6 +2862,7 @@ def main():
             and not args.disable_model
             and not args.disable_scheduled_learning
             else None,
+            learning_status_path=args.learning_status,
             startup_update=startup.update,
         )
     except Exception as exc:
@@ -1888,10 +2926,17 @@ def main():
                         "rest_error_type": type(exc).__name__,
                         "btc_candles": feed.sampled_candles(utcnow()),
                     }
+                # Candle history is chart input, not optional model output.
+                # Publish it before the prediction mailbox so a slow analysis
+                # cycle cannot leave /api/signal-chart empty after preload is
+                # already READY.
+                monitor.accept_candle_batch(payload, utcnow())
                 elapsed = perf_counter() - timer
                 mailbox.put((payload, started, utcnow(), elapsed * 1000))
                 monitor.worker_event("collector", "completed", failure)
-                stop.wait(max(0, args.poll_seconds - elapsed))
+                stop.wait(
+                    collector_wait_seconds(utcnow().timestamp(), elapsed, args.poll_seconds)
+                )
         except BaseException as exc:
             monitor.worker_event("collector", "stopped", exc)
             raise
@@ -1921,15 +2966,12 @@ def main():
                         stop.wait(0.01)
                         continue
                     source_key = key
-                    base, started, completed, duration = previous
                     monitor.worker_event("prediction", "started")
-                    if isinstance(base, Exception):
-                        monitor.tick(previous)
-                    else:
-                        now = utcnow()
-                        enriched = feed.enriched(base, now)
-                        monitor.tick((enriched, started, completed, duration))
-                    monitor.worker_event("prediction", "completed")
+                    # One malformed enrichment frame must not permanently stop
+                    # this thread. The next loop processes the newest mailbox
+                    # value; the failed cycle remains explicitly non-actionable.
+                    failure = process_prediction_frame(monitor, feed, previous)
+                    monitor.worker_event("prediction", "completed", failure)
                     last_processed = monotonic()
                 else:
                     monitor.worker_event("prediction", "started")
@@ -1944,6 +2986,7 @@ def main():
                 monitor.worker_event("prediction", "stopped")
 
     def maintain_indexes():
+        background_thread_priority()
         try:
             result = journal.ensure_performance_indexes()
             monitor.index_maintenance = result
@@ -1992,6 +3035,7 @@ def main():
         monitor.scalp_paper_report.close()
         monitor.edge_report.close()
         monitor.quick_learning_report.close()
+        monitor.opening_scoreboard_report.close()
         if monitor.scheduled_learning:
             monitor.scheduled_learning.close()
         if monitor.scheduled_scalp_learning:

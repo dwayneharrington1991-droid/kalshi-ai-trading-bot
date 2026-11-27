@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import os
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,7 @@ def load_sqlite_backup():
 
 
 def test_deployment_shell_scripts_are_valid_and_do_not_copy_live_databases():
-    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh"):
+    for name in ("configure_host.sh", "preflight.sh", "prepare_baseline.sh", "activate_baseline.sh", "remote_deploy.sh", "rollback.sh", "run_dashboard.sh", "run_learning_refresh.sh", "enable_readonly_account.sh", "install_readonly_credentials.sh", "launch_first_release.sh", "repair_learning_and_deploy.sh", "safe_upgrade_and_evaluate.sh", "run_isolated_ai_evaluation.sh", "apply_live_pipeline_repair.sh"):
         subprocess.run(["bash", "-n", str(DEPLOY / name)], check=True)
     deploy = (DEPLOY / "remote_deploy.sh").read_text()
     assert "sqlite_backup.py" in deploy
@@ -169,6 +170,7 @@ def test_baseline_preserves_dirty_source_and_captures_existing_account_mode():
     assert "MODEL_REGISTRY=/home/opc/kalshi-ai-trading-bot/data/models/registry" in config
     assert "ENABLE_ACCOUNT_READONLY=" not in config
     assert "--account-readonly" in baseline
+    assert '"$staging[dev,dashboard]"' in baseline
     assert "account-monitoring.flags" in baseline
     assert "--exclude='./data'" in baseline
     assert "--exclude='./.venv'" in baseline
@@ -177,6 +179,59 @@ def test_baseline_preserves_dirty_source_and_captures_existing_account_mode():
     assert "Python 3.12" in baseline
     assert "systemctl restart" not in baseline
     assert "production-approved" not in baseline
+
+
+def test_safe_upgrade_validation_installs_dashboard_test_dependencies():
+    script = (DEPLOY / "safe_upgrade_and_evaluate.sh").read_text()
+    assert '"${validation}[dev,dashboard]"' in script
+    assert 'exec 7>"$DEPLOY_ROOT/learning.lock"' in script
+    assert 'exec 8>"$DEPLOY_ROOT/learning-refresh.lock"' in script
+    assert script.index('exec 7>"$DEPLOY_ROOT/learning.lock"') < script.index(
+        'exec 8>"$DEPLOY_ROOT/learning-refresh.lock"'
+    )
+    assert "MODEL_ACTIVATION_PERFORMED=false" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+
+
+def test_isolated_ai_evaluation_cannot_activate_or_write_production_registry():
+    script = (DEPLOY / "run_isolated_ai_evaluation.sh").read_text()
+    assert 'settlement_registry="$evaluation/settlement-registry"' in script
+    assert 'opening_registry="$evaluation/opening-registry"' in script
+    assert "src.signals_display.scalp_learning" in script
+    assert "SCALP_EVALUATION_RC" in script
+    assert "MODEL_ACTIVATION_PERFORMED=false" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+    assert "--activate" not in script
+    assert "timeout --signal=TERM --kill-after=30s 900" in script
+    assert "EVALUATION_STAGE=SETTLEMENT" in script
+    assert "EVALUATION_STAGE=OPENING" in script
+    assert "EVALUATION_STAGE=SCALP" in script
+    assert "EVALUATION_TIMEOUT" in script
+    assert "failure_report" in script
+
+
+def test_live_pipeline_repair_is_atomic_bounded_and_signals_only():
+    script = (DEPLOY / "apply_live_pipeline_repair.sh").read_text()
+    assert "flock -n 8" in script
+    assert "cmp -s" in script
+    assert "mv -Tf" in script
+    assert "LIVE_REPAIR_ROLLED_BACK" in script
+    assert "historical_preload" in script
+    assert '--data-root "$DATA_ROOT" --require-models 0' in script
+    assert '--service "$SERVICE_NAME" --port 8765' not in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+    assert "remote_deploy.sh" not in script
+    assert "sqlite_backup.py" not in script
+    assert "--activate" not in script
+
+
+def test_live_pipeline_repair_distinguishes_upstream_outage_from_regression():
+    script = (DEPLOY / "apply_live_pipeline_repair.sh").read_text()
+    assert "predeploy_ready=0" in script
+    assert "http://127.0.0.1:8765/readyz" in script
+    assert "if (( predeploy_ready == 1 )); then" in script
+    assert "new release lost readiness that the prior release had" in script
+    assert "LIVE_REPAIR_VERIFIED_DEGRADED" in script
 
 
 def test_host_configuration_is_derived_and_never_creates_approval_or_restarts():
@@ -290,15 +345,49 @@ def test_bounded_learning_runner_is_read_only_locked_and_cannot_trade():
     runner = (DEPLOY / "run_learning_refresh.sh").read_text()
     override = (DEPLOY / "kalshi-learning.override.conf.example").read_text()
     assert "flock -n" in runner
-    assert runner.count("timeout --signal=TERM") == 2
+    assert 'exec 8>"$DEPLOY_ROOT/learning.lock"' in runner
+    assert runner.index('learning.lock') < runner.index('learning-refresh.lock')
+    assert runner.count("timeout --signal=TERM") == 3
     assert "--scheduled" in runner
     assert "src.signals_display.opening_models" in runner
+    assert "src.signals_display.scalp_learning" in runner
+    assert all(name in runner for name in ("settlement_rc", "opening_rc", "scalp_rc"))
+    assert "learning-status" in runner and "latest.json" in runner
+    assert all(name in runner for name in (
+        "settlement_elapsed", "opening_elapsed", "scalp_elapsed"
+    ))
     assert "TimeoutStartSec=22min" in override
     assert "NoNewPrivileges=true" in override
     assert "run_learning_refresh.sh" in override
+    launcher = (DEPLOY / "run_dashboard.sh").read_text()
+    assert '--learning-status "$DEPLOY_ROOT/learning-status/latest.json"' in launcher
+    dashboard_override = (DEPLOY / "kalshi-signals.override.conf.example").read_text()
+    assert "StartLimitIntervalSec=300" in dashboard_override
+    assert "StartLimitBurst=10" in dashboard_override
     for unsafe in ("place_order", "cancel_order", "transfer", "src.jobs", "src.orders"):
         assert unsafe not in runner
         assert unsafe not in override
+
+
+def test_consolidated_live_audit_is_bounded_read_only_and_covers_every_subsystem():
+    audit = (DEPLOY / "audit_live_system.py").read_text()
+    compile(audit, "audit_live_system.py", "exec")
+    assert "mode=ro" in audit and "PRAGMA query_only=ON" in audit
+    assert all(route in audit for route in (
+        "/healthz", "/readyz", "/api/state?view=main", "/api/signal-chart"
+    ))
+    assert all(unit in audit for unit in (
+        "kalshi-signals.service", "kalshi-learning.service", "kalshi-learning.timer"
+    ))
+    assert 'for name in ("opening", "settlement", "scalp")' in audit
+    assert all(name in audit for name in (
+        "learning-status", "runtime", "required_indexes_missing",
+    ))
+    for unsafe in (
+        "place_order", "cancel_order", "modify_order", "DELETE FROM",
+        "UPDATE ", "INSERT ", "systemctl restart", "systemctl stop",
+    ):
+        assert unsafe not in audit
 
 
 def test_account_activation_is_get_only_verified_and_rolls_back_on_failure():
@@ -414,3 +503,199 @@ def test_signals_service_import_boundary_excludes_execution_modules():
     for unsafe in ("src.jobs.execute", "cli.py", "place_order", "cancel_order"):
         assert unsafe not in wrapper
         assert unsafe not in override
+
+
+def test_background_evaluation_is_detached_non_promoting_and_signals_only():
+    script = (DEPLOY / "start_isolated_evaluation.sh").read_text()
+    assert "nohup flock -n" in script
+    assert "run_isolated_ai_evaluation.sh" in script
+    assert "DASHBOARD_NOT_BLOCKED=true" in script
+    assert "MODEL_PROMOTION_PERFORMED=false" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+    for unsafe in ("place_order", "cancel_order", "modify_order", "transfer"):
+        assert unsafe not in script
+
+
+def test_finalizer_does_not_fail_a_verified_release_when_evaluation_launch_fails():
+    script = (DEPLOY / "finalize_release.sh").read_text()
+    launch = '"$current/deploy/oracle/start_isolated_evaluation.sh" "$target"'
+    assert f"if ! {launch}; then" in script
+    assert "AI_EVALUATION_BACKGROUND=LAUNCH_FAILED" in script
+    assert "AI_EVALUATION_FAILURE_DOES_NOT_INVALIDATE_DEPLOYMENT=true" in script
+    # Deployment verification and chart readiness must precede evaluation.
+    assert script.index('print("DEPLOYMENT=SUCCESS")') < script.index(launch)
+
+
+def test_evaluation_and_deployment_lock_order_cannot_self_deadlock():
+    launcher = (DEPLOY / "start_isolated_evaluation.sh").read_text()
+    evaluator = (DEPLOY / "run_isolated_ai_evaluation.sh").read_text()
+    deployment = (DEPLOY / "apply_live_pipeline_repair.sh").read_text()
+    scheduled = (DEPLOY / "run_learning_refresh.sh").read_text()
+    # The launcher probes the background lock non-blockingly. Evaluation,
+    # deployment and scheduled learning serialize on one learning lock. No
+    # script takes background-evaluation.lock while already holding learning.lock.
+    assert 'flock -n "$lock" true' in launcher
+    assert 'nohup flock -n "$lock"' in launcher
+    assert 'flock -w 30 8' in evaluator
+    assert 'flock -n 8' in deployment
+    assert 'flock -n 8' in scheduled
+    assert "background-evaluation.lock" not in evaluator
+    assert "background-evaluation.lock" not in deployment
+    assert "background-evaluation.lock" not in scheduled
+
+
+def test_live_pipeline_failure_restores_release_pointer_and_prior_health(tmp_path):
+    """Exercise the actual atomic/ERR rollback path with isolated mocks."""
+    repo = tmp_path / "repo"
+    deploy_root = tmp_path / "deploy"
+    data_root = tmp_path / "data"
+    old = deploy_root / "releases" / "old"
+    fake_bin = tmp_path / "bin"
+    for path in (repo, old / ".venv" / "bin", data_root, fake_bin):
+        path.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='rollback-test'\nversion='1'\n")
+    for relative in (
+        "src/signals_display/monitor.py", "src/signals_display/server.py",
+        "src/signals_display/prediction_engine.py",
+    ):
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("VALUE = 1\n")
+    health = repo / "deploy/oracle/health_check.py"
+    health.parent.mkdir(parents=True, exist_ok=True)
+    health.write_text("raise SystemExit(1)\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "target"], check=True)
+    target = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+    (old / "pyproject.toml").write_text((repo / "pyproject.toml").read_text())
+    (old / ".deployed-commit").write_text("a" * 40 + "\n")
+    (old / ".venv/bin/python3").symlink_to(Path(sys.executable))
+    (deploy_root / "current").symlink_to(old)
+    config = tmp_path / "deployment.env"
+    config.write_text(
+        f"DEPLOY_ROOT={deploy_root}\nSERVICE_NAME=kalshi-signals.service\nDATA_ROOT={data_root}\n"
+    )
+
+    for name, body in {
+        "sudo": "#!/bin/sh\nexit 0\n",
+        "sleep": "#!/bin/sh\nexit 0\n",
+        "curl": "#!/bin/sh\nexit 1\n",
+    }.items():
+        path = fake_bin / name
+        path.write_text(body)
+        path.chmod(0o755)
+
+    script = (DEPLOY / "apply_live_pipeline_repair.sh").read_text()
+    script = script.replace("[[ $(id -un) == opc ]]", "[[ 1 == 1 ]]")
+    script = script.replace("repo=/home/opc/kalshi-ai-trading-bot", f"repo={repo}")
+    script = script.replace("config=/etc/kalshi-signals/deployment.env", f"config={config}")
+    candidate = tmp_path / "apply.sh"
+    candidate.write_text(script)
+    candidate.chmod(0o700)
+    environment = {**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]}
+    result = subprocess.run(
+        ["bash", str(candidate), target, "a" * 40],
+        capture_output=True, text=True, timeout=20, env=environment,
+    )
+    assert result.returncode != 0
+    assert (deploy_root / "current").resolve() == old.resolve()
+    assert "LIVE_REPAIR_ROLLED_BACK" in result.stderr
+    # Prior-release health remains independently testable after pointer restore.
+    prior_health = old / "health.py"
+    prior_health.write_text("print('HEALTHY')\n")
+    restored = subprocess.run(
+        [str(old / ".venv/bin/python3"), str(prior_health)],
+        capture_output=True, text=True, check=True,
+    )
+    assert restored.stdout.strip() == "HEALTHY"
+
+
+def test_finalizer_is_guarded_atomic_and_starts_independent_audits():
+    script = (DEPLOY / "finalize_release.sh").read_text()
+    assert "apply_live_pipeline_repair.sh" in script
+    assert "start_isolated_evaluation.sh" in script
+    assert "observe_live_rollover.py" in script
+    assert "healthz" in script and "readyz" in script and "signal-chart" in script
+    assert "AUTOMATED_TRADING=DISABLED" in script
+    assert "FINALIZE_ROLLED_BACK" in script
+    assert "A failed background evaluation must not roll back" in script
+    assert "curl -sS --max-time 10 http://127.0.0.1:8765/readyz" in script
+    assert "chart_wait_seconds=120" in script
+    assert "chart_readiness_wait" in script
+    assert "chart not ready after ${chart_wait_seconds}s" in script
+    assert "git reset" not in script and "git clean" not in script
+
+
+def test_ai_readiness_auditor_is_read_only_and_never_promotes():
+    path = DEPLOY / "audit_ai_readiness.py"
+    source = path.read_text()
+    assert "?mode=ro" in source
+    assert "PRAGMA query_only=ON" in source
+    assert "MODEL | LABELED MARKETS | FORWARD VALIDATION" in source
+    for forbidden in (
+        "INSERT ", "UPDATE ", "DELETE ", "ModelRegistry.activate",
+        "place_order", "cancel_order", "modify_order", "transfer_funds",
+    ):
+        assert forbidden not in source
+
+    spec = importlib.util.spec_from_file_location("audit_ai_readiness", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    row = module.model_row(
+        "OPENING",
+        {
+            "status": "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT",
+            "unseen_forward_contracts": 26,
+            "required_unseen_forward_contracts": 30,
+            "additional_unseen_contracts_needed": 4,
+            "promotion_allowed": False,
+        },
+        426,
+        False,
+        "No dedicated opening artifact configured",
+    )
+    assert row["status"] == "SHADOW"
+    assert row["additional_needed"] == 4
+    assert "needs 4 additional" in row["what_is_missing"]
+
+
+def test_preview_8768_switch_is_narrow_idempotent_and_rollback_guarded():
+    path = DEPLOY / "switch_preview_8768.sh"
+    source = path.read_text()
+    assert path.stat().st_mode & 0o111
+    assert "set -Eeuo pipefail" in source
+    assert "a739646155cbe36e324e4b5f9c6f58a0cedbc4a8" in source
+    assert "/home/opc/kalshi-preview-upgrade/logs/upgraded-live-8768.db" in source
+    assert "/home/opc/kalshi-preview-repair-a739646" in source
+    assert 'readonly HOST=127.0.0.1' in source and 'readonly PORT=8768' in source
+    assert "MIN_FREE_BYTES" in source and "free storage below 10 GiB" in source
+    assert "PREVIEW_ALREADY_DEPLOYED" in source
+    assert "process_has_environment" in source and "PYTHONPATH=$NEW_ROOT" in source
+    assert 'new_args=(-P)' in source and "--disable-scheduled-learning" in source
+    assert "PREVIEW_OPENING_MODEL_ARTIFACT" in source
+    assert '"$STATE_ROOT"/models/*' in source
+    assert "opening artifact rejected" in source
+    assert 'new_args+=(--opening-model-artifact "$OPENING_ARTIFACT")' in source
+    assert "running process opening artifact identity mismatch" in source
+    assert "kill -TERM \"$old_pid\"" in source
+    assert "wait_stopped" in source and "db_open_pids" in source
+    assert "start_old_in_memory" in source and "rollback_on_error" in source
+    assert "PREVIEW_DEPLOY_SUCCESS" in source
+    assert "execution_capability" in source and "signals_only" in source
+    assert "candle-integrity" in source and "readyz" in source
+    assert "port 8765 listener changed" in source
+    assert "port 8767 listener changed" in source
+    for forbidden in (
+        "fuser -k", "pkill", "kill -9", "rm -", "VACUUM", "DELETE FROM",
+        "systemctl restart", "systemctl stop", "--account-readonly",
+    ):
+        # The account flag appears only in a refusal case, never in new_args.
+        if forbidden == "--account-readonly":
+            assert 'new_args+=(--account-readonly)' not in source
+        else:
+            assert forbidden not in source

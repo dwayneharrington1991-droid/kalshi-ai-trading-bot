@@ -11,7 +11,19 @@ from statistics import mean, pstdev
 
 from .model import timestamp
 
-TIMEFRAMES = {"30s": 30, "1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+TIMEFRAMES = {
+    "30s": 30,
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "2h": 7200,
+    "4h": 14400,
+    "6h": 21600,
+    "12h": 43200,
+    "24h": 86400,
+}
 EMA_PERIODS = (9, 21, 50, 200)
 VERSION = "advanced-closed-technical-v1"
 FEATURE_NAMES = tuple(
@@ -27,6 +39,10 @@ FEATURE_NAMES = tuple(
         "ema21_distance",
         "ema50_distance",
         "ema200_distance",
+        "atr14_fraction",
+        "adx14",
+        "stochastic_k14",
+        "volume_weighted_momentum20",
     )
 )
 
@@ -132,6 +148,57 @@ def bollinger(values, period=20, deviations=2.0):
         "bandwidth": (upper - lower) / center,
         "percent_b": (values[-1] - lower) / (upper - lower) if upper > lower else None,
         "standard_deviation": sd,
+    }
+
+
+def _trend_momentum(bars, period=14):
+    """Closed-bar ATR, ADX, stochastic and volume-weighted momentum."""
+    if len(bars) < period + 1:
+        return None
+    transitions = list(zip(bars, bars[1:]))
+    tr, plus, minus = [], [], []
+    for previous, current in transitions:
+        up = current["high"] - previous["high"]
+        down = previous["low"] - current["low"]
+        tr.append(
+            max(
+                current["high"] - current["low"],
+                abs(current["high"] - previous["close"]),
+                abs(current["low"] - previous["close"]),
+            )
+        )
+        plus.append(up if up > down and up > 0 else 0.0)
+        minus.append(down if down > up and down > 0 else 0.0)
+    atr = mean(tr[-period:])
+    dx_values = []
+    if len(tr) >= 2 * period - 1:
+        for end in range(len(tr) - period + 1, len(tr) + 1):
+            local_atr = mean(tr[end - period : end])
+            plus_di = 100 * mean(plus[end - period : end]) / local_atr if local_atr else 0.0
+            minus_di = 100 * mean(minus[end - period : end]) / local_atr if local_atr else 0.0
+            dx_values.append(
+                100 * abs(plus_di - minus_di) / (plus_di + minus_di) if plus_di + minus_di else 0.0
+            )
+    recent = bars[-period:]
+    high, low = max(b["high"] for b in recent), min(b["low"] for b in recent)
+    stochastic = 100 * (bars[-1]["close"] - low) / (high - low) if high > low else 50.0
+    weighted = [
+        ((b["close"] / a["close"] - 1), b["volume"])
+        for a, b in transitions[-20:]
+        if b["volume"] is not None
+    ]
+    volume_total = sum(volume for _, volume in weighted)
+    return {
+        "atr14_fraction": atr / bars[-1]["close"],
+        # A single receipt-safe directional-movement reading. It remains a
+        # shadow feature until chronological ablation demonstrates value.
+        "adx14": mean(dx_values) if len(dx_values) == period else None,
+        "stochastic_k14": stochastic,
+        "volume_weighted_momentum20": (
+            sum(value * volume for value, volume in weighted) / volume_total
+            if volume_total
+            else None
+        ),
     }
 
 
@@ -420,6 +487,17 @@ def _frame(bars, seconds, now, reason, deviations):
         "interpretation": alignment,
         "actively_contributing": False,
     }
+    trend = _trend_momentum(bars)
+    result["trend_momentum"] = (
+        {
+            "status": "READY",
+            **trend,
+            "actively_contributing": False,
+            "interpretation": "SHADOW_ONLY",
+        }
+        if trend
+        else _unavailable("ATR/ADX/stochastic require 15 closed bars", 15, count)
+    )
     return result
 
 
@@ -456,6 +534,13 @@ def technical_snapshot(candles, now, *, short_bars=None, deviations=2.0):
             candidates[prefix + f"ema{period}_distance"] = frame["ema"]["periods"][str(period)].get(
                 "price_distance_fraction"
             )
+        for name in (
+            "atr14_fraction",
+            "adx14",
+            "stochastic_k14",
+            "volume_weighted_momentum20",
+        ):
+            candidates[prefix + name] = frame["trend_momentum"].get(name)
         for name in FEATURE_NAMES:
             if name.startswith(prefix) and candidates.get(name) is not None:
                 feature_sources[name] = {

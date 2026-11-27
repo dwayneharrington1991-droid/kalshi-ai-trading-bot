@@ -21,7 +21,79 @@ VERSION = "independent-basis-forecast-v3"
 MIN_SAMPLES = 61
 MIN_SECONDS = 120
 MAX_GAP = 5
+PREOPEN_PERSIST_SECONDS = 70  # opening_points uses 65 s; keep a margin
 PATHS = 2000
+
+
+def simulate_paths(rng, paths, initial, sigma, delay, horizon, qs, spreads, caps, slippage, multiplier,
+                   target, stop):
+    """Monte Carlo scalp paths. Exactly the original per-second loop (same seeded
+    draws in the same order, same arithmetic in the same order, same early exits),
+    with loop-invariant work hoisted: the entry fee is computed once per path
+    instead of every second, and seconds before entry only advance the price."""
+    sides = tuple(caps)
+    totals = {
+        s: {"target": 0, "stop": 0, "timeout": 0, "no_entry": 0, "pnl": [],
+            "outcome_pnl": {"target": [], "stop": [], "timeout": []}}
+        for s in sides
+    }
+    gauss, exp, ceil = rng.gauss, math.exp, math.ceil
+    last = delay + horizon
+    for _ in range(paths):
+        value = initial
+        for second in range(1, delay + 1):  # before entry only the price moves
+            value += gauss(0, sigma)
+        # entry second (== delay)
+        p = 1 / (1 + exp(-max(-30, min(30, value))))
+        live = []
+        for side in sides:
+            fair = p if side == "up" else 1 - p
+            q = qs[side]
+            ask = q["ask"] if delay == 0 else min(1, fair + spreads[side])
+            buy = ask + slippage
+            t = totals[side]
+            if buy > caps[side] or buy >= 1:
+                t["no_entry"] += 1
+                t["pnl"].append(0.0)
+                continue
+            live.append((side == "up", buy, fee(buy, multiplier), t, q["bid"], spreads[side]))
+        second = delay
+        k = 0.07 * multiplier  # fee(): ceil(0.07 * m * price * (1 - price) * 100 - 1e-12) / 100
+        while live:
+            if second > delay:
+                v = value
+                v = 30 if v > 30 else (-30 if v < -30 else v)
+                p = 1 / (1 + exp(-v))
+            still = []
+            for item in live:
+                is_up, entry, entry_fee, t, quoted_bid, spread = item
+                fair = p if is_up else 1 - p
+                if second == 0:
+                    raw_bid = quoted_bid
+                else:
+                    raw_bid = fair - spread
+                    raw_bid = raw_bid if raw_bid > 0 else 0
+                bid = raw_bid - slippage
+                bid = bid if bid > 0 else 0
+                net = bid - entry - entry_fee - ceil(k * bid * (1 - bid) * 100 - 1e-12) / 100
+                if second - delay >= horizon:
+                    outcome = "timeout"
+                elif net <= -stop:
+                    outcome = "stop"
+                elif net >= target:
+                    outcome = "target"
+                else:
+                    still.append(item)
+                    continue
+                t[outcome] += 1
+                t["pnl"].append(net)
+                t["outcome_pnl"][outcome].append(net)
+            live = still
+            if not live or second >= last:
+                break
+            second += 1
+            value += gauss(0, sigma)
+    return totals
 
 
 def binary_contract_context(market, remaining, slippage):
@@ -103,14 +175,39 @@ class LiveEstimator:
     def __init__(self, manual_delay=3, slippage=0.01):
         self.manual_delay = manual_delay
         self.slippage = slippage
-        self.reference = deque(maxlen=1800)
+        # One continuous live series per exchange. Coinbase and Kraken ticks arrive
+        # interleaved; a single buffer cleared on every source change never covered
+        # the final 60 s averaging window. Estimates read only the series of the
+        # current reference source, so exchanges are never mixed.
+        self.reference_series = {}
         # Receipt audit used only for as-of-opening selection. Unlike the live
         # volatility buffer, a reconnect/gap must not erase observations that
         # were genuinely received before the contract opened.
         self.opening_references = {}
+        # Accepted reference receipts awaiting the server's pre-opening
+        # persistence filter (drained every tick; bounded).
+        self.pending_preopen_references = []
         self.quotes = {}
         self.reference_source = None
         self.developing = DevelopingCandle()
+
+    @property
+    def reference(self):
+        """The live series of the current reference source (empty if none yet)."""
+        if self.reference_source is None:
+            return deque(maxlen=1800)
+        return self.reference_series.setdefault(self.reference_source, deque(maxlen=1800))
+
+    def _append_live(self, source, when, price):
+        series = self.reference_series.setdefault(source, deque(maxlen=1800))
+        if series and when < series[-1][0]:
+            return False
+        if series and (when - series[-1][0]).total_seconds() > MAX_GAP:
+            series.clear()
+        if not series or when > series[-1][0]:
+            series.append((when, price))
+            return True
+        return None
 
     def restore(self, states):
         """Recover only observed inputs, never probabilities or fabricated paths."""
@@ -132,16 +229,8 @@ class LiveEstimator:
             price = number(reference["price"], 0.000001, 1e12)
             if 0 <= (now - when).total_seconds() <= MAX_GAP:
                 self._audit_reference(source, when, price)
-                if source != self.reference_source:
-                    self.reference.clear()
-                    self.reference_source = source
-                if self.reference and (
-                    when < self.reference[-1][0]
-                    or (when - self.reference[-1][0]).total_seconds() > MAX_GAP
-                ):
-                    self.reference.clear()
-                if not self.reference or when > self.reference[-1][0]:
-                    self.reference.append((when, price))
+                self.reference_source = source
+                self._append_live(source, when, price)
         except (KeyError, ValueError, TypeError, AttributeError):
             pass
         for market in payload.get("markets", []):
@@ -190,7 +279,30 @@ class LiveEstimator:
         if history and received < history[-1][0]:
             return False
         history.append((received, price))
+        # The server persists only receipts inside the 70 s before a DISCOVERED
+        # contract's actual opening; the estimator does not assume a schedule.
+        self.pending_preopen_references.append((source, received, price))
+        del self.pending_preopen_references[:-5000]  # bounded if never drained
         return True
+
+    def drain_preopen_references(self):
+        drained, self.pending_preopen_references = self.pending_preopen_references, []
+        return drained
+
+    def peek_preopen_references(self):
+        """Return the pending receipts without acknowledging persistence.
+
+        The server acknowledges this exact prefix only after the journal write
+        succeeds. A transient SQLite error must not turn receipt-proven inputs
+        into an unrecoverable opening after they have already been drained.
+        """
+        return list(self.pending_preopen_references)
+
+    def acknowledge_preopen_references(self, count):
+        """Discard a successfully handled prefix of the pending receipt queue."""
+        if not isinstance(count, int) or count < 0 or count > len(self.pending_preopen_references):
+            raise ValueError("invalid pre-opening receipt acknowledgement")
+        del self.pending_preopen_references[:count]
 
     def opening_points(self, opened):
         """Select one proxy source using receipts at or before opening only."""
@@ -218,16 +330,9 @@ class LiveEstimator:
             if not 0 <= (now - received).total_seconds() <= 65:
                 return False
             self._audit_reference(source, received, price)
-            if source != self.reference_source:
-                self.reference.clear()
+            if self.reference_source is None:
                 self.reference_source = source
-            if self.reference and received < self.reference[-1][0]:
-                return False
-            if self.reference and (received - self.reference[-1][0]).total_seconds() > MAX_GAP:
-                self.reference.clear()
-            if not self.reference or received > self.reference[-1][0]:
-                self.reference.append((received, price))
-                return True
+            return self._append_live(source, received, price)
         except (KeyError, TypeError, ValueError, AttributeError):
             return False
         return False
@@ -505,59 +610,10 @@ class LiveEstimator:
                 "big",
             )
             rng = random.Random(seed)
-            totals = {
-                s: {
-                    "target": 0,
-                    "stop": 0,
-                    "timeout": 0,
-                    "no_entry": 0,
-                    "pnl": [],
-                    "outcome_pnl": {"target": [], "stop": [], "timeout": []},
-                }
-                for s in caps
-            }
-            for _ in range(PATHS):
-                entries = {s: None for s in caps}
-                resolved = {s: False for s in caps}
-                value = initial
-                for second in range(self.manual_delay + horizon + 1):
-                    if second:
-                        value += rng.gauss(0, sigma)
-                    p = 1 / (1 + math.exp(-max(-30, min(30, value))))
-                    for side in caps:
-                        if resolved[side]:
-                            continue
-                        fair = p if side == "up" else 1 - p
-                        if second < self.manual_delay:
-                            continue
-                        if second == self.manual_delay:
-                            ask = qs[side]["ask"] if second == 0 else min(1, fair + spreads[side])
-                            buy = ask + self.slippage
-                            if buy > caps[side] or buy >= 1:
-                                totals[side]["no_entry"] += 1
-                                totals[side]["pnl"].append(0.0)
-                                resolved[side] = True
-                                continue
-                            entries[side] = buy
-                        raw_bid = qs[side]["bid"] if second == 0 else max(0, fair - spreads[side])
-                        bid = max(0, raw_bid - self.slippage)
-                        entry = entries[side]
-                        net = bid - entry - fee(entry, multiplier) - fee(bid, multiplier)
-                        elapsed = second - self.manual_delay
-                        outcome = None
-                        if elapsed >= horizon:
-                            outcome = "timeout"
-                        elif net <= -stop:
-                            outcome = "stop"
-                        elif net >= target:
-                            outcome = "target"
-                        if outcome:
-                            totals[side][outcome] += 1
-                            totals[side]["pnl"].append(net)
-                            totals[side]["outcome_pnl"][outcome].append(net)
-                            resolved[side] = True
-                    if all(resolved.values()):
-                        break
+            totals = simulate_paths(
+                rng, PATHS, initial, sigma, self.manual_delay, horizon, qs, spreads, caps,
+                self.slippage, multiplier, target, stop,
+            )
             details = {}
             probabilities = {}
             for side, total in totals.items():

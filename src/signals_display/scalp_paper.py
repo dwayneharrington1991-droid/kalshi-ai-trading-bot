@@ -236,7 +236,8 @@ def _verified_legacy(db, mode, limit):
     )
 
 
-def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verified_legacy=False):
+def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verified_legacy=False,
+                 contract_limit=None, per_contract_limit=360):
     """Bounded, read-only normalized records; never load legacy payload blobs."""
     if type(limit) is not int or not 1 <= limit <= 100000:
         raise ValueError("Record limit must be 1..100000")
@@ -263,15 +264,43 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
                     "reason": "No normalized pre-outcome book journal. Legacy prediction rows do not prove actual generation/recording times; collect forward observations instead.",
                 },
             }
-        rows = (
-            db.execute(
-                "SELECT payload FROM (SELECT id,payload FROM scalp_book_observations WHERE mode=? ORDER BY id DESC LIMIT ?) ORDER BY id",
-                (mode, limit + 1),
-            ).fetchall()
-            if exists
-            else []
-        )
-        truncated = len(rows) > limit
+        sampled_contracts = None
+        if exists and contract_limit is not None:
+            if type(contract_limit) is not int or not 1 <= contract_limit <= 250:
+                raise ValueError("Contract limit must be 1..250")
+            if type(per_contract_limit) is not int or not 30 <= per_contract_limit <= 1000:
+                raise ValueError("Per-contract record limit must be 30..1000")
+            tickers = [row[0] for row in db.execute(
+                """SELECT ticker FROM scalp_book_observations WHERE mode=?
+                GROUP BY ticker ORDER BY MAX(id) DESC LIMIT ?""", (mode, contract_limit)
+            )]
+            sampled_contracts = len(tickers)
+            rows = []
+            for ticker in tickers:
+                rows.extend(db.execute(
+                    """SELECT payload FROM (SELECT id,payload FROM scalp_book_observations
+                    WHERE mode=? AND ticker=? ORDER BY id DESC LIMIT ?) ORDER BY id""",
+                    (mode, ticker, per_contract_limit),
+                ).fetchall())
+            def row_time(row):
+                try:
+                    return available_time(json.loads(row[0]))
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    return datetime.min.replace(tzinfo=timezone.utc)
+            rows.sort(key=row_time)
+            if len(rows) > limit:
+                rows = rows[-limit:]
+            truncated = len(tickers) == contract_limit
+        else:
+            rows = (
+                db.execute(
+                    "SELECT payload FROM (SELECT id,payload FROM scalp_book_observations WHERE mode=? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                    (mode, limit + 1),
+                ).fetchall()
+                if exists
+                else []
+            )
+            truncated = len(rows) > limit
         rows = rows[-limit:]
         records, malformed = [], 0
         for row in rows:
@@ -353,6 +382,8 @@ def load_journal(path, *, limit=10000, mode="PUBLIC MARKET DATA", include_verifi
             "official_result_observations": official_count,
             "legacy_selection": legacy_reason,
             "record_limit": limit,
+            "sampled_contracts": sampled_contracts,
+            "per_contract_record_limit": per_contract_limit if sampled_contracts is not None else None,
             "reason": "Latest bounded observation window only; earlier paper positions are not reconstructed across a truncated boundary"
             if truncated
             else "Timestamped observation replay; displayed depth does not establish real fills",
@@ -463,6 +494,47 @@ def _chosen(row, criteria):
     return (
         options[0][1] if options and (len(options) == 1 or options[0][0] > options[1][0]) else None
     )
+
+
+def _rejection_reasons(row, criteria):
+    """Explain shadow candidate rejection without changing any threshold."""
+    if not row["forecast_cutoff_verified"]:
+        return ["MISSING_VERIFIED_FORECAST_CUTOFF"]
+    if row.get("candidate_data_stale"):
+        return ["DATA_STALE_AT_RECORDING"]
+    scanner = row.get("scanner") or {}
+    if scanner.get("macro_blackout"):
+        return ["MACRO_BLACKOUT"]
+    if scanner.get("high_slippage_risk"):
+        return ["HIGH_SLIPPAGE_RISK"]
+    candidates = row.get("candidates") or []
+    if not candidates:
+        return ["NO_MODEL_CANDIDATES_RECORDED"]
+    reasons = []
+    for item in candidates:
+        try:
+            definition = item["model_definition"]
+            if (
+                definition.get("fee_type") != row["market"]["fee_type"]
+                or number(definition.get("fee_multiplier"), 0, 100) != row["multiplier"]
+            ):
+                reasons.append("FEE_DEFINITION_MISMATCH"); continue
+            if any(
+                abs(number(definition[name], 0, 10000) - getattr(criteria, name)) > 1e-8
+                for name in ("quantity", "target", "stop", "holding_seconds", "manual_delay_seconds", "slippage_per_leg")
+            ):
+                reasons.append("PREDECLARED_STRATEGY_MISMATCH"); continue
+            if number(item["target_probability_given_entry"], 0, 1) < criteria.minimum_target_probability:
+                reasons.append("TARGET_PROBABILITY_BELOW_THRESHOLD")
+            if number(item["net_expected_profit_per_opportunity"], -1, 1) <= 0:
+                reasons.append("NONPOSITIVE_EXPECTED_VALUE")
+            if number(item["net_ev_sampling_interval"][0], -1, 1) <= 0:
+                reasons.append("EXPECTED_VALUE_INTERVAL_NOT_POSITIVE")
+            if item["entered_paths"] < criteria.minimum_entered_paths:
+                reasons.append("INSUFFICIENT_MONTE_CARLO_ENTRY_PATHS")
+        except (KeyError, ValueError, TypeError, IndexError):
+            reasons.append("MALFORMED_OR_INCOMPLETE_MODEL_EVENT")
+    return sorted(set(reasons)) or ["AMBIGUOUS_EQUAL_EDGE_CANDIDATES"]
 
 
 class _Strategy:
@@ -881,6 +953,10 @@ def evaluate(records, criteria=None):
 
     windows = {window_key(r) for r in books}
     qualified_windows = {window_key(r) for r in books if _chosen(r, c) is not None}
+    rejection_counts = Counter()
+    for row in books:
+        if _chosen(row, c) is None:
+            rejection_counts.update(_rejection_reasons(row, c))
     result = {
         "protocol": VERSION,
         "status": "PAPER_REPLAY_ONLY" if len(books) >= 2 else "INSUFFICIENT_HISTORICAL_ORDER_BOOKS",
@@ -896,6 +972,7 @@ def evaluate(records, criteria=None):
             else None,
             "window_scope": "Observed contract/UTC interval windows; model candidate presence before execution/risk filters, never an actionable call or a fill",
             "excluded": {k: v for k, v in excluded.items() if v},
+            "candidate_rejection_reasons": dict(rejection_counts.most_common()),
             "first_available_at": accepted[0]["at"].isoformat() if accepted else None,
             "last_available_at": accepted[-1]["at"].isoformat() if accepted else None,
             "contracts": len({r["ticker"] for r in accepted}),

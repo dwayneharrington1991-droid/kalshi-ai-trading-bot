@@ -25,6 +25,7 @@ args=(
   --model-artifact "$MODEL_ARTIFACT"
   --opening-model-artifact "$OPENING_MODEL_ARTIFACT"
   --model-registry "$MODEL_REGISTRY"
+  --learning-status "$DEPLOY_ROOT/learning-status/latest.json"
   --processing-ms 100 --build-commit "$commit"
 )
 if [[ $ENABLE_ACCOUNT_READONLY == 1 ]]; then

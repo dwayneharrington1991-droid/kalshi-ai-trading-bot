@@ -84,6 +84,34 @@ def candidate(report):
     return report["strategies"]["candidate"]
 
 
+def test_contract_bounded_loader_preserves_many_forward_contracts(tmp_path):
+    path = tmp_path / "scalp.db"
+    db = sqlite3.connect(path)
+    create_schema(db)
+    db.execute("CREATE TABLE forecast_outcomes(ticker TEXT,origin TEXT,outcome INTEGER,observed_at TEXT)")
+    for contract in range(12):
+        ticker = f"KXBTC15M-PAPER-{contract}"
+        for second in range(40):
+            payload = row(second, ticker=ticker)
+            db.execute(
+                "INSERT INTO scalp_book_observations(mode,ticker,observed_at,generated_at,recorded_at,payload) VALUES (?,?,?,?,?,?)",
+                ("PUBLIC MARKET DATA", ticker, payload["market"]["observed_at"],
+                 payload["generated_at"], payload["recorded_at"], json.dumps(payload)),
+            )
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            (ticker, "official", contract % 2, (NOW + timedelta(minutes=15)).isoformat()),
+        )
+    db.commit(); db.close()
+    loaded = load_journal(
+        path, limit=1000, contract_limit=10, per_contract_limit=30
+    )
+    books = [r for r in loaded["records"] if r.get("type") != "official_settlement"]
+    assert len({_contract["market"]["ticker"] for _contract in books}) == 10
+    assert len(books) == 300
+    assert loaded["coverage"]["official_result_observations"] == 10
+
+
 def test_target_uses_actual_after_delay_quote_and_both_costs():
     result = evaluate([row(0), row(3), row(4, bid=0.62, ask=0.64)])
     stats = candidate(result)
@@ -105,6 +133,17 @@ def test_old_receipt_cannot_fill_after_delay_and_price_cap_can_miss():
     assert stats["net_simulated_pnl"] == 0
     moved = evaluate([row(0), row(3, bid=0.51, ask=0.53), row(6, bid=0.51, ask=0.53)])
     assert candidate(moved)["simulated_trades"] == 0
+
+
+def test_zero_candidates_report_exact_rejection_reasons():
+    missing = row(0, candidate=False)
+    stale = row(3)
+    stale["candidate_data_stale"] = True
+    result = evaluate([missing, stale])
+    reasons = result["coverage"]["candidate_rejection_reasons"]
+    assert reasons["NO_MODEL_CANDIDATES_RECORDED"] == 1
+    assert reasons["DATA_STALE_AT_RECORDING"] == 1
+    assert result["coverage"]["model_candidate_windows"] == 0
 
 
 def test_partial_entry_and_exit_use_depth_once_and_round_each_fee():

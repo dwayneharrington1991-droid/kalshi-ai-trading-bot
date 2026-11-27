@@ -101,7 +101,7 @@ def test_ensemble_weights_and_calibration_do_not_see_future_test_labels():
     assert original["edge_status"] == "edge unverified"
 
 
-def test_holdout_exposure_blocks_reuse_before_fitting(monkeypatch):
+def test_holdout_exposure_waits_for_a_new_forward_block_before_fitting(monkeypatch):
     data = rows()
     monkeypatch.setattr(
         learning,
@@ -109,8 +109,22 @@ def test_holdout_exposure_blocks_reuse_before_fitting(monkeypatch):
         lambda *args: pytest.fail("Already exposed test labels must not be fitted/evaluated again"),
     )
     candidate, report = learning.compare(data, used_test_contracts={"C179"})
-    assert candidate is None and report["status"] == "HOLDOUT_REUSE_BLOCKED"
-    assert report["holdout_overlap_contracts"] == 1 and report["holdout_reuse_checked"]
+    assert candidate is None and report["status"] == "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT"
+    assert report["unseen_forward_contracts"] == 0 and report["holdout_reuse_checked"]
+    assert report["required_unseen_forward_contracts"] == 30
+    assert report["additional_unseen_contracts_needed"] == 30
+    assert report["last_exposed_contract"] == "C179"
+
+
+def test_next_settlement_evaluation_uses_only_later_unseen_contracts():
+    initial = rows()
+    _candidate, first = learning.compare(initial, used_test_contracts=set())
+    _candidate, forward = learning.compare(
+        rows(210), used_test_contracts=set(first["test_contracts"])
+    )
+    assert forward["evaluation_mode"] == "FORWARD_UNSEEN_HOLDOUT"
+    assert forward["split_contracts"] == [144, 36, 30]
+    assert set(forward["test_contracts"]).isdisjoint(first["test_contracts"])
 
 
 def test_json_loader_validates_all_ensemble_members_and_weights(tmp_path):
@@ -288,3 +302,121 @@ def test_dataset_projects_small_features_and_does_not_invent_market_benchmark(tm
     assert learning.market_score(result)["samples"] == 0
     assert len(json.dumps(result)) < 2000
     assert not any("select payload" in q.lower() for q in queries)
+    dataset_query = next(q for q in queries if "json_extract" in q.lower())
+    assert "forecast_outcomes o cross join predictions p" in dataset_query.lower()
+    assert "exists (select 1 from forecast_outcomes" not in dataset_query.lower()
+
+
+def test_dataset_fast_path_never_drops_valid_row_after_incomplete_candidates(tmp_path):
+    from src.signals_display.monitor import Journal
+
+    journal = Journal(tmp_path / "journal.db")
+    opened = NOW - timedelta(minutes=15)
+    closed = NOW - timedelta(minutes=1)
+    settled = NOW.isoformat()
+    invalid = {
+        "stale": True,
+        "market": {"closes_at": closed.isoformat(), "quotes": {}},
+        "model": {"candidate_features": {"values": {}}, "baseline_probability_up": 0.5},
+    }
+    valid = {
+        "stale": False,
+        "market": {"closes_at": closed.isoformat(), "quotes": {}},
+        "model": {
+            "candidate_features": {"values": {"distance_scaled": 0.2, "return_1m": 0.01}},
+            "baseline_probability_up": 0.6,
+        },
+    }
+    ticker = "KXBTC15M-FASTPATH"
+    with journal.connect() as db:
+        db.execute(
+            "INSERT INTO forecast_outcomes VALUES (?,?,?,?)",
+            (ticker, "official", settled, 1),
+        )
+        db.execute(
+            "INSERT INTO btc_engine_contracts VALUES (?,?,?,?,?)",
+            ("PUBLIC MARKET DATA", ticker, closed.isoformat(), 31, opened.isoformat()),
+        )
+        for index in range(31):
+            at = opened + timedelta(seconds=index)
+            db.execute(
+                """INSERT INTO predictions
+                (mode,ticker,timestamp,payload,settlement_origin,settlement_up,settled_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (
+                    "PUBLIC MARKET DATA", ticker, at.isoformat(),
+                    json.dumps(valid if index == 30 else invalid), "official", 1, settled,
+                ),
+            )
+    with journal.read() as db:
+        queries = []
+        db.set_trace_callback(queries.append)
+        result = learning.dataset(db, NOW + timedelta(seconds=1))
+    assert len(result) == 1
+    assert result[0]["timestamp"] == (opened + timedelta(seconds=30)).isoformat()
+    assert not any("row_number() over" in query.lower() for query in queries)
+    assert any("order by p.timestamp,p.id limit 30" in query.lower() for query in queries)
+    assert not any("p.ticker in (" in query.lower() for query in queries)
+
+
+def test_horizon_summary_uses_one_exact_compact_join_instead_of_revision_scans(tmp_path):
+    from src.signals_display.monitor import Journal
+
+    journal = Journal(tmp_path / "journal.db")
+    opened, closed = NOW - timedelta(minutes=15), NOW - timedelta(minutes=1)
+    ticker, settled = "KXBTC15M-HORIZON", NOW.isoformat()
+    valid = {
+        "stale": False,
+        "market": {"closes_at": closed.isoformat(), "quotes": {}},
+        "model": {
+            "candidate_features": {"values": {"distance_scaled": .2, "return_1m": .01}},
+            "baseline_probability_up": .6,
+        },
+    }
+    chosen = opened + timedelta(minutes=10)
+    with journal.connect() as db:
+        db.execute("INSERT INTO forecast_outcomes VALUES (?,?,?,?)", (ticker, "official", settled, 1))
+        db.execute("INSERT INTO btc_engine_contracts VALUES (?,?,?,?,?)", ("PUBLIC MARKET DATA", ticker, closed.isoformat(), 401, chosen.isoformat()))
+        for index in range(400):
+            at = opened + timedelta(seconds=index)
+            db.execute(
+                """INSERT INTO predictions(mode,ticker,timestamp,payload,settlement_origin,settlement_up,settled_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                ("PUBLIC MARKET DATA", ticker, at.isoformat(), json.dumps({"stale": True}), "official", 1, settled),
+            )
+        db.execute(
+            """INSERT INTO predictions(mode,ticker,timestamp,payload,settlement_origin,settlement_up,settled_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            ("PUBLIC MARKET DATA", ticker, chosen.isoformat(), json.dumps(valid), "official", 1, settled),
+        )
+        db.execute(
+            "INSERT INTO btc_engine_horizons VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("PUBLIC MARKET DATA", ticker, "2-5m", chosen.isoformat(), chosen.isoformat(), closed.isoformat(), .6, "normal", "v", "{}"),
+        )
+    with journal.read() as db:
+        queries = []
+        db.set_trace_callback(queries.append)
+        result = learning.dataset(db, NOW + timedelta(seconds=1))
+    assert len(result) == 1 and result[0]["ticker"] == ticker
+    horizon_queries = [q for q in queries if "from btc_engine_horizons h" in q.lower()]
+    assert len(horizon_queries) == 1
+    assert not any("order by p.timestamp,p.id limit 30" in q.lower() for q in queries)
+
+
+def test_after_cost_assessment_withholds_profitable_edge_without_delayed_quotes():
+    rows = [
+        {
+            "ticker": "KXBTC15M-COST",
+            "outcome": 1,
+            "fee_multiplier": 1,
+            "executable_quotes": {
+                "up": {"bid": 0.49, "ask": 0.50},
+                "down": {"bid": 0.48, "ask": 0.51},
+            },
+        }
+    ]
+    report = learning.after_cost_assessment([0.70], rows)
+    assert report["eligible_quote_observations"] == 1
+    assert report["fees_included"] is True
+    assert report["manual_execution_delay_supported"] is False
+    assert report["profitable_edge_demonstrated"] is False

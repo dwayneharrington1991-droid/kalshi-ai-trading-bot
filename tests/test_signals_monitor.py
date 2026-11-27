@@ -138,6 +138,8 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy, m
                 payload["orderbook_fp"]["no_dollars"] = []
             elif missing_side:
                 payload["orderbook_fp"][missing_side + "_dollars"] = []
+        elif url.startswith(module.COINBASE_MARKET_TRADES):
+            payload = {"trades": []}
         elif "/candles?" in url:
             payload = {"candles": []}
         elif url == module.COINBASE:
@@ -148,9 +150,12 @@ def test_public_adapter_only_gets_allowlisted_public_data(monkeypatch, legacy, m
 
     monkeypatch.setattr(module, "utcnow", lambda: NOW)
     data = PublicFeed(get).poll()
-    assert len(calls) == 10
+    # Empty primary history now exercises bounded independent Exchange and
+    # exact-trade recovery rather than aborting after the first provider.
+    assert len(calls) == 20
     assert any(url.startswith(module.COINBASE_EXCHANGE_CANDLES) for url in calls)
-    assert sum("/candles?" in call for call in calls) == 6
+    assert sum("/candles?" in call for call in calls) == 11
+    assert sum(call.startswith(module.COINBASE_MARKET_TRADES) for call in calls) == 5
     market = data["markets"][0]
     if missing_side == "both":
         assert market["book_diagnostic"].startswith("NO_LIQUIDITY")
@@ -246,12 +251,14 @@ def test_incomplete_startup_candle_preload_retries_after_five_seconds():
 
     feed = PublicFeed(get, multi_venue=False)
     feed.candles(NOW)
-    assert len(calls) == 6
-    assert calls[-1].startswith(module.COINBASE_EXCHANGE_CANDLES)
+    first_attempts = len(calls)
+    assert first_attempts == 16
+    assert any(call.startswith(module.COINBASE_EXCHANGE_CANDLES) for call in calls)
+    assert calls[-1].startswith(module.COINBASE_MARKET_TRADES)
     feed.candles(NOW + timedelta(seconds=4))
-    assert len(calls) == 6
+    assert len(calls) == first_attempts
     feed.candles(NOW + timedelta(seconds=5))
-    assert len(calls) == 12
+    assert len(calls) == first_attempts * 2
 
 
 def test_counterfactual_journal_deduplicates_and_includes_spread_and_fees(tmp_path):
@@ -271,6 +278,46 @@ def test_counterfactual_journal_deduplicates_and_includes_spread_and_fees(tmp_pa
     assert all(row["real_fill"] == 0 for row in rows.values())
     journal.settle("KXBTC15M-MOCK", "yes", "REPLAY / SIMULATED")
     assert all(p["settlement_up"] == 1 for p in journal.history()["predictions"])
+
+
+def test_settlement_skips_malformed_legacy_payload_without_blocking_valid_rows(tmp_path):
+    journal = Journal(tmp_path / "journal.db")
+    state = analyze(frame(), NOW, stop=0.15)
+    journal.step(state)
+    with journal.connect() as db:
+        db.execute(
+            """INSERT INTO predictions
+            (mode,ticker,timestamp,direction,scalp,probability_up,probability_down,payload)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                state["mode"],
+                state["market"]["ticker"],
+                (NOW + timedelta(seconds=1)).isoformat(),
+                "UP",
+                "WAIT",
+                0.6,
+                0.4,
+                "{malformed legacy payload",
+            ),
+        )
+
+    assert journal.settle(
+        state["market"]["ticker"], "yes", state["mode"],
+        (NOW + timedelta(minutes=16)).isoformat(),
+    )
+    with journal.read() as db:
+        rows = db.execute(
+            "SELECT payload,settlement_up,settlement_origin FROM predictions ORDER BY id"
+        ).fetchall()
+        outcome = db.execute(
+            "SELECT outcome FROM forecast_outcomes WHERE ticker=? AND origin='replay'",
+            (state["market"]["ticker"],),
+        ).fetchone()
+    assert rows[0]["settlement_up"] == 1
+    assert rows[0]["settlement_origin"] == "replay"
+    assert rows[1]["settlement_up"] is None
+    assert rows[1]["settlement_origin"] == "legacy_unknown"
+    assert outcome["outcome"] == 1
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,23 @@
+# Kalshi 8768 three-AI opening Telegram alert (LIVE + CHALLENGER + EXPERIMENTAL CONSENSUS). Signals only.
+# Reads only the read-only HTTP API on 127.0.0.1:8768; never opens the journal, never trades.
+# vendor/ holds a copy of the production src/signals_display/phone_alerts.py (stdlib only) so deploys never break the alert.
+# Install: sudo cp deploy/oracle/kalshi-dual-ai-alerts.service /etc/systemd/system/ && sudo systemctl enable --now kalshi-dual-ai-alerts
+[Unit]
+Description=Kalshi 8768 three-AI opening Telegram alerts (signals only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/dual-ai-alerts
+ExecStart=/usr/bin/python3 /home/opc/dual-ai-alerts/dual_ai_alerts.py --release /home/opc/dual-ai-alerts/vendor --db /home/opc/dual-ai-alerts/sent.sqlite3 --hours 0
+Restart=always
+RestartSec=10
+Nice=10
+CPUQuota=10%
+MemoryMax=200M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

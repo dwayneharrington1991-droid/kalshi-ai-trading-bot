@@ -8,7 +8,14 @@ from the snapshot, plus the official-reference settlement direction.
 from dataclasses import dataclass
 from datetime import datetime
 import math
-from typing import Any
+from typing import Any, TypedDict
+
+
+class _DisplayBase(TypedDict):
+    contract: str
+    settlement_up: float
+    settlement_down: float
+    samples: int
 
 
 @dataclass(frozen=True)
@@ -114,7 +121,12 @@ def evaluate(
                 raise ValueError("each scenario needs a settlement outcome")
             outcomes.append(path["settlement_up"])
         up = sum(outcomes) / len(paths)
-        base = dict(contract=ticker, settlement_up=up, settlement_down=1 - up, samples=len(paths))
+        base: _DisplayBase = {
+            "contract": ticker,
+            "settlement_up": up,
+            "settlement_down": 1 - up,
+            "samples": len(paths),
+        }
         try:
             if horizon > remaining:
                 raise ValueError("scalp time limit exceeds remaining contract lifetime")
@@ -125,7 +137,7 @@ def evaluate(
             for path in paths:
                 points = path["quotes"]
                 previous = -1.0
-                resolved = {"up": None, "down": None}
+                resolved: dict[str, bool | None] = {"up": None, "down": None}
                 for point in points:
                     seconds = number(point["seconds"], 0, 900)
                     if seconds <= previous:

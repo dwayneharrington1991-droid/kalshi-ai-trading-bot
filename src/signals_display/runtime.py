@@ -2,13 +2,42 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
+import os
 import threading
 from time import monotonic, perf_counter
 from time import process_time
 import logging
 import json
+import math
 import resource
 from pathlib import Path
+from collections import deque
+
+
+# Background analytics (cached reports, learning readiness, settlement and
+# index maintenance) must never compete on equal terms with the market-data
+# collector and prediction threads: on a single shared CPU that competition
+# delayed published quotes past the 5-second freshness limit. Linux nice values
+# are per thread, so only these worker threads are lowered; the process, the
+# market threads and every other process are unaffected. Never raises priority.
+BACKGROUND_NICE = 10
+
+
+def background_thread_priority():
+    """Lower the calling OS thread's CPU priority to BACKGROUND_NICE (best effort)."""
+    try:
+        tid = threading.get_native_id()
+        if os.getpriority(os.PRIO_PROCESS, tid) < BACKGROUND_NICE:
+            os.setpriority(os.PRIO_PROCESS, tid, BACKGROUND_NICE)
+    except (AttributeError, OSError):
+        pass
+
+
+def background_pool(max_workers, name):
+    """ThreadPoolExecutor whose worker threads run at background priority."""
+    return ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix=name, initializer=background_thread_priority
+    )
 
 
 class CachedReport:
@@ -17,7 +46,7 @@ class CachedReport:
     def __init__(self, calculate, *, interval=30, name="dashboard-report"):
         self.calculate = calculate
         self.interval = interval
-        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
+        self.pool = background_pool(1, name)
         self.lock = threading.Lock()
         self.future = None
         self.started = None
@@ -95,6 +124,47 @@ class RuntimeMeter:
         self.cpu = process_time()
         self.logged = {}
         self.recent_errors = {}
+        self.latency_lock = threading.Lock()
+        self.latency_samples = {}
+
+    def observe(self, stage, milliseconds):
+        """Record a bounded processing latency sample, never provider latency."""
+        if stage not in {
+            "market_collection", "advanced_analysis", "prediction_calculation",
+            "account_manual_scheduling", "journal_write",
+            "total_processing", "publish_after_collection", "http_main_state",
+            "http_chart", "http_other",
+        }:
+            return
+        if not isinstance(milliseconds, (int, float)) or milliseconds < 0:
+            return
+        with self.latency_lock:
+            self.latency_samples.setdefault(stage, deque(maxlen=300)).append(
+                float(milliseconds)
+            )
+
+    @staticmethod
+    def _percentile(ordered, fraction):
+        if not ordered:
+            return None
+        index = max(0, min(len(ordered) - 1, math.ceil(fraction * len(ordered)) - 1))
+        return round(ordered[index], 3)
+
+    def latency_summary(self):
+        """Return nearest-rank percentiles for the bounded recent window."""
+        with self.latency_lock:
+            values = {name: list(samples) for name, samples in self.latency_samples.items()}
+        return {
+            name: {
+                "samples": len(samples),
+                "p50_ms": self._percentile(ordered := sorted(samples), 0.50),
+                "p95_ms": self._percentile(ordered, 0.95),
+                "p99_ms": self._percentile(ordered, 0.99),
+                "latest_ms": round(samples[-1], 3),
+            }
+            for name, samples in values.items()
+            if samples
+        }
 
     def sample(self):
         wall, cpu = monotonic(), process_time()
@@ -123,7 +193,11 @@ class RuntimeMeter:
     def error(self, component, error_type):
         # Callers pass exception TYPE only; never exception messages, account
         # payloads, authentication headers, file contents or arbitrary URLs.
-        if component not in {"public_rest", "account_sync", "settlement", "prediction"}:
+        if component not in {
+            "public_rest", "account_sync", "settlement", "prediction",
+            "journal_indexes", "candle_persistence", "opening_storage",
+            "opening_snapshot_storage",
+        }:
             return
         if not isinstance(error_type, str) or not error_type.isidentifier():
             error_type = "RedactedError"

@@ -12,7 +12,7 @@ jobs:
   test:
     name: Tests (no credentials — live tests are skipped)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +31,14 @@ jobs:
       # automatically (tests/conftest.py) — a plain pytest run never touches
       # the real Kalshi API or places orders.
       - name: Run test suite
-        run: pytest -v
+        # A per-test timeout turns a hung test into a named failure with a
+        # thread dump instead of a silently cancelled job.
+        run: |
+          # Resource trace: a GitHub runner that runs out of memory is shut down
+          # without a pytest summary. This prints memory and the largest
+          # processes every 20 s so a leak is attributable to the tests running.
+          ( while sleep 20; do echo "::group::resources $(date -u +%T)"; free -m | sed -n 2,3p;             echo "python procs: $(pgrep -c -f python || true)"; ps -eo pid,ppid,rss,etimes,args --sort=-rss | head -12 | cut -c1-200;             echo "::endgroup::"; done ) &
+          pytest -v -rfE --timeout=300 --durations=40
 
   secret-scan:
     name: Secret scan (gitleaks)

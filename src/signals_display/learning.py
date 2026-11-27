@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+from time import perf_counter
 
 from .features import FEATURES
 from .model import timestamp
@@ -33,68 +34,207 @@ def dataset(db, asof=None):
     has_results = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forecast_outcomes'"
     ).fetchone()
-    result_filter = (
-        "AND EXISTS (SELECT 1 FROM forecast_outcomes o WHERE o.ticker=predictions.ticker "
-        "AND o.origin='official' AND o.outcome=predictions.settlement_up "
-        "AND julianday(o.observed_at)<=julianday(?)) "
-        if has_results
-        else ""
+    has_contract_summaries = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='btc_engine_contracts'"
+    ).fetchone()
+    compact_count = (
+        db.execute(
+            "SELECT COUNT(*) FROM btc_engine_contracts WHERE mode='PUBLIC MARKET DATA'"
+        ).fetchone()[0]
+        if has_contract_summaries
+        else 0
     )
-    # Project only small scalar feature data inside SQLite. Cursor iteration
-    # never materializes gigabytes of historical JSON payloads in Python.
-    rows = db.execute(
-        """SELECT ticker,timestamp,settlement_up,settled_at,
-        json_extract(payload,'$.stale','$.market.closes_at',
+    payload_projection = """json_extract(p.payload,'$.stale','$.market.closes_at',
           '$.model.candidate_features.values','$.model.baseline_probability_up',
-          '$.market.quotes.up.bid','$.market.quotes.up.ask')
-        FROM predictions WHERE mode='PUBLIC MARKET DATA'
-          AND settlement_origin='official' AND settlement_up IS NOT NULL
-          AND julianday(settled_at)<=julianday(?) """
-        + result_filter
-        + "ORDER BY timestamp,id",
-        (asof.isoformat(),) * (2 if has_results else 1),
-    )
+          '$.market.quotes.up.bid','$.market.quotes.up.ask',
+          '$.market.quotes.down.bid','$.market.quotes.down.ask',
+          '$.market.fee_multiplier')"""
+    row_streams = []
+    if has_results:
+        if compact_count:
+            # A global ROW_NUMBER over the multi-gigabyte revision table made
+            # SQLite read and sort every historical row before returning a
+            # single candidate.  Seek through the existing ticker/mode index
+            # instead.  Each query reads only the earliest bounded candidates
+            # for one settled contract and horizon.
+            contracts = db.execute(
+                """SELECT c.ticker,c.closes_at,o.outcome,o.observed_at
+                FROM forecast_outcomes o JOIN btc_engine_contracts c
+                  ON c.ticker=o.ticker AND c.mode='PUBLIC MARKET DATA'
+                WHERE o.origin='official'
+                  AND julianday(o.observed_at)<=julianday(?)
+                  AND julianday(c.closes_at)<=julianday(o.observed_at)
+                ORDER BY c.closes_at,c.ticker""",
+                (asof.isoformat(),),
+            ).fetchall()
+            horizon_ranges = (
+                (">10m", 600, None),
+                ("5-10m", 300, 600),
+                ("2-5m", 120, 300),
+                ("<=2m", 0, 120),
+            )
+            has_horizons = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='btc_engine_horizons'"
+            ).fetchone()
+            horizon_contracts = set()
+            if has_horizons:
+                horizon_contracts = {
+                    row[0] for row in db.execute(
+                        """SELECT DISTINCT ticker FROM btc_engine_horizons
+                        WHERE mode='PUBLIC MARKET DATA'"""
+                    )
+                }
+                # The horizon table contains at most four timestamps per
+                # contract. Join those exact timestamps back to the compact
+                # prediction evidence once. This replaces roughly 4*N JSON
+                # scans and ORDER BY operations on the multi-gigabyte revision
+                # journal while preserving the same receipt-time rows.
+                row_streams.append(
+                    db.execute(
+                        f"""SELECT p.ticker,p.timestamp,o.outcome,o.observed_at,{payload_projection}
+                        FROM btc_engine_horizons h
+                        JOIN forecast_outcomes o ON o.ticker=h.ticker AND o.origin='official'
+                        JOIN predictions p ON p.ticker=h.ticker
+                          AND p.mode=h.mode AND p.timestamp=h.timestamp
+                        WHERE h.mode='PUBLIC MARKET DATA'
+                          AND julianday(o.observed_at)<=julianday(?)
+                          AND p.settlement_origin='official'
+                          AND p.settlement_up=o.outcome
+                          AND p.settled_at IS NOT NULL
+                          AND julianday(p.settled_at)<=julianday(?)
+                          AND julianday(p.timestamp)<julianday(h.closes_at)
+                        ORDER BY h.closes_at,h.ticker,h.horizon""",
+                        (asof.isoformat(), asof.isoformat()),
+                    )
+                )
+            for ticker, closes_at, outcome, observed_at in contracts:
+                if ticker in horizon_contracts:
+                    continue
+                for _bucket, lower, upper in horizon_ranges:
+                    upper_clause = (
+                        "" if upper is None else
+                        "AND (julianday(?)-julianday(p.timestamp))*86400<=?"
+                    )
+                    parameters = [
+                        outcome, observed_at, outcome, asof.isoformat(),
+                        closes_at, closes_at, lower,
+                    ]
+                    if upper is not None:
+                        parameters.extend((closes_at, upper))
+                    parameters.extend((ticker,))
+                    row_streams.append(
+                        db.execute(
+                            f"""SELECT p.ticker,p.timestamp,?, ?,{payload_projection}
+                            FROM predictions p
+                            WHERE p.mode='PUBLIC MARKET DATA'
+                              AND p.settlement_origin='official'
+                              AND p.settlement_up=?
+                              AND p.settled_at IS NOT NULL
+                              AND julianday(p.settled_at)<=julianday(?)
+                              AND julianday(p.timestamp)<julianday(?)
+                              AND (julianday(?)-julianday(p.timestamp))*86400>?
+                              {upper_clause}
+                              AND p.ticker=?
+                              AND COALESCE(json_extract(p.payload,'$.stale'),1)=0
+                              AND json_type(p.payload,'$.model.candidate_features.values.distance_scaled') IN ('integer','real')
+                              AND json_type(p.payload,'$.model.candidate_features.values.return_1m') IN ('integer','real')
+                            ORDER BY p.timestamp,p.id LIMIT 30""",
+                            parameters,
+                        )
+                    )
+        # Preserve contracts recorded before the compact engine table existed.
+        # Only this bounded legacy subset uses the older revision scan.
+        compact_exclusion = (
+            """AND o.ticker NOT IN (
+              SELECT ticker FROM btc_engine_contracts
+              WHERE mode='PUBLIC MARKET DATA')"""
+            if compact_count
+            else ""
+        )
+        row_streams.append(
+            db.execute(
+                f"""SELECT p.ticker,p.timestamp,o.outcome,o.observed_at,{payload_projection}
+                FROM forecast_outcomes o CROSS JOIN predictions p
+                  ON p.ticker=o.ticker AND p.mode='PUBLIC MARKET DATA'
+                WHERE o.origin='official'
+                  AND julianday(o.observed_at)<=julianday(?)
+                  AND p.settlement_origin='official' AND p.settlement_up=o.outcome
+                  AND p.settled_at IS NOT NULL
+                  AND julianday(p.settled_at)<=julianday(?)
+                  {compact_exclusion}
+                ORDER BY p.timestamp,p.id""",
+                (asof.isoformat(), asof.isoformat()),
+            )
+        )
+    else:
+        row_streams.append(
+            db.execute(
+                f"""SELECT p.ticker,p.timestamp,p.settlement_up,p.settled_at,
+                {payload_projection} FROM predictions p
+                WHERE p.mode='PUBLIC MARKET DATA'
+                  AND p.settlement_origin='official' AND p.settlement_up IS NOT NULL
+                  AND julianday(p.settled_at)<=julianday(?)
+                ORDER BY p.timestamp,p.id""",
+                (asof.isoformat(),),
+            )
+        )
     selected = {}
-    for raw in rows:
-        stale, closes_at, f, baseline, bid, ask = json.loads(raw[4])
-        if (
-            stale
-            or not isinstance(f, dict)
-            or f.get("distance_scaled") is None
-            or f.get("return_1m") is None
-        ):
-            continue
-        t = timestamp(raw[1])
-        close = timestamp(closes_at)
-        if t >= close or not raw[3] or not close <= timestamp(raw[3]) <= asof:
-            continue
-        if (
-            type(baseline) not in (int, float)
-            or not math.isfinite(baseline)
-            or not 0 <= baseline <= 1
-        ):
-            continue
-        mid = (
-            (bid + ask) / 2
-            if all(type(v) in (int, float) and math.isfinite(v) for v in (bid, ask))
-            and 0 <= bid <= ask <= 1
-            else None
-        )
-        key = (raw[0], horizon((close - t).total_seconds()))
-        selected.setdefault(
-            key,
-            dict(
-                ticker=raw[0],
-                timestamp=t.isoformat(),
-                closes_at=close.isoformat(),
-                label_available_at=raw[3],
-                features=f,
-                outcome=int(raw[2]),
-                baseline=baseline,
-                market=mid,
-                remaining=(close - t).total_seconds(),
-            ),
-        )
+
+    def consume(rows):
+        for raw in rows:
+            stale, closes_at, f, baseline, bid, ask, down_bid, down_ask, fee_multiplier = json.loads(raw[4])
+            if (
+                stale
+                or not isinstance(f, dict)
+                or f.get("distance_scaled") is None
+                or f.get("return_1m") is None
+            ):
+                continue
+            t = timestamp(raw[1])
+            close = timestamp(closes_at)
+            if t >= close or not raw[3] or not close <= timestamp(raw[3]) <= asof:
+                continue
+            if (
+                type(baseline) not in (int, float)
+                or not math.isfinite(baseline)
+                or not 0 <= baseline <= 1
+            ):
+                continue
+            mid = (
+                (bid + ask) / 2
+                if all(type(v) in (int, float) and math.isfinite(v) for v in (bid, ask))
+                and 0 <= bid <= ask <= 1
+                else None
+            )
+            key = (raw[0], horizon((close - t).total_seconds()))
+            selected.setdefault(
+                key,
+                dict(
+                    ticker=raw[0], timestamp=t.isoformat(), closes_at=close.isoformat(),
+                    label_available_at=raw[3], features=f, outcome=int(raw[2]),
+                    baseline=baseline, market=mid,
+                    executable_quotes={
+                        "up": {"bid": bid, "ask": ask},
+                        "down": {"bid": down_bid, "ask": down_ask},
+                    },
+                    fee_multiplier=fee_multiplier,
+                    remaining=(close - t).total_seconds(),
+                ),
+            )
+    for rows in row_streams:
+        consume(rows)
+
+    if has_results and compact_count:
+        expected = {
+            (ticker, bucket)
+            for ticker, _close, _outcome, _observed in contracts
+            for bucket, _lower, _upper in horizon_ranges
+        }
+        # Missing horizons remain explicit exclusions.  Never fall back to a
+        # multi-contract payload rescan: on the preserved production journal
+        # that query read gigabytes and repeatedly exceeded the bounded
+        # evaluator deadline.  The indexed per-contract queries above select
+        # the first 30 *usable* rows for each horizon instead.
     return list(selected.values())
 
 
@@ -120,8 +260,59 @@ def market_score(rows):
     return score([r["market"] for r in supported], [r["outcome"] for r in supported])
 
 
-def prepare_comparison(db, now, *, used_test_contracts=None):
+def after_cost_assessment(probabilities, rows, *, slippage=0.01):
+    """Conservative one-contract quote-time counterfactual on the holdout.
+
+    Missing executable asks or fee metadata are withheld.  Historical records
+    do not contain a guaranteed quote after a manual execution delay, so this
+    diagnostic can never by itself demonstrate or activate a profitable edge.
+    """
+    from .edge_scanner import quantity_fee
+
+    observations = []
+    for probability_up, row in zip(probabilities, rows):
+        quotes = row.get("executable_quotes") or {}
+        multiplier = row.get("fee_multiplier")
+        if type(multiplier) not in (int, float) or not math.isfinite(multiplier):
+            continue
+        candidates = []
+        for side, probability in (("up", probability_up), ("down", 1 - probability_up)):
+            ask = (quotes.get(side) or {}).get("ask")
+            if type(ask) not in (int, float) or not math.isfinite(ask) or not 0 < ask < 1:
+                continue
+            fee = quantity_fee(ask, 1, multiplier)
+            cost = ask + slippage + fee
+            candidates.append((probability - cost, side, cost, fee))
+        if not candidates:
+            continue
+        edge, side, cost, fee = max(candidates)
+        if edge <= 0:
+            continue
+        won = row["outcome"] == (1 if side == "up" else 0)
+        observations.append(
+            {"ticker": row["ticker"], "side": side, "won": won, "net_pnl": (1 if won else 0) - cost, "entry_cost": cost, "fee": fee}
+        )
+    pnl = sum(item["net_pnl"] for item in observations)
+    return {
+        "protocol": "quote-time-one-contract-after-costs-v1",
+        "eligible_quote_observations": len(observations),
+        "simulated_net_pnl": pnl,
+        "average_net_pnl_per_call": pnl / len(observations) if observations else None,
+        "slippage_per_contract": slippage,
+        "fees_included": True,
+        "manual_execution_delay_supported": False,
+        "profitable_edge_demonstrated": False,
+        "reason": "Historical post-delay executable quotes are unavailable; quote-time results cannot verify a manually executable edge",
+    }
+
+
+def prepare_comparison(db, now, *, used_test_contracts=None, progress=None):
+    started = perf_counter()
+    def emit(stage, **values):
+        if progress:
+            progress(stage, perf_counter() - started, values)
     count = official_label_count(db, now)
+    emit("official_labels", count=count)
     if count < MIN_CONTRACTS:
         artifact, report = compare([])
         report.update(
@@ -132,7 +323,14 @@ def prepare_comparison(db, now, *, used_test_contracts=None):
         )
         return artifact, report, []
     rows = dataset(db, now)
+    emit("dataset_loaded", rows=len(rows), contracts=len({r["ticker"] for r in rows}))
     artifact, report = compare(rows, used_test_contracts=used_test_contracts)
+    emit("model_comparison_complete", status=report.get("status"), trained=report.get("trained"))
+    report["recorded_official_contracts"] = count
+    report["eligible_feature_contracts"] = len({row["ticker"] for row in rows})
+    report["excluded_official_contracts"] = max(
+        0, count - report["eligible_feature_contracts"]
+    )
     report["dataset_loaded"] = True
     return artifact, report, rows
 
@@ -308,6 +506,63 @@ def calibrate(model, rows):
     model["calibration"] = [a, b]
 
 
+def chronological_contract_partitions(contracts, used_test_contracts=None):
+    """Return chronological train/validation/test contract sets.
+
+    Once a registry has exposed a test contract, a later scheduled evaluation
+    may use that old period as development history, but it may never call it an
+    untouched test again.  The next test is therefore a forward block strictly
+    after the newest previously exposed contract.  Waiting for 30 genuinely new
+    contracts is safer than repeatedly scoring the same holdout.
+    """
+    contracts = list(contracts)
+    used = set(used_test_contracts or ())
+    exposed_positions = [i for i, ticker in enumerate(contracts) if ticker in used]
+    if not exposed_positions:
+        a, b = int(len(contracts) * 0.6), int(len(contracts) * 0.8)
+        return (
+            [set(contracts[:a]), set(contracts[a:b]), set(contracts[b:])],
+            {
+                "evaluation_mode": "INITIAL_CHRONOLOGICAL_HOLDOUT",
+                "previously_exposed_contracts": 0,
+                "unseen_forward_contracts": len(contracts[b:]),
+                "available_eligible_contracts": len(contracts),
+                "development_contracts": b,
+                "required_unseen_forward_contracts": 30,
+                "additional_unseen_contracts_needed": max(0, 30 - len(contracts[b:])),
+                "last_exposed_contract": None,
+            },
+        )
+
+    last_exposed = max(exposed_positions)
+    development = contracts[: last_exposed + 1]
+    future = [ticker for ticker in contracts[last_exposed + 1 :] if ticker not in used]
+    info = {
+        "evaluation_mode": "FORWARD_UNSEEN_HOLDOUT",
+        "previously_exposed_contracts": len(set(contracts) & used),
+        "unseen_forward_contracts": len(future),
+        "available_eligible_contracts": len(contracts),
+        "development_contracts": len(development),
+        "required_unseen_forward_contracts": 30,
+        "additional_unseen_contracts_needed": max(0, 30 - len(future)),
+        "last_exposed_contract": contracts[last_exposed],
+        "registry_contracts_not_in_current_dataset": len(used - set(contracts)),
+    }
+    if len(future) < 30:
+        return None, info
+    validation_size = max(30, int(len(development) * 0.2))
+    if len(development) - validation_size < 100:
+        return None, info
+    return (
+        [
+            set(development[:-validation_size]),
+            set(development[-validation_size:]),
+            set(future),
+        ],
+        info,
+    )
+
+
 def compare(rows, *, used_test_contracts=None):
     contracts = sorted(
         {r["ticker"] for r in rows},
@@ -331,10 +586,16 @@ def compare(rows, *, used_test_contracts=None):
     }
     if len(contracts) < MIN_CONTRACTS:
         return None, report
-    n = len(contracts)
-    a = int(n * 0.6)
-    b = int(n * 0.8)
-    sets = [set(contracts[:a]), set(contracts[a:b]), set(contracts[b:])]
+    sets, partition = chronological_contract_partitions(contracts, used_test_contracts)
+    report.update(partition)
+    report["holdout_reuse_checked"] = used_test_contracts is not None
+    if sets is None:
+        report["status"] = "INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT"
+        report["reason"] = (
+            "Previously exposed holdouts remain recorded; wait for at least 30 "
+            "later verified contracts before another forward evaluation"
+        )
+        return None, report
     groups = [[r for r in rows if r["ticker"] in s] for s in sets]
     val_start = min(timestamp(r["timestamp"]) for r in groups[1])
     test_start = min(timestamp(r["timestamp"]) for r in groups[2])
@@ -355,15 +616,9 @@ def compare(rows, *, used_test_contracts=None):
     if any(c < m for c, m in zip(counts, [100, 30, 30])):
         report["status"] = "INSUFFICIENT_PURGED_SPLITS"
         return None, report
-    if used_test_contracts is not None:
-        overlap = {r["ticker"] for r in test} & set(used_test_contracts)
-        if overlap:
-            report.update(
-                status="HOLDOUT_REUSE_BLOCKED",
-                holdout_overlap_contracts=len(overlap),
-                holdout_reuse_checked=True,
-            )
-            return None, report
+    overlap = {r["ticker"] for r in test} & set(used_test_contracts or ())
+    if overlap:
+        raise AssertionError("Forward holdout partition reused an exposed contract")
     if (
         min(sum(r["outcome"] == y for r in train) for y in (0, 1)) < 10
         or min(sum(r["outcome"] == y for r in val) for y in (0, 1)) < 5
@@ -463,10 +718,9 @@ def compare(rows, *, used_test_contracts=None):
             "note": "Validation diagnostic only; not causal evidence or a profitability claim",
         }
     # Selection is frozen before unsealing the untouched test labels.
+    test_probabilities = [row_predict(chosen, r) for r in test]
     tested = {
-        "selected_candidate": score(
-            [row_predict(chosen, r) for r in test], [r["outcome"] for r in test]
-        ),
+        "selected_candidate": score(test_probabilities, [r["outcome"] for r in test]),
         "zero_drift": score([r["baseline"] for r in test], [r["outcome"] for r in test]),
         "market_implied": market_score(test),
         "train_prior": score([prior] * len(test), [r["outcome"] for r in test]),
@@ -505,6 +759,7 @@ def compare(rows, *, used_test_contracts=None):
             for _, m, v in pool
         ],
         test=tested,
+        after_cost_test=after_cost_assessment(test_probabilities, test),
         test_by_horizon=by_horizon,
         feature_names=prep["names"],
         train_end=max(r["label_available_at"] for r in train),
@@ -523,6 +778,14 @@ def compare(rows, *, used_test_contracts=None):
             if b["samples"]
         ),
         note="Final holdout is a predeclared deployment gate, never used to retune coefficients. No profitability or 90% accuracy claim. No repeat tuning against this test period.",
+    )
+    from .selective_evaluation import selective_report
+
+    report["selective_signal_evaluation"] = selective_report(
+        [row_predict(chosen, r) for r in val],
+        val,
+        test_probabilities,
+        test,
     )
     if not passed:
         return None, report
@@ -696,11 +959,24 @@ def main():
             # A read-only connection cannot create or modify the user's journal.
             db = sqlite3.connect("file:" + str(args.journal.resolve()) + "?mode=ro", uri=True)
             try:
+                import resource
+                evaluation_started = perf_counter()
+                def progress(stage, elapsed, values):
+                    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    print(
+                        "EVALUATION_PROGRESS component=SETTLEMENT "
+                        f"stage={stage} elapsed_seconds={elapsed:.3f} max_rss_kib={rss} "
+                        + " ".join(f"{k}={v}" for k, v in values.items()),
+                        flush=True,
+                    )
+                progress("start", 0.0, {})
                 artifact, report, rows = prepare_comparison(
                     db,
                     now,
                     used_test_contracts=registry.used_test_contracts() if registry else None,
+                    progress=progress,
                 )
+                progress("complete", perf_counter() - evaluation_started, {"status": report.get("status")})
             finally:
                 db.close()
             if args.walk_forward:

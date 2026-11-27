@@ -1,0 +1,14 @@
+# Kalshi 8768 watchdog (signals only): health checks, bounded relaunch of the last healthy build, Telegram on
+# state changes only. Install: sudo cp deploy/oracle/kalshi-8768-watchdog.{service,timer} /etc/systemd/system/
+#   && sudo systemctl daemon-reload && sudo systemctl enable --now kalshi-8768-watchdog.timer
+[Unit]
+Description=Kalshi 8768 watchdog (signals only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=opc
+Nice=10
+WorkingDirectory=/home/opc/dual-ai-alerts
+ExecStart=/usr/bin/python3 /home/opc/dual-ai-alerts/watchdog_8768.py
+TimeoutStartSec=90

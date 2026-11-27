@@ -1,0 +1,111 @@
+# Retirement of test service 8769 (revision 3, after Codex HOLDs on ccab3e2 and f64f088)
+
+Author: Claude. NOT executed anywhere except a local rehearsal on test ports.
+Running it on Oracle requires (1) Codex approval of this revision and (2) the
+owner's explicit authorization. Production 8765 and preview 8768 are only
+observed (identity, and 8768's `/healthz`); 8767 is out of scope.
+
+Script: `deploy/oracle/retire_service_8769.sh`
+Tests:  `tests/test_phase5_retire_8769.py` (static guarantees + real rehearsal)
+
+## Evidence that 8769 is no longer needed (unchanged)
+
+- PID 475993, `/home/opc/kalshi-gap-repair-stage`, shell-launched, commit
+  `7ba1763` (codex/opening-gap-repair), journal `repair-test-8769.db`.
+- `7ba1763` is an ancestor of the running 8768 build `6c19623` and of every
+  Phase 5 build: its change is already live on 8768.
+- No repository file references port 8769 or its directory.
+- 22.2% of the single CPU and 571 MiB on a host 1.7 GB into swap.
+
+## Usage (on Oracle, as opc)
+
+```bash
+bash retire_service_8769.sh check                          # read-only; prints the approval token
+bash retire_service_8769.sh retire --approve RETIRE-8769-PID475993-START<n>
+bash retire_service_8769.sh rollback <state dir printed by retire> --approve ROLLBACK-8769
+```
+
+Exit codes: 0 ok; 2 a gate failed or usage/approval wrong (nothing changed);
+3 SIGTERM sent but the process did not exit in 30 s (never force-killed;
+manual decision); 4 post-check or rollback verification failed.
+
+## Codex's six defects and their fixes
+
+| # | Defect (ccab3e2) | Fix |
+|---|---|---|
+| 1 | Invalid rollback assignment `R=<directory printed in step B>` | Rollback takes the state directory as an argument; the script validates the directory (mode 700) and every state file before acting. |
+| 2 | Time-of-check / time-of-stop race | After capturing state, the script re-checks listener PID **and process start time**, clients, journal users, other-process references, parent and protected identities immediately before the signal. The signal is sent through a **pidfd** opened before a final start-time check, so the PID cannot be reused between check and signal. |
+| 3 | Narrow supervisor check | Searches installed system units (`/etc`, `/usr/lib`, `/lib`, `/run` systemd dirs), system/user units and timers (`systemctl list-units/list-timers`, system and `--user`), `~/.config/systemd/user`, `/etc/crontab`, `/etc/cron.*`, `/var/spool/cron`, `/etc/anacrontab`, user crontab, supervisord, `rc.local`, nginx/caddy/httpd/haproxy/cloudflared configs, `~/.cloudflared`, `~/.ssh/config`, shell profiles, `~/bin`, launch scripts in home and the service directory; every process's argv for the port, journal or directory (tunnels, proxies, readers, restart loops); and the service's parent (a living non-init parent may be a restart loop). |
+| 4 | Manual protected-service comparison | `protected_snapshot` records PID, start time, cwd and argv hash for 8765 and 8768 before; it is compared automatically before the signal and after the stop (and before/after a rollback). Both must each have exactly one readable listener or the check fails. |
+| 5 | Rollback not executable/verified | `rollback` relaunches with the captured argv, cwd and environment (`env -i`, `setsid nohup`), then verifies: exactly one listener, argv identical argument by argument, cwd, git commit, signals-only (no account flags), `/healthz` HEALTHY with workers healthy and `signals_only`, `/readyz` READY, and unchanged protected services. It refuses to start if the port is in use, the journal is missing or locked, or the checkout moved. |
+| 6 | Did not fail closed | Every gate fails closed: missing tool, `ss` failure, timeout (`timeout` on every external command), unreadable location without passwordless sudo, grep read errors, fuser timeout, journal accessible to other users when other users' processes cannot be inspected, wrong commit/cwd/journal/flags, more than one listener, or any client/reader/reference. |
+
+Also: exclusive `flock` on `retire.lock` and, when present, the preview-8768
+deployment lock (so no deployment can run concurrently); a token that binds
+the approval to the exact PID and start time seen by `check`; launch state
+stored 0700/0600 and never printed; journal files are never deleted, moved,
+truncated or opened for writing by the script.
+
+## Codex's seven defects in f64f088 and their fixes (revision 3)
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | Zombie not recognized as exited | `alive_same` treats state Z/X (or a different start time, or a vanished PID) as exited. After exit the script waits (bounded) and REQUIRES the listener to be gone and the journal files to have no holders; otherwise exit 4. Rehearsed with a real zombie (the test process stays the parent and does not reap). |
+| 2 | Unchecked state capture | Every capture step is checked (`|| die "capture failed: ..."`); `validate_state` then requires the directory 0700/owned and all nine files present, non-empty, regular, 0600, with valid contents (port, 40-hex commit, absolute cwd/journal, identity format, protected snapshot format, non-empty NUL-separated argv/env), and the captured argv must equal the running process's argv (streamed compare: /proc files report size 0). All before SIGTERM. Rollback re-validates the same way. |
+| 3 | Silent failures in checks | Supervisor search: grep exit 2 (permission/unreadable entry) and timeouts fail (retry once with passwordless sudo when available); launch-script search fails the same way; `crontab -l` must succeed or report exactly "no crontab"; `systemctl --system/--user list-units` and `list-timers` must succeed. /proc scan: an existing but unreadable cmdline fails (vanished processes are benign); hidepid without root/sudo blocks. Journal holders: fuser exit codes other than 0/1, fallback scan permission errors or timeouts fail. Protected identity reads fail rather than print placeholders. |
+| 4 | Deployment lock optional | `secure_lock` always creates/opens the preview-8768 deployment lock (and the retire lock): directory created owner-only if missing and must be owned and not group/other writable; lock must be a regular, owned, non-symlink file, set 0600, and `flock -n` acquired, else blocked. |
+| 5 | Supervisor checks not repeated before SIGTERM | The final re-check runs `gate_supervisors`, journal holders, process references, parent, protected identity and 8768 health, then the client check last, immediately before the pidfd signal. |
+| 6 | 8768 health only printed | `healthy()` enforces HTTP 200, HEALTHY, workers healthy and signals_only; required before retirement (gate), before the signal, and after retirement (exit 4 on failure). |
+| 7 | Rollback compared fresh snapshots | Rollback compares 8765/8768 against the SAVED pre-retirement snapshot before relaunch (refuses on any difference) and again after verification; protected health is enforced too. |
+
+## Residual races (documented, cannot be fully removed without changing the host)
+
+1. A new client could connect in the milliseconds between the final client
+   re-check and the SIGTERM. The stop would end that session. Removing this
+   would require a firewall change, which is out of scope.
+2. A configuration file could be written between the final supervisor search
+   (in the gate pass) and the signal; the final re-check repeats the process
+   references and parent check but not the full file search (it takes
+   seconds). Low risk: nothing on the host is known to write these files.
+3. Rollback cannot recreate open client sessions; clients reconnect.
+
+## Local rehearsal (sandbox, test ports; never Oracle)
+
+A real signals server in a git worktree played "8769"; an HTTP server and a
+second signals server played the protected services. Rehearsal-only
+overrides: readiness not required (no market feed in the sandbox; the output
+says so explicitly), the sandbox init process accepted as parent, and a
+stand-in `crontab` reporting an empty user crontab.
+
+- `check` passed all gates and printed the token.
+- `retire` with a wrong token: refused, service untouched.
+- `retire` with the token: state captured (0700/0600), final re-check
+  passed, SIGTERM via pidfd, graceful exit, port freed, journal preserved,
+  protected identities unchanged, environment never printed.
+- `rollback` with a wrong approval: refused.
+- `rollback`: relaunched; argv identical (14 arguments), cwd, commit,
+  signals-only, HEALTHY with workers healthy, protected unchanged.
+- A second `rollback` while running: refused (port in use).
+- Fail-closed cases: live client, another journal reader, a restart script
+  referencing the port, a missing protected listener, a wrong commit, and
+  missing tools each blocked the operation with nothing changed.
+
+## Instructions for Codex's independent review
+
+1. `git fetch origin claude/phase5-deploy-failure-repair` and check out the
+   commit named in the handoff message.
+2. Read `deploy/oracle/retire_service_8769.sh` in full. Verify against the
+   six defects above, in particular: the pidfd stop path (`pidfd_term`), the
+   final re-check block before it, `gate_supervisors`/`search_refs`
+   fail-closed behaviour, `protected_snapshot` comparisons, and the rollback
+   verification block.
+3. Run `bash -n` and `shellcheck -S warning` on the script.
+4. Run `python -m pytest -q tests/test_phase5_retire_8769.py` (needs `ss`,
+   `fuser`, `git`, `setsid`; the rehearsal starts local servers on free test
+   ports and removes its temporary worktree).
+5. Confirm or refute: Oracle has passwordless sudo for opc (otherwise
+   unreadable system cron/proxy locations make `check` fail closed, which is
+   intended), and `fuser` is installed (otherwise a bounded descriptor scan
+   is used, and its failure also fails closed).
+6. Record PASS/HOLD with findings in a commit on your branch. Nothing should
+   be run on Oracle until the owner authorizes it after your PASS.

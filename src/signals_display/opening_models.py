@@ -13,16 +13,74 @@ import math
 import re
 from pathlib import Path
 import sqlite3
+from time import perf_counter
 
 from . import learning
-from .features import FEATURES
+from .features import FEATURES, OPENING_CANDLE_FEATURES
+
+# The production decision threshold. Challengers are evaluated at this fixed value, never at a
+# threshold chosen by training. Changing it needs a separately validated, separately approved change.
+LIVE_DECISION_THRESHOLD = 0.55
 from .model import timestamp
 from .scores import score
 
 MIN_CONTRACTS = learning.MIN_CONTRACTS
 BOOST_MIN_CONTRACTS = 500
-PROTOCOL = "opening-frozen-linear-ensemble-stumps-shadow-v1"
+PROTOCOL = "opening-frozen-linear-ensemble-stumps-shadow-v2"
 FEATURE_VERSION = "opening-asof-features-v2"
+# Regression ledger L13: how the stream-derived micro/flow inputs were computed. Deployment 9a9a6ea
+# (first live 2026-11-20 20:21:50 UTC) fixed the reconnect loops, which changed those inputs'
+# distribution without changing FEATURE_VERSION. Records made later carry "stream_computation";
+# older unstamped records are classified by their opening time.
+STREAM_COMPUTATION = "full-window-v1"
+LEGACY_STREAM_COMPUTATION = "reset-window-legacy"
+STREAM_FIX_LIVE_AT = datetime(2026, 11, 20, 20, 21, 50, tzinfo=timezone.utc)
+
+
+def stream_computation(frozen, opened):
+    stamped = frozen.get("stream_computation") if isinstance(frozen, dict) else None
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    return STREAM_COMPUTATION if opened >= STREAM_FIX_LIVE_AT else LEGACY_STREAM_COMPUTATION
+
+PRICE_CORE = {
+    "distance_scaled",
+    "remaining_fraction",
+    "return_1m",
+    "return_3m",
+    "return_5m",
+    "return_15m",
+    "return_30m",
+    "return_60m",
+    "return_24h",
+    "acceleration",
+    "body_fraction",
+    "upper_wick",
+    "lower_wick",
+    "range_fraction",
+    "breakout_distance",
+    "volatility_change",
+    "relative_volume",
+    "candle_body_range_ratio",
+    "candle_close_range_position",
+    "candle_volume_weighted_move",
+    "candle_atr_zscore_20",
+    "candle_unusual_expansion",
+}
+FEATURE_SETS = {
+    "price_core": PRICE_CORE,
+    "multi_hour_candlestick": PRICE_CORE | set(OPENING_CANDLE_FEATURES),
+    "price_technical": PRICE_CORE
+    | {
+        "rsi_14",
+        "macd_scaled",
+        "ema_gap",
+        "vwap_deviation",
+        "bollinger_z",
+        "volatility_24h",
+    },
+    "all_receipt_proven": set(FEATURES),
+}
 
 
 def _opening_rows(db, asof):
@@ -97,14 +155,24 @@ def _assess_opening(raw, asof):
         return None, "INVALID_BASELINE_PROBABILITY"
     if not math.isfinite(baseline) or not 0 <= baseline <= 1:
         return None, "INVALID_BASELINE_PROBABILITY"
-    return dict(
-        ticker=raw[0], timestamp=generated.isoformat(), opens_at=opened.isoformat(),
-        closes_at=closed.isoformat(), label_available_at=observed.isoformat(),
-        features=features, outcome=int(raw[7]), baseline=baseline, market=None,
-        remaining=(closed - opened).total_seconds(),
-        opening_delay_seconds=(generated - opened).total_seconds(),
-        regime=opening.get("regime", "unavailable"),
-    ), "ELIGIBLE"
+    return (
+        dict(
+            ticker=raw[0],
+            timestamp=generated.isoformat(),
+            opens_at=opened.isoformat(),
+            closes_at=closed.isoformat(),
+            label_available_at=observed.isoformat(),
+            features=features,
+            outcome=int(raw[7]),
+            baseline=baseline,
+            market=None,
+            remaining=(closed - opened).total_seconds(),
+            opening_delay_seconds=(generated - opened).total_seconds(),
+            regime=opening.get("regime", "unavailable"),
+            stream_computation=stream_computation(frozen, opened),
+        ),
+        "ELIGIBLE",
+    )
 
 
 def dataset_coverage(db, asof=None):
@@ -116,9 +184,11 @@ def dataset_coverage(db, asof=None):
     asof = asof or datetime.now(timezone.utc)
     counts = {}
     eligible = []
+    recent = []
     for raw in _opening_rows(db, asof):
         row, reason = _assess_opening(raw, asof)
         counts[reason] = counts.get(reason, 0) + 1
+        recent.append({"ticker": raw[0], "label_available_at": raw[6], "status": reason})
         if row is not None:
             eligible.append(row)
     total = sum(counts.values())
@@ -133,16 +203,26 @@ def dataset_coverage(db, asof=None):
         "minimum_for_first_shadow_evaluation": MIN_CONTRACTS,
         "remaining_to_first_shadow_evaluation": max(0, MIN_CONTRACTS - len(eligible)),
         "edge_status": "edge unverified",
+        "recent_official_eligibility": recent[-20:],
+        "newest_eligible_contract": eligible[-1]["ticker"] if eligible else None,
+        "newest_eligible_label_available_at": eligible[-1]["label_available_at"]
+        if eligible
+        else None,
     }
 
 
-def dataset(db, asof=None):
-    """Small immutable opening records joined to observed official outcomes only."""
+def dataset(db, asof=None, stream_computation=None):
+    """Small immutable opening records joined to observed official outcomes only.
+
+    ``stream_computation`` (optional) keeps only records whose micro/flow inputs were computed the
+    same way (L13), so a model is never trained on one computation and served another. The default
+    None keeps every eligible record (unchanged behaviour).
+    """
     asof = asof or datetime.now(timezone.utc)
     rows = []
     for raw in _opening_rows(db, asof):
         row, _reason = _assess_opening(raw, asof)
-        if row is not None:
+        if row is not None and (stream_computation is None or row["stream_computation"] == stream_computation):
             rows.append(row)
     return rows
 
@@ -195,6 +275,16 @@ def predict(model, features, *, baseline_probability=None):
             if weight
         )
     return learning.predict(model, features, baseline_probability=baseline_probability)
+
+
+def decision(artifact, probability):
+    """Apply only the symmetric abstention threshold frozen on validation."""
+    validate_artifact(artifact)
+    threshold = artifact["decision_policy"]["threshold"]
+    p = float(probability)
+    if not math.isfinite(p) or not 0 <= p <= 1:
+        raise ValueError("Opening decision probability must be finite and within [0,1]")
+    return "UP" if p >= threshold else "DOWN" if p <= 1 - threshold else "WAIT"
 
 
 def _row_predict(model, row):
@@ -298,24 +388,39 @@ def _ensemble(components, validation):
     )
 
 
+def _preprocess_subset(train, allowed):
+    reduced = [
+        {
+            **row,
+            "features": {name: value for name, value in row["features"].items() if name in allowed},
+        }
+        for row in train
+    ]
+    return learning.preprocess(reduced)
+
+
 def _pool(train, validation, total_contracts):
-    prep = learning.preprocess(train)
-    if not prep["names"]:
-        return []
     result = []
-    for kind in ("logistic", "ridge"):
-        for l2 in (0.1, 1.0):
-            model = learning.fit(train, kind, l2, prep)
-            learning.calibrate(model, validation)
-            result.append(
-                (
-                    score(
-                        [_row_predict(model, r) for r in validation],
-                        [r["outcome"] for r in validation],
-                    ),
-                    model,
+    for feature_set, allowed in FEATURE_SETS.items():
+        prep = _preprocess_subset(train, allowed)
+        if not prep["names"]:
+            continue
+        for kind in ("logistic", "ridge"):
+            for l2 in (0.1, 1.0):
+                model = learning.fit(train, kind, l2, prep)
+                model["feature_set"] = feature_set
+                learning.calibrate(model, validation)
+                result.append(
+                    (
+                        score(
+                            [_row_predict(model, r) for r in validation],
+                            [r["outcome"] for r in validation],
+                        ),
+                        model,
+                    )
                 )
-            )
+    if not result:
+        return []
     members = [
         min(
             (item for item in result if item[1]["kind"] == kind),
@@ -324,7 +429,9 @@ def _pool(train, validation, total_contracts):
         for kind in ("logistic", "ridge")
     ]
     if total_contracts >= BOOST_MIN_CONTRACTS:
+        prep = _preprocess_subset(train, FEATURE_SETS["all_receipt_proven"])
         boost = fit_boost(train, prep)
+        boost["feature_set"] = "all_receipt_proven"
         _calibrate_boost(boost, validation)
         result.append(
             (
@@ -436,8 +543,20 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
             "reason"
         ] = "Insufficient newly recorded frozen-feature openings; historical live forecasts cannot replace opening data"
         return None, report
-    a, b = int(len(rows) * 0.6), int(len(rows) * 0.8)
-    groups = _purge(rows[:a], rows[a:b], rows[b:])
+    contract_sets, partition = learning.chronological_contract_partitions(
+        [row["ticker"] for row in rows], used_test_contracts
+    )
+    report.update(partition)
+    if contract_sets is None:
+        report.update(
+            status="INSUFFICIENT_UNSEEN_FORWARD_HOLDOUT",
+            reason=(
+                "Previously exposed opening holdouts remain recorded; wait for at "
+                "least 30 later frozen openings with verified outcomes"
+            ),
+        )
+        return None, report
+    groups = _purge(*[[row for row in rows if row["ticker"] in group] for group in contract_sets])
     report["split_contracts"] = _counts(groups)
     blocker = _eligible(groups)
     if blocker:
@@ -446,8 +565,7 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
     train, validation, test = groups
     overlap = {r["ticker"] for r in test} & set(used_test_contracts or ())
     if overlap:
-        report.update(status="HOLDOUT_REUSE_BLOCKED", holdout_overlap_contracts=len(overlap))
-        return None, report
+        raise AssertionError("Forward opening holdout reused an exposed contract")
     from .calibration import chronological_calibration, drift_report
 
     report["shadow_calibration"] = chronological_calibration(
@@ -482,6 +600,7 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         else "EXPERIMENTAL_FALLBACK_RETAINED",
         trained=True,
         selected_before_test=selected["kind"],
+        selected_feature_set_before_test=selected.get("feature_set", "ensemble"),
         selected_model_fingerprint=hashlib.sha256(
             json.dumps(selected, sort_keys=True).encode()
         ).hexdigest(),
@@ -489,8 +608,21 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         validation_baseline=val_baseline,
         validation_train_prior=val_prior,
         candidate_validation=[
-            {"kind": model["kind"], "metrics": metrics} for metrics, model in pool
+            {
+                "kind": model["kind"],
+                "feature_set": model.get("feature_set", "ensemble"),
+                "metrics": metrics,
+            }
+            for metrics, model in pool
         ],
+        feature_ablation={
+            name: min(
+                (metrics for metrics, model in pool if model.get("feature_set") == name),
+                key=lambda metrics: (metrics["log_loss"], metrics["brier"]),
+                default=None,
+            )
+            for name in FEATURE_SETS
+        },
         test=tested,
         test_uncertainty=learning.uncertainty(ps, test),
         test_contracts=[r["ticker"] for r in test],
@@ -504,13 +636,38 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         else "DEFERRED_INSUFFICIENT_OPENING_LABELS",
         reason="Shadow evaluation only. A live-horizon artifact is incompatible with opening-cutoff predictions; no model is activated automatically",
     )
+    from .selective_evaluation import selective_report
+
+    report["selective_signal_evaluation"] = selective_report(
+        [_row_predict(selected, r) for r in validation],
+        validation,
+        ps,
+        test,
+    )
     if include_walk_forward:
-        report["walk_forward"] = walk_forward(rows[:b])
+        development_contracts = contract_sets[0] | contract_sets[1]
+        report["walk_forward"] = walk_forward(
+            [row for row in rows if row["ticker"] in development_contracts]
+        )
         report["walk_forward"][
             "scope"
         ] = "Development contracts only; final untouched holdout excluded"
     if not passed:
         return None, report
+    selective = report["selective_signal_evaluation"]
+    validation_threshold = selective.get("selected_threshold")
+    if validation_threshold is None:
+        report.update(
+            status="SELECTIVE_WAIT_POLICY_UNAVAILABLE",
+            reason=(
+                "Probabilistic gates passed, but validation did not contain enough "
+                "independent calls to freeze an UP/DOWN/WAIT threshold"
+            ),
+        )
+        return None, report
+    # The challenger is scored at the fixed live threshold. The validation-selected value is kept
+    # for audit only; it is never used as the decision policy.
+    decision_threshold = LIVE_DECISION_THRESHOLD
     fingerprint = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
     created_at = datetime.now(timezone.utc).isoformat()
     return {
@@ -531,6 +688,13 @@ def evaluate(rows, used_test_contracts=None, include_walk_forward=False):
         "forecast_activation": "EXPLICIT_CONFIGURATION_ONLY",
         "automatic_activation": False,
         "activation_allowed": False,
+        "decision_policy": {
+            "kind": "fixed_live_threshold",
+            "threshold": decision_threshold,
+            "validation_selected_threshold": validation_threshold,
+            "selected_before_untouched_test": True,
+            "otherwise": "WAIT",
+        },
     }, report
 
 
@@ -614,6 +778,21 @@ def validate_artifact(data):
         raise ValueError("Artifact is not an explicitly opening-targeted forecast candidate")
     validate_model(data["model"])
     report = data["report"]
+    policy = data.get("decision_policy")
+    if not isinstance(policy, dict) or policy.get("selected_before_untouched_test") is not True \
+            or type(policy.get("threshold")) not in (int, float) or policy.get("otherwise") != "WAIT":
+        raise ValueError("Opening artifact lacks a validation-selected WAIT policy")
+    if policy.get("kind") == "fixed_live_threshold":
+        # Challengers use the production threshold exactly; the validation-selected value is audit only.
+        if float(policy["threshold"]) != LIVE_DECISION_THRESHOLD:
+            raise ValueError("Opening artifact threshold differs from the live decision threshold")
+    elif policy.get("kind") == "validation_selected_symmetric_abstention":
+        # Legacy artifacts (including the live model) keep their original, unchanged rule.
+        if not 0.5 < policy["threshold"] < 1 or policy["threshold"] != (
+                report.get("selective_signal_evaluation") or {}).get("selected_threshold"):
+            raise ValueError("Opening artifact lacks a validation-selected WAIT policy")
+    else:
+        raise ValueError("Opening artifact lacks a validation-selected WAIT policy")
     counts = report["split_contracts"]
     if (
         report.get("status") != "SHADOW_CANDIDATE_PASSED_STATISTICAL_GATES"
@@ -759,8 +938,24 @@ def main():
     )
     args = parser.parse_args()
     try:
+        import resource
+
+        started = perf_counter()
+
+        def progress(stage, **values):
+            print(
+                "EVALUATION_PROGRESS component=OPENING "
+                f"stage={stage} elapsed_seconds={perf_counter()-started:.3f} "
+                f"max_rss_kib={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss} "
+                + " ".join(f"{k}={v}" for k, v in values.items()),
+                flush=True,
+            )
+
+        progress("start")
         with closing(sqlite3.connect(args.journal.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            coverage = dataset_coverage(db)
             rows = dataset(db)
+        progress("dataset_loaded", rows=len(rows), official=coverage["official_settled_contracts"])
         from .model_registry import atomic_json, ModelRegistry
 
         registry = ModelRegistry(args.registry)
@@ -770,6 +965,12 @@ def main():
                 used_test_contracts=registry.used_test_contracts(),
                 include_walk_forward=args.walk_forward,
             )
+            progress(
+                "model_comparison_complete",
+                status=report.get("status"),
+                trained=report.get("trained"),
+            )
+            report["dataset_coverage"] = coverage
             atomic_json(args.output.with_suffix(".report.json"), report)
             registry.record_evaluation(report, datetime.now(timezone.utc))
             if artifact:
@@ -777,6 +978,7 @@ def main():
         print(
             f"{report['status']}: {report['opening_contracts']} eligible frozen-feature openings; shadow only, edge unverified"
         )
+        progress("complete", status=report.get("status"))
     except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
         parser.error(str(exc))
 

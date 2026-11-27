@@ -255,3 +255,33 @@ def test_engine_published_only_after_cutoff_leaves_c_ineligible(tmp_path, monkey
     r = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {}, candles=_candles, log=lambda x: None)
     r.step(_state(updated=OPEN + timedelta(seconds=380)), now=OPEN + timedelta(seconds=390), now_mono=0)
     assert r.db.execute("SELECT c_dir, c_p_up FROM minute6").fetchone() == (None, None)
+
+
+@pytest.mark.parametrize("value", [True, float("nan"), float("inf"), -0.01, 1.01])
+def test_invalid_engine_probability_is_ineligible(tmp_path, value):
+    assert m6.component_c(value)["status"] == "INELIGIBLE"
+    runner = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {})
+    runner.remember_engine(runner._market(_state(up=value)), OPEN + timedelta(seconds=366))
+    assert runner.engine_seen == {}
+
+
+@pytest.mark.parametrize("timestamp", ["invalid", "2026-11-22T20:00:00", 1])
+def test_malformed_or_naive_market_timestamps_are_ignored(timestamp):
+    state = _state()
+    engine = state["prediction_engine"]
+    engine["updated_at"] = timestamp
+    assert Minute6Runner._market(state)["engine_at"] is None
+    engine["closes_at"] = timestamp
+    assert Minute6Runner._market(state) is None
+
+
+def test_api_body_rejects_future_output(tmp_path):
+    output = tmp_path / "m6.json"
+    output.write_text(json.dumps({"status": "LOCKED", "generated_at": OPEN.isoformat()}))
+    assert json.loads(m6.latest_body(output, now=OPEN - timedelta(seconds=1)))["status"] == "STALE"
+
+
+def test_engine_first_observed_after_cutoff_is_ineligible(tmp_path):
+    runner = Minute6Runner(str(tmp_path / "a.db"), str(tmp_path / "m6.json"), Sender(), {})
+    runner.remember_engine(runner._market(_state()), OPEN + timedelta(seconds=368))
+    assert runner.engine_seen == {}

@@ -74,8 +74,12 @@ def component_b(closes):
             "parts": {"momentum_1m": m1, "momentum_5m": m5, "ema9_minus_ema21": ema_gap, "acceleration_5m": accel}}
 
 
+def valid_probability(value):
+    return type(value) in (int, float) and 0 <= value <= 1
+
+
 def component_c(engine_up):
-    if not isinstance(engine_up, (int, float)):
+    if not valid_probability(engine_up):
         return {"status": "INELIGIBLE", "reason": "no engine P(UP) published before the cutoff"}
     d = "UP" if engine_up >= RULE["c"] else "DOWN" if engine_up <= 1 - RULE["c"] else "WAIT"
     return {"status": "ELIGIBLE", "p_up": float(engine_up), "direction": d}
@@ -161,9 +165,9 @@ def latest_body(path=None, now=None):
     now = now or datetime.now(timezone.utc)
     try:
         age = (now - datetime.fromisoformat(data["generated_at"])).total_seconds()
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
         age = None
-    if age is None or age > 90:
+    if age is None or not 0 <= age <= 90:
         data = {"status": "STALE", "label": LABEL, "reason": "minute-6 research service is not updating",
                 "age_seconds": age, "scoreboard": data.get("scoreboard"), "scoreboard7": data.get("scoreboard7")}
     return json.dumps(data, default=str).encode()

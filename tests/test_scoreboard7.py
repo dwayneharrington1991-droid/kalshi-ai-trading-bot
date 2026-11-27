@@ -145,3 +145,17 @@ def test_hidden_panels_do_not_poll_heavy_server_reports():
                   "if (box.offsetParent === null) { return; }",
                   "if (document.hidden || !el || el.offsetParent === null) return;"):
         assert guard in html, guard
+
+
+def test_conflicting_official_result_excluded_without_overwriting_history(tmp_path):
+    db = _db(tmp_path)
+    w = sb.start_window(tmp_path / "w.json", now=START)
+    _open(db, "TA", START, "UP", "UP", "UP")
+    sb.record_outcomes(db, [_mk("TA", START, "UP"), _mk("TA", START, "UP")])
+    assert sb.compute(db, w, now=START)["settled_markets"] == 1
+    assert sb.record_outcomes(db, [_mk("TA", START, "DOWN")]) == 0
+    assert db.execute("SELECT outcome FROM outcomes7").fetchone() == ("UP",)
+    assert db.execute("SELECT original, conflicting FROM official_outcome_conflicts").fetchone() == (
+        "UP", "DOWN"
+    )
+    assert sb.compute(db, w, now=START)["settled_markets"] == 0

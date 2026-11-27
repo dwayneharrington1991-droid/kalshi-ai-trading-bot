@@ -54,3 +54,18 @@ def test_watchdog_never_touches_trading_models_or_journal():
     code = (ROOT / "scripts/watchdog_8768.py").read_text(encoding="utf-8")
     for forbidden in ("place_order", "cancel_order", "create_order", "8765", "upgraded-live-8768.db\"", "DELETE", "DROP"):
         assert forbidden not in code, forbidden
+
+
+def test_deployment_guard_holds_both_locks_and_releases_on_contention(tmp_path):
+    deploy, jobs = tmp_path / "deploy.lock", tmp_path / "jobs.lock"
+    with wd.deployment_guard((deploy, jobs)) as acquired:
+        assert acquired
+        for path in (deploy, jobs):
+            with wd.deployment_guard((path,)) as other:
+                assert not other
+    with wd.deployment_guard((jobs,)) as acquired:
+        assert acquired
+        with wd.deployment_guard((deploy, jobs)) as other:
+            assert not other
+        with wd.deployment_guard((deploy,)) as other:
+            assert other

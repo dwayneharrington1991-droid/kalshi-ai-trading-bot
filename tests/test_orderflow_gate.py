@@ -2,6 +2,8 @@
 import hashlib
 import json
 
+import pytest
+
 from src.signals_display import orderflow_gate as g
 
 
@@ -30,3 +32,35 @@ def test_all_gates(tmp_path):
     assert r["source"] == "orderflow" and abs(r["p_up"] - 1 / (1 + 2.718281828459045 ** -2)) < 1e-9
     m.write_text(m.read_text() + " ")                                                      # weights changed
     assert g.enhanced(0.5, {"book.x": 2.0}, 100.0, 101.0, m, flag)["source"] == "production"
+
+
+@pytest.mark.parametrize("bad", [{"weights": []}, {"scale": [0]},
+                                  {"intercept": float("nan")}, {"weights": [float("inf")]}])
+def test_approved_but_malformed_model_falls_back(tmp_path, bad):
+    model, _ = _model(tmp_path)
+    model.write_text(json.dumps(json.loads(model.read_text()) | bad))
+    flag = tmp_path / "flag"
+    flag.write_text(hashlib.sha256(model.read_bytes()).hexdigest())
+    result = g.enhanced(.5, {"book.x": 2.0}, 100.0, 101.0, model, flag)
+    assert result["source"] == "production" and result["p_up"] == .5
+
+
+def test_model_is_parsed_from_the_single_verified_read(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    model, sha = _model(tmp_path)
+    flag = tmp_path / "flag"
+    flag.write_text(sha)
+    original = Path.read_bytes
+    reads = []
+
+    def swap_after_read(path):
+        data = original(path)
+        if path == model:
+            reads.append(path)
+            model.write_text(json.dumps(json.loads(data) | {"intercept": -100}))
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", swap_after_read)
+    result = g.enhanced(.5, {"book.x": 2.0}, 100.0, 101.0, model, flag)
+    assert len(reads) == 1 and result["source"] == "orderflow" and result["p_up"] > .8

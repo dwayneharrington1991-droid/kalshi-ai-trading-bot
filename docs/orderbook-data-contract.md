@@ -24,10 +24,14 @@ venues.{coinbase,kraken}:
   bands {"0.05%","0.10%","0.25%","0.50%"}: bid_btc, ask_btc, imbalance
   walls: up to 3 per side with size >= 5x the side's top-20 median (price, size_btc, x_median, distance_pct)
   wall_events vs the previous second: NEW, GREW (>+20%), SHRANK (<-20%), GONE with classification
-      CONSUMED BY TRADES | PARTLY TRADED / UNCERTAIN | PULLED OR MOVED
+      MATCHING EXECUTIONS OBSERVED | NO MATCHING EXECUTIONS OBSERVED, with matching_trade_btc
   trades {1s,5s,15s,30s,60s,300s}: buy_btc, sell_btc, trades, large_trades (>=1 BTC), imbalance
   cvd_btc (since collector start), pressure {label BUY|SELL|MIXED|UNAVAILABLE + rule; descriptive only}
 ```
+
+A level can disappear from the displayed wall list because its size, rank, or relative size changed.
+Matching executions must share the exact price and compatible aggressor side. The label does not
+assign the decrease to trades or cancellations.
 
 ## Research capture
 `~/dual-ai-alerts/orderbook_research.sqlite3`, table `book_seconds`. One row per venue per second:

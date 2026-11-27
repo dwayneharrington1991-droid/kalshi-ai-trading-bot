@@ -34,9 +34,17 @@ COINBASE = "wss://advanced-trade-ws.coinbase.com"
 
 def ts(v):
     try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00")[:32]).timestamp()
+        value = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return value.timestamp() if value.utcoffset() is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def record_trade(flow, event_at, side, size, price, trade_id, received_at):
+    event = ts(event_at)
+    if event is None or event > received_at or trade_id is None:
+        return False
+    return flow.add(event, side, float(size), float(price), str(trade_id))
 
 
 class State:
@@ -76,9 +84,10 @@ async def kraken(st):
                             book.last_event = ts(d.get("timestamp")) or time.time()
                             book.last_receipt = time.time()
                     elif ch == "trade" and typ == "update":
+                        received_at = time.time()
                         for t in m.get("data") or []:
-                            flow.add(ts(t.get("timestamp")) or time.time(), "buy" if t.get("side") == "buy" else "sell",
-                                     float(t["qty"]), float(t["price"]), trade_id=t.get("trade_id"))
+                            record_trade(flow, t.get("timestamp"), t.get("side"), t["qty"], t["price"],
+                                         t.get("trade_id"), received_at)
             delay = 1
         except Exception as exc:                    # reconnect with capped backoff; never crash the service
             st.errors["kraken"] = f"{type(exc).__name__}: {exc}"[:160]
@@ -113,13 +122,14 @@ async def coinbase(st):
                         book.last_event = ts(m.get("timestamp")) or time.time()
                         book.last_receipt = time.time()
                     elif ch == "market_trades":
+                        received_at = time.time()
                         for ev in m.get("events") or []:
                             if ev.get("type") != "update":
                                 continue
                             for t in ev.get("trades") or []:
-                                aggressor = "sell" if t.get("side") == "BUY" else "buy"     # side = maker side
-                                flow.add(ts(t.get("time")) or time.time(), aggressor, float(t["size"]), float(t["price"]),
-                                         trade_id=t.get("trade_id"))
+                                aggressor = {"BUY": "sell", "SELL": "buy"}.get(t.get("side"))
+                                record_trade(flow, t.get("time"), aggressor, t["size"], t["price"],
+                                             t.get("trade_id"), received_at)
             delay = 1
         except Exception as exc:
             st.errors["coinbase"] = f"{type(exc).__name__}: {exc}"[:160]

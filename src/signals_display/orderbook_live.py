@@ -17,6 +17,7 @@ import time
 import zlib
 from collections import deque
 from decimal import Decimal
+from math import isfinite
 
 STALE_S = 5.0
 KRAKEN_DEPTH = 25
@@ -63,7 +64,9 @@ class Book:
         now = now or time.time()
         if self.status in ("RESYNC", "CONNECTING", "DISCONNECTED"):
             return self.status
-        if self.last_event is None or now - self.last_event > STALE_S or not self.bids or not self.asks:
+        if (self.last_event is None or self.last_receipt is None
+                or not self.last_event <= self.last_receipt <= now
+                or not 0 <= now - self.last_event <= STALE_S or not self.bids or not self.asks):
             return "STALE"
         best_bid, best_ask = max(self.bids), min(self.asks)
         return "LIVE" if best_bid < best_ask else "RESYNC"          # crossed book = corrupt
@@ -104,6 +107,9 @@ class TradeFlow:
         self.seen_set = set()
 
     def add(self, ts, side, size, price, trade_id=None):
+        if (side not in ("buy", "sell") or not all(isfinite(v) for v in (ts, size, price))
+                or size <= 0 or price <= 0):
+            return False
         if trade_id is not None:
             if trade_id in self.seen_set:
                 return False
@@ -122,7 +128,7 @@ class TradeFlow:
         for w in WINDOWS:
             buy = sell = 0.0; n = large = 0
             for ts, side, size, _ in self.trades:
-                if ts >= now - w:
+                if now - w < ts <= now:
                     n += 1
                     large += size >= LARGE_TRADE_BTC
                     if side == "buy":
@@ -137,14 +143,14 @@ class TradeFlow:
 
 def depth_view(book, now=None, prev_walls=None, recent_trades=None):
     """Display/research snapshot of one book. prev_walls: {price_str: size} from the previous second, used to
-    classify wall changes; recent_trades: TradeFlow, to tell consumption by trades from cancellation."""
+    classify visible wall changes. Recent executions can corroborate a change at the same price and side."""
     now = now or time.time()
     bids, asks = book.levels(TOP)
     fresh = book.freshness(now)
     view = {"venue": book.venue, "status": fresh, "resyncs": book.resyncs,
             "last_event": book.last_event, "last_receipt": book.last_receipt,
             "age_s": round(now - book.last_event, 3) if book.last_event else None}
-    if not bids or not asks:
+    if fresh != "LIVE":
         return view, {}
     def ladder(levels):
         cum, out = Decimal(0), []
@@ -177,8 +183,9 @@ def depth_view(book, now=None, prev_walls=None, recent_trades=None):
     if prev_walls is not None:
         traded = {}
         for ts, side, size, price in (recent_trades.trades if recent_trades else []):
-            if ts >= now - 1.5:
-                traded[round(price, 1)] = traded.get(round(price, 1), 0.0) + size
+            if now - 1.5 < ts <= now:
+                key = ("bid" if side == "sell" else "ask", Decimal(str(price)))
+                traded[key] = traded.get(key, 0.0) + size
         for key, q in now_walls.items():
             old = prev_walls.get(key)
             if old is None:
@@ -189,11 +196,11 @@ def depth_view(book, now=None, prev_walls=None, recent_trades=None):
                 events.append({"wall": key, "event": "SHRANK", "from": float(old), "to": float(q)})
         for key, old in prev_walls.items():
             if key not in now_walls:
-                price = float(key.split(":", 1)[1])
-                hit = traded.get(round(price, 1), 0.0)
-                kind = "CONSUMED BY TRADES" if hit >= float(old) * 0.5 else \
-                       "PARTLY TRADED / UNCERTAIN" if hit > 0 else "PULLED OR MOVED (no trades seen at that price)"
-                events.append({"wall": key, "event": "GONE", "size_btc": float(old), "classification": kind})
+                side, price = key.split(":", 1)
+                hit = traded.get((side, Decimal(price)), 0.0)
+                kind = "MATCHING EXECUTIONS OBSERVED" if hit else "NO MATCHING EXECUTIONS OBSERVED"
+                events.append({"wall": key, "event": "GONE", "size_btc": float(old),
+                               "classification": kind, "matching_trade_btc": hit})
     view.update({"best_bid": float(best_bid), "best_ask": float(best_ask), "mid": float(mid),
                  "spread": float(best_ask - best_bid), "spread_bps": round(float((best_ask - best_bid) / mid) * 1e4, 3),
                  "bids": lb, "asks": la, "bands": bands, "walls": walls, "wall_events": events})
@@ -228,7 +235,15 @@ def latest_body(path=None, now=None):
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return json.dumps({"status": "UNAVAILABLE", "reason": "order-book collector output not found"}).encode()
-    age = (now or time.time()) - float(data.get("generated_at") or 0)
+    try:
+        generated = data["generated_at"]
+        if type(generated) not in (float, int) or not isfinite(generated):
+            raise ValueError("invalid generation time")
+        age = (time.time() if now is None else now) - generated
+        if age < 0:
+            raise ValueError("future snapshot")
+    except (TypeError, KeyError, ValueError):
+        return json.dumps({"status": "UNAVAILABLE", "reason": "invalid order-book snapshot time"}).encode()
     if age > STALE_S:
         for v in (data.get("venues") or {}).values():
             v["status"] = "STALE"

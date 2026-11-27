@@ -381,6 +381,10 @@ def evaluate(records_path, spec_path):
                "paired_bootstrap_ci95": _paired_ci(values, recorded, labels)}
         for name, values in series.items() if name != "recorded_baseline"
     }
+    for name, result in comparisons_to_recorded.items():
+        if name in comparisons:
+            comparisons[name]["brier_minus_recorded_baseline"] = result["brier_minus_recorded"]
+            comparisons[name]["vs_recorded_baseline_ci95"] = result["paired_bootstrap_ci95"]
     spec_bytes = Path(spec_path).read_bytes()
     competition = {}
     if spec.get("competition"):

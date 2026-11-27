@@ -75,6 +75,8 @@ def test_competition_scores_recorded_calls_and_separates_each_target(tmp_path, t
     assert "trades_increment" in report["comparisons"]
     assert set(report["comparisons_to_recorded_baseline"]) == {
         "price_only", "price_walls", "price_walls_trades", "combined_research"}
+    assert (report["comparisons"]["price_walls"]["vs_recorded_baseline_ci95"]
+            == report["comparisons_to_recorded_baseline"]["price_walls"]["paired_bootstrap_ci95"])
     records[-1]["decision_at"] = (datetime.fromisoformat(records[-1]["decision_at"]) + timedelta(seconds=1)).isoformat()
     export.write_text("\n".join(map(json.dumps, records)))
     with pytest.raises(ValueError, match="decision outside target cutoff"):

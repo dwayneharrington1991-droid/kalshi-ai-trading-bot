@@ -2369,6 +2369,11 @@ def make_handler(monitor):
                     body = json.dumps(monitor.challenger_view.call(opening), default=str).encode()
                     monitor.challenger_cache = (monotonic(), body)
                 content_type = "application/json"
+            elif route == "/api/orderbook":
+                # Live BTC books + trade flow written by the separate order-book collector. Read-only file read.
+                from .orderbook_live import latest_body as orderbook_body
+                body = orderbook_body()
+                content_type = "application/json"
             elif route == "/api/minute6":
                 # Minute-6 research reading + live analytics written by the alert service. Read-only file read.
                 from .minute6 import latest_body

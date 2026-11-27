@@ -14,6 +14,41 @@ mkdir -p "$OUT" && chmod 700 "$OUT"
 exec 9>"$OUT/run.lock"; flock -n 9 || { echo "another forward-test run is active"; exit 0; }
 min=$(date -u +%M); sec=$(date -u +%S); m=$(( (10#$min % 15) * 60 + 10#$sec ))
 if (( m < 150 || m > 810 )); then echo "inside an opening window; skipped"; exit 0; fi
+# --- failure tracking: a run counts only if the evaluator exited 0 AND wrote valid JSON with its required field.
+# Two consecutive failures of a test send one Telegram line; the next success sends one recovery line.
+notify() {
+  PYTHONPATH=/home/opc/dual-ai-alerts/vendor "$PY" -c '
+import sys
+from src.signals_display import phone_alerts as p
+cfg = p.load_config()
+if "telegram" in p.channels(cfg):
+    p.send("telegram", cfg, sys.argv[1])
+' "$1" || true
+}
+check_report() {   # $1 report json, $2 required top-level field, $3 exit code -> prints OK or a reason
+  "$PY" - "$1" "$2" "$3" <<'PY'
+import json, sys
+path, field, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if rc != 0:
+    print(f"evaluator exit code {rc}"); sys.exit()
+try:
+    r = json.load(open(path))
+except Exception as e:
+    print(f"unreadable or empty report ({type(e).__name__})"); sys.exit()
+print("OK" if isinstance(r, dict) and r.get(field) not in (None, "") else f"report missing '{field}'")
+PY
+}
+record() {          # $1 test, $2 OK|reason
+  f="$OUT/$1.failures"
+  if [[ $2 == OK ]]; then
+    if [[ -f $f.alerted ]]; then notify "8768 RESEARCH JOB RECOVERED: $1 forward test runs again"; rm -f "$f.alerted"; fi
+    rm -f "$f"; return
+  fi
+  echo "$(date -u +%FT%TZ) $2" >> "$f"; echo "$1: FAILED - $2"
+  if (( $(wc -l < "$f") >= 2 )) && [[ ! -f $f.alerted ]]; then
+    notify "8768 RESEARCH JOB FAILING: $1 forward test failed twice in a row ($2). Live bot unaffected."; touch "$f.alerted"
+  fi
+}
 BUILD=$(curl -s --max-time 10 http://127.0.0.1:8768/readyz | "$PY" -c 'import json,sys; print(json.load(sys.stdin).get("build_commit","")[:7])' 2>/dev/null)
 SRC=/home/opc/kalshi-preview-repair-$BUILD
 [[ -n $BUILD && -d $SRC/src ]] || { echo "deployed release not found ($BUILD)"; exit 3; }
@@ -38,11 +73,15 @@ for spec in "v2 2d4d007 forward_eval_v2.py 2026-11-23T02:00:00Z" \
   git -C "$REPO" show "$freeze:scripts/$ev" > "$W/scripts/$ev" || { echo "$name: frozen evaluator missing"; rm -rf "$W"; continue; }
   if [[ -z $dump ]]; then
     dump="$OUT/journal_dump-$(date -u +%Y%m%dT%H%M%SZ).json"
-    ( cd "$SRC" && nice -n 19 ionice -c3 timeout 900 "$PY" scripts/export_opening_research.py ) > "$dump" || { echo "export failed"; rm -f "$dump"; rm -rf "$W"; exit 4; }
+    ( cd "$SRC" && nice -n 19 ionice -c3 timeout 900 "$PY" scripts/export_opening_research.py ) > "$dump" || { record export "journal export failed"; rm -f "$dump"; rm -rf "$W"; exit 4; }
   fi
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
   ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 900 "$PY" "$W/scripts/$ev" --journal "$dump" --artifact "$ART" ) > "$OUT/$name-$stamp.json" 2> "$OUT/$name-$stamp.err"
+  rc=$?
   rm -rf "$W"
+  status=$(check_report "$OUT/$name-$stamp.json" decision "$rc")
+  record "$name" "$status"
+  [[ $status == OK ]] || continue
   decision=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("decision",""))' "$OUT/$name-$stamp.json" 2>/dev/null)
   echo "$name: $decision"
   if [[ -n $decision && $decision != "NOT ENOUGH FORWARD DATA" ]]; then
@@ -69,7 +108,11 @@ if [[ ! -f $OUT/v5.decided ]] && (( now >= v5_due )); then
   # v5 needs scikit-learn: a separate research venv, never the production one (deploy/oracle/research-venv.txt).
   RPY=/home/opc/dual-ai-alerts/research-venv/bin/python
   ( cd "$SRC" && PYTHONPATH="$SRC" nice -n 19 timeout 1200 "$RPY" scripts/train_v5.py --journal "$dump" --artifact "$ART" --mode v5 ) > "$OUT/v5-$stamp.json" 2> "$OUT/v5-$stamp.err"
-  decision=$("$PY" - "$OUT/v5-$stamp.json" <<'PY'
+  rc=$?
+  status=$(check_report "$OUT/v5-$stamp.json" evaluation "$rc")
+  record v5 "$status"
+  decision=""
+  [[ $status == OK ]] && decision=$("$PY" - "$OUT/v5-$stamp.json" <<'PY'
 import json, sys
 try:
     r = json.load(open(sys.argv[1])); e = r.get("evaluation") or {}

@@ -1,3 +1,3 @@
-# Research-only Python environment for v5 (never the production .venv):
+# Research-only Python environment for v5 (never the production .venv). Pinned, as installed 2026-11-27:
 #   python3.12 -m venv /home/opc/dual-ai-alerts/research-venv
-#   /home/opc/dual-ai-alerts/research-venv/bin/pip install numpy scikit-learn
+#   /home/opc/dual-ai-alerts/research-venv/bin/pip install numpy==2.5.5 scikit-learn==1.9.1

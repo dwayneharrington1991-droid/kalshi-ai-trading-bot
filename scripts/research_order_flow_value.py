@@ -81,7 +81,15 @@ def _load_spec(path):
         raise ValueError("spec is missing required fields")
     raw["eval_start"] = _ts(raw["eval_start"], "eval_start")
     raw["eval_end"] = _ts(raw["eval_end"], "eval_end") if raw.get("eval_end") else None
-    if raw["eval_end"] is None or not raw["eval_start"] < raw["eval_end"] <= DEVELOPMENT_END:
+    # Prospective mode (a pre-registered forward test): every record must be decided at or after the registration
+    # time, which must precede eval_start; nothing from the protected development/holdout periods is allowed.
+    raw["prospective_start"] = _ts(raw["prospective_start"], "prospective_start") if raw.get("prospective_start") else None
+    if raw["prospective_start"] is not None:
+        if raw["prospective_start"] < DEVELOPMENT_END or raw["eval_start"] < raw["prospective_start"]:
+            raise ValueError("prospective_start must follow the development period and precede eval_start")
+        if raw["eval_end"] is not None and raw["eval_end"] <= raw["eval_start"]:
+            raise ValueError("eval_end must follow eval_start")
+    elif raw["eval_end"] is None or not raw["eval_start"] < raw["eval_end"] <= DEVELOPMENT_END:
         raise ValueError("eval_end must follow eval_start and stay within the documented development period")
     if not isinstance(raw["min_train"], int) or raw["min_train"] < 20:
         raise ValueError("min_train must be an integer >= 20")
@@ -123,7 +131,10 @@ def load_records(path, spec):
                 if raw.get("target") != spec["target"]:
                     raise ValueError("target does not match fixed spec")
                 decision = _ts(raw["decision_at"], "decision_at")
-                if decision >= DEVELOPMENT_END:
+                if spec.get("prospective_start") is not None:
+                    if decision < spec["prospective_start"]:
+                        raise ValueError("record precedes the pre-registered prospective start")
+                elif decision >= DEVELOPMENT_END:
                     raise ValueError("record outside the documented development period")
                 label_at = _ts(raw["label_observed_at"], "label_observed_at")
                 baseline_at = _ts(raw["baseline_generated_at"], "baseline_generated_at")

@@ -81,3 +81,6 @@ review these gaps before using OF1 to make a promotion claim. For a strict follo
 separately preregistered markets and export genuine event and receipt timestamps, full
 window-coverage flags, the stored call and model version, and quarantined official outcomes.
 If the underlying collector or historical logs lack that evidence, mark the family unavailable.
+Check OF1 market IDs against the reserved V3/V4/V5 inventories before using OF1 rows for
+training. The OF1 start is after the V5 holdout start, and the last recorded V5 count was
+261 of 300. A later start time alone cannot demonstrate disjointness.
